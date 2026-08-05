@@ -10,14 +10,10 @@ the top-1 fetch (the ``top1_*`` payload and the LML#504 release-side
 verification flags) arrive as explicit keyword parameters.
 """
 
-import asyncio
 import logging
 from typing import Any
 from urllib.parse import quote
 
-import sentry_sdk
-
-from clients.streaming.apple_music import AppleMusicTrackMatch
 from clients.streaming.matching import (
     SCORE_MATCH_ACCEPTANCE_FLOOR,
     score_match,
@@ -33,12 +29,6 @@ from discogs.models import (
 )
 from discogs.service import find_track_position
 from discogs.writer_roles import writer_credits_from_release
-from entity.track_streaming_url_cache import (
-    APPLE_MUSIC_TRACK_SERVICE,
-    get_cached_track_streaming_url,
-    set_cached_track_streaming_url,
-)
-from generated.api_models import StreamingResolutionStatus
 from library.models import LibraryItem
 from lookup.artist_resolution import (
     _artist_pair_verified,
@@ -46,6 +36,7 @@ from lookup.artist_resolution import (
     _mb_rescue_song_match_required,
     _project_mb_rescue_attrs,
 )
+from lookup.enrichment.apple_probe import run_apple_music_probe
 from lookup.enrichment.bandcamp_probe import probe_owns_bandcamp_leg, run_bandcamp_live_probe
 from lookup.enrichment.context import EnrichmentContext
 from lookup.enrichment.streaming_status import resolve_streaming_status
@@ -53,10 +44,10 @@ from lookup.rowless import (
     ROWLESS_LIBRARY_ID,
 )
 from lookup.streaming_url_postprocess import apply_streaming_url_postprocess
-from lookup.timeouts import apple_music_lookup_timeout_s
 from release.apple_music_url_parser import url_has_apple_music_host
 from release.musicbrainz_resolver import resolve_tracklist_via_musicbrainz
 from release.spotify_url_parser import url_has_spotify_host
+from streaming.service import StreamingService
 
 logger = logging.getLogger(__name__)
 
@@ -221,202 +212,27 @@ async def enrich_one(
             if apple_music_override and not url_has_apple_music_host(apple_music_override):
                 apple_music_override = None
 
-    # Apple Music probe. ``library_row_acceptable`` picks ``find_track_url``
-    # (URL only — preserves LML#401 baseline); the synthesis path
-    # (LML#487) needs artwork + year too, so calls ``find_track_metadata``.
-    # Both make one ``search_song`` call, so per-request quota is identical
-    # to the LML#401 baseline. Skip the happy-path probe when the
-    # librarian override would win anyway (saves one Apple call per
-    # overridden item). The ``asyncio.wait_for`` ceiling caps single-call
-    # latency under 429/5xx pressure (LML#449/#450). On timeout/error we
-    # degrade to no-Apple-anything (LML#444 swallow). The Sentry data key
-    # encodes the *method* so LML#462 dashboards can distinguish synthesis-
-    # path timeouts (artwork still leaking, high impact) from happy-path
-    # timeouts (URL only, low impact).
-    apple_music_url: str | None = None
-    probe_match: AppleMusicTrackMatch | None = None
-    probe_artwork_url: str | None = None
-    probe_release_year: int | None = None
-    # LML#1053: this item's Apple-leg resolution verdict. ``None`` until some
-    # signal below sets it — stays ``None`` (never-consulted, key omitted from
-    # the final ``StreamingResolution``) when no override/cache-hit/probe ever
-    # ran. Finalized (override precedence) right before ``update`` is built.
-    apple_status: StreamingResolutionStatus | None = None
-    probe_method = "find_track_metadata" if not library_row_acceptable else "find_track_url"
-    skip_happy_probe = library_row_acceptable and apple_music_override
-
-    # L1 (LML#893): cache-first Apple track probe on the happy path. When the
-    # lookup carries a played track (``ctx.song``), peek a track-scoped cache
-    # (``lml_cache.track_streaming_url_cache``, keyed on
-    # ``(service, artist, album, song)``) before paying the ~4.8s live
-    # ``find_track_url``. A HIT returns the cached exact-track deep-link and
-    # skips the probe; a MISS runs the probe live (first-lookup URL preserved)
-    # and writes the resolved deep-link back to the TRACK cache. Both the peek
-    # and the write are gated on the kill-switch flags — an incident flip
-    # disables L1's cache read/write. Track deep-links live ONLY in this table:
-    # never the album-keyed cache (the PR #898 poisoning bug). The synthesis
-    # path (``find_track_metadata``) is untouched — track-absent lookups fall
-    # back to today's album/post-process behavior.
+    # LML#1101: the inline Apple Music live probe (bounded, L1-cache-first;
+    # apple_probe.py). Extracted from here for the same reason LML#1098's
+    # Bandcamp probe was — item.py's module-size budget — leaving enrich_one
+    # with two sibling probe calls instead of one longhand block and one call.
+    # See apple_probe.py's module docstring for why the two probes are sibling
+    # modules rather than rows in a config-driven engine.
     settings = get_settings()
-    track_cache_enabled = (
-        settings.lml_persist_streaming_urls and settings.lml_persist_streaming_url_apple_music
+    (
+        apple_music_url,
+        apple_status,
+        probe_match,
+        probe_artwork_url,
+        probe_release_year,
+    ) = await run_apple_music_probe(
+        ctx,
+        settings=settings,
+        row_artist=row_artist,
+        search_term=search_term,
+        library_row_acceptable=library_row_acceptable,
+        apple_music_override=apple_music_override,
     )
-    l1_eligible = bool(
-        library_row_acceptable
-        and ctx.apple_music is not None
-        and row_artist
-        and ctx.song
-        and ctx.discogs_cache_pg is not None
-        and track_cache_enabled
-        and not skip_happy_probe
-    )
-    track_cache_hit = False
-    if l1_eligible:
-        # Narrowed by ``l1_eligible``; asserted for mypy + as a runtime contract.
-        assert ctx.discogs_cache_pg is not None
-        assert ctx.song is not None
-        cached_track_url = await get_cached_track_streaming_url(
-            ctx.discogs_cache_pg,
-            service=APPLE_MUSIC_TRACK_SERVICE,
-            artist=row_artist,
-            album=ctx.album,
-            song=ctx.song,
-        )
-        if cached_track_url is not None:
-            apple_music_url = cached_track_url
-            track_cache_hit = True
-            apple_status = StreamingResolutionStatus.verified
-
-    if (
-        ctx.apple_music is not None
-        and row_artist
-        and search_term
-        and not skip_happy_probe
-        and not track_cache_hit
-    ):
-        # LML#930: clamp the per-item Apple probe's fixed 4s ceiling to the
-        # remaining caller budget so one slow item can't burn the whole tail
-        # past the caller's window. With no deadline (a direct
-        # ``enrich_artwork_results`` caller) or no caller-budget header, this
-        # returns the unbounded ceiling unchanged.
-        base_apple_timeout_s = apple_music_lookup_timeout_s()
-        apple_probe_timeout_s = (
-            ctx.spine_deadline.clamp_probe_timeout_s(base_apple_timeout_s)
-            if ctx.spine_deadline is not None
-            else base_apple_timeout_s
-        )
-        try:
-            if library_row_acceptable:
-                apple_music_url = await asyncio.wait_for(
-                    ctx.apple_music.find_track_url(row_artist, search_term, album=ctx.album),
-                    timeout=apple_probe_timeout_s,
-                )
-                # LML#1053: the probe ran to completion — a hit is verified, a
-                # clean no-match is absent (terminal, not a couldn't-check).
-                apple_status = (
-                    StreamingResolutionStatus.verified
-                    if apple_music_url is not None
-                    else StreamingResolutionStatus.absent
-                )
-                # L1 write-back: persist a freshly-resolved track deep-link so
-                # the next lookup of this ``(artist, album, song)`` is a HIT.
-                # Never persist a null (#782/BS#1192) — guarded on a non-null
-                # URL and the same kill-switch flags as the peek.
-                if l1_eligible and apple_music_url is not None:
-                    assert ctx.discogs_cache_pg is not None
-                    assert ctx.song is not None
-                    await set_cached_track_streaming_url(
-                        ctx.discogs_cache_pg,
-                        service=APPLE_MUSIC_TRACK_SERVICE,
-                        artist=row_artist,
-                        album=ctx.album,
-                        song=ctx.song,
-                        url=apple_music_url,
-                    )
-            else:
-                probe_match = await asyncio.wait_for(
-                    ctx.apple_music.find_track_metadata(row_artist, search_term, album=ctx.album),
-                    timeout=apple_probe_timeout_s,
-                )
-                # LML#1053: same verdict rule as the happy path above — the
-                # probe ran to completion either way.
-                apple_status = (
-                    StreamingResolutionStatus.verified
-                    if probe_match is not None
-                    else StreamingResolutionStatus.absent
-                )
-                if probe_match is not None:
-                    apple_music_url = probe_match.url
-                    probe_artwork_url = probe_match.artwork_url
-                    probe_release_year = probe_match.release_year
-        except TimeoutError:
-            # LML#1053: attempted but inconclusive — transient, not terminal.
-            # Covers both the genuine-outage and the self-inflicted
-            # deadline-clamped shed cases below; both leave this request with
-            # no confirmed verdict either way.
-            apple_status = StreamingResolutionStatus.unresolved
-            # LML#930 PR2: a `wait_for` timeout self-inflicted by the deadline
-            # clamp above (`apple_probe_timeout_s < base_apple_timeout_s`) is
-            # NOT an Apple outage — it's the budget running out, and at a
-            # near-zero clamp (e.g. ~0.01s) it fires near-instantly on every
-            # row, flooding the log with a signal that reads as "Apple is
-            # down" when it's self-inflicted deadline pressure. Only a
-            # genuine unclamped (full-ceiling) timeout still WARNs.
-            deadline_clamped = apple_probe_timeout_s < base_apple_timeout_s
-            if deadline_clamped:
-                logger.debug(
-                    "AppleMusicClient.%s timed out for %s - %s "
-                    "(deadline-clamped to %.3fs, not an Apple outage)",
-                    probe_method,
-                    row_artist,
-                    search_term,
-                    apple_probe_timeout_s,
-                )
-            else:
-                logger.warning(
-                    "AppleMusicClient.%s timed out for %s - %s",
-                    probe_method,
-                    row_artist,
-                    search_term,
-                )
-            # LML#462: project onto the active Sentry transaction so the
-            # trace explorer can distinguish "Apple Music timed out" from
-            # "Apple Music never ran" — the cancelled inner
-            # `apple_music.search` span never sets its `result` data, so
-            # without this marker the timeout shape is queryably
-            # indistinguishable from a no-op. The legacy key stays for
-            # dashboard continuity; the ``.method`` key disambiguates
-            # synthesis-path timeouts from happy-path timeouts; the LML#930
-            # ``.deadline_clamped`` key disambiguates a self-inflicted
-            # deadline-clamped timeout from a genuine Apple-side one; the
-            # ``.probe_timeout_s`` key records the effective clamp magnitude so
-            # a DEBUG-demoted clamped timeout stays diagnosable — a value near
-            # the base ceiling is a likely genuine Apple slowness, a near-zero
-            # value is self-inflicted deadline pressure.
-            try:
-                transaction = sentry_sdk.get_current_scope().transaction
-                if transaction is not None:
-                    transaction.set_data("apple_music.find_track_url.timeout", True)
-                    transaction.set_data("apple_music.timeout.method", probe_method)
-                    transaction.set_data("apple_music.timeout.deadline_clamped", deadline_clamped)
-                    transaction.set_data(
-                        "apple_music.timeout.probe_timeout_s", round(apple_probe_timeout_s, 3)
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Failed to project apple_music timeout onto Sentry transaction: %s",
-                    e,
-                )
-        except Exception:
-            # LML#1053: the LML#444 swallow-and-degrade path — attempted but
-            # inconclusive, same bucket as a timeout.
-            apple_status = StreamingResolutionStatus.unresolved
-            logger.exception(
-                "AppleMusicClient.%s raised for %s - %s",
-                probe_method,
-                row_artist,
-                search_term,
-            )
 
     # LML#505: post-hoc invalidation of sibling-row override URLs on
     # the synthesis branch. The LML#477 title gate
@@ -657,12 +473,23 @@ async def enrich_one(
     # here, BEFORE the deferred Bandcamp search-URL fallback below, so a
     # generic search page can never masquerade as "verified". See
     # ``lookup/enrichment/streaming_status.py`` for the merge rule.
+    # LML#1101: per-service maps, not per-service parameters. ``verified_urls``
+    # carries only the URL that FORCES ``verified`` for each service — for
+    # Apple the librarian override alone (a probe-resolved URL reports itself
+    # through ``apple_status``), for Spotify the override alone (no probe leg),
+    # for Bandcamp the post-probe slot (LML#1098's probe writes its resolved
+    # URL back there and reports ``verified`` alongside it). A new probing
+    # service is a new key here and no signature change in streaming_status.py.
     update["streaming_status"] = resolve_streaming_status(
-        apple_music_override=apple_music_override,
-        apple_probe_status=apple_status,
-        spotify_url=spotify_url,
-        bandcamp_url=bandcamp_url,
-        bandcamp_probe_status=bandcamp_status,
+        verified_urls={
+            StreamingService.APPLE_MUSIC: apple_music_override,
+            StreamingService.SPOTIFY: spotify_url,
+            StreamingService.BANDCAMP: bandcamp_url,
+        },
+        probe_status={
+            StreamingService.APPLE_MUSIC: apple_status,
+            StreamingService.BANDCAMP: bandcamp_status,
+        },
         postprocess_status=postprocess_status,
     )
 

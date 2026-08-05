@@ -123,7 +123,7 @@ class TestL1TrackCache:
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
             patch(
-                "lookup.enrichment.item.set_cached_track_streaming_url",
+                "lookup.enrichment.apple_probe.set_cached_track_streaming_url",
                 new=AsyncMock(),
             ) as write_mock,
         ):
@@ -165,7 +165,7 @@ class TestL1TrackCache:
 
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
-            patch("lookup.enrichment.item.set_cached_track_streaming_url", new=AsyncMock()),
+            patch("lookup.enrichment.apple_probe.set_cached_track_streaming_url", new=AsyncMock()),
             patch.object(SpineDeadline, "clamp_probe_timeout_s", return_value=0.123) as clamp,
             patch("asyncio.wait_for", side_effect=_capture),
         ):
@@ -199,7 +199,7 @@ class TestL1TrackCache:
 
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
-            patch("lookup.enrichment.item.set_cached_track_streaming_url", new=AsyncMock()),
+            patch("lookup.enrichment.apple_probe.set_cached_track_streaming_url", new=AsyncMock()),
             patch.object(SpineDeadline, "clamp_probe_timeout_s") as clamp,
         ):
             results = await _run(apple_music, pg, item, artwork, _happy_discogs_service())
@@ -217,7 +217,7 @@ class TestL1TrackCache:
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
             patch(
-                "lookup.enrichment.item.set_cached_track_streaming_url",
+                "lookup.enrichment.apple_probe.set_cached_track_streaming_url",
                 new=AsyncMock(),
             ) as write_mock,
         ):
@@ -240,11 +240,11 @@ class TestL1TrackCache:
                 return_value=_flags(apple=False),
             ),
             patch(
-                "lookup.enrichment.item.get_cached_track_streaming_url",
+                "lookup.enrichment.apple_probe.get_cached_track_streaming_url",
                 new=AsyncMock(),
             ) as read_mock,
             patch(
-                "lookup.enrichment.item.set_cached_track_streaming_url",
+                "lookup.enrichment.apple_probe.set_cached_track_streaming_url",
                 new=AsyncMock(),
             ) as write_mock,
         ):
@@ -267,7 +267,7 @@ class TestL1TrackCache:
                 return_value=_flags(master=False),
             ),
             patch(
-                "lookup.enrichment.item.get_cached_track_streaming_url",
+                "lookup.enrichment.apple_probe.get_cached_track_streaming_url",
                 new=AsyncMock(),
             ) as read_mock,
         ):
@@ -312,11 +312,11 @@ class TestL1TrackCache:
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
             patch(
-                "lookup.enrichment.item.get_cached_track_streaming_url",
+                "lookup.enrichment.apple_probe.get_cached_track_streaming_url",
                 new=AsyncMock(),
             ) as read_mock,
             patch(
-                "lookup.enrichment.item.set_cached_track_streaming_url",
+                "lookup.enrichment.apple_probe.set_cached_track_streaming_url",
                 new=AsyncMock(),
             ) as write_mock,
         ):
@@ -365,10 +365,10 @@ class TestClampedTimeoutLogDiscrimination:
 
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
-            patch("lookup.enrichment.item.logger", mock_logger),
+            patch("lookup.enrichment.apple_probe.logger", mock_logger),
             patch.object(SpineDeadline, "clamp_probe_timeout_s", return_value=0.02),
             patch(
-                "lookup.enrichment.item.sentry_sdk.get_current_scope",
+                "lookup.enrichment.apple_probe.sentry_sdk.get_current_scope",
                 return_value=MagicMock(transaction=txn),
             ),
         ):
@@ -414,10 +414,10 @@ class TestClampedTimeoutLogDiscrimination:
 
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
-            patch("lookup.enrichment.item.logger", mock_logger),
-            patch("lookup.enrichment.item.apple_music_lookup_timeout_s", return_value=0.02),
+            patch("lookup.enrichment.apple_probe.logger", mock_logger),
+            patch("lookup.enrichment.apple_probe.apple_music_lookup_timeout_s", return_value=0.02),
             patch(
-                "lookup.enrichment.item.sentry_sdk.get_current_scope",
+                "lookup.enrichment.apple_probe.sentry_sdk.get_current_scope",
                 return_value=MagicMock(transaction=txn),
             ),
         ):
