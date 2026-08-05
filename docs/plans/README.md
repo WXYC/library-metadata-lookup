@@ -18,4 +18,4 @@ Exactly one such link exists today: `docs/scripts.md`'s entry for the per-consum
 
 ## Related directories
 
-`docs/adr/` holds architecture decision records; `docs/reviews/` holds point-in-time code review write-ups. Plans, ADRs, and reviews are different kinds of documents and live in separate directories for that reason, even though all three are prose that outlives the PR that produced it.
+`docs/adr/` holds architecture decision records; `docs/reviews/` holds point-in-time code review write-ups; `docs/audits/` holds point-in-time structural/capability audit write-ups (moved from the top-level `audit/` in LML#1124 Phase 4, disambiguating it from the untracked `.audit/` tool-output directory). Plans, ADRs, reviews, and audits are different kinds of documents and live in separate directories for that reason, even though all four are prose that outlives the PR that produced it.
