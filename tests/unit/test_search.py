@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from core.exceptions import BreakerOpenError
 from core.search import (
     DEFAULT_SEARCH_BUDGET_MS,
     DEFAULT_SEARCH_HARD_TIMEOUT_MS,
@@ -38,6 +39,7 @@ from core.search import (
     resolve_search_hard_timeout_ms,
     song_not_found_with_artist_and_song,
 )
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.service import _retry_budget_deadline_var
 from generated.api_models import TrackMatchHint, TrackMatchSource
 from lookup.strategies import build_strategies
@@ -1273,6 +1275,10 @@ class TestPerStrategyWaitFor:
         assert SearchStrategyType.ARTIST_PLUS_ALBUM in state.strategies_tried
 
 
+class _FutureStreamingBreakerOpenError(BreakerOpenError):
+    """Stand-in for a breaker that does not exist yet (LML#1118 regression pin)."""
+
+
 class TestBreakerShedInRunner:
     """R2-2: a ``DiscogsBreakerOpenError`` raised from a strategy is caught in
     the runner's per-strategy try (the ONE catch boundary) and converted to the
@@ -1315,18 +1321,35 @@ class TestBreakerShedInRunner:
         assert SearchStrategyType.TRACK_ON_COMPILATION in state.strategies_tried
 
     @pytest.mark.asyncio
-    async def test_shed_in_one_strategy_does_not_abort_the_cascade(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "breaker_cls",
+        [DiscogsBreakerOpenError, _FutureStreamingBreakerOpenError],
+        ids=["discogs-breaker", "future-breaker-subclass"],
+    )
+    async def test_shed_in_one_strategy_does_not_abort_the_cascade(self, monkeypatch, breaker_cls):
         """A shed in an early strategy is contained: later strategies still run
-        (the shed is treated as a miss, not a fatal cascade abort)."""
-        from discogs.breaker import DiscogsBreakerOpenError
+        (the shed is treated as a miss, not a fatal cascade abort).
 
+        Parametrized over ``DiscogsBreakerOpenError`` and a throwaway
+        ``BreakerOpenError`` subclass standing in for a breaker introduced
+        after this test is written -- YouTube Music, Spotify, whatever #1100's
+        registry adds next (LML#1118 regression pin). The runner's per-strategy
+        catch is typed on the shared base, not the concrete Discogs type, so a
+        future breaker is degraded the same "continue, not break" way with NO
+        further change to this "ONE catch boundary" leg -- proven here by
+        keeping a second, healthy strategy in the cascade for both cases, not
+        just a single-strategy pipeline where a mutated ``continue`` -> ``break``
+        would go uncaught. Without this, each new breaker would repeat the #755
+        flood's one-miss-at-a-time discovery pattern the 19 hand-patched
+        ``except DiscogsBreakerOpenError`` legs already went through.
+        """
         monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "60000")
         monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
 
         recovered = _item(id=7, artist="Stereolab", title="Aluminum Tunes", genre="Rock")
 
         async def shed_attempt(parsed, state, raw_message):  # noqa: ARG001
-            raise DiscogsBreakerOpenError("shed")
+            raise breaker_cls("shed")
 
         async def healthy_attempt(parsed, state, raw_message):  # noqa: ARG001
             return Outcome.found([recovered])
@@ -1350,43 +1373,6 @@ class TestBreakerShedInRunner:
         # The later strategy still ran and surfaced its match despite the shed.
         assert [i.id for i in state.results] == [7]
         assert SearchStrategyType.SONG_AS_ARTIST in state.strategies_tried
-
-    @pytest.mark.asyncio
-    async def test_a_new_breaker_subclass_is_caught_by_the_existing_leg(self, monkeypatch):
-        """LML#1118 regression pin: the runner's per-strategy catch is typed on
-        ``BreakerOpenError``, not ``DiscogsBreakerOpenError`` specifically, so a
-        breaker introduced after this test is written -- YouTube Music, Spotify,
-        whatever #1100's registry adds next -- is degraded the same way with NO
-        further change to this "ONE catch boundary" leg. Without this, each new
-        breaker would repeat the #755 flood's one-miss-at-a-time discovery
-        pattern the 19 hand-patched ``except DiscogsBreakerOpenError`` legs
-        already went through.
-        """
-        from core.exceptions import BreakerOpenError
-
-        class _FutureStreamingBreakerOpenError(BreakerOpenError):
-            """Stand-in for a breaker that does not exist yet."""
-
-        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "60000")
-        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
-
-        async def shed_attempt(parsed, state, raw_message):  # noqa: ARG001
-            raise _FutureStreamingBreakerOpenError("future breaker open")
-
-        strategies = [
-            _StubStrategy(
-                name=SearchStrategyType.TRACK_ON_COMPILATION,
-                condition=lambda *_a: True,
-                attempt_func=shed_attempt,
-            )
-        ]
-        parsed = ParsedRequest(artist="Sessa", song="Retrato Sonoro", raw_message="x")
-
-        # Must NOT raise -- caught by the same base-typed leg as a Discogs shed.
-        state = await execute_search_pipeline(parsed, "x", strategies, song_not_found=True)
-
-        assert state.results == []
-        assert SearchStrategyType.TRACK_ON_COMPILATION in state.strategies_tried
 
 
 class TestHardCapSoftBudgetIndependence:
