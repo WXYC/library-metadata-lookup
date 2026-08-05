@@ -21,6 +21,7 @@ Run with: pytest -m pg -v tests/integration/test_streaming_url_persistent_lookup
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
@@ -29,6 +30,7 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+import entity.ddl as ddl
 from clients.streaming.base import BaseStreamingClient
 from entity.streaming_url_cache import (
     get_cached_streaming_url,
@@ -199,6 +201,92 @@ class TestSchemaBootstrap:
                 "WHERE service = 'bandcamp'"
             )
         assert is_error is False
+
+    @pytest.mark.asyncio
+    async def test_alter_lock_timeout_does_not_roll_back_the_table_and_is_retryable(
+        self, pg_pool, pg_source, monkeypatch, caplog
+    ):
+        # LML#1121 FIX 5: PG16 confirmed ``ALTER TABLE ... ADD COLUMN IF NOT
+        # EXISTS`` acquires an AccessExclusiveLock even when the column
+        # ALREADY exists -- which conflicts with even the weakest read lock
+        # (AccessShareLock), i.e. live ``/lookup`` traffic just SELECTing
+        # from the table. Pre-fix, that ALTER shared ONE transaction with
+        # CREATE TABLE via ``bootstrap_lml_cache_table`` -- a lock_timeout
+        # there rolled back the WHOLE boot transaction, and on a table that
+        # predates ``is_error`` the column was never created. Every
+        # subsequent SELECT/UPSERT would then raise ``UndefinedColumnError``
+        # and be swallowed, silently disabling the cache for the process
+        # lifetime. Reproduce the exact failure: hold a competing ACCESS
+        # SHARE lock (an ordinary read, exactly the ticket's "waits behind
+        # live /lookup traffic" scenario) on the table from a second
+        # connection while booting, so the ALTER's lock_timeout trips -- then
+        # prove (a) the schema/table step still succeeded, (b) the failure
+        # is logged loud (ERROR, naming the column), and (c) a retry on the
+        # next boot (lock released) actually adds the column. An ACCESS
+        # SHARE blocker (rather than ACCESS EXCLUSIVE) is deliberate: it
+        # conflicts with the ALTER's AccessExclusiveLock but NOT with the
+        # widen step's own read-only regclass lookup, so this isolates the
+        # ALTER's failure without also tripping the (out-of-scope, unrelated
+        # to ``is_error``) widen step.
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS lml_cache.album_streaming_url_cache")
+            await conn.execute("CREATE SCHEMA IF NOT EXISTS lml_cache")
+            await conn.execute(
+                "CREATE TABLE lml_cache.album_streaming_url_cache ("
+                "  service TEXT NOT NULL,"
+                "  artist_normalized TEXT NOT NULL,"
+                "  album_normalized TEXT NOT NULL,"
+                "  url TEXT,"
+                "  last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+                "  PRIMARY KEY (service, artist_normalized, album_normalized),"
+                "  CONSTRAINT album_streaming_url_cache_service_valid CHECK ("
+                "    service IN ('apple_music_album', 'spotify_album', 'bandcamp')"
+                "  )"
+                ")"
+            )
+
+        # A short lock_timeout keeps this test fast; the production value
+        # (10s) would make the deliberate trip below take 10 real seconds.
+        monkeypatch.setattr(ddl, "_BOOTSTRAP_LOCK_TIMEOUT", "SET LOCAL lock_timeout = '200ms'")
+
+        blocker = await pg_pool.acquire()
+        blocker_tx = blocker.transaction()
+        await blocker_tx.start()
+        await blocker.execute("LOCK TABLE lml_cache.album_streaming_url_cache IN ACCESS SHARE MODE")
+        try:
+            with caplog.at_level(logging.ERROR, logger="entity.streaming_url_cache"):
+                await set_up_streaming_url_cache_schema(pg_source)
+        finally:
+            await blocker_tx.rollback()
+            await pg_pool.release(blocker)
+
+        # The column truly was not added -- the ALTER lock-timed-out rather
+        # than silently succeeding some other way.
+        async with pg_pool.acquire() as conn:
+            missing = await conn.fetchval(
+                "SELECT count(*)::int FROM information_schema.columns "
+                "WHERE table_schema = 'lml_cache' "
+                "AND table_name = 'album_streaming_url_cache' "
+                "AND column_name = 'is_error'"
+            )
+        assert missing == 0
+        assert any(
+            "is_error" in record.message and record.levelno == logging.ERROR
+            for record in caplog.records
+        ), "expected an ERROR-level log naming the missing is_error column"
+
+        # Retryable: a second boot, with the competing lock released, adds
+        # the column -- the failed ALTER didn't roll back the schema/table
+        # step or otherwise poison the table for a future boot.
+        await set_up_streaming_url_cache_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            present = await conn.fetchval(
+                "SELECT count(*)::int FROM information_schema.columns "
+                "WHERE table_schema = 'lml_cache' "
+                "AND table_name = 'album_streaming_url_cache' "
+                "AND column_name = 'is_error'"
+            )
+        assert present == 1
 
     @pytest.mark.asyncio
     async def test_second_boot_leaves_the_check_constraint_untouched(self, pg_pool, pg_source):
