@@ -43,6 +43,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Sentry's LoggingIntegration folds the LOGGER NAME into issue grouping, so the
+# LML#1121 extraction renamed this path's logger from
+# ``lookup.streaming_url_postprocess`` to ``lookup.streaming_warm`` and split
+# its Sentry group. LIBRARY-METADATA-LOOKUP-1B (the "Background streaming-URL
+# warm probe failed" TimeoutError, 33,852 events between 2026-06-30 and
+# 2026-08-04) therefore stops accruing at the deploy of 1352882 and continues
+# under a NEW short-ID carrying ``logger:lookup.streaming_warm``. That fork was
+# accepted rather than suppressed: nothing depends on the old group's identity
+# (the three LML metric alerts -- 441584 / 441716 / 441717, docs/observability-
+# rowless-flag.md -- key off ``lml.cache.*`` tags on the ``/api/v1/lookup``
+# transaction, not off issue grouping), and the split lands exactly on the
+# #1120 + #1121 deploy, which makes it a free before/after boundary for
+# measuring whether those fixes cut the timeout rate. The alternative -- pinning
+# a synthetic ``fingerprint`` in ``before_send`` -- would freeze grouping for a
+# message we expect to keep evolving, at permanent cost in the error path.
+#
+# Cites of 1B elsewhere in the tree (clients/streaming/base.py,
+# clients/streaming/spotify.py, lookup/streaming_warm_admission.py,
+# docs/env-vars.md, and two tests) are historical incident evidence and stay
+# accurate as written; they are not live pointers and need no repointing. To
+# read the signal across the seam, query the errors dataset on the message
+# rather than either short-ID.
+
 # Process-wide cap on concurrent background streaming-URL warm probes. Separate
 # from the bio warm's ``_WARM_CACHE_CONCURRENCY`` (different upstreams + rate
 # limits) and, unlike it, env-tunable: this path was added to fix an incident
