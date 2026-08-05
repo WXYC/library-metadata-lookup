@@ -31,7 +31,7 @@ from discogs.models import ReleaseMetadataResponse
 from entity.sources import PgSource
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment import enrich_artwork_results
-from lookup.enrichment.bandcamp_probe import run_bandcamp_live_probe
+from lookup.enrichment.bandcamp_probe import probe_owns_bandcamp_leg, run_bandcamp_live_probe
 from lookup.enrichment.context import EnrichmentContext
 from lookup.rowless import ROWLESS_LIBRARY_ID
 from lookup.spine_deadline import SpineDeadline
@@ -760,3 +760,30 @@ class TestRunBandcampLiveProbeGatesDirect:
         ctx.bandcamp.find_album_match.assert_not_awaited()
         assert result.bandcamp_url == existing
         assert result.status is None
+
+    async def test_fresh_error_row_yields_unresolved_not_absent(self):
+        # LML#1121 FIX 1: resolve_streaming_url_with_cache reads the cache
+        # BEFORE the fail_fast branch, so a fail_fast=True probe DOES see a
+        # fresh LML#1121 error row (cache_error_recent) when one is already
+        # on record -- run_bandcamp_live_probe's final fallthrough previously
+        # mapped it exactly like a genuine live_miss/cache_miss_recent to
+        # ``absent``, a SOURCED negative that also withholds the client from
+        # the streaming post-process (probe_owns_bandcamp_leg) -- so a
+        # couldn't-ask outcome got neither a warm nor a second chance. It
+        # must map to ``unresolved`` instead, and probe_owns_bandcamp_leg
+        # must not withhold the client for it (same as any other unresolved
+        # verdict).
+        set_suppress_streaming_warm(True)
+        ctx = self._ctx()
+        ctx.discogs_cache_pg.fetchone = AsyncMock(return_value={"url": None, "is_error": True})
+
+        result = await run_bandcamp_live_probe(
+            ctx, settings=_flags(), current_bandcamp_url=None, is_top1=True
+        )
+
+        # A fresh error row short-circuits before find_album_match is ever
+        # called (the fail_fast branch is never reached).
+        ctx.bandcamp.find_album_match.assert_not_awaited()
+        assert result.bandcamp_url is None
+        assert result.status == StreamingResolutionStatus.unresolved
+        assert probe_owns_bandcamp_leg(result.status) is False
