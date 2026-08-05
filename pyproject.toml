@@ -76,7 +76,16 @@ requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["core*", "config*", "library*", "discogs*", "lookup*", "routers*", "services*", "generated*", "scripts*", "entity*", "clients*", "storage*"]
+# Kept in lockstep with the actual top-level package layout by
+# tests/unit/test_packaging_manifest.py (LML#1132) -- a new top-level
+# __init__.py-carrying directory that isn't added here fails that test.
+# py-modules = ["main"] is deliberately NOT added: Dockerfile's dependency
+# layer (`COPY pyproject.toml ./` then `pip install .`) installs from a
+# context containing only pyproject.toml, so an explicit py-modules entry
+# would hard-fail on the missing main.py. Making the package genuinely
+# installable needs a Dockerfile reorder that forfeits that layer's cache --
+# out of scope here.
+include = ["core*", "config*", "library*", "discogs*", "lookup*", "routers*", "services*", "generated*", "scripts*", "entity*", "clients*", "storage*", "artists*", "identity*", "release*", "streaming*", "cache*"]
 
 [tool.ruff]
 line-length = 100
