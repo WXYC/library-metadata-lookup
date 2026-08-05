@@ -110,7 +110,7 @@ class TestAppleStreamingStatus:
 
         apple_music.find_track_metadata = AsyncMock(side_effect=slow_find)
 
-        with patch("lookup.enrichment.item.apple_music_lookup_timeout_s", return_value=0.05):
+        with patch("lookup.enrichment.apple_probe.apple_music_lookup_timeout_s", return_value=0.05):
             results = await enrich_artwork_results(
                 [(item, None)],
                 AsyncMock(),

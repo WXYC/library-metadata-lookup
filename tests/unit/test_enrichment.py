@@ -1832,7 +1832,7 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
 
         # Patch the call-site timeout to a tiny value so the test runs in
         # milliseconds and the asyncio.wait_for ceiling fires deterministically.
-        with patch("lookup.enrichment.item.apple_music_lookup_timeout_s", return_value=0.05):
+        with patch("lookup.enrichment.apple_probe.apple_music_lookup_timeout_s", return_value=0.05):
             results = await enrich_artwork_results(
                 items_with_artwork,
                 AsyncMock(),
@@ -1888,9 +1888,9 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         scope.transaction = transaction
 
         with (
-            patch("lookup.enrichment.item.apple_music_lookup_timeout_s", return_value=0.05),
+            patch("lookup.enrichment.apple_probe.apple_music_lookup_timeout_s", return_value=0.05),
             patch(
-                "lookup.enrichment.item.sentry_sdk.get_current_scope",
+                "lookup.enrichment.apple_probe.sentry_sdk.get_current_scope",
                 return_value=scope,
             ),
         ):
@@ -1946,9 +1946,9 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         scope.transaction = None
 
         with (
-            patch("lookup.enrichment.item.apple_music_lookup_timeout_s", return_value=0.05),
+            patch("lookup.enrichment.apple_probe.apple_music_lookup_timeout_s", return_value=0.05),
             patch(
-                "lookup.enrichment.item.sentry_sdk.get_current_scope",
+                "lookup.enrichment.apple_probe.sentry_sdk.get_current_scope",
                 return_value=scope,
             ),
         ):
