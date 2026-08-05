@@ -26,8 +26,18 @@ from cache.models import (
     CacheRefreshResultItem,
     SourceRefreshOutcome,
 )
+from core.exceptions import BreakerOpenError
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import ArtistCredit, ArtistDetails, ReleaseMetadataResponse
+
+
+class _FutureBreakerOpenError(BreakerOpenError):
+    """LML#1118 FIX 2 regression pin: stand-in for a breaker that does not
+    exist yet (YouTube Music, Spotify, ...). Proves the two ``cache/
+    dispatch.py`` legs widened from ``except DiscogsBreakerOpenError`` to
+    ``except BreakerOpenError`` take the quiet debug path for ANY breaker
+    shed, not only a Discogs one."""
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -390,6 +400,35 @@ class TestRefreshIdentity:
             for r in caplog.records
         )
 
+    async def test_release_leg_future_breaker_shed_records_error_without_error_log(self, caplog):
+        """LML#1118 FIX 2 regression pin: mirrors
+        ``test_release_leg_breaker_shed_records_error_without_error_log`` with a
+        breaker type that does not exist yet, proving the leg's catch is typed
+        on the shared ``BreakerOpenError`` base, not the concrete Discogs type
+        -- a future breaker's shed takes the same quiet debug path with no new
+        call-site audit."""
+        discogs = AsyncMock()
+        discogs.get_release = AsyncMock(side_effect=_FutureBreakerOpenError("future breaker open"))
+        discogs.get_artist_details = AsyncMock()
+
+        with caplog.at_level(logging.DEBUG):
+            result = await refresh_identity(
+                identity_id=1,
+                source_pairs=[("discogs_release", "12345")],
+                discogs_service=discogs,
+            )
+
+        assert result.status == "error"
+        assert result.sources["discogs_release"].release_outcome == "error"
+        assert result.sources["discogs_release"].message == "_FutureBreakerOpenError"
+        discogs.get_artist_details.assert_not_awaited()
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records == [], f"breaker shed emitted ERROR record(s): {error_records}"
+        assert any(
+            r.levelno == logging.DEBUG and "breaker" in r.getMessage().lower()
+            for r in caplog.records
+        )
+
     async def test_artist_leg_exception_does_not_demote_release_warmed(self):
         """Issue rule: artist 404 inside a release walk does NOT promote per-id to error."""
         rel = _release(artists=[ArtistCredit(artist_id=42, name="Juana Molina")])
@@ -444,6 +483,38 @@ class TestRefreshIdentity:
         assert artist_outcomes[0].outcome == "error"
         assert artist_outcomes[0].external_id == "42"
         assert artist_outcomes[0].message == "DiscogsBreakerOpenError"
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records == [], f"breaker shed emitted ERROR record(s): {error_records}"
+        assert any(
+            r.levelno == logging.DEBUG and "breaker" in r.getMessage().lower()
+            for r in caplog.records
+        )
+
+    async def test_artist_leg_future_breaker_shed_records_error_without_error_log(self, caplog):
+        """LML#1118 FIX 2 regression pin: mirrors
+        ``test_artist_leg_breaker_shed_records_error_without_error_log`` with a
+        breaker type that does not exist yet -- same rationale as the release-leg
+        sibling above."""
+        rel = _release(artists=[ArtistCredit(artist_id=42, name="Juana Molina")])
+        discogs = AsyncMock()
+        discogs.get_release = AsyncMock(return_value=rel)
+        discogs.get_artist_details = AsyncMock(
+            side_effect=_FutureBreakerOpenError("future breaker open")
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            result = await refresh_identity(
+                identity_id=1,
+                source_pairs=[("discogs_release", "12345")],
+                discogs_service=discogs,
+            )
+
+        assert result.status == "warmed"
+        artist_outcomes = result.sources["discogs_release"].artists
+        assert len(artist_outcomes) == 1
+        assert artist_outcomes[0].outcome == "error"
+        assert artist_outcomes[0].external_id == "42"
+        assert artist_outcomes[0].message == "_FutureBreakerOpenError"
         error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert error_records == [], f"breaker shed emitted ERROR record(s): {error_records}"
         assert any(
