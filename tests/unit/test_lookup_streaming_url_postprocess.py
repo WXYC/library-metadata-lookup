@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -74,6 +75,7 @@ from lookup.streaming_url_postprocess import (
     apply_streaming_url_postprocess,
     set_suppress_streaming_warm,
 )
+from streaming.models import SourceMatch
 from streaming.service import ALBUM_CACHE_KEYS, SERVICE_BY_ALBUM_CACHE_KEY, StreamingService
 from tests.conftest import drain_streaming_warm_tasks, reset_streaming_warm_state
 
@@ -450,30 +452,75 @@ class TestKnownRecentMiss:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("service", list(_CASES))
 class TestFreshErrorRowMiss:
-    async def test_fresh_error_row_enqueues_a_warm_unlike_a_genuine_recent_miss(self, service):
+    async def test_fresh_error_row_warm_bypasses_the_row_and_performs_the_live_call(self, service):
+        # LML#1121 FIX 2: the warm enqueued BECAUSE of a fresh error row must
+        # bypass that SAME row on its OWN read (error_ttl clamped to zero for
+        # that one read) and actually probe -- otherwise the warm's own
+        # resolve_streaming_url_with_cache call re-reads the identical row a
+        # few milliseconds later and short-circuits on it, a guaranteed
+        # no-op that still consumes a warm slot and never performs the retry
+        # its comment promises. This drives the REAL resolver (not
+        # _patch_resolver, which would agree with whatever contract the bug
+        # left behind) against a fake pg.fetchone that emulates the SQL
+        # error-TTL cutoff: fresh under the live ~5-minute error_ttl, but
+        # stale the instant error_ttl is clamped to zero -- so this only
+        # passes when the warm actually threads the zeroed override through.
         case = _CASES[service]
         update = _blank_update()
         scope, transaction = _sentry_scope()
+        row_last_checked_at = datetime.now(UTC) - timedelta(seconds=5)
+
+        async def fake_fetchone(
+            _sql, _service, _artist_key, _album_key, _miss_cutoff, error_cutoff
+        ):
+            # Mirrors _SELECT_SQL's "is_error AND last_checked_at > $5"
+            # branch: fresh against the default ~5-minute error_ttl, but
+            # stale the instant the caller clamps error_ttl to zero
+            # (error_cutoff == now).
+            if row_last_checked_at > error_cutoff:
+                return {"url": None, "is_error": True}
+            return None
+
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(side_effect=fake_fetchone)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        entity_store = _entity_store()
+        clients = _clients()
+        clients[case["client_attr"]].find_album_match = AsyncMock(
+            return_value=SourceMatch(url=case["resolved_url"], confidence=95.0)
+        )
 
         with (
             _patch_cache_peek(None, has_fresh_decision=True, is_error=True),
-            _patch_resolver(return_value=ResolveOutcome(url=None, source="live_error")),
             patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
-            result = await _run(update, settings=_settings(service))
+            result = await _run(
+                update,
+                settings=_settings(service),
+                clients=clients,
+                entity_store=entity_store,
+                pg=pg,
+            )
             # Unlike a genuine recent miss, a fresh error row DOES schedule a
             # warm -- exactly one, same as a genuine absent/stale miss would.
             assert len(mod._background_tasks) == 1
             await _drain_background_tasks()
 
+        # The live call actually happened -- not a guaranteed short-circuit
+        # on the same error row that triggered the warm.
+        clients[case["client_attr"]].find_album_match.assert_awaited_once()
+        entity_store.mint_or_get_release_identity.assert_awaited_once_with(
+            source=service, external_id=case["external_id"]
+        )
         assert update[case["url_field"]] is None
         assert not mod._background_tasks
         assert not mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
-        # Not tagged as any of the genuine-miss outcomes.
+        # LML#1121 FIX 7: the enqueue sub-outcome is tagged ALONGSIDE
+        # cache_error_recent now, not masked by it.
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_enqueued.{service}") is True
         assert calls.get(f"streaming_url.persistent_lookup.cache_miss_recent.{service}") is None
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_enqueued.{service}") is None
         assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
 
     async def test_fresh_error_row_stays_unwarmed_when_bulk_suppressed(self, service):
@@ -497,7 +544,10 @@ class TestFreshErrorRowMiss:
         assert not mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is None
+        # LML#1121 FIX 7: cache_miss_unwarmed is the depth-shed/suppression
+        # signal docs/env-vars.md documents; it must fire ALONGSIDE
+        # cache_error_recent for a suppressed error row, not be masked by it.
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
         assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
 
     async def test_fresh_error_row_is_still_subject_to_the_depth_bound(self, service):
@@ -506,20 +556,30 @@ class TestFreshErrorRowMiss:
         # unbounded enqueue) instead of writing a parallel warm path for error
         # rows. Fill the in-flight set to the bound first so a healthy enqueue
         # would shed; an error-row peek must shed here too, not bypass it.
+        case = _CASES[service]
         bound = mod._streaming_warm_queue_depth_bound()
         for i in range(bound):
             mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
 
         update = _blank_update()
+        scope, transaction = _sentry_scope()
         with (
             _patch_cache_peek(None, has_fresh_decision=True, is_error=True),
             _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             result = await _run(update, settings=_settings(service))
 
         assert not mod._background_tasks
         resolve.assert_not_awaited()
-        assert result == {_CASES[service]["client_attr"]: StreamingResolutionStatus.unresolved}
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
+        # LML#1121 FIX 7: cache_miss_shed is docs/env-vars.md's designated
+        # depth-shed signal; it must not go silent for an error-triggered
+        # shed -- exactly the dominant-service-under-outage case where
+        # shedding peaks and the signal matters most.
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_shed.{service}") is True
+        assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
 
 
 # ---------------------------------------------------------------------------
