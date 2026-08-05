@@ -17,3 +17,13 @@ venv/
 __pycache__/
 *.pyc
 logs/
+
+# Repo-root pipeline scratch output and runtime databases (LML#1132). Plain
+# globs — patterns do not cross `/`, so these do not drop the tracked
+# `tests/fixtures/*.json` (already excluded via `tests/` above) or the
+# tracked `entity/*.sql` reference DDL (nothing at runtime opens those files
+# by path; the executed DDL lives in entity/ddl.py).
+*.db
+*.json
+*.csv
+*.sql
