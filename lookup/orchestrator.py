@@ -35,6 +35,7 @@ from core.search import (
     execute_search_pipeline,
     get_search_type_from_state,
 )
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import DiscogsCacheService
 from discogs.lookup import lookup_releases_by_track
 from discogs.models import (
@@ -1279,14 +1280,15 @@ async def perform_lookup(
         )
     try:
         identities_by_artist = await _step_resolve_result_identities(state, services)
-    # LML#1118: widened alongside the tail-steps catch above, same reason
-    # (`_resolve_identities` swallows per-name exceptions via
-    # `asyncio.gather(..., return_exceptions=True)`, so this leg is defense
-    # in depth, not a normally-reachable path).
-    except BreakerOpenError as exc:
+    # LML#1118 review: kept at `DiscogsBreakerOpenError`, not widened like the
+    # tail-steps catch above. `_resolve_identities` already swallows every
+    # per-name failure via `asyncio.gather(..., return_exceptions=True)`, so
+    # nothing reaches this except -- unreachable and untested (mutation-
+    # verified), so widening it would be unverified code, not defense in depth.
+    except DiscogsBreakerOpenError:
         logger.info(
-            "%s shed identity resolution; returning cache-only lookup for %r",
-            type(exc).__name__,
+            "Discogs saturation breaker shed identity resolution; "
+            "returning cache-only lookup for %r",
             request.raw_message,
         )
         return await _build_degraded_response(
