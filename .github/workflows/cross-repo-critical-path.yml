@@ -6,9 +6,12 @@ name: Cross-repo critical path
 # to Done when the issue closes; manual project removal is the path for
 # "no longer active but still open."
 #
-# Setup requirement: WXYC_PROJECTS_TOKEN org secret, a fine-grained PAT
-# with `read:project, project` scope on the WXYC org.
-# Without that secret this workflow no-ops silently.
+# Setup requirement: a WXYC_PROJECTS_TOKEN org secret holding a PAT with write
+# access to WXYC org projects. Fine-grained token: Organization permissions ->
+# Projects "read and write", plus Repository permissions -> Issues "read-only"
+# and Pull requests "read-only". Classic token: the `project` scope.
+# (`read:project` alone is not enough — the action writes.)
+# Without that secret this workflow no-ops silently; see the `if:` guard below.
 
 on:
   issues:
@@ -31,7 +34,7 @@ jobs:
       PROJECTS_TOKEN: ${{ secrets.WXYC_PROJECTS_TOKEN }}
     steps:
       - if: ${{ env.PROJECTS_TOKEN != '' }}
-        uses: actions/add-to-project@v1.0.2
+        uses: actions/add-to-project@v2.0.0
         with:
           project-url: https://github.com/orgs/WXYC/projects/33
           github-token: ${{ env.PROJECTS_TOKEN }}
