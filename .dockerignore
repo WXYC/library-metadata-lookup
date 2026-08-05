@@ -9,6 +9,10 @@ tests/
 .env
 .env.*
 .pytest_cache/
+# mypy/ruff caches regenerate on every local run; a one-time disk sweep
+# doesn't stop them recurring in the build context, so they're excluded here too.
+.mypy_cache/
+.ruff_cache/
 htmlcov/
 .coverage
 coverage.xml
