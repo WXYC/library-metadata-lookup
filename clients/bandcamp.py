@@ -331,8 +331,8 @@ def _compute_bandcamp_retry_delay(attempt: int, retry_after: str | None) -> floa
 # attempt. Leaves room for the resulting ``BandcampTransportError`` to
 # propagate up through ``resolve_streaming_url_with_cache``'s exception
 # handling and UPSERT a short-TTL error row before the OUTER
-# ``asyncio.wait_for`` in ``lookup.streaming_url_postprocess.
-# _warm_streaming_url_cache`` fires its own cancellation -- a cancellation is
+# ``asyncio.wait_for`` in ``lookup.streaming_warm._warm_streaming_url_cache``
+# fires its own cancellation -- a cancellation is
 # a ``BaseException`` that bypasses ``resolve_streaming_url_with_cache``'s
 # ``except Exception`` and writes nothing (the bug this FIX closes). Not
 # env-tunable: an internal safety margin, not an operator knob.
@@ -473,6 +473,15 @@ class BandcampClient(BaseStreamingClient):
                 budget_deadline=get_probe_deadline(),
                 on_retry=lambda attempt, delay, retry_after: log.warning(
                     f"429 rate limited, retrying in {delay}s (attempt {attempt + 1})"
+                ),
+                # LML#1121 review F5: previously unset, so a budget give-up
+                # (see retry_429's budget_deadline branch) emitted no log
+                # line of its own -- mirrors Discogs's own
+                # on_budget_exceeded wiring (discogs/service.py).
+                on_budget_exceeded=lambda remaining_budget, delay: log.warning(
+                    f"429 rate limited, remaining probe budget ({remaining_budget:.2f}s) "
+                    f"can't absorb the next retry delay ({delay:.2f}s), giving up "
+                    f"early instead of sleeping past the deadline: {url}"
                 ),
                 on_exhausted=lambda: log.warning(
                     f"429 rate limited after {MAX_RETRIES} retries, giving up: {url}"
@@ -735,29 +744,45 @@ class BandcampClient(BaseStreamingClient):
                 )
         return results
 
-    async def fetch_artist_catalog(self, slug: str, *, fail_fast: bool = False) -> list[dict]:
+    async def fetch_artist_catalog(
+        self, slug: str, *, fail_fast: bool = False
+    ) -> list[dict] | None:
         """Fetch album list from {slug}.bandcamp.com/music.
 
         Returns a list of dicts with keys ``url``, ``title`` (deduplicated by
         URL) on a successful fetch -- possibly empty if the page has no album
         links (a genuinely empty catalog). Raises :class:`BandcampTransportError`
-        on a fetch failure (network error, timeout, non-200, or 429 after
-        retries) -- callers must NOT treat that as a definitively-empty
-        catalog: an empty list means "the artist has no releases" while a
-        raise means "we couldn't tell" and should be retried rather than
-        recorded as a final result (#661). Originally ``fail_fast=True``-only
-        (LML#1106, FIX 2); LML#1115 extends the raise to the default
-        (retrying) mode too -- a default-mode fetch failure used to return
-        ``None``, which the live match path's ``or []`` then silently
-        coalesced into "no catalog" and could reach
+        on a fetch failure (network error, timeout, or a non-200/404/410
+        status, or 429 after retries) -- callers must NOT treat that as a
+        definitively-empty catalog: an empty list means "the artist has no
+        releases" while a raise means "we couldn't tell" and should be
+        retried rather than recorded as a final result (#661). Originally
+        ``fail_fast=True``-only (LML#1106, FIX 2); LML#1115 extends the raise
+        to the default (retrying) mode too -- a default-mode fetch failure
+        used to return ``None``, which the live match path's ``or []`` then
+        silently coalesced into "no catalog" and could reach
         ``entity.streaming_url_cache.resolve_streaming_url_with_cache`` as a
         false negative.
+
+        LML#1121 review (F2): a 404 or 410 is a CLEAN absence -- "no artist
+        page at this slug" -- not a couldn't-ask, in EITHER mode. It returns
+        ``None`` (the same value the pre-LML#1115 default-mode code returned
+        on any non-200) instead of raising, so the caller's existing
+        ``or []`` treats it as an empty catalog and the album-autocomplete
+        fallback still gets its shot; a genuine no-match after that fallback
+        stays negative-cacheable rather than being forced into a permanent
+        retry loop. Every other non-200 (5xx, 403, 429, ...) still raises,
+        unchanged.
         """
         url = f"https://{slug}.bandcamp.com/music"
         resp = await self._request_with_retry(
             "GET", url, timeout=15.0, follow_redirects=True, fail_fast=fail_fast
         )
-        if resp is None or resp.status_code != 200:
+        if resp is None:
+            raise BandcampTransportError(url)
+        if resp.status_code in (404, 410):
+            return None
+        if resp.status_code != 200:
             raise BandcampTransportError(url)
 
         # Bandcamp serves UTF-8 but its Content-Type often omits `charset=`;

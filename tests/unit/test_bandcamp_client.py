@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import unittest.mock
 from unittest.mock import AsyncMock, patch
@@ -256,22 +257,26 @@ class TestFetchArtistCatalog:
         assert albums[0]["title"] == "confield"
 
     @pytest.mark.asyncio
-    async def test_raises_transport_error_on_http_error(self):
-        # A non-200 is a fetch failure, distinct from a 200 page with no
-        # albums: callers must not treat it as "definitively no catalog"
-        # (#661). LML#1115: raises BandcampTransportError in the default
-        # mode too (previously returned None here, which the live match
-        # path then coalesced to "no catalog" via `or []` -- silently
-        # turning a couldn't-ask into a no-match verdict).
+    @pytest.mark.parametrize("fail_fast", [False, True])
+    async def test_raises_transport_error_on_http_error(self, fail_fast):
+        # A 5xx is a fetch failure, distinct from a 200 page with no albums:
+        # callers must not treat it as "definitively no catalog" (#661).
+        # LML#1115: raises BandcampTransportError in the default mode too
+        # (previously returned None here, which the live match path then
+        # coalesced to "no catalog" via `or []` -- silently turning a
+        # couldn't-ask into a no-match verdict). LML#1121 FIX (F2): a 404/410
+        # is carved OUT of this raise -- see
+        # TestFetchArtistCatalogCleanAbsence below -- so this test uses a 500
+        # to keep exercising the genuine-transport-failure path.
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.request = AsyncMock(
-            return_value=_error_response(404, "https://nonexistent99.bandcamp.com/music")
+            return_value=_error_response(500, "https://nonexistent99.bandcamp.com/music")
         )
         client._http = mock_http
 
         with pytest.raises(BandcampTransportError):
-            await client.fetch_artist_catalog("nonexistent99")
+            await client.fetch_artist_catalog("nonexistent99", fail_fast=fail_fast)
 
     @pytest.mark.asyncio
     async def test_raises_transport_error_on_network_error(self):
@@ -338,6 +343,34 @@ class TestFetchArtistCatalog:
 
         assert len(albums) == 1
         assert albums[0]["title"] == title
+
+
+class TestFetchArtistCatalogCleanAbsence:
+    """LML#1121 review F2: a 404/410 from ``{slug}.bandcamp.com/music`` is a
+    clean "no artist page at this slug", not a couldn't-ask transport
+    failure. Conflating it with a genuine transport failure means the album
+    is never negative-cached and re-probes on every ``/lookup`` forever.
+    Both 404 and 410, in BOTH ``fail_fast`` modes, must return ``None`` (the
+    same value the pre-LML#1115 default-mode code returned on ANY non-200)
+    rather than raise -- so the caller's existing ``or []`` path runs, the
+    album-autocomplete fallback gets its shot, and a clean fallback miss
+    stays negative-cacheable (see ``_find_album_match_impl``'s
+    ``catalog_leg_failed`` gate, which must NOT be set for this case)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [404, 410])
+    @pytest.mark.parametrize("fail_fast", [False, True])
+    async def test_returns_none_not_raise(self, status, fail_fast):
+        client = BandcampClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(
+            return_value=_error_response(status, "https://gone99.bandcamp.com/music")
+        )
+        client._http = mock_http
+
+        result = await client.fetch_artist_catalog("gone99", fail_fast=fail_fast)
+
+        assert result is None
 
 
 class TestFindAlbumMatch:
@@ -704,6 +737,34 @@ class TestRequestWithRetryHonorsProbeDeadline:
 
         sleep_mock.assert_not_awaited()
         assert mock_http.request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_429_budget_giveup_logs_a_warning(self, caplog):
+        # LML#1121 review F5: a budget give-up (the branch exercised above)
+        # previously emitted no log line of its own -- it silently returned
+        # the still-429 response, which the caller then turns into a raised
+        # BandcampTransportError with no record of WHY. Wire retry_429's
+        # on_budget_exceeded callback (already used by Discogs,
+        # discogs/service.py) so the give-up is observable, with enough
+        # context to identify the key (the request URL) and the remaining
+        # budget.
+        client = BandcampClient()
+        client._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(
+            return_value=httpx.Response(429, request=httpx.Request("GET", _AUTOCOMPLETE_URL))
+        )
+        client._http = mock_http
+        set_probe_deadline(time.monotonic() + 1.0)
+
+        with patch("clients.bandcamp.asyncio.sleep", new=AsyncMock()):
+            with caplog.at_level(logging.WARNING, logger="clients.bandcamp"):
+                with pytest.raises(BandcampTransportError):
+                    await client.search_artist("Autechre")
+
+        giveup_records = [r for r in caplog.records if "giving up" in r.message]
+        assert len(giveup_records) == 1
+        assert _AUTOCOMPLETE_URL in giveup_records[0].message
 
     @pytest.mark.asyncio
     async def test_fail_fast_mode_is_unaffected_by_an_active_deadline(self):

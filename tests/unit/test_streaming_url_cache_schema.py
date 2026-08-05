@@ -74,6 +74,7 @@ class _FakeConnection:
         ):
             raise RuntimeError("simulated lock_timeout")
         self._source.executed.append((sql, self._source.in_transaction))
+        self._source.executed_with_txn_ordinal.append((sql, self._source.transaction_starts))
         return "CREATE"
 
 
@@ -100,6 +101,13 @@ class _FakePgSource:
         fail_statements_containing: str | None = None,
     ) -> None:
         self.executed: list[tuple[str, bool]] = []
+        # (sql, transaction ordinal) for every successfully-executed
+        # statement -- the ordinal is ``transaction_starts`` at execute time,
+        # i.e. "the Nth transaction entered so far". Two statements sharing
+        # an ordinal ran inside the SAME ``conn.transaction()`` block; this
+        # is what lets a test tell "bundled in one transaction" apart from
+        # "each in its own", which the plain ``in_transaction`` bool cannot.
+        self.executed_with_txn_ordinal: list[tuple[str, int]] = []
         self.acquire_count = 0
         self.transaction_starts = 0
         self.transaction_ends = 0
@@ -290,6 +298,23 @@ class TestSetUpStreamingUrlCacheSchema:
         assert pg.transaction_starts == pg.transaction_ends
         assert pg.in_transaction is False
         assert all(in_txn for _, in_txn in pg.executed)
+        # The invariant the docstring above names: it isn't enough for each
+        # DDL statement to merely run INSIDE *some* transaction -- schema and
+        # table creation must run in the SAME one, or a mid-boot failure
+        # between two separate ``bootstrap_lml_cache_table`` calls could
+        # leave the schema committed without its table. ``all(in_txn ...)``
+        # above can't tell that apart from two single-statement transactions.
+        schema_ordinal = next(
+            ordinal
+            for sql, ordinal in pg.executed_with_txn_ordinal
+            if "CREATE SCHEMA IF NOT EXISTS lml_cache" in sql
+        )
+        table_ordinal = next(
+            ordinal
+            for sql, ordinal in pg.executed_with_txn_ordinal
+            if "CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache" in sql
+        )
+        assert schema_ordinal == table_ordinal
 
     async def test_alter_and_widen_each_run_in_their_own_transaction(self):
         # LML#1121 FIX 5: the additive `is_error` ALTER (PG16 confirmed it
