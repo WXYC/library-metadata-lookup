@@ -302,7 +302,7 @@ async def offpath_harness(library_db, test_settings, monkeypatch):
             patch.object(
                 streaming_mod,
                 "peek_cached_streaming_url",
-                new=AsyncMock(return_value=(None, False)),
+                new=AsyncMock(return_value=(None, False, False)),
             ),
             patch.object(
                 streaming_mod,

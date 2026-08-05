@@ -17,24 +17,33 @@ whose client is present in ``clients``, this:
    fix for the wrong-fallback-row attack (a non-library album matched to a
    same-titled library row by a different artist, probed with the wrong artist
    name). The cache key is the album, so URLs are reused across song lookups on
-   the same album. The peek returns ``(url, has_fresh_decision)`` so the hot
-   path can make the same three-way choice the resolver makes — without probing.
+   the same album. The peek returns ``(url, has_fresh_decision, is_error)`` so
+   the hot path can make the same four-way choice the resolver makes — without
+   probing.
 2. On a cache **hit** (url present), mutates ``update[cfg.url_field]`` in place
    synchronously. No mint — cache hits already minted on their original
    resolution.
-3. On a **known recent miss** (no url, but the cache holds a fresh "not found"
-   within the TTL), does nothing: a warm would only re-derive the same verdict.
-4. On a **genuine miss** (absent/stale row), leaves the field ``None`` and
-   enqueues **one** bounded, deduplicated background task
-   (``_warm_streaming_url_cache``) that runs the live probe
+3. On a **known recent GENUINE miss** (no url, ``is_error`` false, but the
+   cache holds a fresh "not found" within ``miss_ttl``), does nothing: a warm
+   would only re-derive the same verdict.
+4. On a **genuine miss** (absent/stale row) — or a fresh LML#1121 **error row**
+   (``is_error`` true, no url, still inside the much shorter ``error_ttl``) —
+   leaves the field ``None`` and enqueues **one** bounded, deduplicated
+   background task (``_warm_streaming_url_cache``) that runs the live probe
    (``resolve_streaming_url_with_cache``) → cache UPSERT → mint-on-``live_resolved``.
-   The response has already returned by the time the probe runs, so streaming
-   URLs are *eventually consistent*: the first lookup of an uncached album omits
-   that service's URL; the warm fills the cache so the next lookup is a hit.
-   Artwork is unaffected (it never flowed through here — the synthesis-path
-   Apple probe in ``lookup/enrichment`` stays synchronous). The warm is suppressed
-   for the whole context when ``should_suppress_streaming_warm()`` is set (the
-   ``/lookup/bulk`` path), which then does cache read-fill only.
+   Unlike point 3, an error row DOES warm here (LML#1115): a couldn't-ask
+   deserves a retry, unlike a real sourced "asked and it's not there" — reusing
+   this same dedup+depth-bounded enqueue (not a bespoke one) is what keeps that
+   retry from reintroducing the unbounded per-key warm growth the ``is_error``
+   column exists to prevent. The response has already returned by the time the
+   probe runs, so streaming URLs are *eventually consistent*: the first lookup
+   of an uncached album omits that service's URL; the warm fills the cache so
+   the next lookup is a hit. Artwork is unaffected (it never flowed through
+   here — the synthesis-path Apple probe in ``lookup/enrichment`` stays
+   synchronous). The warm is suppressed for the whole context when
+   ``should_suppress_streaming_warm()`` is set (the ``/lookup/bulk`` path,
+   uniformly for a genuine miss or a fresh error row), which then does cache
+   read-fill only.
 
 **Background warm.** Each warm handles one ``(service, artist, album)``:
 
@@ -66,9 +75,13 @@ Sentry on the hot path projects, per active service:
 
 * ``streaming_url.persistent_lookup.fired.<service>`` — "post-process ran".
 * ``streaming_url.persistent_lookup.<outcome>.<service>`` — one of
-  ``cache_hit`` / ``cache_miss_recent`` / ``cache_miss_enqueued`` /
-  ``cache_miss_unwarmed`` / ``cache_miss_shed`` (filled, known-miss,
-  warm-scheduled, warm-suppressed-on-bulk, or warm-shed-at-depth-bound).
+  ``cache_hit`` / ``cache_miss_recent`` / ``cache_error_recent`` /
+  ``cache_miss_enqueued`` / ``cache_miss_unwarmed`` / ``cache_miss_shed``
+  (filled, genuine known-miss, fresh LML#1121 error-row miss, warm-scheduled,
+  warm-suppressed-on-bulk, or warm-shed-at-depth-bound). ``cache_error_recent``
+  covers all three of the error row's own enqueue/suppress/shed sub-outcomes —
+  the couldn't-ask signal itself is what matters operationally, not which of
+  those it landed in.
 
 Side effects degrade gracefully: PG errors swallow inside the cache layer; mint
 failures log and continue; Sentry projection errors log and continue; the
@@ -386,11 +399,14 @@ async def apply_streaming_url_postprocess(
         call actually consulted, keyed by ``service.catalog_key`` (``apple_music``
         / ``spotify`` / ``bandcamp`` — the same keys the wire contract's
         ``StreamingResolution`` object uses). A cache hit maps to ``verified``;
-        a known recent miss (a fresh "not found" already on record) maps to
-        ``absent`` — a real, sourced negative, not a couldn't-check; a genuine
+        a known recent GENUINE miss (a fresh "not found" already on record)
+        maps to ``absent`` — a real, sourced negative, not a couldn't-check. A
+        fresh LML#1121 **error row** (LML#1115) maps to ``unresolved`` instead
+        — it is NOT a sourced negative, so it must never be conflated with
+        ``absent`` even though both share the "no url" shape. A genuine
         miss — whether it enqueues a background warm, is suppressed on the
-        bulk path, or is SHED at the LML#1108 pending-depth bound — maps to
-        ``unresolved``, since none of those leave this request with a
+        bulk path, or is SHED at the LML#1108 pending-depth bound — also maps
+        to ``unresolved``, since none of those leave this request with a
         confirmed verdict; a swallowed cache-peek error maps to
         ``unresolved`` too (attempted, inconclusive). A service this call never
         even considered (master/per-service flag off, no client, or the URL
@@ -454,18 +470,19 @@ async def apply_streaming_url_postprocess(
             # never-consulted — same bucket as a timeout.
             statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
             continue
-        cached_url, has_fresh_decision = peek
+        cached_url, has_fresh_decision, is_error = peek
         if cached_url is not None:
             # Synchronous hit: fill the URL now. No mint — the URL was minted on
             # the resolution that first wrote this cache row.
             update[cfg.url_field] = cached_url
             _project_sentry(storage_key, "cache_hit")
             statuses[service.catalog_key] = StreamingResolutionStatus.verified
-        elif has_fresh_decision:
-            # Known recent miss: the cache already records "checked, not found"
-            # within the TTL. No probe is warranted, so don't schedule a no-op
-            # warm (it would just re-derive the same recent-miss verdict). A
-            # real, sourced negative — not a couldn't-check.
+        elif has_fresh_decision and not is_error:
+            # Known recent GENUINE miss: the cache already records "checked,
+            # not found" within miss_ttl. No probe is warranted, so don't
+            # schedule a no-op warm (it would just re-derive the same
+            # recent-miss verdict). A real, sourced negative — not a
+            # couldn't-check, unlike the fresh-error-row case below.
             _project_sentry(storage_key, "cache_miss_recent")
             statuses[service.catalog_key] = StreamingResolutionStatus.absent
         elif suppress_warm and not _bulk_bandcamp_warm_exempt(
@@ -479,22 +496,40 @@ async def apply_streaming_url_postprocess(
             # lml_bulk_bandcamp_streaming_warm is on, is exempted from this
             # suppression (see _bulk_bandcamp_warm_exempt) and falls through to
             # the enqueue branch below. Library rows stay suppressed here — the
-            # offline #1069 drain already warms them.
-            _project_sentry(storage_key, "cache_miss_unwarmed")
+            # offline #1069 drain already warms them. A fresh LML#1121 error
+            # row (below) is gated by this SAME bulk check — an outage during
+            # a bulk drain must not spawn request-time warms either.
+            _project_sentry(
+                storage_key, "cache_error_recent" if is_error else "cache_miss_unwarmed"
+            )
             statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
         else:
-            # Genuine miss (absent/stale) — or a rowless Bandcamp miss on the
-            # bulk path exempted from suppression by
-            # lml_bulk_bandcamp_streaming_warm: defer the live probe + UPSERT +
-            # mint to a bounded, deduplicated background task. The response
-            # returns without this service's URL; the warm fills the cache for
-            # next time — so this request's verdict is transient, not terminal.
+            # Genuine miss (absent/stale), a rowless Bandcamp miss on the bulk
+            # path exempted from suppression, OR (LML#1115) a fresh error row
+            # still inside its short error_ttl: all three defer the live probe
+            # + UPSERT + mint to a bounded, deduplicated background task. A
+            # fresh error row warms HERE unlike the known-recent-GENUINE-miss
+            # branch above — a couldn't-ask deserves a retry, unlike a real
+            # sourced "asked and it's not there" — and reusing this same
+            # dedup+depth-bounded enqueue (not a bespoke one) is what keeps
+            # that retry bounded rather than reintroducing the unbounded
+            # per-key warm growth the is_error column exists to prevent
+            # (LML#1108's depth bound + the in-flight dedup both still apply).
+            # The response returns without this service's URL either way; the
+            # warm fills the cache for next time — transient, not terminal.
             enqueued = _enqueue_streaming_warm(
                 storage_key, cfg, client, pg, entity_store, request_artist, request_album
             )
-            _project_sentry(storage_key, "cache_miss_enqueued" if enqueued else "cache_miss_shed")
+            if is_error:
+                outcome: _SentryOutcome = "cache_error_recent"
+            elif enqueued:
+                outcome = "cache_miss_enqueued"
+            else:
+                outcome = "cache_miss_shed"
+            _project_sentry(storage_key, outcome)
             # A shed (LML#1108) is transient, not terminal, so it gets the
-            # same "couldn't confirm" verdict as a healthy enqueue.
+            # same "couldn't confirm" verdict as a healthy enqueue — same for
+            # a fresh error row, which never reached a verdict either.
             statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
 
     return statuses
@@ -741,6 +776,7 @@ async def _mint_identity(
 _SentryOutcome = Literal[
     "cache_hit",
     "cache_miss_recent",
+    "cache_error_recent",
     "cache_miss_enqueued",
     "cache_miss_unwarmed",
     "cache_miss_shed",
@@ -754,10 +790,13 @@ def _project_sentry(service_key: str, outcome: _SentryOutcome) -> None:
 
     * ``streaming_url.persistent_lookup.fired.<service>`` — ran-for-service.
     * ``streaming_url.persistent_lookup.<outcome>.<service>`` — the hot-path
-      disposition: filled (``cache_hit``), known miss within TTL
-      (``cache_miss_recent``), warm scheduled (``cache_miss_enqueued``), warm
-      suppressed on the bulk path (``cache_miss_unwarmed``), or warm shed at
-      the LML#1108 pending-depth bound (``cache_miss_shed``).
+      disposition: filled (``cache_hit``), genuine known miss within
+      ``miss_ttl`` (``cache_miss_recent``), fresh LML#1121 error-row miss
+      within the shorter ``error_ttl`` (``cache_error_recent``, LML#1115 —
+      covers its own enqueue/suppress/shed sub-cases uniformly), warm
+      scheduled (``cache_miss_enqueued``), warm suppressed on the bulk path
+      (``cache_miss_unwarmed``), or warm shed at the LML#1108 pending-depth
+      bound (``cache_miss_shed``).
 
     Hot-path only (and therefore always in-request — correct attribution): the
     background warm's ``live_*`` outcome is logged, never tagged here, because

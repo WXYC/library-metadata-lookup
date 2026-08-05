@@ -86,7 +86,7 @@ class TestResolveStreamingURLWithCache:
 
     async def test_recent_known_miss_skips_live_call(self, service, sample_url):
         pg = AsyncMock(spec=PgSource)
-        pg.fetchone = AsyncMock(return_value={"url": None})
+        pg.fetchone = AsyncMock(return_value={"url": None, "is_error": False})
         client = AsyncMock(spec=BaseStreamingClient)
 
         outcome = await resolve_streaming_url_with_cache(
@@ -94,6 +94,24 @@ class TestResolveStreamingURLWithCache:
         )
 
         assert outcome == ResolveOutcome(url=None, source="cache_miss_recent")
+        client.find_album_match.assert_not_called()
+
+    async def test_recent_error_row_returns_cache_error_recent_and_skips_live_call(
+        self, service, sample_url
+    ):
+        # LML#1115: a fresh ERROR row means LML never got an answer -- it must
+        # not collapse to the same ``cache_miss_recent`` source a genuine
+        # confirmed-absent miss reports. The /lookup post-process keys its
+        # status mapping and warm-enqueue posture off this distinction.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value={"url": None, "is_error": True})
+        client = AsyncMock(spec=BaseStreamingClient)
+
+        outcome = await resolve_streaming_url_with_cache(
+            pg, client, service=service, artist="Sessa", album="Estrela Acesa"
+        )
+
+        assert outcome == ResolveOutcome(url=None, source="cache_error_recent")
         client.find_album_match.assert_not_called()
 
     async def test_no_cache_row_calls_client_with_request_values(self, service, sample_url):
