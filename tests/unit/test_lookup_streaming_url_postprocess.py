@@ -52,6 +52,7 @@ cache-layer behavior itself is covered in
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -826,6 +827,65 @@ class TestCacheMissEnqueuesBackgroundWarm:
 
         assert update["bandcamp_url"] is None
         entity_store.mint_or_get_release_identity.assert_not_called()
+        pg.execute.assert_awaited_once()
+        call = pg.execute.await_args
+        assert call.args[4] is None
+        assert call.args[5] is True
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+
+    async def test_background_warm_slow_bandcamp_response_still_writes_an_error_row(self):
+        # LML#1121 FIX 4: the dominant Cloudflare-under-load failure mode --
+        # a Bandcamp response slow enough to outlast the warm's OWN
+        # asyncio.wait_for ceiling -- must still write a short-TTL error
+        # row. Pre-fix, the coroutine got cancelled by the OUTER wait_for (a
+        # BaseException that sails past resolve_streaming_url_with_cache's
+        # except Exception and the whole try block, so no UPSERT ever ran).
+        # This proves BandcampClient now honors the LML#1108 probe deadline
+        # and raises a normal BandcampTransportError well inside that
+        # ceiling, giving the resolver a chance to write the row before the
+        # outer cancellation could ever fire. Shrinks Bandcamp's normal 9.0s
+        # ceiling to 1.5s (via a config override) so the test stays fast --
+        # the fake response hangs for 10s, far longer than either ceiling.
+        service = "bandcamp"
+        update = _blank_update()
+        entity_store = _entity_store()
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+
+        bandcamp = BandcampClient()
+        bandcamp._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
+        bandcamp._http = AsyncMock(spec=httpx.AsyncClient)
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(10.0)
+            return httpx.Response(  # pragma: no cover
+                200, json={"results": []}, request=httpx.Request("GET", _BANDCAMP_AUTOCOMPLETE_URL)
+            )
+
+        bandcamp._http.request = AsyncMock(side_effect=_hang)
+
+        small_cfg = dataclasses.replace(
+            mod.STREAMING_URL_CACHE_CONFIG[StreamingService.BANDCAMP], probe_timeout_s=1.5
+        )
+        with (
+            _patch_cache_peek(None),
+            patch.dict(mod.STREAMING_URL_CACHE_CONFIG, {StreamingService.BANDCAMP: small_cfg}),
+        ):
+            await _run(
+                update,
+                settings=_settings(service),
+                clients=_clients(bandcamp=bandcamp),
+                entity_store=entity_store,
+                pg=pg,
+            )
+            await _drain_background_tasks()
+
+        assert update["bandcamp_url"] is None
+        entity_store.mint_or_get_release_identity.assert_not_called()
+        # The load-bearing assertion: a row WAS written (is_error=True), not
+        # silently dropped by an uncaught cancellation.
         pg.execute.assert_awaited_once()
         call = pg.execute.await_args
         assert call.args[4] is None

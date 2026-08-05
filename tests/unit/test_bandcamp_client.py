@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 import unittest.mock
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -14,7 +16,20 @@ from clients.bandcamp import (
     BandcampTransportError,
     extract_slug,
 )
+from clients.streaming.base import reset_probe_deadline, set_probe_deadline
 from streaming.models import SourceMatch
+
+_AUTOCOMPLETE_URL = "https://bandcamp.com/api/fuzzysearch/2/app_autocomplete"
+
+
+class _InstantLimiter:
+    """A rate limiter stand-in with a no-op ``acquire`` -- see the identical
+    fixture in ``test_bandcamp_retry_characterization.py`` and
+    ``test_bandcamp_fail_fast_probe.py``. Duplicated per this repo's
+    convention for private test helpers."""
+
+    async def acquire(self) -> None:
+        return None
 
 
 def _autocomplete_response(results: list[dict]) -> httpx.Response:
@@ -568,3 +583,148 @@ class TestFindAlbumMatchAlbumSearchFallback:
 
         with pytest.raises(BandcampSearchUnavailableError):
             await client.find_album_match("Unknown", "Whatever")
+
+
+class TestRequestWithRetryHonorsProbeDeadline:
+    """LML#1121 FIX 4: ``_request_with_retry`` must honor the LML#1108 probe
+    deadline (``clients.streaming.base.get_probe_deadline``) the way
+    ``SpotifyClient`` does. Outside a background warm this is a complete
+    no-op -- every OTHER caller (the fail_fast live probe, the offline
+    drain, ``/streaming-check``) never sets ``get_probe_deadline()``, so the
+    pre-existing retry characterization tests
+    (``test_bandcamp_retry_characterization.py``) and fail-fast tests
+    (``test_bandcamp_fail_fast_probe.py``) stay pinned unmodified. Inside a
+    warm, a remaining budget too small to plausibly finish another HTTP
+    round trip must raise :class:`BandcampTransportError` -- a normal
+    ``Exception`` -- BEFORE the caller's own ``asyncio.wait_for`` cancels
+    this coroutine out from under it: a cancellation is a ``BaseException``
+    that bypasses ``resolve_streaming_url_with_cache``'s ``except
+    Exception`` and writes no error row, which is the exact bug this FIX
+    closes (see ``test_lookup_streaming_url_postprocess.py``'s
+    ``test_background_warm_slow_bandcamp_response_still_writes_an_error_row``
+    for the end-to-end pin)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_deadline(self):
+        yield
+        # Belt-and-suspenders: a test that raises before its own cleanup
+        # must not leak the deadline ContextVar into a sibling test.
+        token = set_probe_deadline(None)
+        reset_probe_deadline(token)
+
+    @pytest.mark.asyncio
+    async def test_no_deadline_active_is_a_complete_passthrough(self):
+        client = BandcampClient()
+        client._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(
+            return_value=httpx.Response(
+                200, json={"results": []}, request=httpx.Request("GET", _AUTOCOMPLETE_URL)
+            )
+        )
+        client._http = mock_http
+
+        result = await client._request_with_retry("GET", _AUTOCOMPLETE_URL)
+
+        assert result is not None
+        assert result.status_code == 200
+        mock_http.request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_budget_raises_without_attempting_the_call(self):
+        client = BandcampClient()
+        client._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(
+            return_value=httpx.Response(
+                200, json={"results": []}, request=httpx.Request("GET", _AUTOCOMPLETE_URL)
+            )
+        )
+        client._http = mock_http
+        # Already at the deadline -- no room to even attempt a call.
+        set_probe_deadline(time.monotonic())
+
+        with pytest.raises(BandcampTransportError):
+            await client._request_with_retry("GET", _AUTOCOMPLETE_URL)
+
+        mock_http.request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slow_response_is_cut_off_well_before_the_outer_deadline(self):
+        # The dominant failure mode FIX 4 closes: a response slow enough to
+        # outlast the warm's OWN ceiling (Cloudflare under load) must raise a
+        # normal Exception comfortably inside the remaining probe budget --
+        # not run until an EXTERNAL wait_for cancels it out from under this
+        # coroutine. Simulate a 10s-hanging request with ~1s of budget left.
+        client = BandcampClient()
+        client._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(10.0)
+            return httpx.Response(  # pragma: no cover
+                200, json={"results": []}, request=httpx.Request("GET", _AUTOCOMPLETE_URL)
+            )
+
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(side_effect=_hang)
+        client._http = mock_http
+        set_probe_deadline(time.monotonic() + 1.0)
+
+        start = time.monotonic()
+        with pytest.raises(BandcampTransportError):
+            await client._request_with_retry("GET", _AUTOCOMPLETE_URL)
+        elapsed = time.monotonic() - start
+
+        # Nowhere near the fake's 10s hang -- cut off by the REMAINING
+        # probe budget, not the fake's own duration.
+        assert elapsed < 2.0
+
+    @pytest.mark.asyncio
+    async def test_429_backoff_gives_up_instead_of_sleeping_past_the_deadline(self):
+        # LML#758's shared retry_429 budget_deadline mechanism (already used
+        # by Discogs) must now be wired to Bandcamp's default-mode retry loop
+        # too -- previously "Bandcamp never sets one" (discogs/admission.py's
+        # own comment). A give-up must not sleep at all, discriminating it
+        # from simply exhausting MAX_RETRIES (which would sleep -- mocked
+        # here so the assertion is fast and deterministic either way).
+        client = BandcampClient()
+        client._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(
+            return_value=httpx.Response(429, request=httpx.Request("GET", _AUTOCOMPLETE_URL))
+        )
+        client._http = mock_http
+        # Enough budget for one attempt, nowhere near enough to also sleep
+        # RETRY_BASE_DELAY's 5s.
+        set_probe_deadline(time.monotonic() + 1.0)
+
+        with patch("clients.bandcamp.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            with pytest.raises(BandcampTransportError):
+                await client.search_artist("Autechre")
+
+        sleep_mock.assert_not_awaited()
+        assert mock_http.request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_fail_fast_mode_is_unaffected_by_an_active_deadline(self):
+        # Belt-and-suspenders: even if a deadline were somehow active during
+        # a fail_fast call (never happens in production -- only the warm
+        # path sets it), fail_fast's single-attempt contract must not gain a
+        # SECOND raise site. A generous deadline here proves the mechanism
+        # doesn't misfire on a comfortably-budgeted fail_fast call.
+        client = BandcampClient()
+        client._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(
+            return_value=httpx.Response(
+                200, json={"results": []}, request=httpx.Request("GET", _AUTOCOMPLETE_URL)
+            )
+        )
+        client._http = mock_http
+        set_probe_deadline(time.monotonic() + 30.0)
+
+        result = await client._request_with_retry("GET", _AUTOCOMPLETE_URL, fail_fast=True)
+
+        assert result is not None
+        assert result.status_code == 200
+        mock_http.request.assert_awaited_once()

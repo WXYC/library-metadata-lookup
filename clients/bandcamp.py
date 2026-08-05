@@ -8,24 +8,28 @@ and album-level matching (page scraping).
 
 from __future__ import annotations
 
-# LML#1040: ``_request_with_retry``'s 429 loop now delegates to the shared
-# ``discogs.admission.retry_429``, whose ``asyncio.sleep(delay)`` call is no
-# longer textually in this module -- but ``tests/unit/
+# LML#1040: ``_request_with_retry``'s 429 loop delegates to the shared
+# ``discogs.admission.retry_429``, whose ``asyncio.sleep(delay)`` call is not
+# textually in this module -- but ``tests/unit/
 # test_bandcamp_retry_characterization.py`` patches
 # ``clients.bandcamp.asyncio.sleep`` (module-ATTRIBUTE patching against
 # whatever ``asyncio`` name this module exposes). That patch mutates the
 # SAME shared ``asyncio`` module object ``discogs.admission`` also imports,
-# so it still takes effect there; removing this import would only break the
-# patch-target resolution, not any real behavior. Keep it.
-import asyncio  # noqa: F401
+# so it still takes effect there. LML#1121 FIX 4 additionally uses
+# ``asyncio.wait_for`` directly in this module (``_bounded_attempt``), so the
+# import is now also genuinely load-bearing on its own, not just a
+# patch-target anchor.
+import asyncio
 import html
 import logging
 import re
+import time
+from collections.abc import Awaitable, Callable
 
 import httpx
 
 from clients.bandcamp_breaker import BandcampBreakerOpenError, get_bandcamp_probe_breaker
-from clients.streaming.base import BaseStreamingClient
+from clients.streaming.base import BaseStreamingClient, get_probe_deadline
 from clients.streaming.matching import (
     find_best_source_match,
     is_acceptable_match,
@@ -322,6 +326,64 @@ def _compute_bandcamp_retry_delay(attempt: int, retry_after: str | None) -> floa
     return RETRY_BASE_DELAY * (2**attempt)
 
 
+# LML#1121 FIX 4: how much of the active LML#1108 probe-deadline budget
+# ``_bounded_attempt`` holds back when bounding a single Bandcamp HTTP
+# attempt. Leaves room for the resulting ``BandcampTransportError`` to
+# propagate up through ``resolve_streaming_url_with_cache``'s exception
+# handling and UPSERT a short-TTL error row before the OUTER
+# ``asyncio.wait_for`` in ``lookup.streaming_url_postprocess.
+# _warm_streaming_url_cache`` fires its own cancellation -- a cancellation is
+# a ``BaseException`` that bypasses ``resolve_streaming_url_with_cache``'s
+# ``except Exception`` and writes nothing (the bug this FIX closes). Not
+# env-tunable: an internal safety margin, not an operator knob.
+_PROBE_DEADLINE_SAFETY_MARGIN_S = 0.5
+
+
+async def _bounded_attempt(
+    make_coro: Callable[[], Awaitable[httpx.Response]], url: str
+) -> httpx.Response:
+    """Run one Bandcamp HTTP attempt, bounded by the active LML#1108 probe
+    deadline (if any) -- the same mechanism ``SpotifyClient`` already honors
+    (``clients.streaming.base.get_probe_deadline``), extended here to close
+    LML#1121 FIX 4.
+
+    Outside a background warm probe (interactive ``/lookup``, the
+    ``fail_fast`` live probe, the offline drain, ``/streaming-check`` --
+    none of which ever set ``get_probe_deadline()``), this is a transparent
+    passthrough: ``get_probe_deadline()`` is ``None``, so ``make_coro()`` is
+    simply awaited with no wrapping. Every pre-existing retry
+    characterization and fail-fast test stays byte-for-byte unaffected.
+
+    Inside a warm, a remaining budget too small to plausibly finish another
+    round trip (already exhausted by rate-limiter/semaphore queueing, or
+    simply near zero) raises :class:`BandcampTransportError` immediately
+    without attempting the call. Otherwise the attempt runs under an inner
+    ``asyncio.wait_for`` clamped to the remaining budget (minus
+    ``_PROBE_DEADLINE_SAFETY_MARGIN_S``): a request that would hang past
+    that -- the dominant Cloudflare-under-load shape, since a single
+    ``search_artist``/``fetch_artist_catalog`` call's OWN httpx timeout
+    (10s/15s) already exceeds the Bandcamp warm's 9.0s overall ceiling --
+    gets a normal ``TimeoutError`` from THIS wrapper, converted to
+    :class:`BandcampTransportError`, comfortably before the caller's own
+    ``wait_for`` would otherwise force a raw cancellation through the
+    stack. ``make_coro`` is a zero-arg callable (not a pre-built coroutine)
+    so the "raise without attempting" branch never leaves an unawaited
+    coroutine behind.
+    """
+    deadline = get_probe_deadline()
+    if deadline is None:
+        return await make_coro()
+    remaining = deadline - time.monotonic()
+    if remaining <= _PROBE_DEADLINE_SAFETY_MARGIN_S:
+        raise BandcampTransportError(url)
+    try:
+        return await asyncio.wait_for(
+            make_coro(), timeout=remaining - _PROBE_DEADLINE_SAFETY_MARGIN_S
+        )
+    except TimeoutError as e:
+        raise BandcampTransportError(url) from e
+
+
 class _BandcampRequestFailedError(Exception):
     """Internal sentinel: ``client.request()`` raised inside one attempt.
 
@@ -368,16 +430,31 @@ class BandcampClient(BaseStreamingClient):
         genuine no-match (and never record a negative-cache row for it). A
         request-layer failure (network error) still degrades to ``None``
         either way -- that is not a rate-limit signal.
+
+        LML#1121 FIX 4: each attempt is wrapped in :func:`_bounded_attempt`,
+        which honors the active LML#1108 probe deadline
+        (``clients.streaming.base.get_probe_deadline``) -- a no-op outside a
+        background warm (every other caller, including this method's own
+        ``fail_fast`` branch, never sets one), but inside a warm it converts
+        a remaining-budget shortfall into :class:`BandcampTransportError`
+        instead of letting the attempt run into the caller's OWN
+        ``wait_for`` cancellation. ``budget_deadline=get_probe_deadline()``
+        below wires the SAME deadline into the shared ``retry_429`` loop's
+        pre-existing LML#758 give-up-before-sleeping check (previously
+        Bandcamp was the one caller that never armed it).
         """
         client = await self._get_client()
 
         async def _attempt(attempt: int) -> httpx.Response:
-            async with self._semaphore:
-                await self._rate_limiter.acquire()
-                try:
-                    return await client.request(method, url, **kwargs)
-                except Exception as e:
-                    raise _BandcampRequestFailedError() from e
+            async def _do_request() -> httpx.Response:
+                async with self._semaphore:
+                    await self._rate_limiter.acquire()
+                    try:
+                        return await client.request(method, url, **kwargs)
+                    except Exception as e:
+                        raise _BandcampRequestFailedError() from e
+
+            return await _bounded_attempt(_do_request, url)
 
         if fail_fast:
             try:
@@ -393,6 +470,7 @@ class BandcampClient(BaseStreamingClient):
                 _attempt,
                 max_retries=MAX_RETRIES,
                 compute_delay=_compute_bandcamp_retry_delay,
+                budget_deadline=get_probe_deadline(),
                 on_retry=lambda attempt, delay, retry_after: log.warning(
                     f"429 rate limited, retrying in {delay}s (attempt {attempt + 1})"
                 ),
