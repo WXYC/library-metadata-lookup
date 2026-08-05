@@ -7,7 +7,7 @@ label's own subdomain (``into-the-light.bandcamp.com``), not the artist's
 own page (``georgerakis.bandcamp.com``) -- so only the album-first search
 path added by this PR, not the pre-existing artist-first
 ``find_album_match``, can locate it. See
-``plans/lml-1069-bandcamp-album-first.md``'s Appendix for the fixture this
+``docs/plans/lml-1069-bandcamp-album-first.md``'s Appendix for the fixture this
 was captured from.
 
 Skip-vs-fail follows the live Discogs smoke's split

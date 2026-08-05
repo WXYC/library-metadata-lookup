@@ -2893,7 +2893,7 @@ class TestArtistTrigramCandidates:
 # genre/style read, and the artist lean read is a single json_agg SELECT. The
 # shared get_release / get_artist_details keep their per-child reads unchanged so
 # the public /api/v1/discogs/* responses stay full on both warm and cold paths
-# (the plans/lookup-latency-plan.md section 6.3 fence). release_track_artist
+# (the docs/plans/lookup-latency-plan.md section 6.3 fence). release_track_artist
 # (LML#699 writer credits, both extra legs) stays on the lean release path.
 # ---------------------------------------------------------------------------
 

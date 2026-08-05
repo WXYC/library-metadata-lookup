@@ -1,0 +1,125 @@
+```mermaid
+graph LR
+    %% ===== LML (center) =====
+    lml["<b>library-metadata-lookup</b><br/>FastAPI · SQLite FTS5 · asyncpg<br/>Railway: main→staging, prod→prod"]
+
+    %% ===== User-facing client apps (clients of Backend-Service) =====
+    subgraph apps["User-Facing Apps"]
+        djsite["dj-site<br/><i>dj.wxyc.org · Next.js</i>"]
+        ios["wxyc-ios-64<br/><i>iOS/tvOS/watch/mac listener</i>"]
+        android["WXYC-Android<br/><i>Android listener</i>"]
+        djios["wxyc-dj-ios<br/><i>SwiftUI DJ tool</i>"]
+    end
+
+    %% ===== Integration services =====
+    subgraph services["Integration Services"]
+        rom["request-o-matic<br/><i>Slack request parsing</i>"]
+        tf["tubafrenzy<br/><i>legacy flowsheet (turndown 8/31)</i>"]
+        orch["auto-dj-orchestrator<br/><i>AzuraCast bridge (spec only)</i>"]
+    end
+
+    %% ===== Core services =====
+    subgraph core["Core Services"]
+        backend["Backend-Service<br/><i>API + Auth · api.wxyc.org</i>"]
+        si["semantic-index<br/><i>explore.wxyc.org · artist graph API</i>"]
+    end
+
+    %% ===== Monitoring =====
+    canary["wxyc-canary<br/><i>synthetic-DJ uptime monitor</i>"]
+
+    %% ===== Shared libraries / contract =====
+    subgraph shared["Shared Libraries &amp; Contract"]
+        wxycshared["wxyc-shared<br/><i>api.yaml → generated models</i>"]
+        wxycetl["wxyc-etl<br/><i>Rust+PyO3: text norm, schema</i>"]
+        wxycfastapi["wxyc-fastapi<br/><i>FastAPI service template</i>"]
+    end
+
+    %% ===== Upstream ETL (produces the caches LML reads) =====
+    subgraph etl["Upstream ETL (produces caches)"]
+        discogsetl["discogs-etl<br/><i>Discogs dump → PG; daily library.db sync</i>"]
+        xmlconv["discogs-xml-converter<br/><i>Rust XML filter</i>"]
+        wxyccatalog["wxyc-catalog<br/><i>catalog protocols / library.db export</i>"]
+    end
+
+    %% ===== Data stores =====
+    subgraph stores["Data Stores"]
+        librarydb[("library.db<br/>SQLite FTS5")]
+        discogscache[("discogs-cache PostgreSQL :5433<br/>entity.* — shared identity contract<br/>lml_cache.* — LML-owned")]
+    end
+
+    %% ===== External APIs =====
+    subgraph ext["External APIs"]
+        discogsAPI["Discogs API"]
+        spotify["Spotify"]
+        apple["Apple Music"]
+        deezer["Deezer"]
+        bandcamp["Bandcamp"]
+        slack["Slack"]
+    end
+
+    %% ---- apps → Backend-Service / semantic-index ----
+    djsite -->|"web client"| backend
+    ios -->|"anon auth · /config/secrets · V2 metadata"| backend
+    ios -->|"artist graph"| si
+    android -->|"anon auth · /config/secrets"| backend
+    djios -->|"login · search · /djs/bin"| backend
+
+    %% ---- integration services ----
+    rom -->|"lookup"| lml
+    rom -->|"posts results"| slack
+    tf -->|"streaming-check on add"| lml
+    tf -->|"webhook + ETL sync"| backend
+    orch -.->|"auto-DJ writes (spec)"| backend
+    orch -.->|"flowsheet writes (spec)"| tf
+
+    %% ---- core services ----
+    backend -->|"library-search proxy<br/>+ streaming-check on add"| lml
+    backend -->|"nightly sync"| si
+    backend -->|"reads entity.identity"| discogscache
+    si -->|"reads (graph build)"| discogscache
+
+    %% ---- monitoring (black-box checks) ----
+    canary -.->|"checks"| backend
+    canary -.->|"checks"| lml
+    canary -.->|"checks"| si
+
+    %% ---- LML reads / calls ----
+    lml -->|"FTS search"| librarydb
+    lml -->|"Discogs cache;<br/>writes entity.* identity"| discogscache
+    lml -->|"on cache miss"| discogsAPI
+    lml --> spotify
+    lml --> apple
+    lml --> deezer
+    lml --> bandcamp
+
+    %% ---- build / contract dependencies (depends on →) ----
+    lml -.-> wxycshared
+    lml -.-> wxycetl
+    lml -.-> wxycfastapi
+    djsite -.-> wxycshared
+    rom -.-> wxycfastapi
+    si -.-> wxycetl
+    si -.-> wxycfastapi
+    discogsetl -.-> wxycetl
+    xmlconv -.-> wxycetl
+    discogsetl -.-> wxyccatalog
+
+    %% ---- ETL produces the caches ----
+    xmlconv -->|"CSV / PG COPY"| discogsetl
+    discogsetl -->|"populates"| discogscache
+    discogsetl -->|"daily sync"| librarydb
+
+    classDef center fill:#bbf7d0,stroke:#15803d,color:#14532d,stroke-width:2px;
+    classDef repo fill:#dbeafe,stroke:#1e40af,color:#1e3a8a;
+    classDef app fill:#ede9fe,stroke:#6d28d9,color:#4c1d95;
+    classDef store fill:#fef3c7,stroke:#b45309,color:#78350f;
+    classDef extn fill:#f3f4f6,stroke:#6b7280,color:#374151,stroke-dasharray:4 3;
+    classDef monitor fill:#ffedd5,stroke:#c2410c,color:#7c2d12,stroke-dasharray:5 3;
+
+    class lml center;
+    class rom,tf,orch,backend,si,wxycshared,wxycetl,wxycfastapi,discogsetl,xmlconv,wxyccatalog repo;
+    class djsite,ios,android,djios app;
+    class librarydb,discogscache store;
+    class discogsAPI,spotify,apple,deezer,bandcamp,slack extn;
+    class canary monitor;
+```

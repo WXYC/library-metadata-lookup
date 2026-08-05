@@ -21,7 +21,7 @@ matched against a fixed base set. A cell counts as a writer credit if ANY
 component matches. ``Arranged By`` and ``Adapted By`` are deliberately excluded
 (plan decision); performer/engineer roles never match. The base set and its
 variants are grounded in a live discogs-cache enumeration (2026-06-28). See
-``plans/699-composer-credits-bmi.md``.
+``docs/plans/699-composer-credits-bmi.md``.
 """
 
 from __future__ import annotations

@@ -65,5 +65,9 @@ spotify_revalidation_false_positives.json
 not_on_streaming.csv
 cta_inserts.sql
 
+# Pipeline artifact holding directory (LML#1124; script writers route their
+# output here starting in Phase 2 of the root-cleanup effort)
+artifacts/
+
 # Claude Code local config
 .claude/

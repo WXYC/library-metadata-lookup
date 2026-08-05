@@ -1,7 +1,7 @@
 # Plan — LML#1026: make the recall index authoritative on the /lookup comp-track path
 
 **Written:** 2026-08-01 PT
-**Issue:** WXYC/library-metadata-lookup#1026 (follow-up to #1022, merged in #1025; post-fold context from #1029/#1030 and `plans/location-union-transparent-results.md` §6/§7)
+**Issue:** WXYC/library-metadata-lookup#1026 (follow-up to #1022, merged in #1025; post-fold context from #1029/#1030 and `docs/plans/location-union-transparent-results.md` §6/§7)
 **Worktree:** `library-metadata-lookup-worktrees/1026-recall-index-authoritative` (branch `feat/1026-recall-index-authoritative` off `origin/main` = `67e3fe2`)
 
 ## 1. Context and post-fold translation

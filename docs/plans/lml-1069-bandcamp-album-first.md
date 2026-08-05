@@ -94,8 +94,9 @@ Two PRs, sequenced. PR 1 is the substance; PR 2 is a small, separately-verifiabl
 ### Environment
 
 ```bash
-git -C /Users/jake/Developer/WXYC/library-metadata-lookup fetch origin
-git -C /Users/jake/Developer/WXYC/library-metadata-lookup worktree add \
+cd library-metadata-lookup   # the repo root, wherever it's checked out locally
+git fetch origin
+git worktree add \
     ../library-metadata-lookup-worktrees/1069-bandcamp-album-first -b feat/1069-bandcamp-album-first origin/main
 cd ../library-metadata-lookup-worktrees/1069-bandcamp-album-first
 uv sync --extra dev            # REQUIRED in a fresh worktree

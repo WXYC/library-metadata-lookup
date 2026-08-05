@@ -1,7 +1,7 @@
 """LML#907: event-loop-lag gauge.
 
 Covers the three moving parts of the gauge that makes the single-worker
-``/lookup`` starvation tax (``plans/lookup-latency-event-loop-starvation.md`` §3)
+``/lookup`` starvation tax (``docs/plans/lookup-latency-event-loop-starvation.md`` §3)
 machine-readable:
 
 1. the sampler math (``compute_lag_ms``) + the EWMA gauge,

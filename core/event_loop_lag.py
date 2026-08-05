@@ -5,7 +5,7 @@ pydantic (de)serialisation, PyO3 text normalisation, Sentry span assembly,
 orchestrating ~30 DB round-trips — runs on one event loop. Under the enrichment
 flood that loop saturates, and a coroutine's continuations (especially the
 post-await response-return tail) wait seconds to be scheduled. That wait is the
-``/lookup`` **starvation tax** (``plans/lookup-latency-event-loop-starvation.md``
+``/lookup`` **starvation tax** (``docs/plans/lookup-latency-event-loop-starvation.md``
 §3): on a fully cache-warm, zero-I/O trace the awaited work finished at T+5.1s
 and then **5.08s of no spans** passed before the response returned. It is
 invisible to ``RequestTelemetry.track_step`` and the ``Server-Timing`` header —
