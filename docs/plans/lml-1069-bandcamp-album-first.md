@@ -44,7 +44,7 @@ Two PRs, sequenced. PR 1 is the substance; PR 2 is a small, separately-verifiabl
 
 **4. Tests (TDD, red-green per unit; markers per `docs/testing.md`):**
 
-- Unit: `fix_autocomplete_url` (doubled, clean, custom-domain, garbage); `clean_title_for_query` + `normalize_bc_title` parameterized over the measurement's named near-misses and true-negatives; `search_albums` response parsing against the captured real autocomplete responses in `plans/lml-1069-artifacts/` (see Appendix — includes the doubled URL and interleaved `t`-type rows); `find_album_match_via_search` floor logic (accept 100/100, reject 80-artist/66-title, accept via normalized side); `ResultsDB.get_pending_album_search` selection semantics (slug-NULL and slug-`''` in; real-slug and compilation rows out) in `tests/unit/test_results_db.py`; album-search phase against `ResultsDB(":memory:")` per the established convention (hit writes url+found, pending-miss writes not_found, real-slug rows never touched, not_found-miss no-op, `--execute` gating, verify-failure skips write).
+- Unit: `fix_autocomplete_url` (doubled, clean, custom-domain, garbage); `clean_title_for_query` + `normalize_bc_title` parameterized over the measurement's named near-misses and true-negatives; `search_albums` response parsing against the captured real autocomplete responses in `tests/fixtures/bandcamp/` (see Appendix — includes the doubled URL and interleaved `t`-type rows); `find_album_match_via_search` floor logic (accept 100/100, reject 80-artist/66-title, accept via normalized side); `ResultsDB.get_pending_album_search` selection semantics (slug-NULL and slug-`''` in; real-slug and compilation rows out) in `tests/unit/test_results_db.py`; album-search phase against `ResultsDB(":memory:")` per the established convention (hit writes url+found, pending-miss writes not_found, real-slug rows never touched, not_found-miss no-op, `--execute` gating, verify-failure skips write).
 - `external_api`-marked smoke: golden repro (George Theodorakis → `into-the-light.bandcamp.com/album/...`) live end-to-end, with the same runtime-skip-on-unanswerable guard as the live Discogs smoke (a Bandcamp 429/outage must skip, not redden the external lane).
 - Local gate before push: `ruff check`, `ruff format --check`, `uv run --no-sync mypy . --ignore-missing-imports`, full unit suite.
 
@@ -103,12 +103,14 @@ uv run --no-sync pytest        # ALWAYS --no-sync; bare `uv run pytest` grabs ho
 uv run --no-sync mypy . --ignore-missing-imports   # CI has a required mypy job pre-commit doesn't cover
 ```
 
-### Durable artifacts (in `plans/lml-1069-artifacts/`, captured 2026-08-01)
+### Durable artifacts (captured 2026-08-01)
 
-- `autocomplete_b_george_theodorakis.json` — REAL `param="b"` response for `q=George Theodorakis`: 33 results (1 `b`-type at index 0, 1 `a`-type at index 1 — the label-hosted golden-repro album the current type filter drops, 31 `t`-type). Shows the doubled-`url` quirk verbatim.
-- `autocomplete_a_golden_repro.json` — REAL `param="a"` response for the golden-repro artist+title query: 17 results, `a`-type at rank 1. Use these as the parsing-test fixtures rather than hand-writing JSON.
-- `measure_1069_report.json` — full per-row measurement output (111 rows: sampled ids, per-row probe results, scores, verify og:title). Source of truth for every number in the issue comment.
-- `measure_1069.py` — the measurement script (has a working `og:title` extraction regex and the URL-de-doubling logic to port).
+Originally written to an untracked `plans/lml-1069-artifacts/` directory. That directory no longer exists; each file's current home is given below.
+
+- `tests/fixtures/bandcamp/autocomplete_a_golden_repro.json` (tracked) — REAL `param="a"` response for the golden-repro artist+title query: 17 results, `a`-type at rank 1. Use this as the parsing-test fixture rather than hand-writing JSON; `tests/unit/test_bandcamp_album_search.py` already reads it from there.
+- `scripts/measure_1069.py` (tracked) — the measurement script (has a working `og:title` extraction regex and the URL-de-doubling logic to port).
+- `autocomplete_b_george_theodorakis.json` — REAL `param="b"` response for `q=George Theodorakis`: 33 results (1 `b`-type at index 0, 1 `a`-type at index 1 — the label-hosted golden-repro album the current type filter drops, 31 `t`-type). Shows the doubled-`url` quirk verbatim. Run output, not tracked; kept in a local `artifacts/` holding directory. Re-capturable with the command below.
+- `measure_1069_report.json` — full per-row measurement output (111 rows: sampled ids, per-row probe results, scores, verify og:title). Source of truth for every number in the issue comment. Run output, not tracked; kept in a local `artifacts/` holding directory. Regenerable by re-running `scripts/measure_1069.py`.
 - Re-capture command if fixtures need refreshing: `curl -sf -A "Mozilla/5.0" --get --data-urlencode "q=<query>" --data-urlencode "param=a" "https://bandcamp.com/api/fuzzysearch/2/app_autocomplete"`.
 
 ### Golden repro (first failing test)
