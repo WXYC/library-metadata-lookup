@@ -521,11 +521,18 @@ class TestErrorTTL:
     async def test_fresh_error_row_short_circuits_without_a_second_live_call(
         self, pg_source, pg_pool, service, sample_url
     ):
-        # The LML#1121 backpressure guarantee: once an error row is written,
-        # a subsequent resolve for the same key inside error_ttl must NOT
-        # call the client again. LML#1115: the reported source must also say
-        # WHICH miss flavor short-circuited it -- a fresh error row is
-        # ``cache_error_recent``, distinct from a genuine ``cache_miss_recent``.
+        # Pins ``resolve_streaming_url_with_cache``'s own cache-first
+        # short-circuit: once an error row is written, a caller that does NOT
+        # bypass it (the LML#1098 fail-fast probe path) must not call the
+        # client again for the same key inside error_ttl. The default
+        # ``/lookup`` warm path deliberately does NOT get this benefit -- it
+        # passes ``bypass_error_row=True`` precisely so its own retry reaches
+        # the network (see the canonical rationale in
+        # ``lookup/streaming_url_postprocess.py``); this is NOT a backpressure
+        # guarantee on that path (LML#1141 tracks giving it one). LML#1115:
+        # the reported source must also say WHICH miss flavor short-circuited
+        # it -- a fresh error row is ``cache_error_recent``, distinct from a
+        # genuine ``cache_miss_recent``.
         client = AsyncMock(spec=BaseStreamingClient)
         client.find_album_match = AsyncMock(side_effect=RuntimeError("upstream flake"))
 

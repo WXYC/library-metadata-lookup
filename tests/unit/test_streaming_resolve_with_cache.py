@@ -193,9 +193,11 @@ class TestResolveStreamingURLWithCache:
         # request (still ``live_error``, distinct from ``live_miss``), but
         # UNLIKE the pre-#1121 posture it now DOES write a row -- marked
         # ``is_error=True`` so it ages on the short error TTL instead of the
-        # 7-day miss TTL. This is the deliberate backpressure fix: without a
-        # row, every subsequent /lookup for the same album re-enqueues a warm
-        # for as long as the outage lasts (LML#1094).
+        # 7-day miss TTL. This lets a *reader* tell a couldn't-ask apart from
+        # a confirmed absence; it does NOT throttle the default /lookup warm
+        # path's re-enqueue rate (that path deliberately bypasses a fresh
+        # error row -- see the canonical rationale in
+        # lookup/streaming_url_postprocess.py). LML#1094/#1141.
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
         pg.execute = AsyncMock(return_value="INSERT 0 1")
@@ -425,15 +427,18 @@ class TestResolveStreamingURLWithCacheBandcampDefaultPath:
     through this resolver end-to-end, rather than a stand-in that always
     agreed with whatever the client layer's contract used to be.
 
-    LML#1121 review: dropping the write entirely also dropped the only
-    backpressure on the default warm path (the dedup key in
-    ``lookup/streaming_url_postprocess.py`` is discarded once the warm task
-    finishes, so it dedups concurrent warms only) -- for as long as an outage
-    lasts, every subsequent /lookup for the same album re-enqueues a fresh
-    warm. The fix keeps #1115's guarantee (a transport failure never freezes
-    as a 7-day known-miss) while restoring backpressure via a short,
-    env-tunable error TTL (``is_error=True``, see
-    ``TestResolveStreamingErrorTTL`` in ``test_streaming_url_cache.py``).
+    LML#1121 review: dropping the write entirely also left no row for a
+    *reader* to consult (the dedup key in ``lookup/streaming_warm.py`` is
+    discarded once the warm task finishes, so it dedups concurrent warms
+    only) -- for as long as an outage lasts, every subsequent /lookup for the
+    same album re-enqueues a fresh warm, unchanged by this fix. The fix keeps
+    #1115's guarantee (a transport failure never freezes as a 7-day
+    known-miss) and, via a short, env-tunable error TTL (``is_error=True``,
+    see ``TestResolveStreamingErrorTTL`` in ``test_streaming_url_cache.py``),
+    lets a reader tell a couldn't-ask apart from a confirmed absence -- it
+    does NOT restore backpressure on the default /lookup warm path (see the
+    canonical rationale in ``lookup/streaming_url_postprocess.py``; LML#1141
+    tracks that follow-up).
     """
 
     async def test_transport_failure_returns_live_error_and_writes_short_ttl_error_row(self):

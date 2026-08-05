@@ -408,7 +408,12 @@ def test_default_miss_ttl_is_seven_days():
 
 def test_default_error_ttl_is_five_minutes():
     # LML#1121: short enough that a real Bandcamp outage self-heals fast, long
-    # enough to backpressure a hot /lookup loop's re-enqueue during the outage.
+    # enough for the fail-fast probe path (lookup/enrichment/bandcamp_probe.py)
+    # to skip a doomed re-ask against a fresh error row before the outage
+    # clears. Does NOT govern the default /lookup warm path's re-enqueue rate
+    # -- that path deliberately bypasses a fresh error row (see the canonical
+    # rationale in lookup/streaming_url_postprocess.py); LML#1141 tracks
+    # giving it its own throttle.
     assert DEFAULT_ERROR_TTL == timedelta(minutes=5)
 
 
