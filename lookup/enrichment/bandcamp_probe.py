@@ -155,11 +155,14 @@ async def run_bandcamp_live_probe(
     with the URL (``live_resolved`` also mints the external_id into
     ``entity.release_identity`` -- FIX 4, since the withheld client means
     ``_warm_streaming_url_cache`` never runs to mint it instead); a clean
-    live/known miss -> ``absent`` (a fresh ``live_miss`` negative-cache);
-    a breaker shed / 429 / non-429 transport failure / timeout ->
-    ``unresolved`` with NO cache write (``fail_fast`` re-raises before the
-    UPSERT). Exactly one ``find_album_match`` — no title-variant fan-out
-    (LML#1094).
+    live/known miss -> ``absent`` (a fresh ``live_miss``/``cache_miss_recent``
+    negative-cache); a fresh LML#1121 error row (``cache_error_recent`` --
+    the cache read happens BEFORE the ``fail_fast`` branch, so this probe can
+    still land on one) -> ``unresolved`` (LML#1121 FIX 1: a couldn't-ask, not
+    a confirmed absence); a breaker shed / 429 / non-429 transport failure /
+    timeout -> ``unresolved`` with NO cache write (``fail_fast`` re-raises
+    before the UPSERT). Exactly one ``find_album_match`` — no title-variant
+    fan-out (LML#1094).
     """
     if not (
         # is_top1 FIRST (cheapest check, no attribute/ContextVar read): a
@@ -282,6 +285,18 @@ async def run_bandcamp_live_probe(
                     outcome.url,
                 )
         return BandcampProbeResult(outcome.url, StreamingResolutionStatus.verified)
+    if outcome.source == "cache_error_recent":
+        # LML#1121 FIX 1: the cache read above runs BEFORE the fail_fast
+        # branch, so a fail_fast=True probe can still land on a fresh
+        # LML#1121 error row (a couldn't-ask, not a confirmed absence) --
+        # this was previously falling through to the ``absent`` return below
+        # unconditionally, which is a SOURCED verdict that
+        # ``probe_owns_bandcamp_leg`` withholds the client for, leaving the
+        # item with no fill AND no background retry. Map it to
+        # ``unresolved`` instead, exactly like a breaker shed / 429 /
+        # transport failure / timeout -- none of which reached a verdict
+        # either.
+        return BandcampProbeResult(current_bandcamp_url, StreamingResolutionStatus.unresolved)
     # live_miss / cache_miss_recent: a sourced, terminal no-match. Leave the URL
     # to the deferred search fallback; the verdict says "checked, absent", not
     # "couldn't check".
