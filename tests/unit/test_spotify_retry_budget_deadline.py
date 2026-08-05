@@ -6,8 +6,8 @@ gives up early.
 ``_search_with_retry_type``'s 429 handler sleeps for ``Retry-After`` (floored
 at 5s when the header is absent) with no knowledge of the caller's remaining
 budget; its 5xx handler sleeps an exponential backoff with the same blindness.
-The background streaming-URL warm probe (``lookup.
-streaming_url_postprocess._warm_streaming_url_cache``) wraps every client
+The background streaming-URL warm probe
+(``lookup.streaming_warm._warm_streaming_url_cache``) wraps every client
 call in ``asyncio.wait_for(timeout=_DEFAULT_PROBE_TIMEOUT_S)`` -- 4.0s by
 default -- so either sleep could be *guaranteed* to be cancelled mid-flight
 (LIBRARY-METADATA-LOOKUP-1B: 33k+ occurrences), burning the full timeout on a

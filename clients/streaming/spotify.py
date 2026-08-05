@@ -146,7 +146,7 @@ class SpotifyClient(BaseStreamingClient):
         background-warm-probe deadline (LML#1108).
 
         A background streaming-URL warm probe
-        (``lookup.streaming_url_postprocess._warm_streaming_url_cache``) arms
+        (``lookup.streaming_warm._warm_streaming_url_cache``) arms
         an absolute deadline via ``clients.streaming.base.set_probe_deadline``
         before calling into this client -- its own ``asyncio.wait_for`` will
         cancel this coroutine at, or just before (it re-reads the clock a
