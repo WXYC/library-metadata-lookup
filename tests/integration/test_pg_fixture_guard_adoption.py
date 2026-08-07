@@ -67,6 +67,8 @@ _LML_CACHE_FIXTURE_FILES = (
     "test_compilation_track_location_schema.py",
     "test_build_compilation_track_location_pg.py",
     "test_compilation_track_location_read.py",
+    "test_compilation_track_identity_schema.py",
+    "test_compilation_track_identity_store.py",
 )
 
 # Any DROP SCHEMA aimed at lml_cache, however spelled (with/without IF
