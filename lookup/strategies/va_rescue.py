@@ -132,7 +132,7 @@ async def _tracklist_credits_artist(
     if release is None or not release.tracklist:
         return False
     for track in release.tracklist:
-        for credit in track.artists or []:
+        for credit in track.artists:
             if score_match(query_artist, credit) >= SCORE_MATCH_ACCEPTANCE_FLOOR:
                 return True
         for segment in _segments(track.title or ""):
