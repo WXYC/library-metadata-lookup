@@ -4,8 +4,10 @@ Per the cross-cache-identity architecture pivot
 (WXYC/Backend-Service#800, 2026-05-09), LML — not Backend — is the sole
 composer of cross-cache identity. Backend POSTs library rows; LML returns one
 verdict per row. The handler shape is contract-locked in
-`wxyc-shared/api.yaml` (v1.2.0). The composition rules implemented here come
-from the wiki spec at `plans/library-hook-canonicalization.md` §3.4.1.1.
+`wxyc-shared/api.yaml` (the `(tracks_attempted, tracks)` pair since 1.30.0,
+`tracks_contract_version` since 1.31.0). The composition rules implemented
+here come from the wiki spec at `plans/library-hook-canonicalization.md`
+§3.4.1.1.
 
 Rule 1 (manual override) executes in Backend (per the pivot decision record),
 NOT here. Rules 2-6 execute here:
@@ -18,9 +20,11 @@ NOT here. Rules 2-6 execute here:
 - Rule 5: documents the supersedure direction; not enforced at compose time.
 - Rule 6: per-source rows below 0.70 are dropped from the response provenance.
 
-V/A detection uses `wxyc_etl.text.is_compilation_artist`. For `kind:
-compilation` this PR returns `tracks: []` and `provenance: []` — full
-per-track resolution lands in WXYC/library-metadata-lookup#271.
+V/A detection uses `wxyc_etl.text.is_compilation_artist`. `kind: compilation`
+returns empty `provenance: []`; its `(tracks_attempted, tracks)` pair follows
+the request's `include_tracks` flag — absent/NULL when off, `(False, [])`
+("asked, matcher not yet visited") when on — until per-track resolution lands
+in WXYC/library-metadata-lookup#1021 (V/A) and #1138 (non-V/A).
 """
 
 from __future__ import annotations
@@ -321,7 +325,7 @@ async def compose_for_identity(
     apply §3.4.1.1 composition.
 
     `include_tracks` gates the `(tracks_attempted, tracks)` pair per the
-    1.31.0 four-state contract: flag off (or `kind: unresolved` on either
+    four-state contract (both fields 1.30.0; the response marker is 1.31.0): flag off (or `kind: unresolved` on either
     flag path) keeps both absent/NULL; flag on emits `(False, [])` — the
     "asked, not yet visited" state — until WXYC/library-metadata-lookup#1138
     wires real tracklist derivation for the `single_artist` arm.
@@ -380,8 +384,8 @@ async def compose_for_identity(
 def compilation_result(library_id: int, *, include_tracks: bool = False) -> BulkResolveResult:
     """Build a `kind: compilation` verdict.
 
-    The `(tracks_attempted, tracks)` pair follows the 1.31.0 four-state
-    contract: flag off keeps both absent/NULL (the always-empty `tracks: []`
+    The `(tracks_attempted, tracks)` pair follows the four-state contract
+    (1.30.0): flag off keeps both absent/NULL (the always-empty `tracks: []`
     the pre-1.30.0 wire shipped is retired); flag on emits `(False, [])` —
     "asked, matcher hasn't visited" — until WXYC/library-metadata-lookup#1021
     reads real per-track verdicts out of `lml_cache.compilation_track_identity`.

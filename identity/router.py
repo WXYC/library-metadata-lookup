@@ -207,7 +207,7 @@ async def bulk_resolve_libraries(
     - When the lookup misses we return ``kind: unresolved`` so Backend
       can cache the no-match verdict (with TTL) and avoid re-asking.
 
-    ``include_tracks`` (1.31.0, wxyc-shared#297/#307) gates the
+    ``include_tracks`` (1.30.0, wxyc-shared#297) gates the
     ``(tracks_attempted, tracks)`` pair on both resolved kinds; ``None``
     and ``false`` are one state. When understood-true, the response
     carries ``tracks_contract_version: 1`` so a consumer can tell "this
