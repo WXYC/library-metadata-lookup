@@ -1456,10 +1456,27 @@ class DiscogsService:
                 data = response.json()
 
                 # Extract all artists
-                raw_artists = data.get("artists", [])
+                # Discogs may send an explicit null for a container key too,
+                # not just a scalar; .get(key, default) only defaults on an
+                # absent key, so a present-but-null container would raise
+                # `for a in None` here (LML#1156, same class as `join` below).
+                # Rule applied throughout this parse: guard a site iff the
+                # guard restores a documented schema default (a container
+                # defaults to `[]`, `join` defaults to `""`); never invent a
+                # value for a required field with no default (`name` below,
+                # `title`, `position`) -- `_api_fetch`'s return is persisted
+                # via `cache.write_release`, so inventing "" there would
+                # write bad data into the PG cache instead of leaving a
+                # malformed payload as a retryable miss. Same principle as
+                # the `master_id` normalization below (never persist an
+                # invented `0`).
+                raw_artists = data.get("artists") or []
                 artist_credits = [
                     ArtistCredit(
                         artist_id=a.get("id"),
+                        # `name` has no schema default (required `str`) --
+                        # deliberately left unguarded; see the container-vs-
+                        # leaf note above `raw_artists` (LML#1156).
                         name=a.get("name", ""),
                         # Discogs may send an explicit null; .get() only
                         # defaults on an absent key, and the model rejects
@@ -1472,10 +1489,11 @@ class DiscogsService:
                 artist_id = artist_credits[0].artist_id if artist_credits else None
 
                 # Extract extra artists (credits)
-                raw_extras = data.get("extraartists", [])
+                raw_extras = data.get("extraartists") or []
                 extra_artist_credits = [
                     ArtistCredit(
                         artist_id=a.get("id"),
+                        # No default for `name` -- see the rule above.
                         name=a.get("name", ""),
                         role=a.get("role"),
                     )
@@ -1483,10 +1501,11 @@ class DiscogsService:
                 ]
 
                 # Extract all labels
-                raw_labels = data.get("labels", [])
+                raw_labels = data.get("labels") or []
                 label_credits = [
                     LabelCredit(
                         label_id=lbl.get("id"),
+                        # No default for `name` -- see the rule above.
                         name=lbl.get("name", ""),
                         catno=lbl.get("catno"),
                     )
@@ -1501,12 +1520,16 @@ class DiscogsService:
                 # Extract tracklist with per-track artists (for compilations)
                 tracklist = [
                     TrackItem(
+                        # `position`/`title` have no defaults -- see the rule
+                        # above; left unguarded, same as before this PR.
                         position=t.get("position", ""),
                         title=t.get("title", ""),
                         duration=t.get("duration"),
-                        artists=[a.get("name", "") for a in t.get("artists", [])],
+                        # Container guard: a track with a release-level-only
+                        # credit can carry `"artists": null` (LML#1156).
+                        artists=[a.get("name", "") for a in t.get("artists") or []],
                     )
-                    for t in data.get("tracklist", [])
+                    for t in data.get("tracklist") or []
                 ]
 
                 # Extract artwork
@@ -1523,7 +1546,7 @@ class DiscogsService:
                         # survives; None is rejected post-wxyc-shared#302.
                         embed=True if v.get("embed") is None else v["embed"],
                     )
-                    for v in data.get("videos", [])
+                    for v in data.get("videos") or []
                     if v.get("uri")
                 ]
 
@@ -1709,13 +1732,19 @@ class DiscogsService:
 
                 return ArtistDetails(
                     artist_id=artist_id,
+                    # No default for `name` -- see the guard-vs-leaf rule in
+                    # `get_release` above `raw_artists` (LML#1156); left
+                    # unguarded, same as before this PR.
                     name=data.get("name", ""),
                     profile=data.get("profile") or None,
                     image_url=image_url,
                     name_variations=data.get("namevariations") or [],
                     aliases=[
                         ArtistRef(id=a["id"], name=a["name"])
-                        for a in data.get("aliases", [])
+                        # Container guard, same class as namevariations/urls
+                        # above: a present-but-null "aliases" would raise
+                        # `for a in None` here (LML#1156).
+                        for a in data.get("aliases") or []
                         if "id" in a and "name" in a
                     ],
                     members=[
@@ -1726,7 +1755,8 @@ class DiscogsService:
                             # survives; None is rejected post-wxyc-shared#302.
                             active=True if m.get("active") is None else m["active"],
                         )
-                        for m in data.get("members", [])
+                        # Same container guard as "aliases" above (LML#1156).
+                        for m in data.get("members") or []
                         if "id" in m and "name" in m
                     ],
                     urls=data.get("urls") or [],
