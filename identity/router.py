@@ -285,6 +285,19 @@ async def bulk_resolve_libraries(
     # singleton pool) -- gracefully degrading every compilation row to
     # unvisited is the safe reading (never a false "resolved"), so this does
     # not 503 the whole batch over it.
+    #
+    # A TRANSIENT_PG_ERRORS failure from the query itself degrades the SAME
+    # way (review finding, deliberate posture choice -- state in the PR
+    # body): this is an OPTIONAL `include_tracks` enrichment layered on top
+    # of the core per-input resolution below, not a core resolution path
+    # like `resolve_library_name` (whose own failures DO 503 the batch,
+    # because a false `kind: unresolved` would poison Backend's TTL cache
+    # for up to 30 days). Degrading `tracks[]` to `(false, [])` never poisons
+    # anything -- it is EXACTLY the "asked, not yet visited" state BS#1991's
+    # retry sweep already re-asks on its own schedule, so a transient PG
+    # hiccup here self-heals for free on the next pass. 503ing the WHOLE
+    # batch over it would also fail every unrelated single_artist/unresolved
+    # row in the same request, which doesn't touch this table at all.
     track_rows_by_legacy_id: dict[int, list[CompilationTrackIdentityRow]] = {}
     if include_tracks and discogs_cache_pg is not None:
         legacy_release_ids = sorted(
@@ -301,14 +314,16 @@ async def bulk_resolve_libraries(
                     discogs_cache_pg, legacy_release_ids
                 )
             except TRANSIENT_PG_ERRORS:
-                logger.exception(
-                    "compilation_track_identity batched read failed mid-bulk-resolve "
-                    "for %d legacy_release_id(s)",
+                logger.warning(
+                    "compilation_track_identity batched read failed mid-bulk-resolve for "
+                    "%d legacy_release_id(s); degrading every affected compilation row to "
+                    "the unvisited state (false, []) rather than failing the whole batch",
                     len(legacy_release_ids),
+                    exc_info=True,
                 )
-                raise HTTPException(
-                    status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
-                ) from None
+                # track_rows_by_legacy_id stays {} -- every affected
+                # compilation input degrades to (False, []) below, same as
+                # a missing legacy_release_id or an unavailable pool.
 
     # Per-input lookups dispatch concurrently under a semaphore (LML#278).
     # Worst case drops from ~3,000 sequential PG round-trips for a 1,000-row

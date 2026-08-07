@@ -748,6 +748,267 @@ class TestCompilationTracksFromStore:
         result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
         assert len(result.tracks) == 2500
 
+    def test_resolved_but_nameless_leg_falls_back_to_raw_credit(self):
+        """Review finding: a tier-1 `identity_store` Discogs hit persists
+        NULL resolved_artist_name (`artists/resolver.py`'s ArtistResolveResult
+        .canonical_name is None for that tier; `discogs_verdict_from_resolve_result`
+        persists it verbatim). With no other leg to supply a name, the
+        composed entry must NOT emit the api.yaml-forbidden pairing
+        (resolved_artist_name=None alongside non-null confidence/method) --
+        fall back to the raw CTA credit string, honest because identity_store
+        tier means the credit string itself exact-matched entity.identity.
+        """
+        rows = [
+            _track_row(
+                track_artist="sessa",
+                track_title="pequena vertigem de amor",
+                source="discogs",
+                external_id="7654321",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name=None,
+                track_artist_raw="Sessa",
+                track_title_raw="Pequena Vertigem de Amor",
+            ),
+            _track_row(
+                track_artist="sessa",
+                track_title="pequena vertigem de amor",
+                source="musicbrainz",
+                external_id=None,
+                confidence=None,
+                method=None,
+                resolved_artist_name=None,
+                track_artist_raw="Sessa",
+                track_title_raw="Pequena Vertigem de Amor",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        track = result.tracks[0]
+        assert track.resolved_artist_name == "Sessa"
+        assert track.confidence == 1.0
+        assert track.method is IdentityMethod.exact_match
+        # The MB miss leg stays excluded from sources[] (the documented gap).
+        assert len(track.sources) == 1
+
+    def test_name_selection_prefers_the_strongest_name_bearing_leg_over_the_weakest_row(self):
+        """The core bug: composed confidence/method stay MIN/weakest (Rule 4,
+        unchanged), but the DISPLAY NAME must not just parrot whichever row
+        is weakest. A weaker split-derived Discogs leg (member_group, 0.75,
+        no name) alongside a stronger MusicBrainz trigram leg (0.80, name
+        'Sessa') must surface 'Sessa', not None."""
+        rows = [
+            _track_row(
+                track_artist="sessa",
+                track_title="pequena vertigem de amor",
+                source="discogs",
+                external_id="7654321",
+                confidence=0.75,
+                method="member_group",
+                resolved_artist_name=None,
+                track_artist_raw="Sessa",
+                track_title_raw="Pequena Vertigem de Amor",
+            ),
+            _track_row(
+                track_artist="sessa",
+                track_title="pequena vertigem de amor",
+                source="musicbrainz",
+                external_id="mbid-sessa",
+                confidence=0.80,
+                method="trigram",
+                resolved_artist_name="Sessa",
+                track_artist_raw="Sessa",
+                track_title_raw="Pequena Vertigem de Amor",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        track = result.tracks[0]
+        assert track.resolved_artist_name == "Sessa"
+        assert track.confidence == 0.75  # MIN, unchanged by the name fix
+        assert track.method is IdentityMethod.member_group  # weakest row's method, unchanged
+        assert len(track.sources) == 2
+
+    def test_name_selection_falls_through_past_a_nameless_strongest_leg(self):
+        """Mirror of the case above: the STRONGEST leg has no name
+        (identity_store tier), but a WEAKER leg does -- the scan must
+        continue past the nameless strongest leg rather than stopping
+        there."""
+        rows = [
+            _track_row(
+                track_artist="sessa",
+                track_title="pequena vertigem de amor",
+                source="discogs",
+                external_id="7654321",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name=None,
+                track_artist_raw="Sessa",
+                track_title_raw="Pequena Vertigem de Amor",
+            ),
+            _track_row(
+                track_artist="sessa",
+                track_title="pequena vertigem de amor",
+                source="musicbrainz",
+                external_id="mbid-sessa",
+                confidence=0.80,
+                method="trigram",
+                resolved_artist_name="Sessa",
+                track_artist_raw="Sessa",
+                track_title_raw="Pequena Vertigem de Amor",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        track = result.tracks[0]
+        assert track.resolved_artist_name == "Sessa"
+        assert track.confidence == 0.80
+        assert track.method is IdentityMethod.trigram
+
+    def test_composition_is_stable_regardless_of_store_rows_input_order(self):
+        """A genuine cross-source confidence tie (both legs at 0.80 --
+        reachable via cache_trigram corroboration on the Discogs leg landing
+        on the same _METHOD_CONFIDENCE[trigram] value the MB leg always
+        uses) must resolve the same way regardless of which order the rows
+        arrive in -- never Python's "first occurrence wins" `min()` riding
+        on incidental list/DB order (review finding)."""
+        discogs_row = _track_row(
+            track_artist="sessa",
+            track_title="pequena vertigem de amor",
+            source="discogs",
+            external_id="7654321",
+            confidence=0.80,
+            method="trigram",
+            resolved_artist_name="Sessa D",
+            track_artist_raw="Sessa",
+            track_title_raw="Pequena Vertigem de Amor",
+        )
+        mb_row = _track_row(
+            track_artist="sessa",
+            track_title="pequena vertigem de amor",
+            source="musicbrainz",
+            external_id="mbid-sessa",
+            confidence=0.80,
+            method="name_variation",
+            resolved_artist_name="Sessa MB",
+            track_artist_raw="Sessa",
+            track_title_raw="Pequena Vertigem de Amor",
+        )
+
+        forward = compilation_result(
+            library_id=99, include_tracks=True, store_rows=[discogs_row, mb_row]
+        )
+        reversed_order = compilation_result(
+            library_id=99, include_tracks=True, store_rows=[mb_row, discogs_row]
+        )
+
+        assert forward.tracks == reversed_order.tracks
+        track = forward.tracks[0]
+        # 'name_variation' < 'trigram' lexicographically -> MB is the
+        # deterministic "weakest" row on this tie; method/confidence come
+        # from it. The name is picked by scanning strongest-first from the
+        # SAME canonical order, landing on the Discogs leg's name.
+        assert track.method is IdentityMethod.name_variation
+        assert track.confidence == 0.80
+        assert track.resolved_artist_name == "Sessa D"
+        assert [s.source for s in track.sources] == [
+            s.source for s in reversed_order.tracks[0].sources
+        ]
+
+    def test_blank_raw_artist_credit_is_dropped_not_crashed(self):
+        """A data-quality anomaly on library.db's CTA export (blank
+        artist_name) must not 500 the whole bulk-resolve batch --
+        BulkResolveTrackIdentity.artist_name is `minLength: 1` on the wire,
+        so constructing one with an empty string would raise a pydantic
+        ValidationError that propagates uncaught through the per-input
+        gather path (review finding). The malformed credit is dropped from
+        tracks[]; every other credit on the release still composes."""
+        rows = [
+            _track_row(
+                track_artist="",
+                track_title="untitled",
+                source="discogs",
+                external_id="1",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Ghost Artist",
+                track_artist_raw="",
+                track_title_raw="Untitled",
+            ),
+            _track_row(
+                track_artist="stereolab",
+                track_title="brakhage",
+                source="discogs",
+                external_id="2",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Stereolab",
+                track_artist_raw="Stereolab",
+                track_title_raw="Brakhage",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        assert result.tracks_attempted is True
+        assert len(result.tracks) == 1
+        assert result.tracks[0].artist_name == "Stereolab"
+
+    def test_unmappable_method_drops_the_leg_without_crashing(self):
+        """A method string outside the IdentityMethod enum domain (not
+        reachable today -- the store's writer only ever writes values from
+        that enum -- but the `method` column has no DB-level domain CHECK)
+        must not raise into the per-input gather path. The leg is dropped
+        with a warning; since it's the credit's only leg here, the credit
+        composes as an all-miss entry rather than crashing the batch."""
+        rows = [
+            _track_row(
+                track_artist="stereolab",
+                track_title="brakhage",
+                source="discogs",
+                external_id="1",
+                confidence=0.90,
+                method="not_a_real_method",
+                resolved_artist_name="Stereolab",
+                track_artist_raw="Stereolab",
+                track_title_raw="Brakhage",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        assert result.tracks_attempted is True
+        track = result.tracks[0]
+        assert track.resolved_artist_name is None
+        assert track.confidence is None
+        assert track.method is None
+        assert track.sources == []
+
+    def test_unmappable_source_drops_the_leg_without_crashing(self):
+        """Symmetric with the method case -- `IdentitySource(row.source)`
+        must not raise uncaught either, even though the DB CHECK constraint
+        makes an out-of-domain `source` unreachable in production today.
+        `spotify`/`wikidata`/etc. are valid `IdentitySource` members (the
+        enum is shared with album-grain composition) but not valid
+        `compilation_track_identity.source` values, so this uses a string
+        outside the `IdentitySource` enum entirely."""
+        rows = [
+            _track_row(
+                track_artist="stereolab",
+                track_title="brakhage",
+                source="not_a_real_source",
+                external_id="1",
+                confidence=0.90,
+                method="trigram",
+                resolved_artist_name="Stereolab",
+                track_artist_raw="Stereolab",
+                track_title_raw="Brakhage",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        track = result.tracks[0]
+        assert track.resolved_artist_name is None
+        assert track.sources == []
+
 
 def test_floors_are_what_the_spec_says():
     """Sanity-check the floor constants haven't drifted from the spec."""

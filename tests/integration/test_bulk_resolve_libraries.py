@@ -508,3 +508,55 @@ class TestIncludeTracksCompilationStoreEndToEnd:
         result = resp.json()["results"][0]
         assert result["tracks_attempted"] is False
         assert result["tracks"] == []
+
+    @pytest.mark.asyncio
+    async def test_identity_store_shaped_row_composes_a_real_name_not_null(
+        self, pg_app_client, pg_source, set_up_track_identity_schema
+    ):
+        """Review finding: a tier-1 `identity_store` Discogs hit persists a
+        real `external_id` alongside a NULL `resolved_artist_name` (the
+        store never learned a canonical name for an exact-match cache hit --
+        see `tests/integration/test_compilation_track_identity_store.py`'s
+        `TestMatcherVerdictMappingInsertsCleanly`, which proves this exact
+        shape writes cleanly against the real CHECK constraint but never
+        routed it through composition). End-to-end through the real HTTP
+        endpoint + real PG, this credit's `resolved_artist_name` on the wire
+        must not be null alongside a non-null confidence/method -- with no
+        other leg to supply a name, it falls back to the raw credit."""
+        from entity.compilation_track_identity import write_compilation_track_identity_verdict
+
+        await write_compilation_track_identity_verdict(
+            pg_source,
+            library_id=555000,
+            track_artist_raw="Sessa",
+            track_title_raw="Pequena Vertigem de Amor",
+            source="discogs",
+            external_id="7654321",
+            confidence=1.0,
+            method="exact_match",
+            resolved_artist_name=None,
+        )
+
+        resp = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "include_tracks": True,
+                "inputs": [
+                    {
+                        "library_id": 42,
+                        "legacy_release_id": 555000,
+                        "artist_name": "Various Artists",
+                        "album_title": "Edits",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["tracks_attempted"] is True
+        track = result["tracks"][0]
+        assert track["artist_name"] == "Sessa"
+        assert track["resolved_artist_name"] == "Sessa"  # raw-credit fallback, never null
+        assert track["confidence"] == pytest.approx(1.0)
+        assert track["method"] == "exact_match"
