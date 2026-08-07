@@ -126,6 +126,40 @@ class TestBulkResolveLibrariesEndpoint:
         ]
 
     @pytest.mark.asyncio
+    async def test_include_tracks_pair_and_marker_end_to_end(self, pg_app_client):
+        """1.31.0 wire against real PG: flag on -> resolved kinds carry
+        (false, []) and the response carries tracks_contract_version: 1;
+        flag omitted -> null pair everywhere, null marker (the un-upgraded
+        caller's byte-compatible view, minus the retired V/A empty array)."""
+        inputs = [
+            {"library_id": 100, "artist_name": "Various Artists", "album_title": "VA"},
+            {"library_id": 200, "artist_name": "Stereolab", "album_title": "AT"},
+            {"library_id": 300, "artist_name": "Nobody Artist", "album_title": "x"},
+        ]
+
+        flag_on = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={"include_tracks": True, "inputs": inputs},
+        )
+        assert flag_on.status_code == 200
+        data = flag_on.json()
+        assert data["tracks_contract_version"] == 1
+        by_id = {r["library_id"]: r for r in data["results"]}
+        assert (by_id[100]["tracks_attempted"], by_id[100]["tracks"]) == (False, [])
+        assert (by_id[200]["tracks_attempted"], by_id[200]["tracks"]) == (False, [])
+        assert (by_id[300]["tracks_attempted"], by_id[300]["tracks"]) == (None, None)
+
+        flag_off = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={"inputs": inputs},
+        )
+        assert flag_off.status_code == 200
+        data = flag_off.json()
+        assert data["tracks_contract_version"] is None
+        for r in data["results"]:
+            assert (r["tracks_attempted"], r["tracks"]) == (None, None)
+
+    @pytest.mark.asyncio
     async def test_case_drift_resolves_via_lower_fall_through(self, pg_app_client, pg_pool):
         """Per #276: case drift between Backend input and verbatim-cased storage hits.
 

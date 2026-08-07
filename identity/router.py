@@ -41,6 +41,7 @@ from generated.api_models import (
     BulkResolveResult,
     ReleaseIdentityResolveRequest,
     ReleaseIdentityResolveResponse,
+    TracksContractVersion,
 )
 from identity.bulk_resolve import compilation_result, compose_for_identity
 from identity.dependencies import get_entity_store, require_entity_store
@@ -200,13 +201,20 @@ async def bulk_resolve_libraries(
     Per-input handling:
 
     - V/A rows (detected via ``wxyc_etl.text.is_compilation_artist`` on
-      ``artist_name``) return ``kind: compilation`` with empty
-      ``tracks: []`` — full track resolution lands in
-      WXYC/library-metadata-lookup#271.
+      ``artist_name``) return ``kind: compilation``.
     - Otherwise we look up ``artist_name`` in ``entity.identity`` and
       compose per-source provenance via ``identity.bulk_resolve``.
     - When the lookup misses we return ``kind: unresolved`` so Backend
       can cache the no-match verdict (with TTL) and avoid re-asking.
+
+    ``include_tracks`` (1.31.0, wxyc-shared#297/#307) gates the
+    ``(tracks_attempted, tracks)`` pair on both resolved kinds; ``None``
+    and ``false`` are one state. When understood-true, the response
+    carries ``tracks_contract_version: 1`` so a consumer can tell "this
+    producer understood the flag" from "this producer predates it"
+    (wxyc-shared#303, Q1 option A). Until #1021/#1138 wire real
+    emission, flag-on rows carry ``(false, [])`` — asked, not yet
+    visited — and the consumer keeps re-asking.
 
     Response order matches request input order, as per the api.yaml
     contract.
@@ -224,6 +232,10 @@ async def bulk_resolve_libraries(
     request = await parse_bulk_body(
         http_request, BulkResolveLibrariesRequest, _BULK_RESOLVE_INPUT_CAP, field="inputs"
     )
+
+    # None and False are one state by contract (the field carries no
+    # schema-level default for openapi-typescript optionality reasons).
+    include_tracks = bool(request.include_tracks)
 
     store = require_entity_store(entity_store)
 
@@ -278,7 +290,7 @@ async def bulk_resolve_libraries(
         # multiply against the shared pool.
         async with semaphore, acquire_bulk_global_permit():
             if is_compilation_artist(input_row.artist_name):
-                return compilation_result(input_row.library_id)
+                return compilation_result(input_row.library_id, include_tracks=include_tracks)
 
             try:
                 # Three-leg fall-through lookup (issues #274 / #276): exact
@@ -304,7 +316,9 @@ async def bulk_resolve_libraries(
                 # `get_latest_provenance_by_source` query — that second round-trip
                 # is covered by the same permit, so a resolved input never holds
                 # two pool connections at once.
-                return await compose_for_identity(input_row.library_id, identity, store)
+                return await compose_for_identity(
+                    input_row.library_id, identity, store, include_tracks=include_tracks
+                )
             except TRANSIENT_PG_ERRORS:
                 logger.exception(
                     "Provenance fetch failed mid-bulk-resolve for library_id=%d",
@@ -385,18 +399,29 @@ async def bulk_resolve_libraries(
         # it had to fall back to local-cache simulation.
         kinds = Counter(r.kind.value for r in results)
         logger.info(
-            "bulk resolve complete: inputs=%d single_artist=%d compilation=%d unresolved=%d",
+            "bulk resolve complete: inputs=%d single_artist=%d compilation=%d unresolved=%d"
+            " include_tracks=%s",
             inputs_count,
             kinds.get("single_artist", 0),
             kinds.get("compilation", 0),
             kinds.get("unresolved", 0),
+            include_tracks,
         )
         http_span.set_data("lml.bulk_resolve.single_artist", kinds.get("single_artist", 0))
         http_span.set_data("lml.bulk_resolve.compilation", kinds.get("compilation", 0))
         http_span.set_data("lml.bulk_resolve.unresolved", kinds.get("unresolved", 0))
+        http_span.set_data("lml.bulk_resolve.include_tracks", include_tracks)
         http_span.set_data("http.status_code", 200)
 
-    return BulkResolveLibrariesResponse(results=results)
+    return BulkResolveLibrariesResponse(
+        results=results,
+        # The producer-echoed capability marker (wxyc-shared#303 Q1 option A):
+        # present exactly when the flag was understood-true. When None, the
+        # wire spells it "tracks_contract_version": null (no exclude_none on
+        # this response_model) — consumers use the null-tolerant check; the
+        # nullability doc fix is wxyc-shared#313.
+        tracks_contract_version=TracksContractVersion.integer_1 if include_tracks else None,
+    )
 
 
 @api_v1_router.post(

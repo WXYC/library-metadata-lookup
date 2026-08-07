@@ -175,12 +175,18 @@ class TestBulkResolveLibrariesEndpoint:
             )
 
         assert resp.status_code == 200
-        result = resp.json()["results"][0]
+        data = resp.json()
+        result = data["results"][0]
         assert result["kind"] == "compilation"
         assert result["library_id"] == 5678
         assert result["main"] is None
         assert result["provenance"] == []
-        assert result["tracks"] == []
+        # 1.31.0: flag off means the absent/NULL pair state for EVERY result,
+        # compilations included — the one documented wire change vs 1.29's
+        # always-empty [] (WXYC/library-metadata-lookup#1151).
+        assert result["tracks"] is None
+        assert result["tracks_attempted"] is None
+        assert data["tracks_contract_version"] is None
         # V/A short-circuits the entity lookup — should never call get_identity.
         mock_entity_store.resolve_library_name.assert_not_awaited()
 
@@ -1166,3 +1172,105 @@ class TestBulkResolveFamilyAlignment:
         schema = BulkResolveLibrariesRequest.model_json_schema()
         assert schema["properties"]["inputs"]["maxItems"] == _BULK_RESOLVE_INPUT_CAP
         assert _BULK_RESOLVE_INPUT_CAP == 1000
+
+
+class TestIncludeTracksWire:
+    """The `include_tracks` flag and the `(tracks_attempted, tracks)` pair
+    at the HTTP boundary, plus the `tracks_contract_version` marker
+    (wxyc-shared#307, per the #303 decision).
+
+    Pre-#1021/#1138 the only reachable flag-on state is `(false, [])` —
+    the honest "asked, matcher hasn't visited" answer that keeps the
+    consumer re-asking until the emitters land.
+    """
+
+    async def _post(self, app, body):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            return await ac.post("/api/v1/identity/bulk-resolve-libraries", json=body)
+
+    @pytest.mark.asyncio
+    async def test_flag_on_mixed_batch(self, app_client, mock_entity_store):
+        """Flag on: resolved kinds emit (false, []), unresolved emits the
+        absent pair, and the response carries the capability marker."""
+        mock_entity_store.resolve_library_name.side_effect = [
+            _identity("Stereolab", id=1, discogs_artist_id=2154),
+            None,
+        ]
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+
+        resp = await self._post(
+            app_client,
+            {
+                "include_tracks": True,
+                "inputs": [
+                    {"library_id": 1, "artist_name": "Stereolab", "album_title": "Dots and Loops"},
+                    {"library_id": 2, "artist_name": "Csillagrablók", "album_title": "Ismeretlen"},
+                    {"library_id": 3, "artist_name": "Various Artists", "album_title": "Edits"},
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["tracks_contract_version"] == 1
+
+        by_id = {r["library_id"]: r for r in data["results"]}
+        assert by_id[1]["kind"] == "single_artist"
+        assert by_id[1]["tracks"] == []
+        assert by_id[1]["tracks_attempted"] is False
+        assert by_id[2]["kind"] == "unresolved"
+        assert by_id[2]["tracks"] is None
+        assert by_id[2]["tracks_attempted"] is None
+        assert by_id[3]["kind"] == "compilation"
+        assert by_id[3]["tracks"] == []
+        assert by_id[3]["tracks_attempted"] is False
+
+    @pytest.mark.asyncio
+    async def test_flag_omitted_is_backwards_compatible_wire(self, app_client, mock_entity_store):
+        """An un-upgraded caller (no `include_tracks` key at all) sees the
+        pre-1.30.0 wire: null pair everywhere, null marker."""
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Stereolab", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+
+        resp = await self._post(
+            app_client,
+            {
+                "inputs": [
+                    {"library_id": 1, "artist_name": "Stereolab", "album_title": "Dots and Loops"},
+                    {"library_id": 3, "artist_name": "Various Artists", "album_title": "Edits"},
+                ]
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["tracks_contract_version"] is None
+        for result in data["results"]:
+            assert result["tracks"] is None
+            assert result["tracks_attempted"] is None
+
+    @pytest.mark.asyncio
+    async def test_flag_explicit_false_matches_omitted(self, app_client, mock_entity_store):
+        """`include_tracks: false` and omitting it are one state."""
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Stereolab", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+
+        resp = await self._post(
+            app_client,
+            {
+                "include_tracks": False,
+                "inputs": [
+                    {"library_id": 1, "artist_name": "Stereolab", "album_title": "Dots and Loops"}
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["tracks_contract_version"] is None
+        assert data["results"][0]["tracks"] is None
+        assert data["results"][0]["tracks_attempted"] is None
