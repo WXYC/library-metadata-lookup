@@ -346,6 +346,9 @@ async def lifespan(app: FastAPI):
     if settings.database_url_discogs:
         from core.dependencies import get_discogs_pool
         from entity.api_keys import set_up_api_keys_schema
+        from entity.compilation_track_identity import (
+            set_up_compilation_track_identity_schema,
+        )
         from entity.compilation_track_location import (
             set_up_compilation_track_location_schema,
         )
@@ -446,6 +449,16 @@ async def lifespan(app: FastAPI):
                 (
                     "Compilation track location",
                     set_up_compilation_track_location_schema,
+                ),
+                # Per-track compilation identity (LML#1020), the Layer-2
+                # sibling of the recall index above: same lml_cache.*
+                # ownership, same best-effort posture. No runtime reader yet
+                # -- scripts/backfill_compilation_track_identity.py populates
+                # it out-of-band; LML#1021 adds the bulk-resolve consumer
+                # that turns it into `tracks[]`.
+                (
+                    "Compilation track identity",
+                    set_up_compilation_track_identity_schema,
                 ),
             )
             await _run_lml_cache_bootstraps(source, bootstraps)
