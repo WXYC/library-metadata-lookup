@@ -26,6 +26,7 @@ from entity.compilation_track_identity import (
     write_compilation_track_identity_position,
     write_compilation_track_identity_verdict,
 )
+from scripts.backfill_compilation_track_identity import discogs_verdict_from_resolve_result
 from tests.integration.conftest import skip_if_named_tables_populated
 
 
@@ -125,6 +126,52 @@ class TestWriteVerdict:
         rows = await get_compilation_track_identity_for_library(pg_source, 1)
         assert len(rows) == 1
         assert rows[0].external_id == "999"
+
+
+@pytest.mark.pg
+class TestMatcherVerdictMappingInsertsCleanly:
+    """LML#1020 slice 3's method/confidence mapping feeding slice 2's writer.
+
+    A tier-1 ``identity_store`` resolution carries a non-NULL Discogs id
+    alongside a NULL ``canonical_name`` (``entity.identity`` stores no
+    Discogs title) -- the common resolved shape on a warm store, and the
+    plan calls out the risk that this could trip the verdict-coherence
+    CHECK if ``resolved_artist_name`` were bound into it. It isn't (D1), but
+    this is the end-to-end proof: the matcher's own mapping function feeding
+    the real writer against a real constraint, not just a shape assertion.
+    """
+
+    @pytest.mark.asyncio
+    async def test_identity_store_hit_inserts_without_tripping_the_coherence_check(self, pg_source):
+        resolve_result = {
+            "name": "Juana Molina",
+            "discogs_artist_id": 12345,
+            "canonical_name": None,
+            "method": "identity_store",
+            "cache_corroboration": [],
+            "unresolved_reason": None,
+            "candidate_count": None,
+        }
+        verdict = discogs_verdict_from_resolve_result(resolve_result)
+        assert verdict is not None
+
+        await write_compilation_track_identity_verdict(
+            pg_source,
+            library_id=1,
+            track_artist_raw="Juana Molina",
+            track_title_raw="La Paradoja",
+            source="discogs",
+            external_id=verdict.external_id,
+            confidence=verdict.confidence,
+            method=verdict.method,
+            resolved_artist_name=verdict.resolved_artist_name,
+        )
+
+        rows = await get_compilation_track_identity_for_library(pg_source, 1)
+        assert rows[0].external_id == "12345"
+        assert rows[0].resolved_artist_name is None
+        assert rows[0].method is not None
+        assert rows[0].confidence is not None
 
 
 @pytest.mark.pg
