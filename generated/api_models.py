@@ -221,10 +221,10 @@ class Order(StrEnum):
 
 class PlaylistSearchParams(BaseModel):
     q: str | None = Field(None, description='Search query (supports AND, OR, NOT, "", *)')
-    page: conint(ge=0) | None = 0
-    limit: conint(ge=1, le=100) | None = 50
-    sort: Sort | None = "date"
-    order: Order | None = "desc"
+    page: conint(ge=0) = 0
+    limit: conint(ge=1, le=100) = 50
+    sort: Sort = "date"
+    order: Order = "desc"
 
 
 class PlaylistSearchResult(BaseModel):
@@ -258,7 +258,7 @@ class FlowsheetEntryType(StrEnum):
 
 class FlowsheetV2Base(BaseModel):
     id: int
-    show_id: int
+    show_id: int | None = Field(...)
     play_order: int
     add_time: AwareDatetime
 
@@ -341,7 +341,7 @@ class OnAirInfo(BaseModel):
 
 
 class OnAirDJ(BaseModel):
-    id: str = Field(
+    id: str | None = Field(
         ...,
         description="The DJ's better-auth `auth_user.id` (an opaque `varchar(255)` string), or `null` for a legacy/tubafrenzy-mirrored show whose on-air DJ has no Backend-Service account (their identity is `legacy_dj_name`, surfaced on `/flowsheet/djs-on-air` with a null id). Historically mistyped as `integer`; corrected to the nullable string it is at runtime (BS#1547).",
     )
@@ -640,7 +640,7 @@ class CompilationTracksWriteResponse(BaseModel):
 
 class CompilationTrackSuggestions(BaseModel):
     library_id: int
-    discogs_release_id: int = Field(
+    discogs_release_id: int | None = Field(
         ..., description="The resolved Discogs release id, or null if none resolved."
     )
     tracks: list[CompilationTrackInput]
@@ -848,7 +848,7 @@ class Venue(BaseModel):
     name: str
     city: str
     state: str
-    address: str
+    address: str | None = Field(...)
 
 
 class ConcertStatus(StrEnum):
@@ -875,35 +875,35 @@ class Concert(BaseModel):
     starts_on: date_aliased = Field(
         ..., description="Venue-local (America/New_York) calendar date."
     )
-    starts_at: AwareDatetime = Field(
+    starts_at: AwareDatetime | None = Field(
         ..., description="Exact start instant; null for date-only events."
     )
-    doors_at: AwareDatetime = Field(
+    doors_at: AwareDatetime | None = Field(
         ..., description="Doors-open instant, when the source publishes one."
     )
     headlining_artist_raw: str = Field(
         ..., description="Headliner billing string exactly as the source displays it."
     )
-    headlining_artist_id: int = Field(
+    headlining_artist_id: int | None = Field(
         ...,
         description="WXYC catalog artist id when the resolver matched the headliner; null otherwise. A non-null id is what `curated=true` filters on.",
     )
-    title: str = Field(
+    title: str | None = Field(
         ...,
         description="Event name as the source displays it, when distinct from the artist billing.",
     )
     supporting_artists_raw: list[str] = Field(
         ..., description="Supporting-act billing strings, in source order."
     )
-    ticket_url: str
-    image_url: str
-    event_url: str = Field(
+    ticket_url: str | None = Field(...)
+    image_url: str | None = Field(...)
+    event_url: str | None = Field(
         ...,
         description="The venue's own event-detail page, distinct from `ticket_url` (often a third-party seller like Etix/Ticketmaster). Null when no venue page is known; clients fall back to `ticket_url`.",
     )
-    price_min: float = Field(..., description="Dollars. Free events carry price_min = 0.")
-    price_max: float = Field(..., description="Dollars.")
-    age_restriction: str = Field(
+    price_min: float | None = Field(..., description="Dollars. Free events carry price_min = 0.")
+    price_max: float | None = Field(..., description="Dollars.")
+    age_restriction: str | None = Field(
         ..., description='Source-displayed age restriction (e.g. "18+", "All Ages").'
     )
     status: ConcertStatus
@@ -941,41 +941,47 @@ class ConcertsResponse(BaseModel):
 
 class AlbumReview(BaseModel):
     id: int
-    album_id: int = Field(
+    album_id: int | None = Field(
         ...,
         description="WXYC library album id when the free-text artist/album resolved to exactly one catalog row; null otherwise.",
     )
-    artist_name: str = Field(..., description="Artist name exactly as the reviewer entered it.")
-    album_title: str = Field(..., description="Album title exactly as the reviewer entered it.")
-    record_label: str
-    artist_blurb: str = Field(..., description="Short reviewer-written background on the artist.")
-    review: str = Field(..., description="The review body.")
-    recommended_tracks: str = Field(
+    artist_name: str | None = Field(
+        ..., description="Artist name exactly as the reviewer entered it."
+    )
+    album_title: str | None = Field(
+        ..., description="Album title exactly as the reviewer entered it."
+    )
+    record_label: str | None = Field(...)
+    artist_blurb: str | None = Field(
+        ..., description="Short reviewer-written background on the artist."
+    )
+    review: str | None = Field(..., description="The review body.")
+    recommended_tracks: str | None = Field(
         ...,
         description='Raw recommended-tracks text, including the form\'s `!`-rating notation (1–5 exclamation marks) and "Play All" shorthand.',
     )
-    buzzwords: str = Field(..., description="Comma-separated reviewer-chosen descriptors.")
-    fcc_violations: str = Field(
+    buzzwords: str | None = Field(..., description="Comma-separated reviewer-chosen descriptors.")
+    fcc_violations: str | None = Field(
         ...,
         description='Verbatim reviewer answer listing FCC-violating track numbers. Blank (unanswered) is distinct from "None"/"N/A" (affirmatively clean); values are not normalized.',
     )
-    review_purpose: str = Field(
+    review_purpose: str | None = Field(
         ...,
         description='Raw multi-select of "Rotation", "New DJ Assignment", "Album in the Library"; comma-joined when multiple were selected.',
     )
-    rotated: bool = Field(
+    rotated: bool | None = Field(
         ...,
         description='Curator-maintained "was this album rotated" flag; null when the sheet cell is blank or unparseable.',
     )
-    released_within_six_months: bool = Field(
+    released_within_six_months: bool | None = Field(
         ...,
         description="Whether the album was released within 6 months of the review; null when unanswered (question added mid-2024).",
     )
-    social_consent: bool = Field(
+    social_consent: bool | None = Field(
         ...,
         description="Whether the reviewer consented to the review being shared on station social media (always anonymously); null when unanswered.",
     )
-    submitted_at: AwareDatetime = Field(
+    submitted_at: AwareDatetime | None = Field(
         ...,
         description="Form submission instant. Null only for the rare row whose sheet timestamp is missing.",
     )
@@ -1272,7 +1278,7 @@ class LookupRequest(BaseModel):
         None,
         description="Original request message (used for ambiguous format detection). Optional when structured fields (artist, album, song) are provided.\n",
     )
-    include_identity: bool | None = Field(
+    include_identity: bool = Field(
         False,
         description="Per cross-cache-identity plan §3.2.2 (E2-LML write contract). When true, the response carries an additional `identity` block (the §3.2.5 cascade's per-source resolution detail), and `api_version` is set to 2. When false (the default), the response is byte-identical to v0.5.0 — `identity` is absent and `api_version` is omitted. Backend's `library-identity-writer.ts` (E2-BS) sets this to true on every call; other consumers (catalog search, dj-site proxy, iOS apps) leave it false.\n",
     )
@@ -1433,7 +1439,7 @@ class BulkResolveResultKind(StrEnum):
 class BulkResolveProvenanceEntry(BaseModel):
     source: IdentitySource
     method: IdentityMethod
-    confidence: confloat(ge=0.0, le=1.0) = Field(
+    confidence: confloat(ge=0.0, le=1.0) | None = Field(
         ...,
         description="Per-source confidence in [0, 1], within the source's locked method range from §3.4.1. NULL when `external_id` is NULL — the source ran but produced no candidate, so confidence is undefined (not zero). When non-null, equal to or greater than the `confidence` of the object this entry hangs off — the composition rules either MIN or boost, and never lower a per-source row. That referent is grain-relative, because this schema is reused at two grains: under `BulkResolveResult.provenance` it is the result's own `confidence`, and under `BulkResolveTrackIdentity.sources` it is that track's `confidence`, not the result's. The two are unrelated — a `kind: compilation` result has no result-level `confidence` at all, while its tracks each have their own.\n",
     )
@@ -1444,7 +1450,7 @@ class BulkResolveProvenanceEntry(BaseModel):
 
 
 class BulkResolveTrackIdentity(BaseModel):
-    track_position: str = Field(
+    track_position: str | None = Field(
         ...,
         description='Track position as the source has it ("A1", "3", …). Required-but-nullable: the key is always present, and NULL says "no position is recoverable for this track" rather than "not echoed". Not a usable row identifier on its own — most of Backend\'s compilation-track rows are position-NULL (WXYC/Backend-Service#1989); join on `artist_name` + `track_title` instead.\n',
     )
@@ -1452,19 +1458,19 @@ class BulkResolveTrackIdentity(BaseModel):
         ...,
         description="Join-back echo of the per-track credit, verbatim, and the load-bearing half of the join key — never NULL, and never the empty string (`minLength: 1`, matching `CatalogCompilationTrackRow.artist_name`, since an empty join key is indistinguishable from a missing one). No `maxLength` here, unlike the CTA read/write shapes: those bound one physical `varchar(255)` column, while this field is dual-mode and the `kind: single_artist` arm carries a source credit that no WXYC column bounds. A cap the sources don't respect would turn a long credit into a decode failure. Dual-mode: for `kind: compilation` it echoes the `compilation_track_artist` row as exported in library.db, so a consumer can match it to its own CTA row; for `kind: single_artist` there is no CTA row and it carries the credit as LML's source has it.\n",
     )
-    track_title: str = Field(
+    track_title: str | None = Field(
         ...,
         description="Join-back echo of the track title, completing the join key. Dual-mode in the same way as `artist_name` — the library.db CTA row's title for `kind: compilation`, the source's track title for `kind: single_artist`. NULL when that row or source carries no title (the underlying CTA column is nullable).\n",
     )
-    resolved_artist_name: str = Field(
+    resolved_artist_name: str | None = Field(
         ...,
         description="The composed canonical artist for this track — the per-track analogue of `BulkResolveResult.main`, carried as a name because LML does not know Backend's artist ids; consumers map it to their own artist tables locally. NULL when the matcher visited this track and resolved nothing: the entry is still returned so consumers see the leg ran (same convention as `BulkResolveProvenanceEntry.external_id`), and `confidence` and `method` are NULL alongside it.\n",
     )
-    confidence: confloat(ge=0.0, le=1.0) = Field(
+    confidence: confloat(ge=0.0, le=1.0) | None = Field(
         ...,
         description="Composed track-level confidence in [0, 1] — where LML#1021's per-track composition lands (cross-source agreement boost, MIN-of-confidences fallback), applied at track grain exactly as `BulkResolveResult.confidence` applies at album grain. NULL when `resolved_artist_name` is NULL — the matcher ran and produced no verdict, so confidence is undefined (not zero).\n",
     )
-    method: IdentityMethod = Field(
+    method: IdentityMethod | None = Field(
         ...,
         description="The composed track-level method — typically the strongest leg's method, or `cross_source_agreement` when LML#1021's boost fired. NULL when `resolved_artist_name` is NULL.\n",
     )
@@ -1495,7 +1501,7 @@ class BulkResolveResult(BaseModel):
     )
     tracks_attempted: bool | None = Field(
         None,
-        description='Whether LML\'s per-track matcher has visited this row — `true` once it has run, **regardless of how many tracks it resolved**, including none. This is the resolved signal for per-track identity; `tracks.length` is not (WXYC/Backend-Service#1991).\n\nRead it with `tracks` as a pair, four states in total: **absent or NULL** — the caller did not ask (`include_tracks` false or omitted), or the result is `kind: unresolved`, and `tracks` is in the same state; **`false` with an empty `tracks`** — the caller asked and the matcher has not reached this row; **`true` with an empty `tracks`** — the matcher ran and resolved nothing; **`true` with a populated `tracks`** — the matcher ran and produced entries. `false` alongside a populated `tracks` is not a state; producers must not emit it.\n\nThe middle two are what this field exists for. They are byte-identical in `tracks`, they are not rare — a `kind: single_artist` release LML holds no tracklist for is the ordinary case, and extending the gate to that kind is the whole point of #297 — and a consumer that reads emptiness as "not yet visited" re-asks every one of them on every pass, forever. That is the re-asking pathology `kind: unresolved` was made a first-class outcome to prevent, reintroduced at track grain. A consumer cannot repair it locally, because the two states are indistinguishable on the wire without this field.\n\nAbsent and NULL are one state, for the same producer reason as `tracks` below.\n',
+        description='Whether LML\'s per-track matcher has visited this row — `true` once it has run, **regardless of how many tracks it resolved**, including none. This is the resolved signal for per-track identity; `tracks.length` is not (WXYC/Backend-Service#1991).\n\nRead it with `tracks` as a pair, four states in total: **absent or NULL** — the caller did not ask (`include_tracks` false or omitted), or the result is `kind: unresolved`, and `tracks` is in the same state; **`false` with an empty `tracks`** — the caller asked and the matcher has not reached this row; **`true` with an empty `tracks`** — the matcher ran and resolved nothing; **`true` with a populated `tracks`** — the matcher ran and produced entries. `false` alongside a populated `tracks` is not a state; producers must not emit it. A consumer that observes `tracks_attempted: false` alongside a populated `tracks` anyway MUST read it as `true` — the populated array is stronger evidence of what happened than the flag that disagrees with it, and reading the row as unattempted would either drop already-resolved tracks or re-ask a row that already has an answer (WXYC/wxyc-shared#303).\n\nThe middle two are what this field exists for. They are byte-identical in `tracks`, they are not rare — a `kind: single_artist` release LML holds no tracklist for is the ordinary case, and extending the gate to that kind is the whole point of #297 — and a consumer that reads emptiness as "not yet visited" re-asks every one of them on every pass, forever. That is the re-asking pathology `kind: unresolved` was made a first-class outcome to prevent, reintroduced at track grain. A consumer cannot repair it locally, because the two states are indistinguishable on the wire without this field.\n\nAbsent and NULL are one state, for the same producer reason as `tracks` below.\n',
     )
     tracks: list[BulkResolveTrackIdentity] | None = Field(
         None,
@@ -1503,7 +1509,15 @@ class BulkResolveResult(BaseModel):
     )
 
 
+class TracksContractVersion(IntEnum):
+    integer_1 = 1
+
+
 class BulkResolveLibrariesResponse(BaseModel):
+    tracks_contract_version: TracksContractVersion | None = Field(
+        None,
+        description='Present and equal to 1 only when the request set `include_tracks: true` and the producer understands the flag. Absent otherwise — both when `include_tracks` was false or omitted, and when the producer predates this field entirely and does not implement `include_tracks` at all. Same precedent as `LookupResponse.api_version` (`LookupRequest.include_identity`): a producer-echoed capability marker that lets a consumer distinguish "the producer understood my flag and the answer is genuinely nothing" from "the producer predates my flag" — a distinction `tracks_attempted`/`tracks` cannot make alone, because both are spelled `null` in either case (WXYC/wxyc-shared#303). No schema-level `default`, for the same `openapi-typescript` `defaultNonNullable` reason documented on `BulkResolveLibrariesRequest.include_tracks`.\n',
+    )
     results: list[BulkResolveResult]
     cache_stats: CacheStats | None = None
 
@@ -1658,7 +1672,7 @@ class ArtistResolveBulkRequest(BaseModel):
         max_length=25,
         min_length=1,
     )
-    dry_run: bool | None = Field(
+    dry_run: bool = Field(
         False,
         description="Run every tier identically — including live Discogs API verification — but skip the `entity.identity` write-back. No partial-write mode.\n",
     )
@@ -1732,7 +1746,7 @@ class CacheRefreshArtistOutcome(BaseModel):
 
 class CacheRefreshSourceResult(BaseModel):
     release_outcome: CacheRefreshSourceOutcome
-    artists: list[CacheRefreshArtistOutcome] | None = Field([], validate_default=True)
+    artists: list[CacheRefreshArtistOutcome] = Field([], validate_default=True)
     message: str | None = None
 
 
@@ -1755,13 +1769,13 @@ class DiscogsTrackItem(BaseModel):
     position: str
     title: str
     duration: str | None = None
-    artists: list[str] | None = []
+    artists: list[str] = []
 
 
 class DiscogsArtistCredit(BaseModel):
     artist_id: int | None = None
     name: str
-    join: str | None = Field("", description='Join phrase (e.g. " & ", ", ")')
+    join: str = Field("", description='Join phrase (e.g. " & ", ", ")')
     role: str | None = Field(
         None, description='Role for extra artists (e.g. "Producer", "Mixed By")'
     )
@@ -1800,7 +1814,7 @@ class DiscogsReleaseVideo(BaseModel):
     src: str
     title: str | None = None
     duration: int | None = Field(None, description="Duration in seconds")
-    embed: bool | None = True
+    embed: bool = True
 
 
 class DiscogsReleaseMetadata(BaseModel):
@@ -1815,25 +1829,25 @@ class DiscogsReleaseMetadata(BaseModel):
     label: str | None = None
     artist_id: int | None = None
     label_id: int | None = None
-    genres: list[str] | None = []
-    styles: list[str] | None = []
-    tracklist: list[DiscogsTrackItem] | None = Field([], validate_default=True)
+    genres: list[str] = []
+    styles: list[str] = []
+    tracklist: list[DiscogsTrackItem] = Field([], validate_default=True)
     artwork_url: str | None = None
     artwork_checked_at: AwareDatetime | None = Field(
         None,
         description="Timestamp of the most recent live Discogs API call that resolved\nthis release's artwork. `null` means LML's bulk loader populated\nthe row but the live API has not been queried yet (the \"never\nasked\" state); a value means LML hit the live API and either\npopulated `artwork_url` or confirmed Discogs has no cover. LML\nuses this to distinguish bulk-loader gaps (which it back-fills)\nfrom genuinely-imageless releases (which it does not refetch).\nSee WXYC/discogs-etl#239 + WXYC/library-metadata-lookup#423.\n",
     )
-    not_found: bool | None = Field(
+    not_found: bool = Field(
         False,
         description='Tombstone marker for Discogs 404s on `get_release`. `true` means\nLML hit the live Discogs API for this release id and Discogs\nreturned 404; subsequent reads short-circuit on this flag rather\nthan re-burning the rate-limit budget. The tombstone row carries\n`title = ""` and `artist = ""` as identifier sentinels;\nconsumers must guard against rendering those empty strings as\nreal values. `release_url` is identifier-derived\n(`https://www.discogs.com/release/{release_id}`) and remains\nvalid even on a tombstone. LML\'s public boundary translates\n`not_found = true` back to `None` for direct callers; this flag\nis observable only by consumers that read the cache row\ndirectly (none of which exist in LML\'s public API today, but\nthe contract is exposed here for future cross-service readers).\nSee WXYC/library-metadata-lookup#510.\n',
     )
     release_url: str
-    cached: bool | None = False
-    artists: list[DiscogsArtistCredit] | None = Field([], validate_default=True)
-    extra_artists: list[DiscogsArtistCredit] | None = Field([], validate_default=True)
-    labels: list[DiscogsLabelCredit] | None = Field([], validate_default=True)
+    cached: bool = False
+    artists: list[DiscogsArtistCredit] = Field([], validate_default=True)
+    extra_artists: list[DiscogsArtistCredit] = Field([], validate_default=True)
+    labels: list[DiscogsLabelCredit] = Field([], validate_default=True)
     released: str | None = Field(None, description="Release date as ISO string")
-    videos: list[DiscogsReleaseVideo] | None = Field([], validate_default=True)
+    videos: list[DiscogsReleaseVideo] = Field([], validate_default=True)
 
 
 class Type1(StrEnum):
@@ -1872,7 +1886,7 @@ class Alias(BaseModel):
 class Member(BaseModel):
     id: int
     name: str
-    active: bool | None = True
+    active: bool = True
 
 
 class DiscogsArtistDetails(BaseModel):
@@ -1883,11 +1897,11 @@ class DiscogsArtistDetails(BaseModel):
         None, description="Pre-parsed structured tokens from the Discogs profile markup"
     )
     image_url: str | None = None
-    name_variations: list[str] | None = []
-    aliases: list[Alias] | None = Field([], validate_default=True)
-    members: list[Member] | None = Field([], validate_default=True)
-    urls: list[str] | None = []
-    cached: bool | None = False
+    name_variations: list[str] = []
+    aliases: list[Alias] = Field([], validate_default=True)
+    members: list[Member] = Field([], validate_default=True)
+    urls: list[str] = []
+    cached: bool = False
 
 
 class DiscogsReleaseInfo(BaseModel):
@@ -1895,15 +1909,15 @@ class DiscogsReleaseInfo(BaseModel):
     artist: str
     release_id: int
     release_url: str
-    is_compilation: bool | None = False
+    is_compilation: bool = False
 
 
 class DiscogsTrackReleasesResponse(BaseModel):
     track: str | None = None
     artist: str | None = None
-    releases: list[DiscogsReleaseInfo] | None = Field([], validate_default=True)
-    total: int | None = 0
-    cached: bool | None = False
+    releases: list[DiscogsReleaseInfo] = Field([], validate_default=True)
+    total: int = 0
+    cached: bool = False
 
 
 class TrackMatchSource(StrEnum):
@@ -1988,7 +2002,7 @@ class StreamingCheckSources(BaseModel):
 
 
 class StreamingCheckResponse(BaseModel):
-    on_streaming: bool = Field(
+    on_streaming: bool | None = Field(
         ...,
         description='True if found on any service, false if all services confirmed absent (no errors),\nnull if inconclusive — either no services checked OR at least one service raised\nan error (see `errored_sources`). Treat null as "do not persist" / "retry later".\n',
     )
@@ -2343,7 +2357,7 @@ class Transport(StrEnum):
 class AutoDJDeviceStatus(BaseModel):
     connected: bool
     transport: Transport
-    last_heartbeat_at: AwareDatetime
+    last_heartbeat_at: AwareDatetime | None = Field(...)
     last_heartbeat: AutoDJHeartbeat | None = None
     pending_commands: int | None = Field(
         None, description="Number of unacknowledged commands in the queue"
@@ -2636,7 +2650,7 @@ class DiscogsMatchResult(BaseModel):
         description="URL to the release on Discogs. Non-empty for a real release identity; the empty string accompanies the `release_id == 0` streaming-only sentinel.\n",
     )
     artwork_url: str | None = Field(None, description="Artwork image URL")
-    confidence: confloat(ge=0.0, le=1.0) | None = Field(0, description="Match confidence score")
+    confidence: confloat(ge=0.0, le=1.0) = Field(0, description="Match confidence score")
     release_year: int | None = Field(None, description="Release year from Discogs")
     artist_bio: str | None = Field(None, description="Artist biography from Discogs profile")
     wikipedia_url: str | None = Field(None, description="Wikipedia URL for the artist")
@@ -2703,16 +2717,16 @@ class LookupResponse(BaseModel):
         None,
         description="Present and equal to 2 only when the request set `include_identity: true`. Absent for the v1-compatible shape so existing consumers see byte-identical responses.\n",
     )
-    results: list[LookupResultItem] | None = Field([], validate_default=True)
-    search_type: SearchType | None = Field(
+    results: list[LookupResultItem] = Field([], validate_default=True)
+    search_type: SearchType = Field(
         "none",
         description="The search strategy that produced results: direct, fallback, alternative, compilation, song_as_artist, or none\n",
     )
-    song_not_found: bool | None = Field(
+    song_not_found: bool = Field(
         False,
         description="True if search fell back to artist-only (track not confirmed on results)",
     )
-    found_on_compilation: bool | None = Field(
+    found_on_compilation: bool = Field(
         False, description="True if the track was found on a compilation album"
     )
     context_message: str | None = Field(
@@ -2723,11 +2737,11 @@ class LookupResponse(BaseModel):
     )
     cache_stats: CacheStats | None = None
     identity: LookupIdentityBlock | None = None
-    timeout: bool | None = Field(
+    timeout: bool = Field(
         False,
         description="True when LML's server-side hard cap fired and the search pipeline was abandoned mid-execution (LML#370). `results` may be partial or empty in that case. Callers can use this to distinguish \"no match\" (empty `results`, `timeout: false`) from \"ran out of time\" (`results` may be empty, `timeout: true`). The hard cap is an internal LML safety floor independent of the caller's `X-Caller-Budget-Ms` header; see LML#338 / LML#340 / LML#370 for the cascade-budget design. Backend also forwards two sibling informal headers on the same `/lookup` and `/lookup/bulk` requests, both prose-referenced here rather than formal parameters (matching `X-Caller-Budget-Ms`'s own precedent): `X-Caller-Class` (the resolved BS→LML traffic class, an integer 1-5 per Backend-Service's per-caller policy, BS#1826) and `X-Caller-Reason` (the `caller` label string itself, e.g. `proxy-library-search` or `catalog-popularity-freetext-resolve`). Both are sent only when Backend has a registered caller for the request and are otherwise omitted; sending them is inert until LML reads them (LML#928 for `X-Caller-Class`-driven lane routing, LML#931 for `X-Caller-Reason` caller telemetry) — see BS#1843.\n",
     )
-    degraded: bool | None = Field(
+    degraded: bool = Field(
         False,
         description="True when LML returned partial or cache-only data because it intentionally shed the enrichment tail — under a caller deadline, admission-control pressure, or an unavailable upstream (LML#930). Distinguishes a degraded/cache-only result from a full success (`degraded: false`) and from a genuine no-match (empty `results`, `degraded: false`, `timeout: false`). Distinct from `timeout`, which signals the internal hard cap fired and the pipeline was abandoned mid-execution; `degraded` is a deliberate shed-the-tail outcome where the returned data is trustworthy but incomplete. Default false, so existing consumers see a byte-identical response.\n",
     )
