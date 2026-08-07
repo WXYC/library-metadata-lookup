@@ -2878,6 +2878,80 @@ class TestGetReleaseExtractsMasterId:
         assert result.master_id is None
 
 
+class TestGetReleaseNullFieldNormalization:
+    """Discogs can send an explicit JSON ``null`` where it usually omits a key,
+    and ``dict.get(key, default)`` only defaults on an *absent* key — a
+    present-but-null value passes straight through into the response model.
+    After the ``--strict-nullable`` regen (wxyc-shared#302) these fields
+    reject ``None``, so the API arm must normalize null to the same default
+    an absent key gets. ``embed`` is guarded with an ``is None`` check rather
+    than ``or`` so an explicit ``False`` survives."""
+
+    @pytest.mark.asyncio
+    async def test_null_genres_styles_join_embed_normalize_to_defaults(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Aluminum Tunes",
+            "artists": [{"id": 388, "name": "Stereolab", "join": None}],
+            "year": 1998,
+            "labels": [{"name": "Drag City"}],
+            "genres": None,
+            "styles": None,
+            "tracklist": [],
+            "images": [],
+            "videos": [
+                {
+                    "uri": "https://www.youtube.com/watch?v=x",
+                    "title": "Fried Monkey Eggs",
+                    "duration": 100,
+                    "embed": None,
+                }
+            ],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(12345)
+
+        assert result is not None
+        assert result.genres == []
+        assert result.styles == []
+        assert result.artists[0].join == ""
+        assert result.videos[0].embed is True
+
+    @pytest.mark.asyncio
+    async def test_explicit_false_embed_survives_normalization(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Aluminum Tunes",
+            "artists": [{"id": 388, "name": "Stereolab"}],
+            "labels": [],
+            "tracklist": [],
+            "images": [],
+            "videos": [
+                {
+                    "uri": "https://www.youtube.com/watch?v=x",
+                    "title": "Fried Monkey Eggs",
+                    "duration": 100,
+                    "embed": False,
+                }
+            ],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(12345)
+
+        assert result is not None
+        assert result.videos[0].embed is False
+
+
 # ---------------------------------------------------------------------------
 # get_artist_details
 # ---------------------------------------------------------------------------
@@ -2922,6 +2996,36 @@ class TestGetArtistDetails:
         assert len(result.members) == 2
         assert result.members[0].name == "Rob Brown"
         assert result.urls == ["https://autechre.ws", "https://warp.net/artists/autechre"]
+
+    @pytest.mark.asyncio
+    async def test_member_active_null_defaults_true_and_false_survives(self, service):
+        """A present-but-null ``active`` normalizes to ``True`` (the same
+        default an absent key gets), while an explicit ``False`` survives —
+        an ``or``-guard would corrupt it. Post-#302-regen, ``Member.active``
+        rejects ``None`` outright, so the guard must live in the parse."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "id": 388,
+            "name": "Stereolab",
+            "members": [
+                {"id": 200, "name": "Laetitia Sadier", "active": None},
+                {"id": 201, "name": "Mary Hansen", "active": False},
+                {"id": 202, "name": "Tim Gane"},
+            ],
+            "images": [],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_artist_details(388)
+
+        assert result is not None
+        assert result.members[0].active is True
+        assert result.members[1].active is False
+        assert result.members[2].active is True
 
     @pytest.mark.asyncio
     async def test_handles_minimal_response(self, service):
