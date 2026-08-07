@@ -14,17 +14,33 @@ premises (F1-F4) and the design decisions (D1-D6) -- is in
 This module owns the matcher's pure/mockable core (slice 3): CTA extraction
 + the F1 fail-fast shape check, the D4 whole-then-split credit cascade, the
 Discogs leg's D3 method/confidence mapping and three-outcome failure
-contract, and the MusicBrainz leg's floor/ambiguity rule. HTTP paging,
-retry-with-cooldown, and resume-on-restart are NOT reimplemented here --
-slice 5's CLI wrapper imports ``run_drain``/``make_post_batch``/``resolve_batch``
-from ``scripts.artist_resolve_drain.drain`` and supplies the fan-back from a
-resolved credit string to the ``(library_id, track_title)`` rows it came
-from, plus the D1 two-statement write.
+contract, and the MusicBrainz leg's floor/ambiguity rule.
 
 It also owns D5's position recovery (slice 4): a deterministic LATERAL join
 against the LML#1019 recall index (``lml_cache.compilation_track_location``)
 that fills ``track_position`` on rows this table's own matcher can never
 supply a position for (F1 -- CTA carries no position column at all).
+
+And it owns the fan-back + CLI (slice 5): ``group_credits_by_artist`` maps
+one resolved credit STRING back to every ``(library_id, track_title)`` row
+that carries it (the same artist is routinely credited on many
+compilations), ``run_backfill`` drives one pass over a credit population,
+and ``main`` is the operator entry point.
+
+**On reuse of ``scripts.artist_resolve_drain.drain``:** the plan's slice 5
+names ``run_drain`` (JSONL-logged resume + escalation-cooldown retry) as an
+import candidate alongside ``make_post_batch``/``resolve_batch``/``PAGE_SIZE``.
+This module imports the latter three but deliberately does NOT drive
+``run_drain``'s outer loop. D2 already gives this backfill a STRONGER,
+cross-process resumability mechanism than a local JSONL file: every attempt
+IS a durable PG row, so a crash mid-page loses at most one in-flight page
+(<=25 credits), and a subsequent ``--incremental`` / ``--retry-misses`` run
+picks up exactly where the process left off, on a different machine if
+need be. Layering ``run_drain``'s own file-based resume on top would be
+tracking the same fact twice. Escalation-cooldown retry-within-a-session
+is the one property this trade-off gives up; an escalated credit still
+gets no row (D3) and is picked up by the next ``--incremental`` invocation
+instead of a same-session backoff.
 
 The Discogs leg is reached ONLY over ``POST /api/v1/artists/resolve/bulk``
 against the running LML service (F3) -- never by importing ``DiscogsService``
@@ -38,19 +54,27 @@ uncoordinated N+1th limiter against the same token
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import aiosqlite
+from wxyc_etl.text import to_match_form
 
 from artists.resolver import InvalidNameError, _sanitize_name, _validate_name
-from entity.compilation_track_identity import write_compilation_track_identity_position
+from entity.compilation_track_identity import (
+    write_compilation_track_identity_position,
+    write_compilation_track_identity_verdict,
+)
 from entity.sources import PgSource, PgSourceProtocol
 from generated.api_models import IdentityMethod
 from lookup.external_search import fetch_mb_artist_candidates
+from scripts.artist_resolve_drain.drain import PAGE_SIZE, chunk
 
 logger = logging.getLogger("backfill_compilation_track_identity")
 
@@ -60,6 +84,16 @@ logger = logging.getLogger("backfill_compilation_track_identity")
 # Protocol) so this module has no import-time dependency on that package
 # beyond what slice 5's CLI wrapper actually wires.
 PostBatch = Callable[[list[str], bool], Awaitable[list[dict[str, Any]]]]
+
+
+class ShutdownFlagProtocol(Protocol):
+    """Structural match for ``scripts._lib.signals.ShutdownFlag`` -- kept as a
+    Protocol (not an import) so this module's only runtime dependency on
+    ``scripts._lib`` is at the CLI wiring layer, not the orchestration core.
+    """
+
+    @property
+    def requested(self) -> bool: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -555,3 +589,500 @@ async def recover_track_positions(pg: PgSource, library_ids: list[int]) -> Posit
         candidate_rows=len(candidates),
         recovered_rows=len(recoverable),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Slice 5: the fan-back, --incremental / --retry-misses selection, and the
+# per-pass orchestrator. CLI argument parsing + wiring is at the bottom.
+# --------------------------------------------------------------------------- #
+
+
+def group_credits_by_artist(credits: Sequence[CtaCredit]) -> dict[str, list[CtaCredit]]:
+    """Map one raw credit STRING back to every ``CtaCredit`` row that carries it.
+
+    The genuinely new part of this backfill relative to the sibling artist
+    drain: that one keys on distinct NAMES and stops there, while a
+    compilation credit routinely repeats across many library shelf rows (the
+    same artist credited on many comps), so one resolved verdict must fan
+    back to every one of them. Dict order preserves first-occurrence order
+    of the distinct artist strings, which is what makes chunking below
+    deterministic in content rather than in fetch order.
+    """
+    grouped: dict[str, list[CtaCredit]] = {}
+    for credit in credits:
+        grouped.setdefault(credit.track_artist, []).append(credit)
+    return grouped
+
+
+def _credit_key(
+    library_id: int, track_artist: str, track_title: str | None
+) -> tuple[int, str, str]:
+    """The normalized ``(library_id, track_artist, track_title)`` triple two of
+    D1's PK columns key on -- shared here so selection agrees with storage
+    about what "the same credit" means (a raw-string comparison would miss
+    a case/whitespace variant the writer's own normalization collapses)."""
+    return (
+        library_id,
+        to_match_form(track_artist),
+        to_match_form(track_title) if track_title else "",
+    )
+
+
+def filter_by_attempted_keys(
+    credits: Sequence[CtaCredit], attempted: set[tuple[int, str, str]]
+) -> list[CtaCredit]:
+    """``--incremental``'s predicate for ONE source: credits with no existing row.
+
+    Evaluated per ``(library_id, track_artist, track_title)`` against
+    ``attempted`` (which the caller has already scoped to one ``source`` --
+    see :func:`load_attempted_keys`), not per raw credit string -- calling
+    this once for ``source='discogs'`` and once for ``source='musicbrainz'``
+    with each source's own attempted set is what lets a credit already
+    resolved on Discogs still be selected for the MB leg alone.
+    """
+    return [
+        credit
+        for credit in credits
+        if _credit_key(credit.library_id, credit.track_artist, credit.track_title) not in attempted
+    ]
+
+
+_ATTEMPTED_KEYS_SQL = """\
+SELECT DISTINCT library_id, track_artist, track_title
+FROM lml_cache.compilation_track_identity
+WHERE source = $1\
+"""
+
+_MISS_KEYS_SQL = """\
+SELECT DISTINCT library_id, track_artist, track_title
+FROM lml_cache.compilation_track_identity
+WHERE source = $1 AND external_id IS NULL\
+"""
+
+
+async def load_attempted_keys(pg: PgSource, source: str) -> set[tuple[int, str, str]]:
+    """Every ``(library_id, track_artist, track_title)`` this ``source`` has a row for at all."""
+    rows = await pg.fetchall(_ATTEMPTED_KEYS_SQL, source)
+    return {(row["library_id"], row["track_artist"], row["track_title"]) for row in rows}
+
+
+async def load_miss_keys(pg: PgSource, source: str) -> set[tuple[int, str, str]]:
+    """Every ``(library_id, track_artist, track_title)`` this ``source`` attempted and missed."""
+    rows = await pg.fetchall(_MISS_KEYS_SQL, source)
+    return {(row["library_id"], row["track_artist"], row["track_title"]) for row in rows}
+
+
+@dataclass(frozen=True)
+class BackfillStats:
+    """One pass's yield, per source, plus the rows actually written."""
+
+    candidates: int
+    distinct_credits: int
+    discogs_resolved: int
+    discogs_missed: int
+    discogs_no_row: int
+    musicbrainz_configured: bool
+    musicbrainz_resolved: int
+    musicbrainz_missed: int
+    rows_written: int
+    position_stats: PositionRecoveryStats | None = None
+
+
+async def run_backfill(
+    *,
+    credits: Sequence[CtaCredit],
+    post_batch: PostBatch,
+    mb_pg: PgSourceProtocol | None,
+    pg: PgSource,
+    dry_run_write: bool,
+    dry_run_http: bool,
+    discogs_credits: Sequence[CtaCredit] | None = None,
+    musicbrainz_credits: Sequence[CtaCredit] | None = None,
+    recover_positions: bool = True,
+    shutdown: ShutdownFlagProtocol | None = None,
+) -> BackfillStats:
+    """Drive one pass: resolve, fan back, write, recover positions.
+
+    ``credits`` is the full population this pass was handed (used for the
+    yield denominator and, when the per-source overrides below are omitted,
+    as the default set for both legs). ``discogs_credits`` /
+    ``musicbrainz_credits`` let the caller select each source's candidates
+    independently -- the ``--incremental`` grain (a credit already resolved
+    on Discogs but never on MusicBrainz is still an MB candidate) -- and
+    default to ``credits`` when omitted (``--full`` / a fresh
+    ``--retry-misses`` caller that wants both legs re-attempted).
+
+    ``mb_pg is None`` means MusicBrainz is unconfigured (``DATABASE_URL_MUSICBRAINZ``
+    unset): the MB leg is skipped ENTIRELY -- no row of any kind -- per D3's
+    rule that "unconfigured" is a third outcome distinct from both a query
+    error and a miss.
+
+    ``dry_run_http`` is the wire's ``dry_run`` (the resolve endpoint skips
+    minting into ``entity.identity``) -- the script's ``--live`` flag negated.
+    ``dry_run_write`` gates whether THIS table is written at all -- the
+    script's own ``--dry-run`` flag, independent of the HTTP one.
+
+    ``shutdown`` (a :class:`scripts._lib.signals.ShutdownFlag`, org
+    long-running-script convention) is checked between Discogs pages and
+    between MusicBrainz credits -- a graceful stop finishes the in-flight
+    HTTP call, writes what it already resolved, and returns early. Per D2,
+    the credits left unattempted are simply picked up by the next
+    ``--incremental`` invocation; there is no separate resume state to save.
+    """
+    discogs_credits = list(credits if discogs_credits is None else discogs_credits)
+    musicbrainz_credits = list(credits if musicbrainz_credits is None else musicbrainz_credits)
+
+    by_artist_discogs = group_credits_by_artist(discogs_credits)
+    by_artist_mb = group_credits_by_artist(musicbrainz_credits) if mb_pg is not None else {}
+
+    discogs_verdicts: dict[str, DiscogsCreditVerdict] = {}
+    for page in chunk(list(by_artist_discogs), PAGE_SIZE):
+        if shutdown is not None and shutdown.requested:
+            logger.info("shutdown requested; stopping the Discogs pass early")
+            break
+        page_verdicts = await resolve_discogs_credits(post_batch, page, dry_run=dry_run_http)
+        discogs_verdicts.update(page_verdicts)
+
+    musicbrainz_verdicts: dict[str, MusicBrainzCreditVerdict | None] = {}
+    if mb_pg is None and musicbrainz_credits:
+        logger.warning(
+            "DATABASE_URL_MUSICBRAINZ is not configured -- skipping the MusicBrainz leg "
+            "entirely for this pass (no row written for any credit, per D3)"
+        )
+    elif mb_pg is not None:
+        for artist in by_artist_mb:
+            if shutdown is not None and shutdown.requested:
+                logger.info("shutdown requested; stopping the MusicBrainz pass early")
+                break
+            musicbrainz_verdicts[artist] = await resolve_musicbrainz_credit(mb_pg, artist)
+
+    rows_written = 0
+    touched_library_ids: set[int] = set()
+    if not dry_run_write:
+        for artist, group in by_artist_discogs.items():
+            verdict = discogs_verdicts.get(artist)
+            if verdict is None:
+                continue
+            for credit in group:
+                await write_compilation_track_identity_verdict(
+                    pg,
+                    library_id=credit.library_id,
+                    track_artist_raw=credit.track_artist,
+                    track_title_raw=credit.track_title,
+                    source="discogs",
+                    external_id=verdict.external_id,
+                    confidence=verdict.confidence,
+                    method=verdict.method,
+                    resolved_artist_name=verdict.resolved_artist_name,
+                )
+                rows_written += 1
+                touched_library_ids.add(credit.library_id)
+
+        for artist, group in by_artist_mb.items():
+            mb_verdict = musicbrainz_verdicts.get(artist)
+            if mb_verdict is None:
+                continue
+            for credit in group:
+                await write_compilation_track_identity_verdict(
+                    pg,
+                    library_id=credit.library_id,
+                    track_artist_raw=credit.track_artist,
+                    track_title_raw=credit.track_title,
+                    source="musicbrainz",
+                    external_id=mb_verdict.external_id,
+                    confidence=mb_verdict.confidence,
+                    method=mb_verdict.method,
+                    resolved_artist_name=mb_verdict.resolved_artist_name,
+                )
+                rows_written += 1
+                touched_library_ids.add(credit.library_id)
+
+    position_stats = None
+    if not dry_run_write and recover_positions and touched_library_ids:
+        position_stats = await recover_track_positions(pg, sorted(touched_library_ids))
+
+    discogs_resolved = sum(1 for v in discogs_verdicts.values() if v.external_id is not None)
+    discogs_missed = sum(1 for v in discogs_verdicts.values() if v.external_id is None)
+    mb_resolved = sum(1 for v in musicbrainz_verdicts.values() if v and v.external_id is not None)
+    mb_missed = sum(1 for v in musicbrainz_verdicts.values() if v and v.external_id is None)
+
+    return BackfillStats(
+        candidates=len(credits),
+        distinct_credits=len(by_artist_discogs),
+        discogs_resolved=discogs_resolved,
+        discogs_missed=discogs_missed,
+        discogs_no_row=len(by_artist_discogs) - discogs_resolved - discogs_missed,
+        musicbrainz_configured=mb_pg is not None,
+        musicbrainz_resolved=mb_resolved,
+        musicbrainz_missed=mb_missed,
+        rows_written=rows_written,
+        position_stats=position_stats,
+    )
+
+
+_MODE_INCREMENTAL = "incremental"
+_MODE_FULL = "full"
+_MODE_RETRY_MISSES = "retry-misses"
+
+
+async def select_credit_population(
+    pg: PgSource,
+    all_credits: Sequence[CtaCredit],
+    *,
+    mode: str,
+    mb_configured: bool,
+) -> tuple[list[CtaCredit], list[CtaCredit]]:
+    """Resolve ``--incremental`` / ``--full`` / ``--retry-misses`` into per-source candidates.
+
+    Returns ``(discogs_credits, musicbrainz_credits)``. The two lists are
+    computed independently -- never derived from one another -- which is
+    what lets ``--incremental`` select a credit for the MB leg alone once
+    ``DATABASE_URL_MUSICBRAINZ`` lands on an environment that has already
+    fully drained Discogs (the scenario the plan's slice 5 test pins:
+    drain MB-unconfigured, then MB-configured, and the second run writes MB
+    rows for credits the first run already resolved on Discogs).
+    """
+    if mode == _MODE_FULL:
+        discogs_credits = list(all_credits)
+        musicbrainz_credits = list(all_credits) if mb_configured else []
+        return discogs_credits, musicbrainz_credits
+
+    if mode == _MODE_INCREMENTAL:
+        attempted_discogs = await load_attempted_keys(pg, "discogs")
+        discogs_credits = filter_by_attempted_keys(all_credits, attempted_discogs)
+        musicbrainz_credits = []
+        if mb_configured:
+            attempted_mb = await load_attempted_keys(pg, "musicbrainz")
+            musicbrainz_credits = filter_by_attempted_keys(all_credits, attempted_mb)
+        return discogs_credits, musicbrainz_credits
+
+    if mode == _MODE_RETRY_MISSES:
+        miss_discogs = await load_miss_keys(pg, "discogs")
+        discogs_credits = [
+            credit
+            for credit in all_credits
+            if _credit_key(credit.library_id, credit.track_artist, credit.track_title)
+            in miss_discogs
+        ]
+        musicbrainz_credits = []
+        if mb_configured:
+            miss_mb = await load_miss_keys(pg, "musicbrainz")
+            musicbrainz_credits = [
+                credit
+                for credit in all_credits
+                if _credit_key(credit.library_id, credit.track_artist, credit.track_title)
+                in miss_mb
+            ]
+        return discogs_credits, musicbrainz_credits
+
+    raise ValueError(f"unknown backfill mode {mode!r}")
+
+
+# --------------------------------------------------------------------------- #
+# CLI. Precedents: scripts/build_compilation_track_location.py for the mode
+# flags (--incremental/--full/--limit/--dry-run) and
+# scripts/artist_resolve_drain/__main__.py for the operational shape
+# (--live/--base-url/--api-key/--timeout, set_up_script_runtime).
+# --------------------------------------------------------------------------- #
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m scripts.backfill_compilation_track_identity",
+        description=(
+            "Populate lml_cache.compilation_track_identity from library.db's "
+            "compilation_track_artist credits (LML#1020)."
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Only credits with no existing row for a source yet (daily cadence).",
+    )
+    mode.add_argument(
+        "--full",
+        action="store_true",
+        help="Reprocess every CTA credit against both sources (monthly cadence).",
+    )
+    mode.add_argument(
+        "--retry-misses",
+        action="store_true",
+        help="Only credits whose existing row is a miss (external_id IS NULL).",
+    )
+    parser.add_argument(
+        "--library-db",
+        default="library.db",
+        help="Path to library.db (default: library.db)",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Cap the number of CTA credits loaded"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Match + report only; no lml_cache.compilation_track_identity writes. "
+            "Default is OFF -- rows ARE written."
+        ),
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Let the resolve endpoint mint entity.identity rows. Default is a dry "
+            "HTTP run (no write-back to entity.identity)."
+        ),
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="LML base URL. Defaults to $LML_BASE_URL, then $PRODUCTION_URL.",
+    )
+    parser.add_argument(
+        "--api-key", default=None, help="LML API key (bearer). Defaults to $LML_API_KEY."
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Per-request timeout (s); a fully-escalating page can take ~30s. Default: 120",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+
+
+async def _run(args: argparse.Namespace, shutdown: ShutdownFlagProtocol) -> None:
+    import asyncpg
+    import httpx
+
+    from config.settings import get_settings
+    from scripts.artist_resolve_drain.drain import make_post_batch
+
+    settings = get_settings()
+    db_url = settings.database_url_discogs
+    if not db_url:
+        raise SystemExit("DATABASE_URL_DISCOGS is not configured -- cannot run the backfill")
+
+    await validate_cta_shape(args.library_db)
+    all_credits = await load_compilation_track_credits(args.library_db)
+    if args.limit is not None:
+        all_credits = all_credits[: args.limit]
+    logger.info("loaded %d CTA credit(s) from %s", len(all_credits), args.library_db)
+    if not all_credits:
+        logger.warning("no CTA credits to process; nothing to do")
+        return
+
+    base_url = args.base_url or os.environ.get("LML_BASE_URL") or os.environ.get("PRODUCTION_URL")
+    if not base_url:
+        raise SystemExit("no base URL: pass --base-url or set $LML_BASE_URL / $PRODUCTION_URL")
+    api_key = args.api_key or os.environ.get("LML_API_KEY")
+    if not api_key:
+        raise SystemExit("no API key: pass --api-key or set $LML_API_KEY")
+
+    pool = await asyncpg.create_pool(db_url, min_size=1, max_size=4)
+    mb_pg: PgSource | None = None
+    if settings.database_url_musicbrainz:
+        mb_pg = PgSource(dsn=settings.database_url_musicbrainz)
+    else:
+        logger.warning(
+            "DATABASE_URL_MUSICBRAINZ is not configured -- the MusicBrainz leg is "
+            "skipped entirely for this run (no musicbrainz row for ANY credit, per D3)"
+        )
+
+    try:
+        pg = PgSource(pool=pool)
+        from entity.compilation_track_identity import set_up_compilation_track_identity_schema
+
+        await set_up_compilation_track_identity_schema(pg)
+
+        mode = (
+            _MODE_FULL
+            if args.full
+            else _MODE_RETRY_MISSES
+            if args.retry_misses
+            else _MODE_INCREMENTAL
+        )
+        discogs_credits, musicbrainz_credits = await select_credit_population(
+            pg, all_credits, mode=mode, mb_configured=mb_pg is not None
+        )
+        logger.info(
+            "population selected [%s]: %d discogs candidate(s), %d musicbrainz candidate(s)",
+            mode,
+            len(discogs_credits),
+            len(musicbrainz_credits),
+        )
+
+        dry_run_http = not args.live
+        if dry_run_http:
+            logger.info(
+                "DRY HTTP RUN -- the resolve endpoint will not mint entity.identity "
+                "(pass --live to mint)"
+            )
+        else:
+            logger.warning(
+                "LIVE run against %s -- the resolve endpoint MAY mint DURABLE "
+                "entity.identity rows (COALESCE never-clobber). Ensure the dry run's "
+                "spot-check was human-reviewed.",
+                base_url,
+            )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(args.timeout)) as client:
+            post_batch = make_post_batch(client, base_url, api_key)
+            stats = await run_backfill(
+                credits=all_credits,
+                post_batch=post_batch,
+                mb_pg=mb_pg,
+                pg=pg,
+                dry_run_write=args.dry_run,
+                dry_run_http=dry_run_http,
+                discogs_credits=discogs_credits,
+                musicbrainz_credits=musicbrainz_credits,
+                shutdown=shutdown,
+            )
+    finally:
+        await pool.close()
+        if mb_pg is not None:
+            await mb_pg.close()
+
+    logger.info(
+        "backfill complete: candidates=%d distinct_credits=%d discogs_resolved=%d "
+        "discogs_missed=%d discogs_no_row=%d musicbrainz_configured=%s "
+        "musicbrainz_resolved=%d musicbrainz_missed=%d rows_written=%d%s",
+        stats.candidates,
+        stats.distinct_credits,
+        stats.discogs_resolved,
+        stats.discogs_missed,
+        stats.discogs_no_row,
+        stats.musicbrainz_configured,
+        stats.musicbrainz_resolved,
+        stats.musicbrainz_missed,
+        stats.rows_written,
+        " [dry-run]" if args.dry_run else "",
+    )
+    if stats.position_stats is not None:
+        logger.info(
+            "position recovery: candidate_library_ids=%d recall_index_covered=%d "
+            "candidate_rows=%d recovered_rows=%d",
+            stats.position_stats.candidate_library_ids,
+            stats.position_stats.recall_index_covered_library_ids,
+            stats.position_stats.candidate_rows,
+            stats.position_stats.recovered_rows,
+        )
+
+
+def main(argv: list[str] | None = None) -> None:
+    from scripts._lib.runtime import set_up_script_runtime
+
+    args = _build_arg_parser().parse_args(argv)
+    shutdown = set_up_script_runtime(
+        logger=logger,
+        verbose=args.verbose,
+        shutdown_unit="batch",
+        include_logger_name=False,
+    )
+    asyncio.run(_run(args, shutdown))
+
+
+if __name__ == "__main__":
+    main()
