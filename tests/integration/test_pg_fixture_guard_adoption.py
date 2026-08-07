@@ -71,6 +71,10 @@ _LML_CACHE_FIXTURE_FILES = (
     "test_compilation_track_identity_store.py",
     "test_backfill_compilation_track_identity_position_pg.py",
     "test_backfill_compilation_track_identity_pg.py",
+    # LML#1021: the compilation-arm tracks[] end-to-end suite drops its own
+    # scratch lml_cache.compilation_track_identity rows (its `entity.*`
+    # fixture above is separately covered by _MIGRATED_FILES).
+    "test_bulk_resolve_libraries.py",
 )
 
 # Any DROP SCHEMA aimed at lml_cache, however spelled (with/without IF

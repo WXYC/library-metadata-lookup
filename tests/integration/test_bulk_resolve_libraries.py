@@ -128,9 +128,17 @@ class TestBulkResolveLibrariesEndpoint:
     @pytest.mark.asyncio
     async def test_include_tracks_pair_and_marker_end_to_end(self, pg_app_client):
         """1.31.0 wire against real PG: flag on -> resolved kinds carry
-        (false, []) and the response carries tracks_contract_version: 1;
-        flag omitted -> null pair everywhere, null marker (the un-upgraded
-        caller's byte-compatible view, minus the retired V/A empty array)."""
+        (false, []); flag omitted -> null pair everywhere (the un-upgraded
+        caller's byte-compatible view, minus the retired V/A empty array).
+
+        `tracks_contract_version` stays None on BOTH paths: api.yaml 1.32.0
+        (wxyc-shared#314) requires both producer arms (`kind: compilation` --
+        LML#1021, done -- and `kind: single_artist` -- LML#1138, not yet) to
+        emit real `tracks_attempted` before the marker may be `1`. Setting it
+        on `include_tracks` alone (the pre-1.32.0 behavior) would tell a
+        consumer to trust `tracks_attempted` on `single_artist` rows where
+        it's still meaningless.
+        """
         inputs = [
             {"library_id": 100, "artist_name": "Various Artists", "album_title": "VA"},
             {"library_id": 200, "artist_name": "Stereolab", "album_title": "AT"},
@@ -143,7 +151,7 @@ class TestBulkResolveLibrariesEndpoint:
         )
         assert flag_on.status_code == 200
         data = flag_on.json()
-        assert data["tracks_contract_version"] == 1
+        assert data["tracks_contract_version"] is None
         by_id = {r["library_id"]: r for r in data["results"]}
         assert (by_id[100]["tracks_attempted"], by_id[100]["tracks"]) == (False, [])
         assert (by_id[200]["tracks_attempted"], by_id[200]["tracks"]) == (False, [])
@@ -329,3 +337,174 @@ class TestBulkResolveLibrariesEndpoint:
             json={"inputs": oversized},
         )
         assert resp.status_code == 413
+
+
+@pytest_asyncio.fixture
+async def set_up_track_identity_schema(pg_pool, pg_source):
+    """Fresh `lml_cache.compilation_track_identity` for the LML#1021 end-to-end suite.
+
+    Independent of `set_up_entity_schema` above (`entity.*` vs `lml_cache.*` --
+    different schemas, both live on the same `pg_app_client` pool). Same
+    populated-table safety guard as every other schema-dropping fixture in
+    this suite.
+    """
+    from entity.compilation_track_identity import set_up_compilation_track_identity_schema
+    from tests.integration.conftest import skip_if_named_tables_populated
+
+    async with pg_pool.acquire() as conn:
+        await skip_if_named_tables_populated(conn, (("lml_cache", "compilation_track_identity"),))
+        await conn.execute("DROP TABLE IF EXISTS lml_cache.compilation_track_identity")
+    await set_up_compilation_track_identity_schema(pg_source)
+    yield
+    async with pg_pool.acquire() as conn:
+        await conn.execute("DROP TABLE IF EXISTS lml_cache.compilation_track_identity")
+
+
+@pytest.mark.pg
+class TestIncludeTracksCompilationStoreEndToEnd:
+    """LML#1021 end-to-end: `tracks[]` composed from real
+    `lml_cache.compilation_track_identity` rows via the router's batched
+    read, keyed on `legacy_release_id` (deliberately a DIFFERENT number from
+    `library_id` in every test here, to prove the id-space bridge is what's
+    doing the join — see wxyc-shared#315 and LML#1021's F2 finding).
+    """
+
+    @pytest.mark.asyncio
+    async def test_visited_release_composes_a_hit_and_a_miss(
+        self, pg_app_client, pg_source, set_up_track_identity_schema
+    ):
+        from entity.compilation_track_identity import write_compilation_track_identity_verdict
+
+        await write_compilation_track_identity_verdict(
+            pg_source,
+            library_id=555000,
+            track_artist_raw="Juana Molina",
+            track_title_raw="La Paradoja",
+            source="discogs",
+            external_id="305253",
+            confidence=1.0,
+            method="exact_match",
+            resolved_artist_name="Juana Molina",
+        )
+        # A miss: the matcher visited this credit but neither leg produced
+        # a candidate. Attempt rows exist for misses (D2) -- the whole point
+        # of the LML#1021 amendments' three-state tracks[] convention.
+        await write_compilation_track_identity_verdict(
+            pg_source,
+            library_id=555000,
+            track_artist_raw="Unrecognized Artist",
+            track_title_raw="Unrecognized Track",
+            source="discogs",
+            external_id=None,
+            confidence=None,
+            method=None,
+            resolved_artist_name=None,
+        )
+
+        resp = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "include_tracks": True,
+                "inputs": [
+                    {
+                        "library_id": 42,
+                        "legacy_release_id": 555000,
+                        "artist_name": "Various Artists",
+                        "album_title": "Edits",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["kind"] == "compilation"
+        assert result["library_id"] == 42
+        assert result["tracks_attempted"] is True
+        assert len(result["tracks"]) == 2
+
+        by_artist = {t["artist_name"]: t for t in result["tracks"]}
+
+        hit = by_artist["Juana Molina"]
+        assert hit["track_title"] == "La Paradoja"
+        assert hit["resolved_artist_name"] == "Juana Molina"
+        assert hit["confidence"] == pytest.approx(1.0)
+        assert hit["method"] == "exact_match"
+        assert len(hit["sources"]) == 1
+        assert hit["sources"][0]["source"] == "discogs"
+        assert hit["sources"][0]["external_id"] == "305253"
+
+        miss = by_artist["Unrecognized Artist"]
+        assert miss["track_title"] == "Unrecognized Track"
+        assert miss["resolved_artist_name"] is None
+        assert miss["confidence"] is None
+        assert miss["method"] is None
+        # The miss leg cannot be echoed into sources[] on the current wire
+        # contract -- BulkResolveProvenanceEntry.method is required and
+        # non-nullable, but D1's CHECK constraint makes a miss row's method
+        # NULL. See identity/bulk_resolve.py's _store_row_to_composed.
+        assert miss["sources"] == []
+
+    @pytest.mark.asyncio
+    async def test_unvisited_release_stays_false_and_empty(
+        self, pg_app_client, set_up_track_identity_schema
+    ):
+        resp = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "include_tracks": True,
+                "inputs": [
+                    {
+                        "library_id": 42,
+                        "legacy_release_id": 999999,
+                        "artist_name": "Various Artists",
+                        "album_title": "Never Visited",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["tracks_attempted"] is False
+        assert result["tracks"] == []
+
+    @pytest.mark.asyncio
+    async def test_missing_legacy_release_id_degrades_to_unvisited(
+        self, pg_app_client, pg_source, set_up_track_identity_schema
+    ):
+        """A compilation input with NO legacy_release_id (un-upgraded
+        caller) degrades to the unvisited state even when the store DOES
+        hold rows LML simply has no bridge to find."""
+        from entity.compilation_track_identity import write_compilation_track_identity_verdict
+
+        await write_compilation_track_identity_verdict(
+            pg_source,
+            library_id=555000,
+            track_artist_raw="Juana Molina",
+            track_title_raw="La Paradoja",
+            source="discogs",
+            external_id="305253",
+            confidence=1.0,
+            method="exact_match",
+            resolved_artist_name="Juana Molina",
+        )
+
+        resp = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "include_tracks": True,
+                "inputs": [
+                    {
+                        "library_id": 42,
+                        "artist_name": "Various Artists",
+                        "album_title": "No Bridge",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["tracks_attempted"] is False
+        assert result["tracks"] == []

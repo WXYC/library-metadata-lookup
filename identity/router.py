@@ -31,8 +31,10 @@ from core.bulk_concurrency import (
     run_bulk_gather,
     watch_disconnect,
 )
-from core.dependencies import discogs_pool_max_size
+from core.dependencies import discogs_pool_max_size, get_discogs_cache_pg
 from discogs.ratelimit import set_discogs_low_priority
+from entity.compilation_track_identity import CompilationTrackIdentityRow
+from entity.sources import PgSource
 from entity.store import EntityStore, Identity
 from generated.api_models import (
     BulkResolveInput,
@@ -41,9 +43,12 @@ from generated.api_models import (
     BulkResolveResult,
     ReleaseIdentityResolveRequest,
     ReleaseIdentityResolveResponse,
-    TracksContractVersion,
 )
-from identity.bulk_resolve import compilation_result, compose_for_identity
+from identity.bulk_resolve import (
+    compilation_result,
+    compose_for_identity,
+    load_compilation_track_rows_by_legacy_id,
+)
 from identity.dependencies import get_entity_store, require_entity_store
 from identity.models import (
     BulkIdentityRequest,
@@ -189,6 +194,7 @@ async def bulk_resolve_identities(
 async def bulk_resolve_libraries(
     http_request: Request,
     entity_store: EntityStore | None = Depends(get_entity_store),
+    discogs_cache_pg: PgSource | None = Depends(get_discogs_cache_pg),
 ) -> BulkResolveLibrariesResponse:
     """Compose cross-cache-identity verdicts for a batch of library rows.
 
@@ -201,7 +207,14 @@ async def bulk_resolve_libraries(
     Per-input handling:
 
     - V/A rows (detected via ``wxyc_etl.text.is_compilation_artist`` on
-      ``artist_name``) return ``kind: compilation``.
+      ``artist_name``) return ``kind: compilation``. When ``include_tracks``
+      is set and the input carries a ``legacy_release_id`` (wxyc-shared#315
+      — library.db's / ``lml_cache.compilation_track_identity``'s id space,
+      NOT ``library_id``, which is Backend's own serial and a different
+      space per LML#1021's F2 finding), its `tracks[]` is composed from real
+      per-track identity (see ``load_compilation_track_rows_by_legacy_id``
+      below). Absent ``legacy_release_id`` degrades to the unvisited
+      ``(false, [])`` state — LML has no bridge to look the row up with.
     - Otherwise we look up ``artist_name`` in ``entity.identity`` and
       compose per-source provenance via ``identity.bulk_resolve``.
     - When the lookup misses we return ``kind: unresolved`` so Backend
@@ -209,12 +222,13 @@ async def bulk_resolve_libraries(
 
     ``include_tracks`` (1.30.0, wxyc-shared#297) gates the
     ``(tracks_attempted, tracks)`` pair on both resolved kinds; ``None``
-    and ``false`` are one state. When understood-true, the response
-    carries ``tracks_contract_version: 1`` so a consumer can tell "this
-    producer understood the flag" from "this producer predates it"
-    (wxyc-shared#303, Q1 option A). Until #1021/#1138 wire real
-    emission, flag-on rows carry ``(false, [])`` — asked, not yet
-    visited — and the consumer keeps re-asking.
+    and ``false`` are one state. ``tracks_contract_version`` stays absent
+    even when the flag is understood-true: api.yaml 1.32.0 (wxyc-shared#314)
+    requires BOTH producer arms (`kind: compilation` — this ticket, LML#1021
+    — and `kind: single_artist` — LML#1138) to emit real `tracks_attempted`
+    before the marker may be `1`; the `single_artist` arm still hardcodes
+    `tracks=None` via `compose_for_identity`, so setting the marker now would
+    misrepresent those rows as trustworthy. #1138 flips it once its arm ships.
 
     Response order matches request input order, as per the api.yaml
     contract.
@@ -258,6 +272,44 @@ async def bulk_resolve_libraries(
     inputs_count = len(request.inputs)
     logger.info("bulk resolve start: inputs=%d", inputs_count)
 
+    # LML#1021: ONE batched read of lml_cache.compilation_track_identity for
+    # the whole batch's compilation rows, BEFORE the fan-out below -- the
+    # ticket's hard "no N+1" requirement. Only compilation inputs that carry
+    # a legacy_release_id (wxyc-shared#315's id-space bridge) are candidates;
+    # an input missing it can never join this table (it is keyed on
+    # library.db's legacy id space, not Backend's serial `library_id`), so
+    # it is left out of the read and degrades to the unvisited state in
+    # `compilation_result` below. `discogs_cache_pg is None` can only happen
+    # if the shared discogs-cache pool became unavailable between
+    # `require_entity_store` succeeding and here (both draw from the same
+    # singleton pool) -- gracefully degrading every compilation row to
+    # unvisited is the safe reading (never a false "resolved"), so this does
+    # not 503 the whole batch over it.
+    track_rows_by_legacy_id: dict[int, list[CompilationTrackIdentityRow]] = {}
+    if include_tracks and discogs_cache_pg is not None:
+        legacy_release_ids = sorted(
+            {
+                input_row.legacy_release_id
+                for input_row in request.inputs
+                if input_row.legacy_release_id is not None
+                and is_compilation_artist(input_row.artist_name)
+            }
+        )
+        if legacy_release_ids:
+            try:
+                track_rows_by_legacy_id = await load_compilation_track_rows_by_legacy_id(
+                    discogs_cache_pg, legacy_release_ids
+                )
+            except TRANSIENT_PG_ERRORS:
+                logger.exception(
+                    "compilation_track_identity batched read failed mid-bulk-resolve "
+                    "for %d legacy_release_id(s)",
+                    len(legacy_release_ids),
+                )
+                raise HTTPException(
+                    status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
+                ) from None
+
     # Per-input lookups dispatch concurrently under a semaphore (LML#278).
     # Worst case drops from ~3,000 sequential PG round-trips for a 1,000-row
     # miss-heavy batch to ~``ceil(N / max_concurrent)`` waves. The semaphore is
@@ -290,7 +342,16 @@ async def bulk_resolve_libraries(
         # multiply against the shared pool.
         async with semaphore, acquire_bulk_global_permit():
             if is_compilation_artist(input_row.artist_name):
-                return compilation_result(input_row.library_id, include_tracks=include_tracks)
+                store_rows = (
+                    track_rows_by_legacy_id.get(input_row.legacy_release_id)
+                    if input_row.legacy_release_id is not None
+                    else None
+                )
+                return compilation_result(
+                    input_row.library_id,
+                    include_tracks=include_tracks,
+                    store_rows=store_rows,
+                )
 
             try:
                 # Three-leg fall-through lookup (issues #274 / #276): exact
@@ -415,12 +476,21 @@ async def bulk_resolve_libraries(
 
     return BulkResolveLibrariesResponse(
         results=results,
-        # The producer-echoed capability marker (wxyc-shared#303 Q1 option A):
-        # present exactly when the flag was understood-true. When None, the
-        # wire spells it "tracks_contract_version": null (no exclude_none on
-        # this response_model) — consumers use the null-tolerant check; the
-        # nullability doc fix is wxyc-shared#313.
-        tracks_contract_version=TracksContractVersion.integer_1 if include_tracks else None,
+        # The producer-echoed capability marker (wxyc-shared#303 Q1 option A)
+        # -- always None today, deliberately, not merely "not yet wired up".
+        # api.yaml 1.32.0 (wxyc-shared#314) tightened its producer rule: `1`
+        # is valid only once BOTH arms emit real `tracks_attempted` --
+        # `kind: compilation` (LML#1021, done above) AND `kind: single_artist`
+        # (LML#1138, not yet -- `compose_for_identity` still hardcodes
+        # `tracks=None` there). Setting it on `include_tracks` alone (the
+        # pre-1.32.0 behavior this reverts) would tell a BS consumer to trust
+        # `tracks_attempted` on `single_artist` rows where it is still
+        # meaningless. #1138 flips this to `TracksContractVersion.integer_1`
+        # once its arm ships; coordinate the flip with whoever lands it.
+        # When None, the wire spells it "tracks_contract_version": null (no
+        # exclude_none on this response_model) — consumers use the
+        # null-tolerant check; the nullability doc fix is wxyc-shared#313.
+        tracks_contract_version=None,
     )
 
 

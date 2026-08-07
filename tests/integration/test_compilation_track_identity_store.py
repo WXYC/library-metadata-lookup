@@ -22,6 +22,7 @@ import pytest_asyncio
 
 from entity.compilation_track_identity import (
     fill_compilation_track_identity_positions_from_recall_index,
+    get_compilation_track_identity_for_libraries,
     get_compilation_track_identity_for_library,
     get_compilation_track_identity_misses,
     set_up_compilation_track_identity_schema,
@@ -380,4 +381,46 @@ class TestGetForLibrary:
     @pytest.mark.asyncio
     async def test_empty_for_a_library_id_never_visited(self, pg_source):
         rows = await get_compilation_track_identity_for_library(pg_source, 999)
+        assert rows == []
+
+
+@pytest.mark.pg
+class TestGetForLibraries:
+    """The LML#1021 batched read -- one query spanning several ``library_id``s."""
+
+    @pytest.mark.asyncio
+    async def test_spans_multiple_library_ids_and_skips_unvisited_ones(self, pg_source):
+        await write_compilation_track_identity_verdict(
+            pg_source,
+            library_id=1,
+            track_artist_raw="The Bug",
+            track_title_raw="Pressure",
+            source="discogs",
+            external_id="1",
+            confidence=1.0,
+            method="exact_match",
+            resolved_artist_name=None,
+        )
+        await write_compilation_track_identity_verdict(
+            pg_source,
+            library_id=2,
+            track_artist_raw="Juana Molina",
+            track_title_raw="La Paradoja",
+            source="musicbrainz",
+            external_id=None,
+            confidence=None,
+            method=None,
+            resolved_artist_name=None,
+        )
+
+        # library_id=999 was never visited; it should contribute zero rows,
+        # not error, alongside the two that were.
+        rows = await get_compilation_track_identity_for_libraries(pg_source, [1, 2, 999])
+
+        assert {row.library_id for row in rows} == {1, 2}
+        assert len(rows) == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_library_ids_returns_empty_without_a_round_trip(self, pg_source):
+        rows = await get_compilation_track_identity_for_libraries(pg_source, [])
         assert rows == []
