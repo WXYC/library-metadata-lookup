@@ -104,6 +104,16 @@ _SOURCE_TO_COLUMN: list[tuple[IdentitySource, str]] = [
     (IdentitySource.bandcamp, "bandcamp_id"),
 ]
 
+# The SAME fixed priority `_build_per_source_rows` already emits rows in
+# (`_SOURCE_TO_COLUMN` order), reindexed for O(1) lookup. This is the ONLY
+# tie-break `_composed_row_sort_key` uses below (review finding, LML#1021
+# follow-up) — deliberately NOT method or source name alphabetically, both
+# of which can disagree with this fixed priority and silently pick the
+# wrong row on a confidence tie.
+_SOURCE_PRIORITY: dict[IdentitySource, int] = {
+    source: priority for priority, (source, _) in enumerate(_SOURCE_TO_COLUMN)
+}
+
 
 def _identity_to_external_ids(identity: Identity) -> dict[IdentitySource, str]:
     """Pluck non-null external IDs off an Identity row, keyed by source.
@@ -279,10 +289,10 @@ def _has_cross_source_agreement(rows: list[_ComposedRow]) -> bool:
     return len(independent) >= 2
 
 
-def _composed_row_sort_key(row: _ComposedRow) -> tuple[float, str, str, str]:
+def _composed_row_sort_key(row: _ComposedRow) -> tuple[float, int]:
     """Canonical deterministic order for one credit's composed per-source
-    legs: confidence ascending, then method / source / external_id as a
-    fixed tie-break.
+    legs: confidence ascending, then `_SOURCE_PRIORITY`'s fixed index as the
+    ONLY tie-break.
 
     Review finding (LML#1021): a genuine cross-source confidence tie is
     reachable in production — `cache_trigram` corroboration on the Discogs
@@ -291,19 +301,48 @@ def _composed_row_sort_key(row: _ComposedRow) -> tuple[float, str, str, str]:
     bare `min(rows, key=lambda r: r.confidence)` "wins" such a tie by
     whichever row the caller's list happens to put first — which depends on
     database row order / query plan, not on any property of the data.
-    Sorting (or taking `min`/`max`) off this composite key instead makes the
-    pick a function of the DATA alone: the same set of rows always produces
-    the same winner, regardless of what order they arrived in. Both the
-    Rule-4 weakest-row selection (method/confidence, `_compose_confidence_and_method`)
+
+    An EARLIER version of this key tie-broke on `(method.value, source.value,
+    external_id)` alphabetically — this was itself a regression (review
+    finding, LML#1021 follow-up): at album grain, `_build_per_source_rows`
+    always emits its per-source rows in `_SOURCE_TO_COLUMN` order (discogs,
+    musicbrainz, wikidata, spotify, apple_music, bandcamp), and a log-less
+    ("inherited") leg is ALWAYS pinned at `exact_match`/1.00
+    (`_LEGACY_DEFAULT_METHOD`/`_LEGACY_DEFAULT_CONFIDENCE`) — so a real
+    logged leg (e.g. `manual`, a human override) tied with an inherited
+    placeholder at the same confidence would lose the pick whenever its
+    method sorted alphabetically after `'exact_match'` (most of them do —
+    'manual', 'name_variation', 'trigram' all do), even though the ORIGINAL
+    list-order tie-break would have picked whichever leg's SOURCE came
+    first in `_SOURCE_TO_COLUMN`, independent of method. Backend persists
+    the composed `method` verbatim into `library_identity`, so losing that
+    pick durably erases real evidence (e.g. a manual override) behind a
+    placeholder the code itself documents as a mere approximation.
+
+    Tie-breaking on `_SOURCE_PRIORITY` instead reproduces the ORIGINAL
+    list-order pick exactly (`_build_per_source_rows`'s output already IS in
+    that order, so the old `min()`'s "first occurrence" tie-break was really
+    a source-priority tie-break all along) while still being deterministic
+    independent of the CALLER's list order — the property LML#1021's track
+    grain needs, since its rows come from an `ORDER BY`-less-in-spirit
+    in-memory grouping rather than `_build_per_source_rows`'s fixed
+    iteration. `confidence` + source priority is already a TOTAL order: a
+    row's `source` is unique within one composed-rows list at BOTH grains
+    (`_build_per_source_rows` keys `external_ids` by `IdentitySource`; the
+    track-grain store's PK is `(library_id, track_artist, track_title,
+    source)`, so at most one row per source per credit) — no further
+    tie-break component is needed.
+
+    Both the Rule-4 weakest-row selection (`_compose_confidence_and_method`)
     and LML#1021's strongest-name-bearing-leg scan (`_compose_track_row`)
     key off this SAME tuple, so they can never desync over a tie.
     """
-    return (row.confidence, row.method.value, row.source.value, row.external_id)
+    return (row.confidence, _SOURCE_PRIORITY[row.source])
 
 
 def _compose_confidence_and_method(
     rows: list[_ComposedRow], *, allow_agreement: bool
-) -> tuple[IdentityMethod, float, _ComposedRow]:
+) -> tuple[IdentityMethod, float]:
     """Rules 2 + 4 of §3.4.1.1: MIN-of-confidences, optionally boosted by
     cross-source agreement.
 
@@ -318,30 +357,20 @@ def _compose_confidence_and_method(
     cross-reference step, and the store carries no wikidata QID to check
     one. Requires a non-empty `rows`.
 
-    Returns `(method, confidence, weakest_row)`. `weakest_row` is the
-    `_ComposedRow` that produced Rule 4's MIN confidence, picked
-    deterministically via `_composed_row_sort_key` — never a bare
-    `min(rows, key=lambda r: r.confidence)`, whose tie-break depends on
-    incidental list order (review finding). Returning the row (not just the
-    two scalars) lets a caller that also needs "the weakest row" — none
-    today at album grain, but LML#1021's track composer needs it for
-    `resolved_artist_name` bookkeeping — reuse this SAME pick instead of
-    recomputing its own `min()` that could silently desync from this one.
+    The weakest row is picked deterministically via `_composed_row_sort_key`
+    — never a bare `min(rows, key=lambda r: r.confidence)`, whose tie-break
+    depends on incidental list order (review finding).
     """
     weakest = min(rows, key=_composed_row_sort_key)
 
     if allow_agreement and _has_cross_source_agreement(rows):
-        return (
-            IdentityMethod.cross_source_agreement,
-            max(AGREEMENT_FLOOR, weakest.confidence),
-            weakest,
-        )
+        return IdentityMethod.cross_source_agreement, max(AGREEMENT_FLOOR, weakest.confidence)
 
     # Rule 4: MIN-of-confidences. The method is the per-source method of the
     # row whose confidence is minimal — matches §3.4.1.1's worked example
     # "Two sources, exact_match 1.00 + name_variation 0.92 -> name_variation
     # 0.92".
-    return weakest.method, weakest.confidence, weakest
+    return weakest.method, weakest.confidence
 
 
 def _compose_main(
@@ -373,10 +402,8 @@ def _compose_main(
             main.bandcamp_id = row.external_id
 
     # Rule 1 (manual override) is Backend's responsibility per the pivot
-    # decision; not applied here. Album grain has no use for "the weakest
-    # row" itself (main's per-source ids are populated from ALL rows above,
-    # not just the winner), so the third element is discarded.
-    composed_method, composed_confidence, _weakest_row = _compose_confidence_and_method(
+    # decision; not applied here.
+    composed_method, composed_confidence = _compose_confidence_and_method(
         rows, allow_agreement=True
     )
 
@@ -636,23 +663,25 @@ def _compose_track_row(
     composes to a null verdict with a populated (or empty) `sources[]` per
     `_store_row_to_composed`'s documented gap.
 
-    Returns `None` when the credit's raw artist text is blank (review
-    finding) — a data-quality anomaly on library.db's CTA export, never
-    expected in practice, but `BulkResolveTrackIdentity.artist_name` is a
-    required `minLength: 1` field on the wire, and constructing one with an
-    empty string would raise a pydantic `ValidationError` that — uncaught
-    anywhere in the per-input gather path — would 500 the ENTIRE
-    bulk-resolve batch over one bad row. The caller
-    (`_compose_track_entries`) drops a `None` from `tracks[]` and this
-    function logs a warning; every other credit on the release still
-    composes normally.
+    Returns `None` when the credit's raw artist text is blank OR
+    whitespace-only (review finding — a truthiness-only guard lets
+    `"   "` through, since it's a non-empty string) — a data-quality
+    anomaly on library.db's CTA export, never expected in practice, but
+    `BulkResolveTrackIdentity.artist_name` is a required `minLength: 1`
+    field on the wire, and constructing one with an empty (or
+    all-whitespace, functionally the same non-name) string would raise a
+    pydantic `ValidationError` that — uncaught anywhere in the per-input
+    gather path — would 500 the ENTIRE bulk-resolve batch over one bad row.
+    The caller (`_compose_track_entries`) drops a `None` from `tracks[]`
+    and this function logs a warning; every other credit on the release
+    still composes normally.
     """
     raw_artist, raw_title = _pick_raw_credit(rows)
-    if not raw_artist:
+    if not raw_artist.strip():
         logger.warning(
-            "compilation_track_identity: blank track_artist_raw for library_id=%d "
-            "track_artist=%r -- dropping this credit from tracks[] rather than "
-            "500ing the whole batch",
+            "compilation_track_identity: blank (or whitespace-only) track_artist_raw "
+            "for library_id=%d track_artist=%r -- dropping this credit from tracks[] "
+            "rather than 500ing the whole batch",
             rows[0].library_id,
             rows[0].track_artist,
         )
@@ -678,9 +707,7 @@ def _compose_track_row(
     # and sources[] echoes it in the same stable order. No independent
     # min()/max() call anywhere else in this function.
     ordered = sorted(composed, key=_composed_row_sort_key)
-    method, confidence, _weakest_row = _compose_confidence_and_method(
-        ordered, allow_agreement=False
-    )
+    method, confidence = _compose_confidence_and_method(ordered, allow_agreement=False)
 
     resolved_artist_name = next(
         (

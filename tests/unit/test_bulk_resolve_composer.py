@@ -228,6 +228,79 @@ async def test_two_independent_legs_with_name_variation_lifts_to_agreement_floor
 
 
 @pytest.mark.asyncio
+async def test_logged_leg_beats_inherited_placeholder_on_a_confidence_tie():
+    """Regression pin (review, LML#1021 follow-up): a logged leg (e.g. a
+    human `manual` override) must win Rule 4's weakest-row pick over a
+    log-less INHERITED placeholder tied at the same confidence -- never the
+    other way around.
+
+    `_build_per_source_rows` pins every log-less leg at
+    `_LEGACY_DEFAULT_METHOD`/`_LEGACY_DEFAULT_CONFIDENCE` (exact_match /
+    1.00), so a real `manual` leg landing at that SAME 1.00 confidence is a
+    routine, reachable tie -- not an edge case. A sort key that tie-breaks
+    on the alphabetical method string ('exact_match' < 'manual') picks the
+    placeholder over the real leg; the LML#1021 track-grain determinism fix
+    introduced exactly that bug by reusing an alphabetical-method key at
+    album grain too. The composed method Backend receives here is persisted
+    verbatim into `library_identity`, so losing this pick durably erases a
+    manual override.
+    """
+    identity = _make_identity(
+        discogs_artist_id=2154,
+        musicbrainz_artist_id="abc-def",
+    )
+    provenance = {
+        "discogs": ProvenanceRow(
+            source="discogs", external_id="2154", confidence=1.00, method="manual"
+        ),
+        # musicbrainz has NO provenance log row -> the inherited placeholder
+        # (exact_match / 1.00), tied with discogs's REAL 1.00 above.
+    }
+    result = await compose_for_identity(
+        library_id=20, identity=identity, entity_store=_store(provenance)
+    )
+
+    assert result.method is IdentityMethod.manual
+    assert result.confidence == 1.00
+
+
+@pytest.mark.asyncio
+async def test_discogs_beats_musicbrainz_on_a_source_priority_tie():
+    """Source priority ALONE governs Rule 4's tie-break here -- not "prefer
+    the logged leg". Roles are reversed from the test above: musicbrainz is
+    the LOGGED leg (`trigram`) and discogs is the INHERITED placeholder
+    (`exact_match`), both tied at 1.00. Discogs still wins, because
+    `_SOURCE_TO_COLUMN` puts it before musicbrainz -- exactly reproducing
+    the pre-LML#1021 list-order pick (`_build_per_source_rows` emits rows
+    in `_SOURCE_TO_COLUMN` order, so the original `min()`'s "first
+    occurrence" tie-break was really a source-priority tie-break all
+    along). This isolates that the tie-break is priority, not evidentiary
+    quality: the previous test's win could be read as "logged beats
+    inherited" by coincidence (discogs happened to be logged there too);
+    here the SAME source (discogs) wins despite being the WEAKER-evidence
+    leg, proving priority alone decides it.
+    """
+    identity = _make_identity(
+        discogs_artist_id=2154,
+        musicbrainz_artist_id="abc-def",
+    )
+    provenance = {
+        "musicbrainz": ProvenanceRow(
+            source="musicbrainz", external_id="abc-def", confidence=1.00, method="trigram"
+        ),
+        # discogs has NO provenance log row -> the inherited placeholder
+        # (exact_match / 1.00), tied with musicbrainz's REAL 1.00 above.
+    }
+    result = await compose_for_identity(
+        library_id=21, identity=identity, entity_store=_store(provenance)
+    )
+
+    assert result.method is IdentityMethod.exact_match  # discogs's inherited placeholder wins
+    assert result.confidence == 1.00
+    assert result.main.discogs_artist_id == 2154
+
+
+@pytest.mark.asyncio
 async def test_four_source_legacy_identity_does_not_inflate_via_rule_2():
     """Regression: a 4-source log-less legacy identity must NOT inflate.
 
@@ -871,7 +944,13 @@ class TestCompilationTracksFromStore:
         on the same _METHOD_CONFIDENCE[trigram] value the MB leg always
         uses) must resolve the same way regardless of which order the rows
         arrive in -- never Python's "first occurrence wins" `min()` riding
-        on incidental list/DB order (review finding)."""
+        on incidental list/DB order (review finding). The tie-break is
+        `_SOURCE_PRIORITY` (discogs before musicbrainz), NOT an alphabetical
+        comparison of method or source name (a follow-up review finding: an
+        earlier version of this fix used exactly that alphabetical key and
+        introduced a real album-grain regression -- see
+        `test_logged_leg_beats_inherited_placeholder_on_a_confidence_tie` in
+        this file)."""
         discogs_row = _track_row(
             track_artist="sessa",
             track_title="pequena vertigem de amor",
@@ -904,15 +983,21 @@ class TestCompilationTracksFromStore:
 
         assert forward.tracks == reversed_order.tracks
         track = forward.tracks[0]
-        # 'name_variation' < 'trigram' lexicographically -> MB is the
-        # deterministic "weakest" row on this tie; method/confidence come
-        # from it. The name is picked by scanning strongest-first from the
-        # SAME canonical order, landing on the Discogs leg's name.
-        assert track.method is IdentityMethod.name_variation
+        # discogs's _SOURCE_PRIORITY index (0) is lower than musicbrainz's
+        # (1) -> discogs is the deterministic "weakest" row on this tie;
+        # method/confidence come from it, independent of either leg's
+        # method string. The name is picked by scanning strongest-first
+        # (source-priority descending) from the SAME canonical order,
+        # landing on the MusicBrainz leg's name.
+        assert track.method is IdentityMethod.trigram
         assert track.confidence == 0.80
-        assert track.resolved_artist_name == "Sessa D"
+        assert track.resolved_artist_name == "Sessa MB"
         assert [s.source for s in track.sources] == [
             s.source for s in reversed_order.tracks[0].sources
+        ]
+        assert [s.source for s in track.sources] == [
+            IdentitySource.discogs,
+            IdentitySource.musicbrainz,
         ]
 
     def test_blank_raw_artist_credit_is_dropped_not_crashed(self):
@@ -933,6 +1018,43 @@ class TestCompilationTracksFromStore:
                 method="exact_match",
                 resolved_artist_name="Ghost Artist",
                 track_artist_raw="",
+                track_title_raw="Untitled",
+            ),
+            _track_row(
+                track_artist="stereolab",
+                track_title="brakhage",
+                source="discogs",
+                external_id="2",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Stereolab",
+                track_artist_raw="Stereolab",
+                track_title_raw="Brakhage",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        assert result.tracks_attempted is True
+        assert len(result.tracks) == 1
+        assert result.tracks[0].artist_name == "Stereolab"
+
+    def test_whitespace_only_raw_artist_credit_is_dropped_not_crashed(self):
+        """Review finding: the blank-credit guard above was truthiness-only
+        (`if not raw_artist`), so a whitespace-only `track_artist_raw`
+        (e.g. `"   "`) passed it -- non-empty string, but not a real name --
+        and became both `artist_name` and (via the raw-credit fallback)
+        `resolved_artist_name` on the wire. Same drop-with-warning treatment
+        as a genuinely empty string."""
+        rows = [
+            _track_row(
+                track_artist="",
+                track_title="untitled",
+                source="discogs",
+                external_id="1",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Ghost Artist",
+                track_artist_raw="   ",
                 track_title_raw="Untitled",
             ),
             _track_row(
