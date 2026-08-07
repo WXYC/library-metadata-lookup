@@ -11,7 +11,7 @@ Full design -- including the four findings that corrected the ticket's stated
 premises (F1-F4) and the design decisions (D1-D6) -- is in
 ``docs/plans/lml-1020-per-track-identity-matcher.md``.
 
-This module (slice 3) owns the matcher's pure/mockable core: CTA extraction
+This module owns the matcher's pure/mockable core (slice 3): CTA extraction
 + the F1 fail-fast shape check, the D4 whole-then-split credit cascade, the
 Discogs leg's D3 method/confidence mapping and three-outcome failure
 contract, and the MusicBrainz leg's floor/ambiguity rule. HTTP paging,
@@ -20,6 +20,11 @@ slice 5's CLI wrapper imports ``run_drain``/``make_post_batch``/``resolve_batch`
 from ``scripts.artist_resolve_drain.drain`` and supplies the fan-back from a
 resolved credit string to the ``(library_id, track_title)`` rows it came
 from, plus the D1 two-statement write.
+
+It also owns D5's position recovery (slice 4): a deterministic LATERAL join
+against the LML#1019 recall index (``lml_cache.compilation_track_location``)
+that fills ``track_position`` on rows this table's own matcher can never
+supply a position for (F1 -- CTA carries no position column at all).
 
 The Discogs leg is reached ONLY over ``POST /api/v1/artists/resolve/bulk``
 against the running LML service (F3) -- never by importing ``DiscogsService``
@@ -42,7 +47,8 @@ from typing import Any
 import aiosqlite
 
 from artists.resolver import InvalidNameError, _sanitize_name, _validate_name
-from entity.sources import PgSourceProtocol
+from entity.compilation_track_identity import write_compilation_track_identity_position
+from entity.sources import PgSource, PgSourceProtocol
 from generated.api_models import IdentityMethod
 from lookup.external_search import fetch_mb_artist_candidates
 
@@ -439,4 +445,113 @@ async def resolve_musicbrainz_credit(
         confidence=top["score"],
         resolved_artist_name=top["name"],
         method=IdentityMethod.trigram,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# D5: position recovery -- a local join against the LML#1019 recall index.
+#
+# 100% of positions come from this join, never from CTA (F1). The join spans
+# two independently-lossy things -- did the comp match a Discogs release at
+# all (recall-index COVERAGE), and does the CTA credit string agree with
+# Discogs's OWN tracklist spelling after normalization (CREDIT-STRING
+# AGREEMENT within a covered comp) -- so this reports them as two separate
+# stats. Conflating them would make a string-agreement problem look like a
+# coverage problem and send the fix in the wrong direction (D5).
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class PositionRecoveryStats:
+    """The D5 yield, split along its two independent axes.
+
+    ``recall_index_covered_library_ids / candidate_library_ids`` is recall-
+    index coverage; ``recovered_rows / candidate_rows`` (scoped to covered
+    comps by construction -- see :data:`_RECOVERABLE_POSITIONS_SQL`) is
+    credit-string agreement within those covered comps.
+    """
+
+    candidate_library_ids: int
+    recall_index_covered_library_ids: int
+    candidate_rows: int
+    recovered_rows: int
+
+
+_CANDIDATE_ROWS_SQL = """\
+SELECT library_id, track_artist, track_title, source
+FROM lml_cache.compilation_track_identity
+WHERE track_position IS NULL AND library_id = ANY($1)\
+"""
+
+_COVERED_LIBRARY_IDS_SQL = """\
+SELECT DISTINCT library_id
+FROM lml_cache.compilation_track_location
+WHERE library_id = ANY($1)\
+"""
+
+# The fan-out-collapse join (D5): the recall index's PK is
+# (library_id, track_position, track_artist) -- track_title is NOT in it, so
+# one (library_id, track_artist, track_title) triple can legitimately match
+# several recall-index rows (the same artist credited at two positions on
+# one comp, or two titles that collapse to the same normalized form). A
+# plain JOIN fans out and the fan-out lands as conflicting upserts on this
+# table's PK from a single credit. LATERAL with ORDER BY + LIMIT 1 picks one
+# row deterministically (content-derived, so re-runs are stable) instead.
+_RECOVERABLE_POSITIONS_SQL = """\
+SELECT cti.library_id, cti.track_artist, cti.track_title, cti.source, loc.track_position
+FROM lml_cache.compilation_track_identity cti
+JOIN LATERAL (
+    SELECT ctl.track_position
+    FROM lml_cache.compilation_track_location ctl
+    WHERE ctl.library_id = cti.library_id
+      AND ctl.track_artist = cti.track_artist
+      AND ctl.track_title = cti.track_title
+    ORDER BY ctl.track_position
+    LIMIT 1
+) loc ON true
+WHERE cti.track_position IS NULL
+  AND cti.library_id = ANY($1)\
+"""
+
+
+async def recover_track_positions(pg: PgSource, library_ids: list[int]) -> PositionRecoveryStats:
+    """Fill ``track_position`` on NULL-position identity rows for ``library_ids``.
+
+    Safe to re-run: :func:`entity.compilation_track_identity.write_compilation_track_identity_position`
+    only ever fills a NULL, never overwrites a populated position or touches
+    a verdict column (D1) -- including on an already-resolved row, so a
+    later run can still gain a position for a credit that resolved before
+    its comp entered the recall index (the scenario D1's split-statement
+    write exists for).
+
+    ``library_ids`` scopes the pass (e.g. the set the current backfill
+    session touched); an empty list is a no-op.
+    """
+    if not library_ids:
+        return PositionRecoveryStats(0, 0, 0, 0)
+
+    candidates = await pg.fetchall(_CANDIDATE_ROWS_SQL, library_ids)
+    candidate_library_ids = {row["library_id"] for row in candidates}
+    if not candidate_library_ids:
+        return PositionRecoveryStats(0, 0, len(candidates), 0)
+
+    covered_rows = await pg.fetchall(_COVERED_LIBRARY_IDS_SQL, list(candidate_library_ids))
+    covered_ids = {row["library_id"] for row in covered_rows}
+
+    recoverable = await pg.fetchall(_RECOVERABLE_POSITIONS_SQL, library_ids)
+    for row in recoverable:
+        await write_compilation_track_identity_position(
+            pg,
+            library_id=row["library_id"],
+            track_artist=row["track_artist"],
+            track_title=row["track_title"],
+            source=row["source"],
+            track_position=row["track_position"],
+        )
+
+    return PositionRecoveryStats(
+        candidate_library_ids=len(candidate_library_ids),
+        recall_index_covered_library_ids=len(candidate_library_ids & covered_ids),
+        candidate_rows=len(candidates),
+        recovered_rows=len(recoverable),
     )
