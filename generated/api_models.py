@@ -1435,7 +1435,7 @@ class BulkResolveProvenanceEntry(BaseModel):
     method: IdentityMethod
     confidence: confloat(ge=0.0, le=1.0) = Field(
         ...,
-        description="Per-source confidence in [0, 1], within the source's locked method range from §3.4.1. NULL when `external_id` is NULL — the source ran but produced no candidate, so confidence is undefined (not zero). When non-null, equal to or greater than the top-level `confidence` (composition rules either MIN or boost, never lower a per-source row).\n",
+        description="Per-source confidence in [0, 1], within the source's locked method range from §3.4.1. NULL when `external_id` is NULL — the source ran but produced no candidate, so confidence is undefined (not zero). When non-null, equal to or greater than the `confidence` of the object this entry hangs off — the composition rules either MIN or boost, and never lower a per-source row. That referent is grain-relative, because this schema is reused at two grains: under `BulkResolveResult.provenance` it is the result's own `confidence`, and under `BulkResolveTrackIdentity.sources` it is that track's `confidence`, not the result's. The two are unrelated — a `kind: compilation` result has no result-level `confidence` at all, while its tracks each have their own.\n",
     )
     external_id: str | None = Field(
         None,
@@ -1444,10 +1444,33 @@ class BulkResolveProvenanceEntry(BaseModel):
 
 
 class BulkResolveTrackIdentity(BaseModel):
-    track_position: str = Field(..., description="Track position; matches the request input.")
+    track_position: str = Field(
+        ...,
+        description='Track position as the source has it ("A1", "3", …). Required-but-nullable: the key is always present, and NULL says "no position is recoverable for this track" rather than "not echoed". Not a usable row identifier on its own — most of Backend\'s compilation-track rows are position-NULL (WXYC/Backend-Service#1989); join on `artist_name` + `track_title` instead.\n',
+    )
+    artist_name: constr(min_length=1) = Field(
+        ...,
+        description="Join-back echo of the per-track credit, verbatim, and the load-bearing half of the join key — never NULL, and never the empty string (`minLength: 1`, matching `CatalogCompilationTrackRow.artist_name`, since an empty join key is indistinguishable from a missing one). No `maxLength` here, unlike the CTA read/write shapes: those bound one physical `varchar(255)` column, while this field is dual-mode and the `kind: single_artist` arm carries a source credit that no WXYC column bounds. A cap the sources don't respect would turn a long credit into a decode failure. Dual-mode: for `kind: compilation` it echoes the `compilation_track_artist` row as exported in library.db, so a consumer can match it to its own CTA row; for `kind: single_artist` there is no CTA row and it carries the credit as LML's source has it.\n",
+    )
+    track_title: str = Field(
+        ...,
+        description="Join-back echo of the track title, completing the join key. Dual-mode in the same way as `artist_name` — the library.db CTA row's title for `kind: compilation`, the source's track title for `kind: single_artist`. NULL when that row or source carries no title (the underlying CTA column is nullable).\n",
+    )
+    resolved_artist_name: str = Field(
+        ...,
+        description="The composed canonical artist for this track — the per-track analogue of `BulkResolveResult.main`, carried as a name because LML does not know Backend's artist ids; consumers map it to their own artist tables locally. NULL when the matcher visited this track and resolved nothing: the entry is still returned so consumers see the leg ran (same convention as `BulkResolveProvenanceEntry.external_id`), and `confidence` and `method` are NULL alongside it.\n",
+    )
+    confidence: confloat(ge=0.0, le=1.0) = Field(
+        ...,
+        description="Composed track-level confidence in [0, 1] — where LML#1021's per-track composition lands (cross-source agreement boost, MIN-of-confidences fallback), applied at track grain exactly as `BulkResolveResult.confidence` applies at album grain. NULL when `resolved_artist_name` is NULL — the matcher ran and produced no verdict, so confidence is undefined (not zero).\n",
+    )
+    method: IdentityMethod = Field(
+        ...,
+        description="The composed track-level method — typically the strongest leg's method, or `cross_source_agreement` when LML#1021's boost fired. NULL when `resolved_artist_name` is NULL.\n",
+    )
     sources: list[BulkResolveProvenanceEntry] = Field(
         ...,
-        description="One per-source row per source LML composed the track from. Empty array means LML attempted resolution at track grain and found no matches.\n",
+        description="One per-source row per source LML composed the track from — audit detail, and the track-grain analogue of `BulkResolveResult.provenance`. Empty array means no source produced a row at track grain at all. That is a different statement from a populated array whose entries carry NULL `external_id`: there, the legs ran and reported no candidate. Read the verdict off `resolved_artist_name`, not off this array's length — an empty `sources` and a `sources` full of NULL-`external_id` legs both accompany a NULL `resolved_artist_name`.\n",
     )
 
 
@@ -1470,9 +1493,13 @@ class BulkResolveResult(BaseModel):
         ...,
         description="Per-source rows feeding LML's composition. Always present; empty array means LML attempted the cascade and no source produced a row above the §3.4.1.1 Rule 6 floor.\n",
     )
+    tracks_attempted: bool | None = Field(
+        None,
+        description='Whether LML\'s per-track matcher has visited this row — `true` once it has run, **regardless of how many tracks it resolved**, including none. This is the resolved signal for per-track identity; `tracks.length` is not (WXYC/Backend-Service#1991).\n\nRead it with `tracks` as a pair, four states in total: **absent or NULL** — the caller did not ask (`include_tracks` false or omitted), or the result is `kind: unresolved`, and `tracks` is in the same state; **`false` with an empty `tracks`** — the caller asked and the matcher has not reached this row; **`true` with an empty `tracks`** — the matcher ran and resolved nothing; **`true` with a populated `tracks`** — the matcher ran and produced entries. `false` alongside a populated `tracks` is not a state; producers must not emit it.\n\nThe middle two are what this field exists for. They are byte-identical in `tracks`, they are not rare — a `kind: single_artist` release LML holds no tracklist for is the ordinary case, and extending the gate to that kind is the whole point of #297 — and a consumer that reads emptiness as "not yet visited" re-asks every one of them on every pass, forever. That is the re-asking pathology `kind: unresolved` was made a first-class outcome to prevent, reintroduced at track grain. A consumer cannot repair it locally, because the two states are indistinguishable on the wire without this field.\n\nAbsent and NULL are one state, for the same producer reason as `tracks` below.\n',
+    )
     tracks: list[BulkResolveTrackIdentity] | None = Field(
         None,
-        description="Set only for `kind: compilation`; absent for every other `kind`. Empty array when LML has no per-track data for the V/A row yet. Two states (present-array or absent), not three.\n",
+        description='Per-track identity, returned only when the request set `include_tracks: true`. That flag — not `kind` — gates the field, and it gates it on both `kind: single_artist` and `kind: compilation` (#297); `kind: unresolved` never carries tracks. The array carries the entries; **it does not carry the state** — an empty array means the matcher found nothing *or* has not run, and only `tracks_attempted` separates those. See that field for the four states of the pair. Entries whose `resolved_artist_name` is NULL are tracks the matcher tried and failed on ("the leg ran", the same convention as `BulkResolveProvenanceEntry.external_id`), so a populated array is per-track detail rather than a per-track guarantee.\n\nAbsent and NULL are the same state, deliberately. LML builds every non-track result with `tracks=None` and serves the endpoint through FastAPI\'s `response_model` without `response_model_exclude_none`, so the wire has always carried `"tracks": null` rather than omitting the key. `nullable: true` documents the shipped producer instead of describing a wire nobody emits; consumers must accept both spellings.\n',
     )
 
 
@@ -2716,6 +2743,10 @@ class BulkResolveLibrariesRequest(BaseModel):
         description="Inputs to resolve. Order preserved in `BulkResolveLibrariesResponse.results`.\n",
         max_length=1000,
         min_length=1,
+    )
+    include_tracks: bool | None = Field(
+        None,
+        description="Opt in to per-track identity, for every input in the batch (the flag is batch-level, not per-input). Omitting the field means `false`; it carries no schema-level `default` on purpose, because `openapi-typescript` emits a default-bearing property as non-optional even when it is absent from `required`, which would force every TypeScript caller to pass the one field whose whole contract is that you need not. When `false` or omitted — the default, and what an un-upgraded caller sends — `BulkResolveResult.tracks` is absent from every result, so an album-identity drain pays nothing for track composition it would discard. When `true`, LML composes per-track identity for both `kind: single_artist` and `kind: compilation` results and sets `tracks_attempted` on each of them; `kind: unresolved` never carries either field. See `BulkResolveResult.tracks_attempted` for the four states the pair distinguishes, and why the array's length is not one of them.\n\nThe flag is batch-level by design, and the payload it admits is not bounded by the schema — `inputs` still caps at 1,000 either way. A caller that can classify its own rows should partition its drains rather than send a mixed page: Backend holds both signals LML auto-detects on (`library.code_volume_letters LIKE 'Z%'`, `EXISTS compilation_track_artist`), so WXYC/Backend-Service#1991 runs a small-paged V/A drain separately from a full-width non-V/A one. A per-input flag was considered and rejected as mechanism for a problem the one consumer can solve locally.\n",
     )
 
 
