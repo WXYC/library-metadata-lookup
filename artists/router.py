@@ -319,7 +319,7 @@ async def resolve_bulk(
     )
 
     names = [n.root for n in request.names]
-    dry_run = bool(request.dry_run)
+    dry_run = request.dry_run
     logger.info("artist-resolve bulk start: names=%d dry_run=%s", len(names), dry_run)
 
     # Per-request telemetry bracket: `search_artists` records API calls into
