@@ -64,17 +64,20 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import aiosqlite
+import httpx
 from wxyc_etl.text import to_match_form
 
 from artists.resolver import InvalidNameError, _sanitize_name, _validate_name
 from entity.compilation_track_identity import (
-    write_compilation_track_identity_position,
+    fill_compilation_track_identity_positions_from_recall_index,
+    get_compilation_track_identity_misses,
     write_compilation_track_identity_verdict,
 )
 from entity.sources import PgSource, PgSourceProtocol
 from generated.api_models import IdentityMethod
 from lookup.external_search import fetch_mb_artist_candidates
-from scripts.artist_resolve_drain.drain import PAGE_SIZE, chunk
+from scripts.artist_resolve_drain.drain import _TERMINAL_REASONS, PAGE_SIZE, chunk
+from scripts.artist_resolve_drain.report import sample_spot_check
 
 logger = logging.getLogger("backfill_compilation_track_identity")
 
@@ -268,6 +271,21 @@ _METHOD_CONFIDENCE: dict[IdentityMethod, float] = {
     IdentityMethod.trigram: 0.80,
 }
 
+# The D4 split lane's own entry in that mapping. A split-derived verdict is the
+# ONE case where the resolved id does not belong to the string the row is keyed
+# on: the key is the whole CTA credit ("Chico Science & Nação Zumbi") while the
+# id belongs to one part of it ("Chico Science"). Carrying the part's own
+# method/confidence through would record that as `exact_match`/1.00 --
+# top-tier evidence for the weakest lane in the cascade, indistinguishable
+# from a genuine whole-string exact hit. `member_group` is the wire method
+# that actually describes the relationship (the resolved artist is one
+# participant in the credited joint entity), and the confidence sits strictly
+# below every whole-string value -- including `trigram`, since D4 only splits
+# AFTER the whole string has already missed -- while staying above the
+# album-level 0.70 sidecar floor.
+_SPLIT_DERIVED_METHOD = IdentityMethod.member_group
+_SPLIT_DERIVED_CONFIDENCE = 0.75
+
 
 def derive_identity_method(cache_corroboration: Sequence[str]) -> IdentityMethod:
     """D3's IdentityMethod derivation from a resolved ``ArtistResolveResult``.
@@ -286,32 +304,55 @@ def derive_identity_method(cache_corroboration: Sequence[str]) -> IdentityMethod
     return IdentityMethod.exact_match
 
 
+_MISS = DiscogsCreditVerdict(
+    external_id=None, confidence=None, method=None, resolved_artist_name=None
+)
+
+
 def discogs_verdict_from_resolve_result(result: dict[str, Any]) -> DiscogsCreditVerdict | None:
     """Map one ``ArtistResolveResult`` (as JSON) onto D3's three-outcome contract.
 
-    Returns ``None`` for ``escalation_unavailable`` -- the leg was never
-    successfully consulted (breaker shed / 429 / 5xx-after-retries / no
-    token), so the caller must write NO discogs row at all. Returns a MISS
-    verdict (``external_id=None``) for ``not_found`` / ``ambiguous`` -- the
-    leg ran and measured a genuine zero or a doubt, both of which are
-    attempt rows. Returns a resolved verdict otherwise, with ``method``
-    derived via :func:`derive_identity_method` and ``confidence`` looked up
-    from :data:`_METHOD_CONFIDENCE`.
+    Returns a resolved verdict when the endpoint produced an id, with
+    ``method`` derived via :func:`derive_identity_method` and ``confidence``
+    looked up from :data:`_METHOD_CONFIDENCE`.
+
+    Otherwise the reason decides, and it decides against an **allowlist**, not
+    a denylist. Only the sibling drain's ``_TERMINAL_REASONS`` --
+    ``not_found`` and ``ambiguous``, the verdicts that will not change on a
+    re-page -- mean "the leg ran and answered with nothing", which is what a
+    miss row (``external_id=None``) asserts. Every other reason returns
+    ``None``: the caller writes NO discogs row at all, so the credit stays in
+    the ``--incremental`` cohort and is simply re-asked next run.
+
+    The direction matters because D2 makes negative evidence durable and D10
+    makes a non-empty ``tracks[]`` a resolved signal for
+    WXYC/Backend-Service#1991. A denylist keyed on ``escalation_unavailable``
+    would silently turn any reason the endpoint grows LATER into permanent
+    negative evidence for a credit Discogs may never have been asked about;
+    an allowlist fails the other way, costing at most a re-ask. Unrecognized
+    reasons are logged rather than swallowed, since a new terminal reason
+    upstream is a mapping this module owes an update.
     """
-    if result.get("unresolved_reason") == "escalation_unavailable":
-        return None
     discogs_artist_id = result.get("discogs_artist_id")
-    if discogs_artist_id is None:
+    if discogs_artist_id is not None:
+        method = derive_identity_method(result.get("cache_corroboration") or [])
         return DiscogsCreditVerdict(
-            external_id=None, confidence=None, method=None, resolved_artist_name=None
+            external_id=str(discogs_artist_id),
+            confidence=_METHOD_CONFIDENCE[method],
+            method=method,
+            resolved_artist_name=result.get("canonical_name"),
         )
-    method = derive_identity_method(result.get("cache_corroboration") or [])
-    return DiscogsCreditVerdict(
-        external_id=str(discogs_artist_id),
-        confidence=_METHOD_CONFIDENCE[method],
-        method=method,
-        resolved_artist_name=result.get("canonical_name"),
-    )
+    reason = result.get("unresolved_reason")
+    if reason in _TERMINAL_REASONS:
+        return _MISS
+    if reason != "escalation_unavailable":
+        logger.warning(
+            "unrecognized unresolved_reason %r for %r -- writing no discogs row (it will be "
+            "re-asked). Add it to the D3 mapping if it is a terminal verdict.",
+            reason,
+            result.get("name"),
+        )
+    return None
 
 
 def _index_results_by_name(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -322,46 +363,64 @@ async def resolve_discogs_credits(
     post_batch: PostBatch,
     credits: Sequence[str],
     *,
-    dry_run: bool = False,
+    dry_run: bool = True,
+    raw_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, DiscogsCreditVerdict]:
     """The D4 cascade over one page of DISTINCT credit strings.
 
-    Issues at most two ``post_batch`` calls regardless of input size -- one
-    for the whole-string pass, one for the union of split parts of whatever
-    missed. Callers (slice 5's fan-back) are responsible for pre-paging
-    ``credits`` to the endpoint's cap (``PAGE_SIZE``, 25) before calling this
-    function; an oversized page risks exceeding that cap on the split pass
-    if many whole-string entries miss and split.
+    ``dry_run`` defaults to ``True`` -- the mode that does NOT mint into the
+    discogs-cache-owned ``entity.identity``. Minting is the consequential
+    mode, so it is the one a caller has to ask for by name; a default of
+    ``False`` would make an omitted keyword the live-write path.
 
-    A credit ABSENT from the returned mapping means "no row at all" --
-    either it was never sent (an invalid/unresolvable credit is instead
-    written as an immediate miss verdict below) — actually the reverse: an
-    invalid credit IS present, mapped to a miss, since the leg conceptually
-    "ran" against ungood input and found nothing resolvable (mirrors
-    ``InvalidNameError``'s D3 row: "the name has no identity content" is
-    still a miss, not silence). A credit is absent only when the whole-string
-    attempt (or, if split, every split part) came back
-    ``escalation_unavailable``.
+    **Every POST is chunked to** :data:`PAGE_SIZE` (the endpoint's ``names``
+    ``maxItems`` cap). The whole-string pass pages ``credits``, and the split
+    pass pages the union of split parts independently -- a page of 25 joint
+    credits that all miss whole-string unions into far more than 25 parts,
+    which the endpoint answers with a 413 that ``make_post_batch`` does not
+    retry (4xx is a misconfig, not a transient fault), deterministically
+    killing the drain at the same page on every re-run.
+
+    A credit ABSENT from the returned mapping means "write no row at all":
+    the whole-string attempt (and, if it split, every split part) came back
+    with a non-terminal verdict, so the source was never successfully
+    consulted (D3). An invalid credit is NOT absent -- it maps to a miss,
+    since ``InvalidNameError``'s D3 row is "the name has no identity
+    content", which is an answer.
 
     Where splitting resolves more than one side to different artists, the
     FIRST part (in split order) that resolves wins -- deterministic, since
     the grain stays one row per CTA credit (D4) and there is no schema slot
-    for two ids on one row.
+    for two ids on one row. A split-derived verdict is re-stamped with
+    :data:`_SPLIT_DERIVED_METHOD` / :data:`_SPLIT_DERIVED_CONFIDENCE` rather
+    than carrying the part's own: the id belongs to the part, while the row
+    is keyed on the whole credit, and that gap must be visible to LML#1021's
+    composer instead of masquerading as a whole-string exact hit.
+
+    ``raw_results``, when given, collects the endpoint's verbatim
+    whole-string verdicts so the caller can feed the sibling drain's
+    ``sample_spot_check`` sampler. Split-pass verdicts are deliberately not
+    sampled: their ids are attributed to a DIFFERENT string than the one the
+    reviewer would see, which is a wrong-mint review of its own kind and
+    would make the table misleading.
     """
     distinct = list(dict.fromkeys(credits))
     verdicts: dict[str, DiscogsCreditVerdict] = {}
 
     invalid = {credit for credit in distinct if not is_resolvable_credit(credit)}
     for credit in invalid:
-        verdicts[credit] = DiscogsCreditVerdict(
-            external_id=None, confidence=None, method=None, resolved_artist_name=None
-        )
+        verdicts[credit] = _MISS
 
     resolvable = [credit for credit in distinct if credit not in invalid]
     if not resolvable:
         return verdicts
 
-    whole_results = _index_results_by_name(await post_batch(resolvable, dry_run))
+    whole_results: dict[str, dict[str, Any]] = {}
+    for page in chunk(resolvable, PAGE_SIZE):
+        results = await post_batch(page, dry_run)
+        if raw_results is not None:
+            raw_results.extend(results)
+        whole_results.update(_index_results_by_name(results))
 
     miss_names: list[str] = []
     for credit in resolvable:
@@ -372,7 +431,7 @@ async def resolve_discogs_credits(
             continue
         verdict = discogs_verdict_from_resolve_result(result)
         if verdict is None:
-            continue  # escalation_unavailable -- no row, no split attempted
+            continue  # never consulted -- no row, no split attempted
         if verdict.external_id is not None:
             verdicts[credit] = verdict
         else:
@@ -383,9 +442,9 @@ async def resolve_discogs_credits(
     all_parts = [part for part in all_parts if is_resolvable_credit(part)]
 
     part_verdicts: dict[str, DiscogsCreditVerdict] = {}
-    if all_parts:
-        part_results = _index_results_by_name(await post_batch(all_parts, dry_run))
-        for part in all_parts:
+    for page in chunk(all_parts, PAGE_SIZE):
+        part_results = _index_results_by_name(await post_batch(page, dry_run))
+        for part in page:
             result = part_results.get(part)
             if result is None:
                 continue
@@ -397,8 +456,15 @@ async def resolve_discogs_credits(
         winner = next(
             (part_verdicts[part] for part in split_map[credit] if part in part_verdicts), None
         )
-        verdicts[credit] = winner or DiscogsCreditVerdict(
-            external_id=None, confidence=None, method=None, resolved_artist_name=None
+        verdicts[credit] = (
+            DiscogsCreditVerdict(
+                external_id=winner.external_id,
+                confidence=_SPLIT_DERIVED_CONFIDENCE,
+                method=_SPLIT_DERIVED_METHOD,
+                resolved_artist_name=winner.resolved_artist_name,
+            )
+            if winner is not None
+            else _MISS
         )
 
     return verdicts
@@ -472,11 +538,24 @@ async def resolve_musicbrainz_credit(
     top = ranked[0]
     if top["score"] < _MB_SIMILARITY_FLOOR:
         return _MB_MISS
-    if len(ranked) > 1 and (top["score"] - ranked[1]["score"]) < _MB_AMBIGUITY_BAND:
+    # Only a runner-up that would ITSELF have been acceptable can create doubt.
+    # A near-tie between two candidates that are both below the floor is not an
+    # ambiguity -- neither is a contender -- and vetoing on one would discard a
+    # clear winner because of a row that could never have won.
+    contenders = [c for c in ranked[1:] if c["score"] >= _MB_SIMILARITY_FLOOR]
+    if contenders and (top["score"] - contenders[0]["score"]) < _MB_AMBIGUITY_BAND:
         return _MB_MISS
     return MusicBrainzCreditVerdict(
         external_id=str(top["id"]),
-        confidence=top["score"],
+        # NOT the raw pg_trgm similarity. `confidence` is compared across
+        # `sources[]` by LML#1021's composer, and a similarity score and a
+        # method-derived confidence are different scales -- storing an MB
+        # acceptance at 0.76 next to a Discogs `trigram` row at 0.80 would
+        # read as "the MB match is weaker" when both cleared their own leg's
+        # bar. One method, one confidence: the acceptance is what is being
+        # recorded, and its strength is the method's, from the single
+        # method->confidence table.
+        confidence=_METHOD_CONFIDENCE[IdentityMethod.trigram],
         resolved_artist_name=top["name"],
         method=IdentityMethod.trigram,
     )
@@ -500,19 +579,22 @@ class PositionRecoveryStats:
     """The D5 yield, split along its two independent axes.
 
     ``recall_index_covered_library_ids / candidate_library_ids`` is recall-
-    index coverage; ``recovered_rows / candidate_rows`` (scoped to covered
-    comps by construction -- see :data:`_RECOVERABLE_POSITIONS_SQL`) is
-    credit-string agreement within those covered comps.
+    index coverage; ``recovered_rows / covered_candidate_rows`` is credit-
+    string agreement within those covered comps. The agreement denominator
+    counts ONLY rows whose comp the recall index covers -- a NULL-position
+    row on an uncovered comp says nothing about how well CTA credit strings
+    agree with Discogs's tracklist spellings, and folding it in would make a
+    coverage problem read as a string-agreement problem (D5).
     """
 
     candidate_library_ids: int
     recall_index_covered_library_ids: int
-    candidate_rows: int
+    covered_candidate_rows: int
     recovered_rows: int
 
 
 _CANDIDATE_ROWS_SQL = """\
-SELECT library_id, track_artist, track_title, source
+SELECT library_id
 FROM lml_cache.compilation_track_identity
 WHERE track_position IS NULL AND library_id = ANY($1)\
 """
@@ -523,43 +605,42 @@ FROM lml_cache.compilation_track_location
 WHERE library_id = ANY($1)\
 """
 
-# The fan-out-collapse join (D5): the recall index's PK is
-# (library_id, track_position, track_artist) -- track_title is NOT in it, so
-# one (library_id, track_artist, track_title) triple can legitimately match
-# several recall-index rows (the same artist credited at two positions on
-# one comp, or two titles that collapse to the same normalized form). A
-# plain JOIN fans out and the fan-out lands as conflicting upserts on this
-# table's PK from a single credit. LATERAL with ORDER BY + LIMIT 1 picks one
-# row deterministically (content-derived, so re-runs are stable) instead.
-_RECOVERABLE_POSITIONS_SQL = """\
-SELECT cti.library_id, cti.track_artist, cti.track_title, cti.source, loc.track_position
-FROM lml_cache.compilation_track_identity cti
-JOIN LATERAL (
-    SELECT ctl.track_position
-    FROM lml_cache.compilation_track_location ctl
-    WHERE ctl.library_id = cti.library_id
-      AND ctl.track_artist = cti.track_artist
-      AND ctl.track_title = cti.track_title
-    ORDER BY ctl.track_position
-    LIMIT 1
-) loc ON true
-WHERE cti.track_position IS NULL
-  AND cti.library_id = ANY($1)\
+_NULL_POSITION_LIBRARY_IDS_SQL = """\
+SELECT DISTINCT library_id
+FROM lml_cache.compilation_track_identity
+WHERE track_position IS NULL\
 """
+
+
+async def load_null_position_library_ids(pg: PgSource) -> list[int]:
+    """Every ``library_id`` with at least one NULL-position identity row.
+
+    The population for a standalone ``--recover-positions`` pass. Recovery is
+    a local join (D5) costing zero external calls, so its natural scope is
+    "everything still missing a position" -- independent of which credits any
+    resolve session touched. Without this entry point, a comp that entered
+    the recall index AFTER its credits were fully attempted would be
+    unreachable: ``--incremental`` selects zero credits on a drained
+    population, so the session-scoped recovery pass never runs (the exact
+    late-arrival scenario D1's fill-only-NULL statement exists for).
+    """
+    rows = await pg.fetchall(_NULL_POSITION_LIBRARY_IDS_SQL)
+    return sorted(row["library_id"] for row in rows)
 
 
 async def recover_track_positions(pg: PgSource, library_ids: list[int]) -> PositionRecoveryStats:
     """Fill ``track_position`` on NULL-position identity rows for ``library_ids``.
 
-    Safe to re-run: :func:`entity.compilation_track_identity.write_compilation_track_identity_position`
+    Safe to re-run: the set-based fill
+    (:func:`entity.compilation_track_identity.fill_compilation_track_identity_positions_from_recall_index`)
     only ever fills a NULL, never overwrites a populated position or touches
     a verdict column (D1) -- including on an already-resolved row, so a
     later run can still gain a position for a credit that resolved before
-    its comp entered the recall index (the scenario D1's split-statement
-    write exists for).
+    its comp entered the recall index.
 
-    ``library_ids`` scopes the pass (e.g. the set the current backfill
-    session touched); an empty list is a no-op.
+    ``library_ids`` scopes the pass: the set the current backfill session
+    touched, or :func:`load_null_position_library_ids` for a standalone
+    ``--recover-positions`` pass. An empty list is a no-op.
     """
     if not library_ids:
         return PositionRecoveryStats(0, 0, 0, 0)
@@ -567,27 +648,19 @@ async def recover_track_positions(pg: PgSource, library_ids: list[int]) -> Posit
     candidates = await pg.fetchall(_CANDIDATE_ROWS_SQL, library_ids)
     candidate_library_ids = {row["library_id"] for row in candidates}
     if not candidate_library_ids:
-        return PositionRecoveryStats(0, 0, len(candidates), 0)
+        return PositionRecoveryStats(0, 0, 0, 0)
 
     covered_rows = await pg.fetchall(_COVERED_LIBRARY_IDS_SQL, list(candidate_library_ids))
     covered_ids = {row["library_id"] for row in covered_rows}
+    covered_candidate_rows = sum(1 for row in candidates if row["library_id"] in covered_ids)
 
-    recoverable = await pg.fetchall(_RECOVERABLE_POSITIONS_SQL, library_ids)
-    for row in recoverable:
-        await write_compilation_track_identity_position(
-            pg,
-            library_id=row["library_id"],
-            track_artist=row["track_artist"],
-            track_title=row["track_title"],
-            source=row["source"],
-            track_position=row["track_position"],
-        )
+    filled = await fill_compilation_track_identity_positions_from_recall_index(pg, library_ids)
 
     return PositionRecoveryStats(
         candidate_library_ids=len(candidate_library_ids),
         recall_index_covered_library_ids=len(candidate_library_ids & covered_ids),
-        candidate_rows=len(candidates),
-        recovered_rows=len(recoverable),
+        covered_candidate_rows=covered_candidate_rows,
+        recovered_rows=len(filled),
     )
 
 
@@ -653,12 +726,6 @@ FROM lml_cache.compilation_track_identity
 WHERE source = $1\
 """
 
-_MISS_KEYS_SQL = """\
-SELECT DISTINCT library_id, track_artist, track_title
-FROM lml_cache.compilation_track_identity
-WHERE source = $1 AND external_id IS NULL\
-"""
-
 
 async def load_attempted_keys(pg: PgSource, source: str) -> set[tuple[int, str, str]]:
     """Every ``(library_id, track_artist, track_title)`` this ``source`` has a row for at all."""
@@ -667,9 +734,15 @@ async def load_attempted_keys(pg: PgSource, source: str) -> set[tuple[int, str, 
 
 
 async def load_miss_keys(pg: PgSource, source: str) -> set[tuple[int, str, str]]:
-    """Every ``(library_id, track_artist, track_title)`` this ``source`` attempted and missed."""
-    rows = await pg.fetchall(_MISS_KEYS_SQL, source)
-    return {(row["library_id"], row["track_artist"], row["track_title"]) for row in rows}
+    """Every ``(library_id, track_artist, track_title)`` this ``source`` attempted and missed.
+
+    A projection of :func:`entity.compilation_track_identity.get_compilation_track_identity_misses`
+    -- the store helper is the ONE definition of the miss cohort (D2), and this
+    wrapper only reshapes its rows into the key set
+    :func:`filter_by_attempted_keys`'s sibling selection logic consumes.
+    """
+    rows = await get_compilation_track_identity_misses(pg, source=source)
+    return {(row.library_id, row.track_artist, row.track_title) for row in rows}
 
 
 @dataclass(frozen=True)
@@ -700,6 +773,7 @@ async def run_backfill(
     musicbrainz_credits: Sequence[CtaCredit] | None = None,
     recover_positions: bool = True,
     shutdown: ShutdownFlagProtocol | None = None,
+    raw_results: list[dict[str, Any]] | None = None,
 ) -> BackfillStats:
     """Drive one pass: resolve, fan back, write, recover positions.
 
@@ -728,6 +802,18 @@ async def run_backfill(
     HTTP call, writes what it already resolved, and returns early. Per D2,
     the credits left unattempted are simply picked up by the next
     ``--incremental`` invocation; there is no separate resume state to save.
+
+    **Verdicts are persisted page-by-page, not session-end.** Each Discogs
+    page's fan-back rows are written before the next page is fetched, and
+    each MusicBrainz verdict is written as it is produced -- that is what
+    makes the module docstring's loss bound ("a crash loses at most one
+    in-flight page") true rather than aspirational. For the same reason an
+    ``httpx.HTTPError`` from the Discogs leg is caught at the page boundary
+    and ends the pass gracefully (mirroring ``run_drain``'s
+    degrade-not-crash posture): the pages already resolved are already in
+    PG, and the rest of the population stays in the ``--incremental``
+    cohort. ``raw_results``, when given, collects the endpoint's verbatim
+    whole-string verdicts for the ``sample_spot_check`` review table.
     """
     discogs_credits = list(credits if discogs_credits is None else discogs_credits)
     musicbrainz_credits = list(credits if musicbrainz_credits is None else musicbrainz_credits)
@@ -735,13 +821,56 @@ async def run_backfill(
     by_artist_discogs = group_credits_by_artist(discogs_credits)
     by_artist_mb = group_credits_by_artist(musicbrainz_credits) if mb_pg is not None else {}
 
+    rows_written = 0
+    touched_library_ids: set[int] = set()
+
+    async def write_fan_back(
+        source: str,
+        artist: str,
+        group: list[CtaCredit],
+        verdict: DiscogsCreditVerdict | MusicBrainzCreditVerdict,
+    ) -> None:
+        nonlocal rows_written
+        for credit in group:
+            await write_compilation_track_identity_verdict(
+                pg,
+                library_id=credit.library_id,
+                track_artist_raw=credit.track_artist,
+                track_title_raw=credit.track_title,
+                source=source,
+                external_id=verdict.external_id,
+                confidence=verdict.confidence,
+                method=verdict.method,
+                resolved_artist_name=verdict.resolved_artist_name,
+            )
+            rows_written += 1
+            touched_library_ids.add(credit.library_id)
+
     discogs_verdicts: dict[str, DiscogsCreditVerdict] = {}
     for page in chunk(list(by_artist_discogs), PAGE_SIZE):
         if shutdown is not None and shutdown.requested:
             logger.info("shutdown requested; stopping the Discogs pass early")
             break
-        page_verdicts = await resolve_discogs_credits(post_batch, page, dry_run=dry_run_http)
+        try:
+            page_verdicts = await resolve_discogs_credits(
+                post_batch, page, dry_run=dry_run_http, raw_results=raw_results
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Discogs pass aborted at a page boundary (%s: %s). Pages resolved before "
+                "this one are already persisted; this page's credits and the rest of the "
+                "population stay in the --incremental cohort for the next run.",
+                type(exc).__name__,
+                exc,
+            )
+            break
         discogs_verdicts.update(page_verdicts)
+        if not dry_run_write:
+            for artist in page:
+                verdict = page_verdicts.get(artist)
+                if verdict is None:
+                    continue
+                await write_fan_back("discogs", artist, by_artist_discogs[artist], verdict)
 
     musicbrainz_verdicts: dict[str, MusicBrainzCreditVerdict | None] = {}
     if mb_pg is None and musicbrainz_credits:
@@ -750,52 +879,24 @@ async def run_backfill(
             "entirely for this pass (no row written for any credit, per D3)"
         )
     elif mb_pg is not None:
-        for artist in by_artist_mb:
+        for artist, group in by_artist_mb.items():
             if shutdown is not None and shutdown.requested:
                 logger.info("shutdown requested; stopping the MusicBrainz pass early")
                 break
-            musicbrainz_verdicts[artist] = await resolve_musicbrainz_credit(mb_pg, artist)
-
-    rows_written = 0
-    touched_library_ids: set[int] = set()
-    if not dry_run_write:
-        for artist, group in by_artist_discogs.items():
-            verdict = discogs_verdicts.get(artist)
-            if verdict is None:
-                continue
-            for credit in group:
-                await write_compilation_track_identity_verdict(
-                    pg,
-                    library_id=credit.library_id,
-                    track_artist_raw=credit.track_artist,
-                    track_title_raw=credit.track_title,
-                    source="discogs",
-                    external_id=verdict.external_id,
-                    confidence=verdict.confidence,
-                    method=verdict.method,
-                    resolved_artist_name=verdict.resolved_artist_name,
-                )
-                rows_written += 1
-                touched_library_ids.add(credit.library_id)
-
-        for artist, group in by_artist_mb.items():
-            mb_verdict = musicbrainz_verdicts.get(artist)
-            if mb_verdict is None:
-                continue
-            for credit in group:
-                await write_compilation_track_identity_verdict(
-                    pg,
-                    library_id=credit.library_id,
-                    track_artist_raw=credit.track_artist,
-                    track_title_raw=credit.track_title,
-                    source="musicbrainz",
-                    external_id=mb_verdict.external_id,
-                    confidence=mb_verdict.confidence,
-                    method=mb_verdict.method,
-                    resolved_artist_name=mb_verdict.resolved_artist_name,
-                )
-                rows_written += 1
-                touched_library_ids.add(credit.library_id)
+            # The same structural gate the Discogs leg applies inside
+            # resolve_discogs_credits: an invalid credit gets a deterministic
+            # MB miss row ("the leg ran against ungood input"), not an eternal
+            # re-select. Without it a NUL-bearing credit reaches the PG bind,
+            # raises, is classified "not consulted" (no row), and is re-paid on
+            # every --incremental run forever.
+            mb_verdict = (
+                _MB_MISS
+                if not is_resolvable_credit(artist)
+                else await resolve_musicbrainz_credit(mb_pg, artist)
+            )
+            musicbrainz_verdicts[artist] = mb_verdict
+            if not dry_run_write and mb_verdict is not None:
+                await write_fan_back("musicbrainz", artist, group, mb_verdict)
 
     position_stats = None
     if not dry_run_write and recover_positions and touched_library_ids:
@@ -910,13 +1011,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only credits whose existing row is a miss (external_id IS NULL).",
     )
+    mode.add_argument(
+        "--recover-positions",
+        action="store_true",
+        help=(
+            "Run ONLY the D5 position-recovery join over every stored NULL-position row. "
+            "Zero external calls, no library.db needed -- the pass to run after the recall "
+            "index grows (e.g. build_compilation_track_location.py picked up new comps)."
+        ),
+    )
     parser.add_argument(
         "--library-db",
         default="library.db",
         help="Path to library.db (default: library.db)",
     )
     parser.add_argument(
-        "--limit", type=int, default=None, help="Cap the number of CTA credits loaded"
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Per-session work budget: cap the number of SELECTED credits processed per "
+            "source this run (the next N unattempted/miss credits), so a session ends at "
+            "a planned boundary. Applied after population selection -- NOT a cap on CTA "
+            "rows read, which would starve --incremental once the table's head is drained."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -964,10 +1082,26 @@ async def _run(args: argparse.Namespace, shutdown: ShutdownFlagProtocol) -> None
     if not db_url:
         raise SystemExit("DATABASE_URL_DISCOGS is not configured -- cannot run the backfill")
 
+    if args.recover_positions:
+        pool = await asyncpg.create_pool(db_url, min_size=1, max_size=4)
+        try:
+            pg = PgSource(pool=pool)
+            from entity.compilation_track_identity import set_up_compilation_track_identity_schema
+
+            await set_up_compilation_track_identity_schema(pg)
+            library_ids = await load_null_position_library_ids(pg)
+            logger.info(
+                "position recovery pass over %d library id(s) with NULL-position rows",
+                len(library_ids),
+            )
+            position_stats = await recover_track_positions(pg, library_ids)
+        finally:
+            await pool.close()
+        _log_position_stats(position_stats)
+        return
+
     await validate_cta_shape(args.library_db)
     all_credits = await load_compilation_track_credits(args.library_db)
-    if args.limit is not None:
-        all_credits = all_credits[: args.limit]
     logger.info("loaded %d CTA credit(s) from %s", len(all_credits), args.library_db)
     if not all_credits:
         logger.warning("no CTA credits to process; nothing to do")
@@ -1006,9 +1140,13 @@ async def _run(args: argparse.Namespace, shutdown: ShutdownFlagProtocol) -> None
         discogs_credits, musicbrainz_credits = await select_credit_population(
             pg, all_credits, mode=mode, mb_configured=mb_pg is not None
         )
+        if args.limit is not None:
+            discogs_credits = discogs_credits[: args.limit]
+            musicbrainz_credits = musicbrainz_credits[: args.limit]
         logger.info(
-            "population selected [%s]: %d discogs candidate(s), %d musicbrainz candidate(s)",
+            "population selected [%s%s]: %d discogs candidate(s), %d musicbrainz candidate(s)",
             mode,
+            f", limit={args.limit}" if args.limit is not None else "",
             len(discogs_credits),
             len(musicbrainz_credits),
         )
@@ -1027,6 +1165,7 @@ async def _run(args: argparse.Namespace, shutdown: ShutdownFlagProtocol) -> None
                 base_url,
             )
 
+        raw_results: list[dict[str, Any]] = []
         async with httpx.AsyncClient(timeout=httpx.Timeout(args.timeout)) as client:
             post_batch = make_post_batch(client, base_url, api_key)
             stats = await run_backfill(
@@ -1039,6 +1178,7 @@ async def _run(args: argparse.Namespace, shutdown: ShutdownFlagProtocol) -> None
                 discogs_credits=discogs_credits,
                 musicbrainz_credits=musicbrainz_credits,
                 shutdown=shutdown,
+                raw_results=raw_results,
             )
     finally:
         await pool.close()
@@ -1061,14 +1201,38 @@ async def _run(args: argparse.Namespace, shutdown: ShutdownFlagProtocol) -> None
         " [dry-run]" if args.dry_run else "",
     )
     if stats.position_stats is not None:
+        _log_position_stats(stats.position_stats)
+
+    # The --live gate's review table (D3 mint policy): a seeded, reproducible
+    # sample of this run's api_search resolutions -- the only method tier that
+    # can mint a NEW entity.identity row under --live. Emitted on dry runs so
+    # there is something concrete to human-review BEFORE anyone passes --live,
+    # and on live runs as the audit record of what minted.
+    sample = sample_spot_check(raw_results)
+    if sample:
         logger.info(
-            "position recovery: candidate_library_ids=%d recall_index_covered=%d "
-            "candidate_rows=%d recovered_rows=%d",
-            stats.position_stats.candidate_library_ids,
-            stats.position_stats.recall_index_covered_library_ids,
-            stats.position_stats.candidate_rows,
-            stats.position_stats.recovered_rows,
+            "spot-check sample (%d api_search resolution(s) -- review before any --live run):",
+            len(sample),
         )
+        for rec in sample:
+            logger.info(
+                "  %r -> %r  %s  corroboration=%s",
+                rec["name"],
+                rec["canonical_name"],
+                rec["url"],
+                ",".join(rec["cache_corroboration"]) or "none",
+            )
+
+
+def _log_position_stats(position_stats: PositionRecoveryStats) -> None:
+    logger.info(
+        "position recovery: candidate_library_ids=%d recall_index_covered=%d "
+        "covered_candidate_rows=%d recovered_rows=%d",
+        position_stats.candidate_library_ids,
+        position_stats.recall_index_covered_library_ids,
+        position_stats.covered_candidate_rows,
+        position_stats.recovered_rows,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

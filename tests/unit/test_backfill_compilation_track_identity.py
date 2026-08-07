@@ -23,6 +23,10 @@ import pytest
 
 from generated.api_models import IdentityMethod
 from scripts.backfill_compilation_track_identity import (
+    _METHOD_CONFIDENCE,
+    _SPLIT_DERIVED_CONFIDENCE,
+    _SPLIT_DERIVED_METHOD,
+    PAGE_SIZE,
     CtaShapeError,
     MusicBrainzCreditVerdict,
     discogs_verdict_from_resolve_result,
@@ -245,6 +249,21 @@ class TestDiscogsVerdictFromResolveResult:
         )
         assert verdict is None
 
+    def test_unknown_unresolved_reason_returns_none_not_a_miss(self, caplog):
+        # The three-outcome contract is an ALLOWLIST of terminal reasons
+        # (the sibling drain's _TERMINAL_REASONS), not a denylist keyed on
+        # escalation_unavailable. A reason the endpoint grows later must NOT
+        # silently become a miss row -- D2 makes that durable negative
+        # evidence --retry-misses declines to revisit and BS#1991 reads as a
+        # resolved signal. Fail open to a re-ask, and warn so the mapping
+        # gets updated.
+        with caplog.at_level("WARNING"):
+            verdict = discogs_verdict_from_resolve_result(
+                _unresolved_result("Whoever", "token_expired")
+            )
+        assert verdict is None
+        assert "token_expired" in caplog.text
+
 
 # --------------------------------------------------------------------------- #
 # The D4 cascade end to end, over a fake post_batch.
@@ -337,6 +356,92 @@ class TestResolveDiscogsCredits:
 
         assert "Whoever" not in verdicts
 
+    async def test_split_pass_pages_the_part_union_to_the_endpoint_cap(self):
+        # A full page of 25 joint credits that all miss whole-string unions
+        # into 50 split parts. Unchunked, that second POST exceeds the
+        # endpoint's 25-name maxItems cap, 413s, and -- since make_post_batch
+        # treats 4xx as a misconfig and re-raises -- deterministically kills
+        # the drain at the same page on every restart. Every POST, both
+        # passes, must respect PAGE_SIZE.
+        joints = [f"Left{i:02d} & Right{i:02d}" for i in range(PAGE_SIZE)]
+        results = {joint: _unresolved_result(joint, "not_found") for joint in joints}
+        for i in range(PAGE_SIZE):
+            results[f"Left{i:02d}"] = _unresolved_result(f"Left{i:02d}", "not_found")
+            results[f"Right{i:02d}"] = _unresolved_result(f"Right{i:02d}", "not_found")
+        post_batch = _fake_post_batch(results)
+
+        verdicts = await resolve_discogs_credits(post_batch, joints)
+
+        assert len(verdicts) == PAGE_SIZE  # every joint credit got a verdict (all misses)
+        assert max(len(call) for call in post_batch.calls) <= PAGE_SIZE
+        assert len(post_batch.calls) == 3  # 1 whole-string page + 2 split-part pages
+
+    async def test_first_resolving_part_wins_when_multiple_parts_resolve(self):
+        # The D4 tie-break, pinned by a case that DISCRIMINATES orderings:
+        # both parts resolve, to different artists. First in split order wins;
+        # a last-wins or dict-order-accident rule returns mb-id 2.
+        post_batch = _fake_post_batch(
+            {
+                "Mira Calix ft. Tom Skinner": _unresolved_result(
+                    "Mira Calix ft. Tom Skinner", "not_found"
+                ),
+                "Mira Calix": _resolved_result(
+                    "Mira Calix", discogs_artist_id=1, canonical_name="Mira Calix"
+                ),
+                "Tom Skinner": _resolved_result(
+                    "Tom Skinner", discogs_artist_id=2, canonical_name="Tom Skinner"
+                ),
+            }
+        )
+
+        verdicts = await resolve_discogs_credits(post_batch, ["Mira Calix ft. Tom Skinner"])
+
+        assert verdicts["Mira Calix ft. Tom Skinner"].external_id == "1"
+        assert verdicts["Mira Calix ft. Tom Skinner"].resolved_artist_name == "Mira Calix"
+
+    async def test_split_derived_verdict_is_restamped_below_every_whole_string_tier(self):
+        # A split-derived id belongs to ONE PART of the credit the row is
+        # keyed on. Carrying the part's own verdict through would record
+        # "Chico Science & Nação Zumbi" -> "Chico Science" as
+        # exact_match/1.00, indistinguishable from a genuine whole-string
+        # exact hit -- top-tier evidence for the weakest cascade lane, which
+        # LML#1021's composer could then never discount.
+        post_batch = _fake_post_batch(
+            {
+                "Chico Science & Nação Zumbi": _unresolved_result(
+                    "Chico Science & Nação Zumbi", "not_found"
+                ),
+                "Chico Science": _resolved_result(
+                    "Chico Science", discogs_artist_id=7, canonical_name="Chico Science"
+                ),
+                "Nação Zumbi": _unresolved_result("Nação Zumbi", "not_found"),
+            }
+        )
+
+        verdicts = await resolve_discogs_credits(post_batch, ["Chico Science & Nação Zumbi"])
+
+        verdict = verdicts["Chico Science & Nação Zumbi"]
+        assert verdict.external_id == "7"
+        assert verdict.method == _SPLIT_DERIVED_METHOD
+        assert verdict.confidence == _SPLIT_DERIVED_CONFIDENCE
+        # Strictly below every whole-string tier, including trigram -- D4
+        # only splits after the whole string already missed.
+        assert verdict.confidence < min(_METHOD_CONFIDENCE.values())
+
+    async def test_dry_run_defaults_to_the_non_minting_mode(self):
+        # The consequential mode (minting into discogs-cache-owned
+        # entity.identity) must be the one a caller asks for by name. An
+        # omitted keyword is a dry run.
+        seen_dry_run: list[bool] = []
+
+        async def post_batch(names: list[str], dry_run: bool) -> list[dict]:
+            seen_dry_run.append(dry_run)
+            return [_resolved_result(name) for name in names]
+
+        await resolve_discogs_credits(post_batch, ["Juana Molina"])
+
+        assert seen_dry_run == [True]
+
 
 # --------------------------------------------------------------------------- #
 # The MusicBrainz leg.
@@ -351,9 +456,13 @@ class TestResolveMusicbrainzCredit:
 
         verdict = await resolve_musicbrainz_credit(mb_pg, "Csillagrablok")
 
+        # confidence is the single method->confidence table's `trigram` value,
+        # NOT the raw pg_trgm similarity (0.9 here): `confidence` is compared
+        # across sources[] by LML#1021's composer, and a similarity score and
+        # a method-derived confidence are different scales.
         assert verdict == MusicBrainzCreditVerdict(
             external_id="mb-uuid-1",
-            confidence=0.9,
+            confidence=_METHOD_CONFIDENCE[IdentityMethod.trigram],
             resolved_artist_name="Csillagrablók",
             method=IdentityMethod.trigram,
         )
@@ -413,26 +522,43 @@ class TestResolveMusicbrainzCredit:
 
         assert verdict is None
 
-    async def test_tie_break_is_deterministic_on_id(self):
+    async def test_tied_contenders_are_ambiguous_regardless_of_fetch_order(self):
+        # Two candidates tied above the floor are a genuine ambiguity: the
+        # veto must fire, and it must fire identically for BOTH fetch orders
+        # (the ranking sorts on (-score, id), so fetch order cannot leak into
+        # the outcome).
+        tied = [
+            {"id": "mb-b", "name": "B", "score": 0.95},
+            {"id": "mb-a", "name": "A", "score": 0.95},
+        ]
+        for candidates in (tied, list(reversed(tied))):
+            mb_pg = AsyncMock()
+            mb_pg.fetchall = AsyncMock(return_value=candidates)
+
+            verdict = await resolve_musicbrainz_credit(mb_pg, "X")
+
+            assert verdict == MusicBrainzCreditVerdict(
+                external_id=None, confidence=None, resolved_artist_name=None, method=None
+            )
+
+    async def test_runner_up_below_the_floor_cannot_veto(self):
+        # Only a runner-up that would itself have been acceptable can create
+        # doubt. Here the gap (0.02) is inside the ambiguity band, but the
+        # runner-up (0.74) is below the acceptance floor -- it could never
+        # have won, so vetoing on it would discard a clear winner. The old
+        # rule (band over ranked[1] unconditionally) returns a miss here.
         mb_pg = AsyncMock()
-        # Two equal-score candidates within the ambiguity band -- still a
-        # miss (covered above), but a THIRD case: equal top score with a
-        # clear gap to the rest must pick deterministically, not by fetch
-        # order, so re-runs are stable.
         mb_pg.fetchall = AsyncMock(
             return_value=[
-                {"id": "mb-b", "name": "B", "score": 0.95},
-                {"id": "mb-a", "name": "A", "score": 0.95},
+                {"id": "mb-a", "name": "A", "score": 0.76},
+                {"id": "mb-b", "name": "B", "score": 0.74},
             ]
         )
 
         verdict = await resolve_musicbrainz_credit(mb_pg, "X")
 
-        # Exactly-tied top score falls inside the ambiguity band (band >= 0),
-        # so this is a miss -- but it must be the SAME miss every time,
-        # which this test pins by running it twice.
-        verdict_again = await resolve_musicbrainz_credit(mb_pg, "X")
-        assert verdict == verdict_again
+        assert verdict is not None
+        assert verdict.external_id == "mb-a"
 
 
 # --------------------------------------------------------------------------- #

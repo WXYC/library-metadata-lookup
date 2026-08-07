@@ -92,10 +92,19 @@ class TestCanonicalDDLReference:
         # F2: library.db's library.id is the legacy MySQL LIBRARY_RELEASE_ID,
         # NOT Backend's wxyc_schema.library.id. A naive id join in #1021
         # silently returns zero rows, so the warning must survive in the
-        # generated sidecar -- not only in the module docstring.
+        # generated sidecar -- not only in the module docstring -- and it must
+        # be the full statement of the semantic, not merely the word "legacy":
+        # which id space the column holds, which it does NOT hold, and the
+        # named contract bridge a consumer joins through.
         ddl = _SQL_REFERENCE.read_text()
-        assert "legacy" in ddl.lower()
-        assert "wxyc_schema.library.id" in ddl
+        assert "IS the legacy MySQL" in ddl
+        assert "LIBRARY_RELEASE_ID" in ddl
+        assert "NOT Backend's `wxyc_schema.library.id`" in ddl
+        assert "CatalogCompilationTrackRow.legacy_release_id" in ddl
+        # The end-to-end fixture proof (a library.db id unlike any Backend
+        # serial flowing verbatim into the write binds) lives in
+        # tests/unit/test_backfill_compilation_track_identity_orchestration.py::
+        # TestRunBackfill::test_library_id_binds_hold_the_library_db_id_space_verbatim.
 
     def test_module_create_table_matches_sql_reference(self):
         ddl = _SQL_REFERENCE.read_text()
