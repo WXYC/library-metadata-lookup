@@ -2952,6 +2952,149 @@ class TestGetReleaseNullFieldNormalization:
         assert result.videos[0].embed is False
 
 
+class TestGetReleaseNullContainerNormalization:
+    """WXYC/library-metadata-lookup#1156: the container siblings PR #1154
+    (0bc5a40) left unguarded. ``dict.get(key, default)`` only applies
+    ``default`` on an *absent* key -- a present-but-null container (Discogs
+    sends ``"tracklist": null`` the same way it sends a null scalar) passes
+    straight into a ``for x in None`` comprehension, raising ``TypeError``
+    inside ``get_release``'s broad ``except Exception: return None`` and
+    degrading a correct Discogs answer into a cache miss on the ``/lookup``
+    hot path. Same hazard class as ``TestGetReleaseNullFieldNormalization``
+    above, two lines away.
+
+    The container guard is only correct because a container has a documented
+    schema default (``[]``) to restore. The required-``str`` leaves in the
+    same comprehensions (``name``, ``title``) have no such default, and
+    ``_api_fetch``'s return value is persisted (``cache.write_release``) --
+    so those sites are deliberately left unguarded and asserted to degrade to
+    ``None`` below, not normalized to an invented ``""``."""
+
+    BASE_RESPONSE = {
+        "title": "Aluminum Tunes",
+        "artists": [{"id": 388, "name": "Stereolab"}],
+        "extraartists": [{"id": 500, "name": "John McEntire", "role": "Mixed By"}],
+        "labels": [{"id": 1, "name": "Drag City"}],
+        "tracklist": [{"position": "A1", "title": "Pause", "artists": []}],
+        "images": [],
+        "videos": [{"uri": "https://www.youtube.com/watch?v=x", "title": "Pause"}],
+    }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "json_key,result_attr",
+        [
+            ("artists", "artists"),
+            ("extraartists", "extra_artists"),
+            ("labels", "labels"),
+            ("tracklist", "tracklist"),
+            ("videos", "videos"),
+        ],
+    )
+    async def test_null_container_normalizes_to_empty_list(self, service, json_key, result_attr):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {**self.BASE_RESPONSE, json_key: None}
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(12345)
+
+        assert result is not None
+        assert getattr(result, result_attr) == []
+
+    @pytest.mark.asyncio
+    async def test_null_per_track_artists_normalizes_to_empty_list(self, service):
+        """The tracklist comprehension's per-track ``t.get("artists", [])`` is
+        the same hazard nested one level deeper -- a track that carries
+        ``"artists": null`` (release-level-only credit) must not raise."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            **self.BASE_RESPONSE,
+            "tracklist": [{"position": "A1", "title": "Pause", "artists": None}],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(12345)
+
+        assert result is not None
+        assert result.tracklist[0].artists == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "json_key",
+        ["artists", "extraartists", "labels"],
+    )
+    async def test_null_credit_name_degrades_to_none(self, service, caplog, json_key):
+        """``ArtistCredit.name``/``LabelCredit.name`` are required ``str``
+        with no schema default to restore -- unlike the container sites
+        above, there is nothing documented to fall back to, and
+        ``_api_fetch``'s return value is persisted via
+        ``cache.write_release``. Inventing ``""`` here would write bad data
+        into the PG cache instead of leaving a malformed payload as a
+        retryable miss, so a present-but-null ``name`` is deliberately left
+        unguarded and must degrade to ``None`` (LML#1156 review)."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            **self.BASE_RESPONSE,
+            json_key: [{"id": 1, "name": None}],
+        }
+
+        with (
+            patch.object(
+                service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+            ),
+            caplog.at_level("ERROR", logger="discogs.service"),
+        ):
+            result = await service.get_release(12345)
+
+        assert result is None
+        assert any(
+            "Failed to fetch release" in r.getMessage() and "name" in r.getMessage()
+            for r in caplog.records
+        ), (
+            "expected a validation-error breadcrumb naming the unguarded "
+            f"field, got: {[r.getMessage() for r in caplog.records]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_null_track_title_degrades_to_none(self, service, caplog):
+        """``TrackItem.title`` has no schema default -- same rule as
+        ``test_null_credit_name_degrades_to_none`` above."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            **self.BASE_RESPONSE,
+            "tracklist": [{"position": "A1", "title": None, "artists": []}],
+        }
+
+        with (
+            patch.object(
+                service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+            ),
+            caplog.at_level("ERROR", logger="discogs.service"),
+        ):
+            result = await service.get_release(12345)
+
+        assert result is None
+        assert any(
+            "Failed to fetch release" in r.getMessage() and "title" in r.getMessage()
+            for r in caplog.records
+        ), (
+            "expected a validation-error breadcrumb naming the unguarded "
+            f"field, got: {[r.getMessage() for r in caplog.records]}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # get_artist_details
 # ---------------------------------------------------------------------------
@@ -3411,6 +3554,76 @@ class TestGetArtistDetails:
                 await service.get_artist_details(77)
 
         get_settings.cache_clear()
+
+
+class TestGetArtistDetailsNullContainerNormalization:
+    """WXYC/library-metadata-lookup#1156: the ``aliases``/``members`` container
+    siblings of ``namevariations``/``urls`` (guarded in 42189e8). Same hazard
+    as ``TestGetReleaseNullContainerNormalization`` above: a present-but-null
+    container raises ``for x in None`` inside ``get_artist_details``'s broad
+    ``except Exception: return None``, degrading a correct artist read into
+    a cache miss.
+
+    ``ArtistDetails.name`` has no schema default to restore and
+    ``_api_fetch``'s return value is persisted (``cache.write_artist_details``),
+    so it is deliberately left unguarded below (see the release-parse tests'
+    class docstring for the full rule)."""
+
+    BASE_RESPONSE = {
+        "id": 388,
+        "name": "Stereolab",
+        "aliases": [{"id": 500, "name": "Groop"}],
+        "members": [{"id": 200, "name": "Laetitia Sadier"}],
+        "images": [],
+    }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "json_key,result_attr",
+        [("aliases", "aliases"), ("members", "members")],
+    )
+    async def test_null_container_normalizes_to_empty_list(self, service, json_key, result_attr):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {**self.BASE_RESPONSE, json_key: None}
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_artist_details(388)
+
+        assert result is not None
+        assert getattr(result, result_attr) == []
+
+    @pytest.mark.asyncio
+    async def test_null_artist_name_degrades_to_none(self, service, caplog):
+        """``ArtistDetails.name`` is required ``str`` with no schema default
+        -- the same unguarded-leaf shape as the release parse's
+        ``ArtistCredit.name``. A present-but-null value must degrade to a
+        retryable cache miss, not persist an invented ``""`` into
+        ``cache.write_artist_details`` (LML#1156 review)."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {**self.BASE_RESPONSE, "name": None}
+
+        with (
+            patch.object(
+                service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+            ),
+            caplog.at_level("ERROR", logger="discogs.service"),
+        ):
+            result = await service.get_artist_details(388)
+
+        assert result is None
+        assert any(
+            "Failed to fetch artist details" in r.getMessage() and "name" in r.getMessage()
+            for r in caplog.records
+        ), (
+            "expected a validation-error breadcrumb naming the unguarded "
+            f"field, got: {[r.getMessage() for r in caplog.records]}"
+        )
 
 
 # ---------------------------------------------------------------------------
