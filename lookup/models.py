@@ -64,7 +64,12 @@ class LookupResultItem(_GeneratedLookupResultItem):
 class LookupResponse(_GeneratedLookupResponse):
     """Override so results use our LookupResultItem with SerializeAsAny."""
 
-    results: list[LookupResultItem] | None = None  # type: ignore[assignment]
+    # Non-Optional to match the contract: every construction site passes a
+    # list, so ``null`` never reaches the wire, and the post-wxyc-shared#302
+    # regeneration types the base field non-nullable too.
+    results: list[LookupResultItem] = Field(  # type: ignore[assignment]
+        default_factory=list
+    )
     external_source: Literal["library", "discogs", "musicbrainz"] | None = Field(
         None,
         description=(

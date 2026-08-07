@@ -1461,7 +1461,10 @@ class DiscogsService:
                     ArtistCredit(
                         artist_id=a.get("id"),
                         name=a.get("name", ""),
-                        join=a.get("join", ""),
+                        # Discogs may send an explicit null; .get() only
+                        # defaults on an absent key, and the model rejects
+                        # None (wxyc-shared#302).
+                        join=a.get("join") or "",
                     )
                     for a in raw_artists
                 ]
@@ -1516,7 +1519,9 @@ class DiscogsService:
                         src=v["uri"],
                         title=v.get("title"),
                         duration=v.get("duration"),
-                        embed=v.get("embed", True),
+                        # is-None guard (not ``or``) so an explicit False
+                        # survives; None is rejected post-wxyc-shared#302.
+                        embed=True if v.get("embed") is None else v["embed"],
                     )
                     for v in data.get("videos", [])
                     if v.get("uri")
@@ -1547,8 +1552,8 @@ class DiscogsService:
                     label=label_name,
                     artist_id=artist_id,
                     label_id=label_id,
-                    genres=data.get("genres", []),
-                    styles=data.get("styles", []),
+                    genres=data.get("genres") or [],
+                    styles=data.get("styles") or [],
                     tracklist=tracklist,
                     artwork_url=artwork_url,
                     release_url=f"https://www.discogs.com/release/{release_id}",
@@ -1717,7 +1722,9 @@ class DiscogsService:
                         MemberRef(
                             id=m["id"],
                             name=m["name"],
-                            active=m.get("active", True),
+                            # is-None guard (not ``or``) so an explicit False
+                            # survives; None is rejected post-wxyc-shared#302.
+                            active=True if m.get("active") is None else m["active"],
                         )
                         for m in data.get("members", [])
                         if "id" in m and "name" in m

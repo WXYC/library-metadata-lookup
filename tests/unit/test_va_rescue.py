@@ -22,9 +22,7 @@ TASQUIER_COMP_TITLE = (
 )
 
 
-def make_release_metadata(
-    tracklist_artists: list[list[str] | None], titles: list[str] | None = None
-):
+def make_release_metadata(tracklist_artists: list[list[str]], titles: list[str] | None = None):
     """Minimal ReleaseMetadataResponse stand-in with a tracklist."""
     return ReleaseMetadataResponse(
         release_id=1,
@@ -94,7 +92,7 @@ class TestTracklistCreditShape:
             release_id=27518829, artist="Various", album=TASQUIER_COMP_TITLE
         )
         mock_discogs_service.get_release.return_value = make_release_metadata(
-            [["Lionel Tasquier"], ["Somebody Else"], None]
+            [["Lionel Tasquier"], ["Somebody Else"], []]
         )
         best = await find_va_comp_match(
             [candidate],
@@ -137,7 +135,7 @@ class TestTracklistCreditShape:
             release_id=27518829, artist="Various", album=TASQUIER_COMP_TITLE
         )
         mock_discogs_service.get_release.return_value = make_release_metadata(
-            [["Somebody Else"], None]
+            [["Somebody Else"], []]
         )
         best = await find_va_comp_match(
             [candidate],

@@ -2223,7 +2223,13 @@ class DiscogsCacheService:
             ],
             name_variations=[r["name"] for r in nv_rows],
             members=[
-                MemberRef(id=r["member_id"], name=r["member_name"], active=r["active"])
+                MemberRef(
+                    id=r["member_id"],
+                    name=r["member_name"],
+                    # artist_member.active is nullable in the discogs-cache DDL;
+                    # is-None guard (not ``or``) so an explicit False survives.
+                    active=True if r["active"] is None else r["active"],
+                )
                 for r in member_rows
             ],
             urls=[r["url"] for r in url_rows],
@@ -2315,7 +2321,8 @@ class DiscogsCacheService:
                     MemberRef(
                         id=row["member_id"],
                         name=row["member_name"],
-                        active=row["active"],
+                        # Same nullable-DDL guard as the singular read above.
+                        active=True if row["active"] is None else row["active"],
                     )
                 )
             result: dict[int, ArtistDetails] = {}

@@ -1989,6 +1989,42 @@ class TestGetArtistDetails:
         assert result is not None
         assert result.fetched_at == stamp
 
+    @pytest.mark.asyncio
+    async def test_member_active_null_defaults_true_and_false_survives(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """``artist_member.active`` is nullable in the discogs-cache DDL
+        (``active boolean DEFAULT true``, no NOT NULL), and LML itself can
+        write the NULL through the API arm's ``MemberRef``. Post-#302-regen
+        ``Member.active`` rejects ``None``, so the read must normalize NULL
+        to ``True`` while preserving an explicit ``False`` (``is None``
+        guard, never ``or`` — see the ``embed`` pattern in read_release)."""
+        from datetime import datetime
+
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 77,
+                "name": "Stereolab",
+                "profile": None,
+                "image_url": None,
+                "fetched_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "not_found": False,
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                artist_member=[
+                    {"member_id": 200, "member_name": "Laetitia Sadier", "active": None},
+                    {"member_id": 201, "member_name": "Mary Hansen", "active": False},
+                ],
+            )
+        )
+
+        result = await cache_service.get_artist_details(77)
+        assert result is not None
+        assert result.members[0].active is True
+        assert result.members[1].active is False
+
         sql = mock_asyncpg_pool.fetchrow.call_args.args[0]
         assert "fetched_at" in sql, (
             f"get_artist_details SELECT must project fetched_at; got: {sql!r}"
@@ -2281,6 +2317,54 @@ class TestGetArtistDetailsBulkStubSemantics:
         assert result[305253].fetched_at == hydrated_ts
         assert result[2154].cached is True
         assert result[305253].cached is True
+
+    @pytest.mark.asyncio
+    async def test_bulk_member_active_null_defaults_true_and_false_survives(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """Bulk sibling of the singular NULL-``active`` guard: the same
+        nullable DDL feeds both paths, and post-#302-regen ``Member.active``
+        rejects ``None`` — normalize NULL to ``True``, preserve ``False``."""
+        from datetime import datetime
+
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                **{
+                    "FROM artist ": [
+                        {
+                            "id": 2154,
+                            "name": "Stereolab",
+                            "profile": None,
+                            "image_url": None,
+                            "fetched_at": datetime(2026, 5, 1, tzinfo=UTC),
+                            "not_found": False,
+                        },
+                    ],
+                    "artist_alias": [],
+                    "artist_name_variation": [],
+                    "artist_member": [
+                        {
+                            "artist_id": 2154,
+                            "member_id": 200,
+                            "member_name": "Laetitia Sadier",
+                            "active": None,
+                        },
+                        {
+                            "artist_id": 2154,
+                            "member_id": 201,
+                            "member_name": "Mary Hansen",
+                            "active": False,
+                        },
+                    ],
+                }
+            )
+        )
+
+        result = await cache_service.get_artist_details_bulk([2154])
+
+        members = result[2154].members
+        assert members[0].active is True
+        assert members[1].active is False
 
     @pytest.mark.asyncio
     async def test_bulk_select_projects_fetched_at(self, cache_service, mock_asyncpg_pool):
