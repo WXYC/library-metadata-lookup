@@ -310,6 +310,8 @@ async def compose_for_identity(
     library_id: int,
     identity: Identity | None,
     entity_store: EntityStore,
+    *,
+    include_tracks: bool = False,
 ) -> BulkResolveResult:
     """Compose a single-artist verdict for one library row.
 
@@ -317,6 +319,12 @@ async def compose_for_identity(
     the lookup found no row — we return `kind: unresolved`. When present,
     we read the per-source reconciliation log to assemble provenance and
     apply §3.4.1.1 composition.
+
+    `include_tracks` gates the `(tracks_attempted, tracks)` pair per the
+    1.31.0 four-state contract: flag off (or `kind: unresolved` on either
+    flag path) keeps both absent/NULL; flag on emits `(False, [])` — the
+    "asked, not yet visited" state — until WXYC/library-metadata-lookup#1138
+    wires real tracklist derivation for the `single_artist` arm.
 
     TODO(WXYC/library-metadata-lookup#274): the caller of this function
     looks up `identity` via exact `library_name = $1` against the
@@ -364,16 +372,22 @@ async def compose_for_identity(
         method=method,
         confidence=confidence,
         provenance=provenance,
-        tracks=None,
+        tracks=[] if include_tracks else None,
+        tracks_attempted=False if include_tracks else None,
     )
 
 
-def compilation_result(library_id: int) -> BulkResolveResult:
+def compilation_result(library_id: int, *, include_tracks: bool = False) -> BulkResolveResult:
     """Build a `kind: compilation` verdict.
 
-    Per the spec for this PR (#272), V/A rows return `kind: compilation`
-    with empty `tracks: []` and empty `provenance: []`. Full per-track
-    resolution lands in WXYC/library-metadata-lookup#271.
+    The `(tracks_attempted, tracks)` pair follows the 1.31.0 four-state
+    contract: flag off keeps both absent/NULL (the always-empty `tracks: []`
+    the pre-1.30.0 wire shipped is retired); flag on emits `(False, [])` —
+    "asked, matcher hasn't visited" — until WXYC/library-metadata-lookup#1021
+    reads real per-track verdicts out of `lml_cache.compilation_track_identity`.
+    Emitting `False` here is honest per-row truth today (the #1020 backfill
+    has not run in production), and the consumer keeps re-asking, which is
+    exactly the behavior the pair exists to make possible.
     """
     return BulkResolveResult(
         kind=BulkResolveResultKind.compilation,
@@ -382,5 +396,6 @@ def compilation_result(library_id: int) -> BulkResolveResult:
         method=None,
         confidence=None,
         provenance=[],
-        tracks=[],
+        tracks=[] if include_tracks else None,
+        tracks_attempted=False if include_tracks else None,
     )

@@ -67,6 +67,7 @@ async def test_unresolved_when_identity_is_none():
     assert result.confidence is None
     assert result.provenance == []
     assert result.tracks is None
+    assert result.tracks_attempted is None
 
 
 @pytest.mark.asyncio
@@ -288,7 +289,13 @@ async def test_all_sources_below_floor_returns_unresolved():
 
 @pytest.mark.asyncio
 async def test_compilation_result_shape():
-    """compilation_result returns kind=compilation, tracks=[], provenance=[]."""
+    """Flag off (the default): `tracks` and `tracks_attempted` are both None.
+
+    1.31.0 retired the compilation arm's always-empty `tracks: []` — with
+    `include_tracks` false or omitted, every result carries the absent/NULL
+    pair state, compilations included (the one documented wire change vs
+    1.29; see WXYC/library-metadata-lookup#1151).
+    """
     result = compilation_result(library_id=99)
     assert result.kind is BulkResolveResultKind.compilation
     assert result.library_id == 99
@@ -296,7 +303,128 @@ async def test_compilation_result_shape():
     assert result.method is None
     assert result.confidence is None
     assert result.provenance == []
-    assert result.tracks == []
+    assert result.tracks is None
+    assert result.tracks_attempted is None
+
+
+class TestIncludeTracksPlumbing:
+    """The four-state `(tracks_attempted, tracks)` pair at composer grain.
+
+    Pre-#1021/#1138 the emitters haven't run for any row, so the only
+    reachable flag-on state is `(False, [])` — "the caller asked and the
+    matcher has not reached this row". `kind: unresolved` never carries
+    the pair in any state.
+    """
+
+    def test_compilation_flag_on_emits_not_yet_visited(self):
+        result = compilation_result(library_id=99, include_tracks=True)
+        assert result.tracks == []
+        assert result.tracks_attempted is False
+
+    def test_compilation_flag_off_explicit(self):
+        result = compilation_result(library_id=99, include_tracks=False)
+        assert result.tracks is None
+        assert result.tracks_attempted is None
+
+    @pytest.mark.asyncio
+    async def test_single_artist_flag_on_emits_not_yet_visited(self):
+        identity = _make_identity(discogs_artist_id=2154)
+        result = await compose_for_identity(
+            library_id=10, identity=identity, entity_store=_store(), include_tracks=True
+        )
+        assert result.kind is BulkResolveResultKind.single_artist
+        assert result.tracks == []
+        assert result.tracks_attempted is False
+
+    @pytest.mark.asyncio
+    async def test_single_artist_flag_off_stays_absent(self):
+        identity = _make_identity(discogs_artist_id=2154)
+        result = await compose_for_identity(
+            library_id=10, identity=identity, entity_store=_store(), include_tracks=False
+        )
+        assert result.tracks is None
+        assert result.tracks_attempted is None
+
+    @pytest.mark.asyncio
+    async def test_unresolved_never_carries_the_pair_even_flag_on(self):
+        """`kind: unresolved` carries neither field, on both flag paths."""
+        result = await compose_for_identity(
+            library_id=42, identity=None, entity_store=_store(), include_tracks=True
+        )
+        assert result.kind is BulkResolveResultKind.unresolved
+        assert result.tracks is None
+        assert result.tracks_attempted is None
+
+    @pytest.mark.asyncio
+    async def test_unresolved_via_empty_composition_never_carries_the_pair(self):
+        """The all-sources-below-floor unresolved arm behaves identically."""
+        identity = _make_identity(discogs_artist_id=2154)
+        store = _store(
+            {
+                IdentitySource.discogs.value: ProvenanceRow(
+                    source=IdentitySource.discogs.value,
+                    external_id="2154",
+                    method=IdentityMethod.trigram.value,
+                    confidence=0.10,
+                )
+            }
+        )
+        result = await compose_for_identity(
+            library_id=42, identity=identity, entity_store=store, include_tracks=True
+        )
+        assert result.kind is BulkResolveResultKind.unresolved
+        assert result.tracks is None
+        assert result.tracks_attempted is None
+
+    @pytest.mark.asyncio
+    async def test_producer_never_emits_false_with_populated_tracks(self):
+        """The forbidden pairing: every composer-reachable state honors it."""
+        reachable = [
+            compilation_result(library_id=1),
+            compilation_result(library_id=1, include_tracks=True),
+            await compose_for_identity(
+                library_id=1,
+                identity=_make_identity(discogs_artist_id=2154),
+                entity_store=_store(),
+                include_tracks=True,
+            ),
+            await compose_for_identity(
+                library_id=1, identity=None, entity_store=_store(), include_tracks=True
+            ),
+        ]
+        for result in reachable:
+            assert not (result.tracks_attempted is False and result.tracks), (
+                f"forbidden (False, populated) pairing emitted for {result.kind}"
+            )
+
+    def test_middle_states_are_distinguishable_on_the_wire(self):
+        """`(False, [])` and `(True, [])` are byte-identical in `tracks` —
+        the field exists so they differ on the wire. Serialize both."""
+        from generated.api_models import BulkResolveResult
+
+        not_visited = BulkResolveResult(
+            kind=BulkResolveResultKind.compilation,
+            library_id=1,
+            main=None,
+            method=None,
+            confidence=None,
+            provenance=[],
+            tracks=[],
+            tracks_attempted=False,
+        ).model_dump_json()
+        visited_nothing = BulkResolveResult(
+            kind=BulkResolveResultKind.compilation,
+            library_id=1,
+            main=None,
+            method=None,
+            confidence=None,
+            provenance=[],
+            tracks=[],
+            tracks_attempted=True,
+        ).model_dump_json()
+        assert not_visited != visited_nothing
+        assert '"tracks_attempted":false' in not_visited
+        assert '"tracks_attempted":true' in visited_nothing
 
 
 def test_floors_are_what_the_spec_says():
