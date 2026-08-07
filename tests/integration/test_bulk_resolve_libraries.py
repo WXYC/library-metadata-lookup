@@ -828,3 +828,43 @@ class TestIncludeTracksSingleArtistEndToEnd:
         result = data["results"][0]
         assert result["tracks_attempted"] is None
         assert result["tracks"] is None
+
+    @pytest.mark.asyncio
+    async def test_pin_to_release_absent_from_cache_stays_unvisited(
+        self, pg_app_client, pg_pool, set_up_single_artist_tracklist_schema
+    ):
+        """Review finding: a pin can target a release the FILTERED
+        discogs-cache doesn't hold (the cache build filters by exact
+        case-folded artist-name equality; pins exist precisely where
+        automatic matching failed, spelling/ANV divergence included). No
+        `release` row is seeded here — only the pin — so the derivation
+        must report the not-yet-visited (false, []), never freeze
+        "couldn't look" as a (true, []) "nothing there" that would exit
+        BS#1991's re-ask sweep before a later discogs-etl ingest can
+        supply the release."""
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO lml_cache.library_release_override "
+                "(library_id, discogs_release_id, source) VALUES (777000, 557, 'test-seed')"
+            )
+
+        resp = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "include_tracks": True,
+                "inputs": [
+                    {
+                        "library_id": 42,
+                        "legacy_release_id": 777000,
+                        "artist_name": "Stereolab",
+                        "album_title": "Not In The Cache",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["kind"] == "single_artist"
+        assert result["tracks_attempted"] is False
+        assert result["tracks"] == []

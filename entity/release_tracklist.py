@@ -95,3 +95,36 @@ async def get_release_tracklists_for_releases(
         return []
     rows = await pg.fetchall(_SELECT_TRACKLISTS_SQL, list(release_ids))
     return [ReleaseTracklistRow(**row) for row in rows]
+
+
+# Presence probe for the pinned release ids (review finding). The discogs
+# cache is FILTERED — its build admits releases by exact case-folded
+# artist-name equality against the library artist set, and override pins
+# exist precisely where automatic matching failed (spelling/ANV divergence
+# being a common cause) — so a pin can point at a release the cache does not
+# hold. Zero tracklist rows is therefore ambiguous between "present, no
+# track rows" (a genuine attempted-nothing) and "absent entirely" (couldn't
+# look; must stay not-yet-visited so BS#1991 keeps re-asking and a later
+# discogs-etl ingest surfaces). This cheap batched id probe disambiguates.
+_SELECT_PRESENT_RELEASES_SQL = """\
+SELECT id
+FROM release
+WHERE id = ANY($1::int[])\
+"""
+
+
+async def get_present_release_ids(pg: PgSource, release_ids: Sequence[int]) -> set[int]:
+    """Which of ``release_ids`` exist in the discogs-cache ``release`` table.
+
+    ONE query for the whole batch, same no-N+1 discipline as the tracklist
+    read above. An empty ``release_ids`` short-circuits before the
+    round-trip. PG failures propagate — see the module docstring; a
+    swallowed failure here would silently reclassify every pinned release
+    as absent, which happens to be the safe direction, but the router's
+    degrade arm owns that decision and its fail-open counter must see the
+    failure.
+    """
+    if not release_ids:
+        return set()
+    rows = await pg.fetchall(_SELECT_PRESENT_RELEASES_SQL, list(release_ids))
+    return {row["id"] for row in rows}

@@ -1796,11 +1796,69 @@ class TestIncludeTracksSingleArtistDerivation:
         assert bridgeless["tracks"] == []
 
     @pytest.mark.asyncio
-    async def test_pinned_release_with_no_cached_tracklist_is_attempted_nothing(
+    async def test_pinned_release_present_with_empty_tracklist_is_attempted_nothing(
         self, app_client, mock_entity_store
     ):
-        """The pin resolved but the cache holds no tracks: a genuine attempt
-        that found nothing — (true, []), NOT the unvisited state."""
+        """The pin resolved AND the release row exists in the cache, but it
+        has no track rows: a genuine attempt that found nothing — (true, []),
+        NOT the unvisited state. Presence is the tracklist map's key
+        membership: an empty list is a PRESENT release."""
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.sources import PgSource
+
+        async def fake_pins(pg, legacy_release_ids):
+            return {101: 555}
+
+        async def fake_tracklists(pg, release_ids):
+            return {555: []}
+
+        saved_pins = router_module.load_single_artist_release_pins
+        saved_tracklists = router_module.load_release_tracklists_by_release_id
+        router_module.load_single_artist_release_pins = fake_pins
+        router_module.load_release_tracklists_by_release_id = fake_tracklists
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Stereolab", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+        try:
+            resp = await self._post(
+                app_client,
+                {
+                    "include_tracks": True,
+                    "inputs": [
+                        {
+                            "library_id": 1,
+                            "legacy_release_id": 101,
+                            "artist_name": "Stereolab",
+                            "album_title": "Dots and Loops",
+                        },
+                    ],
+                },
+            )
+        finally:
+            router_module.load_single_artist_release_pins = saved_pins
+            router_module.load_release_tracklists_by_release_id = saved_tracklists
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["tracks_attempted"] is True
+        assert result["tracks"] == []
+
+    @pytest.mark.asyncio
+    async def test_pin_to_release_absent_from_cache_stays_unvisited(
+        self, app_client, mock_entity_store
+    ):
+        """Review finding: a pin can point at a release the FILTERED
+        discogs-cache doesn't hold at all (the cache build filters releases
+        by exact case-folded artist-name equality, and pins exist precisely
+        where automatic matching failed — spelling/ANV divergence). That is
+        "couldn't look", not "looked, nothing there": it must stay
+        (false, []) so BS#1991 keeps re-asking and a later discogs-etl
+        ingest that supplies the release actually surfaces. The absent
+        release has NO key in the tracklist map — distinct from the
+        present-but-trackless `{555: []}` case above."""
         import identity.router as router_module
         from core.dependencies import get_discogs_cache_pg
         from entity.sources import PgSource
@@ -1841,7 +1899,8 @@ class TestIncludeTracksSingleArtistDerivation:
 
         assert resp.status_code == 200
         result = resp.json()["results"][0]
-        assert result["tracks_attempted"] is True
+        assert result["kind"] == "single_artist"
+        assert result["tracks_attempted"] is False
         assert result["tracks"] == []
 
     @pytest.mark.asyncio

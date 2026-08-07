@@ -1336,11 +1336,17 @@ class TestSingleArtistDerivedTracks:
         assert result.tracks[0].artist_name == "Stereolab"
 
     @pytest.mark.asyncio
-    async def test_blank_release_artist_drops_the_entry_not_the_batch(self, caplog):
-        """`artist_name` is required `minLength: 1` on the wire; with no
-        credit AND a blank resolved release artist there is nothing valid to
-        echo — the entry is dropped with a warning (mirroring the LML#1021
-        blank-credit guard), never a pydantic 500 for the whole batch."""
+    async def test_blank_release_artist_drops_the_entries_not_the_batch(self, caplog):
+        """A blank resolved release artist (data-quality anomaly — the
+        entity store's `library_name` is non-null in practice) makes EVERY
+        entry unshippable, credit or no credit: the no-credit row has no
+        valid `minLength: 1` echo, and the credited row would carry
+        `resolved_artist_name: ""` — an empty string api.yaml gives no
+        meaning (NULL and a real name are the only defined states, and NULL
+        is forbidden alongside the non-null inherited confidence/method).
+        Both drop with a warning (mirroring the LML#1021 blank-credit
+        guard), never a pydantic 500 or an invalid wire value for the whole
+        batch; the release still reads as attempted."""
         derivation = SingleArtistTrackDerivation(
             discogs_release_id=555,
             rows=[
@@ -1352,8 +1358,23 @@ class TestSingleArtistDerivedTracks:
             result = await self._compose(derivation, library_name="   ")
 
         assert result.tracks_attempted is True
-        assert [t.track_title for t in result.tracks] == ["Fine"]
+        assert result.tracks == []
         assert any("blank" in r.message.lower() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_blank_release_artist_with_credit_never_ships_empty_resolved_name(self):
+        """The credited-row case in isolation (review finding): a present
+        per-track credit gives the echo a valid value, so the original
+        blank-echo guard alone would let the entry through with
+        `resolved_artist_name: ""`. It must drop instead."""
+        derivation = SingleArtistTrackDerivation(
+            discogs_release_id=555,
+            rows=[_tracklist_row(sequence=1, title="Fine", credit_artist_name="Sessa")],
+        )
+        result = await self._compose(derivation, library_name="   ")
+
+        assert result.tracks_attempted is True
+        assert result.tracks == []
 
     @pytest.mark.asyncio
     async def test_unresolved_ignores_derivation(self):
