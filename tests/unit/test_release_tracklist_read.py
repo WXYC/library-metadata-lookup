@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock
 import pytest
 from asyncpg.exceptions import PostgresError
 
-from entity.release_tracklist import ReleaseTracklistRow, get_release_tracklists_for_releases
+from entity.release_tracklist import (
+    ReleaseTracklistRow,
+    get_present_release_ids,
+    get_release_tracklists_for_releases,
+)
 from entity.sources import PgSource
 
 
@@ -91,3 +95,39 @@ class TestGetReleaseTracklistsForReleases:
 
         with pytest.raises(PostgresError):
             await get_release_tracklists_for_releases(pg, [555])
+
+
+@pytest.mark.asyncio
+class TestGetPresentReleaseIds:
+    """The presence half of the LML#1138 batched tracklist read (review
+    finding): a pinned release ABSENT from the filtered discogs-cache must
+    be distinguishable from one present with zero track rows, or the router
+    would freeze "couldn't look" as `(true, [])` "nothing there"."""
+
+    async def test_returns_only_ids_present_in_release(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[{"id": 555}])
+
+        present = await get_present_release_ids(pg, [555, 556])
+
+        assert present == {555}
+        assert pg.fetchall.await_count == 1
+        query = pg.fetchall.await_args.args[0]
+        assert "release" in query
+        assert "ANY(" in query
+
+    async def test_empty_release_ids_short_circuits_without_query(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[])
+
+        present = await get_present_release_ids(pg, [])
+
+        assert present == set()
+        pg.fetchall.assert_not_awaited()
+
+    async def test_pg_error_propagates(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(side_effect=PostgresError("connection reset"))
+
+        with pytest.raises(PostgresError):
+            await get_present_release_ids(pg, [555])

@@ -384,6 +384,17 @@ async def bulk_resolve_libraries(
     inputs_count = len(request.inputs)
     logger.info("bulk resolve start: inputs=%d", inputs_count)
 
+    # One V/A-vs-single-artist partition per input, computed ONCE (review
+    # finding): three sites branch on it — the LML#1021 compilation
+    # pre-fetch, the LML#1138 single-artist pre-fetch, and the per-input
+    # fan-out — and evaluating `is_compilation_artist` independently at each
+    # left the single-artist set as the compilation set's negation only
+    # implicitly. `zip(..., strict=True)` below keeps result[i] <-> input[i]
+    # aligned by construction.
+    input_is_compilation: list[bool] = [
+        is_compilation_artist(input_row.artist_name) for input_row in request.inputs
+    ]
+
     # LML#1021: ONE batched read of lml_cache.compilation_track_identity for
     # the whole batch's compilation rows, BEFORE the fan-out below -- the
     # ticket's hard "no N+1" requirement. Only compilation inputs that carry
@@ -415,9 +426,10 @@ async def bulk_resolve_libraries(
         legacy_release_ids = sorted(
             {
                 input_row.legacy_release_id
-                for input_row in request.inputs
-                if input_row.legacy_release_id is not None
-                and is_compilation_artist(input_row.artist_name)
+                for input_row, is_compilation in zip(
+                    request.inputs, input_is_compilation, strict=True
+                )
+                if input_row.legacy_release_id is not None and is_compilation
             }
         )
         if legacy_release_ids:
@@ -464,9 +476,10 @@ async def bulk_resolve_libraries(
         single_artist_legacy_ids = sorted(
             {
                 input_row.legacy_release_id
-                for input_row in request.inputs
-                if input_row.legacy_release_id is not None
-                and not is_compilation_artist(input_row.artist_name)
+                for input_row, is_compilation in zip(
+                    request.inputs, input_is_compilation, strict=True
+                )
+                if input_row.legacy_release_id is not None and not is_compilation
             }
         )
         single_artist_track_candidates = len(single_artist_legacy_ids)
@@ -506,8 +519,13 @@ async def bulk_resolve_libraries(
     max_concurrent = max_concurrency_from_env(_bulk_resolve_default_concurrency())
     semaphore = asyncio.Semaphore(max(1, min(max_concurrent, inputs_count)))
 
-    async def _resolve_one(input_row: BulkResolveInput) -> BulkResolveResult:
+    async def _resolve_one(
+        input_row: BulkResolveInput, *, is_compilation: bool
+    ) -> BulkResolveResult:
         """Compose one verdict, gated by the shared pool semaphore.
+
+        ``is_compilation`` is this input's slot in the ``input_is_compilation``
+        partition computed once above — never re-derived here.
 
         Holds a single permit across the whole per-input path so the in-flight
         connection count never exceeds the pool. A ``PostgresError`` / ``OSError``
@@ -526,7 +544,7 @@ async def bulk_resolve_libraries(
         # refresh, so unbounded concurrent bulk-resolve requests can't
         # multiply against the shared pool.
         async with semaphore, acquire_bulk_global_permit():
-            if is_compilation_artist(input_row.artist_name):
+            if is_compilation:
                 store_rows = (
                     track_rows_by_legacy_id.get(input_row.legacy_release_id)
                     if input_row.legacy_release_id is not None
@@ -558,18 +576,24 @@ async def bulk_resolve_libraries(
                 ) from None
 
             # LML#1138: bind this input's derivation slice from the batched
-            # pre-fan-out reads above -- pure dict lookups, no PG here. A
-            # pinned release absent from the tracklist map still gets a
-            # derivation with empty rows ("the pin resolved, the cache holds
-            # no tracks" is attempted-nothing, not unvisited).
+            # pre-fan-out reads above -- pure dict lookups, no PG here. The
+            # tracklist map's KEY MEMBERSHIP is the presence verdict (review
+            # finding): a pinned release PRESENT in the cache maps to its
+            # rows (possibly [] -- "the pin resolved, the cache holds no
+            # tracks" is attempted-nothing); a pinned release ABSENT from
+            # the filtered cache has no key and gets NO derivation, staying
+            # at the not-yet-visited (false, []) so BS#1991 keeps re-asking
+            # until a discogs-etl ingest supplies the release.
             track_derivation: SingleArtistTrackDerivation | None = None
             if include_tracks and input_row.legacy_release_id is not None:
                 pinned_release_id = single_artist_pins.get(input_row.legacy_release_id)
                 if pinned_release_id is not None:
-                    track_derivation = SingleArtistTrackDerivation(
-                        discogs_release_id=pinned_release_id,
-                        rows=tracklists_by_release.get(pinned_release_id, []),
-                    )
+                    tracklist_rows = tracklists_by_release.get(pinned_release_id)
+                    if tracklist_rows is not None:
+                        track_derivation = SingleArtistTrackDerivation(
+                            discogs_release_id=pinned_release_id,
+                            rows=tracklist_rows,
+                        )
 
             try:
                 # `compose_for_identity` issues its own
@@ -630,7 +654,10 @@ async def bulk_resolve_libraries(
         # body messages the JSON parser needs.
         try:
             results = await run_bulk_gather(
-                (_resolve_one(r) for r in request.inputs),
+                (
+                    _resolve_one(r, is_compilation=c)
+                    for r, c in zip(request.inputs, input_is_compilation, strict=True)
+                ),
                 http_request=http_request,
                 watch_disconnect_fn=watch_disconnect,
                 on_abort=_on_abort,

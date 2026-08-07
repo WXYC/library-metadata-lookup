@@ -59,6 +59,7 @@ from entity.compilation_track_identity import (
 from entity.library_release_override import get_library_release_overrides_strict
 from entity.release_tracklist import (
     ReleaseTracklistRow,
+    get_present_release_ids,
     get_release_tracklists_for_releases,
 )
 from entity.sources import PgSource
@@ -452,15 +453,19 @@ async def compose_for_identity(
     absent/NULL. Flag on reads `track_derivation` (LML#1138):
 
     - `None` — no `lml_cache.library_release_override` pin resolved this
-      row's Discogs release (or the caller had no `legacy_release_id`
-      bridge, or the batched reads degraded on a transient PG failure).
-      Emits the honest `(False, [])` "asked, not yet visited" state — LML
-      genuinely cannot look yet, and the consumer keeps re-asking, so
-      coverage self-heals as pins and the LML#842 `streaming_album` leg
-      grow (the 2026-08-08 decision record on LML#1138).
-    - present — the pin resolved a release; emits `(True, entries)` derived
-      from its cached tracklist, or `(True, [])` when the tracklist join
-      genuinely returned no tracks ("we looked, the answer is nothing").
+      row's Discogs release, or the pinned release is ABSENT from the
+      filtered discogs-cache (reachable — pins exist precisely where the
+      cache build's exact artist-name matching failed), or the caller had
+      no `legacy_release_id` bridge, or the batched reads degraded on a
+      transient PG failure. All emit the honest `(False, [])` "asked, not
+      yet visited" state — LML genuinely cannot look yet, and the consumer
+      keeps re-asking, so coverage self-heals as pins, the LML#842
+      `streaming_album` leg, and discogs-etl ingests grow (the 2026-08-08
+      decision record on LML#1138).
+    - present — the pin resolved a release the cache holds; emits
+      `(True, entries)` derived from its cached tracklist, or `(True, [])`
+      when the present release genuinely has no track rows ("we looked,
+      the answer is nothing").
 
     `track_derivation` is the composer-side seam of the derivation: the
     router builds it per input from the batched pre-fan-out reads
@@ -886,7 +891,10 @@ def compilation_result(
 #      non-V/A rows to the re-match's ~77% with no composer change).
 #   2. `load_release_tracklists_by_release_id` — the pinned releases'
 #      tracklists from the discogs-cache `release_track` /
-#      `release_track_artist` tables.
+#      `release_track_artist` tables, keyed by the releases PRESENT in the
+#      cache (a batched presence probe on `release` disambiguates a
+#      trackless present release — attempted-nothing — from a pin pointing
+#      outside the filtered cache, which must stay not-yet-visited).
 #
 # Per-track `confidence`/`method` inherit the PIN's provenance — `manual`/1.0,
 # an honest description of a hand-verified release mapping (D13's "inherit the
@@ -912,10 +920,13 @@ _PIN_CONFIDENCE = 1.0
 class SingleArtistTrackDerivation:
     """One pinned release's derivation input, already scoped to one input row.
 
-    Built by the router from the batched reads; `rows` may be empty — a
-    pinned release whose tracklist join returned nothing is still a genuine
-    attempt (`(True, [])` on the wire), distinct from "no pin" (`None`
-    derivation → `(False, [])`, the not-yet-visited state).
+    Built by the router from the batched reads — and ONLY for pinned
+    releases PRESENT in the discogs-cache (`load_release_tracklists_by_release_id`'s
+    key membership). `rows` may be empty: a present release with no track
+    rows is still a genuine attempt (`(True, [])` on the wire), distinct
+    from "no pin" and from "pin to a release the filtered cache doesn't
+    hold" (both `None` derivation → `(False, [])`, the not-yet-visited
+    state).
     """
 
     discogs_release_id: int
@@ -949,21 +960,35 @@ async def load_single_artist_release_pins(
 async def load_release_tracklists_by_release_id(
     pg: PgSource, release_ids: Sequence[int]
 ) -> dict[int, list[ReleaseTracklistRow]]:
-    """Batched tracklist read for the pinned releases, grouped per release.
+    """Batched tracklist read for the pinned releases, grouped per release —
+    keyed by the releases PRESENT in the discogs-cache.
 
-    ONE query for the whole batch's distinct pinned Discogs release ids
-    (`entity.release_tracklist.get_release_tracklists_for_releases`), grouped
-    in memory — the same no-N+1 shape as
-    `load_compilation_track_rows_by_legacy_id` above. A pinned release with
-    no cached tracklist is simply absent from the map; the router still
-    builds a derivation for it (empty `rows`), because "the pin resolved but
-    the cache holds no tracks" is an attempted-nothing answer, not an
-    unvisited one. PG failures propagate, same as the pins read.
+    Two batched queries (`entity.release_tracklist`), constant per request —
+    the same no-N+1 discipline as `load_compilation_track_rows_by_legacy_id`
+    above: a presence probe on `release`, then the tracklist rows. Key
+    membership carries the presence verdict (review finding):
+
+    - a release PRESENT in the cache always has a key, mapping to its track
+      rows or to `[]` when it genuinely has none — the router builds a
+      derivation either way, and an empty one composes to the
+      attempted-nothing `(True, [])`;
+    - a release ABSENT from the cache has NO key — reachable because the
+      cache build filters releases by exact case-folded artist-name
+      equality and pins exist precisely where automatic matching failed
+      (spelling/ANV divergence), so a pin can point outside the filtered
+      cache. The router builds NO derivation for it, leaving the row at the
+      not-yet-visited `(False, [])` so BS#1991 keeps re-asking and a later
+      discogs-etl ingest that supplies the release actually surfaces —
+      never frozen as a false "we looked, nothing there".
+
+    PG failures (from either query) propagate, same as the pins read — the
+    router's single degrade arm clears both maps.
     """
     if not release_ids:
         return {}
+    present = await get_present_release_ids(pg, release_ids)
     rows = await get_release_tracklists_for_releases(pg, release_ids)
-    grouped: dict[int, list[ReleaseTracklistRow]] = {}
+    grouped: dict[int, list[ReleaseTracklistRow]] = {rid: [] for rid in present}
     for row in rows:
         grouped.setdefault(row.release_id, []).append(row)
     return grouped
@@ -996,12 +1021,14 @@ def _compose_derived_track_entries(
 
     Empty-string `position`/`title` round-trip as NULL ("no position is
     recoverable" per api.yaml — Discogs heading rows carry empty positions),
-    never as empty strings. A track whose computed echo is blank — no usable
-    credit AND a blank `resolved_artist_name` (a data-quality anomaly; the
-    entity store's `library_name` is non-null in practice) — is dropped with
-    a warning rather than 500ing the whole batch on the wire model's
-    `minLength: 1`, mirroring LML#1021's blank-credit guard. No cap, no
-    truncation (the payload-discipline rule): every track becomes one entry.
+    never as empty strings. A track whose computed echo OR whose
+    `resolved_artist_name` is blank (the latter reachable when a per-track
+    credit fills the echo but `library_name` is blank — a data-quality
+    anomaly; the entity store's `library_name` is non-null in practice) is
+    dropped with a warning rather than shipping a `minLength: 1` violation
+    or a meaningless `resolved_artist_name: ""`, mirroring LML#1021's
+    blank-credit guard. No cap, no truncation (the payload-discipline
+    rule): every other track becomes one entry.
     """
     grouped: dict[int, list[ReleaseTracklistRow]] = {}
     for row in sorted(derivation.rows, key=_derived_row_sort_key):
@@ -1015,11 +1042,18 @@ def _compose_derived_track_entries(
             if name and name not in credits:
                 credits.append(name)
         artist_name = ", ".join(credits) if credits else resolved_artist_name
-        if not artist_name.strip():
+        # Two blank guards, both dropping the entry (review finding): a blank
+        # ECHO would violate the wire's `minLength: 1`, and a blank RESOLVED
+        # name — reachable when a per-track credit fills the echo but
+        # `library_name` is blank — would ship `resolved_artist_name: ""`,
+        # a value api.yaml gives no meaning (NULL and a real name are the
+        # only defined states, and NULL is forbidden alongside the non-null
+        # inherited confidence/method).
+        if not artist_name.strip() or not resolved_artist_name.strip():
             logger.warning(
-                "derived tracks: blank artist echo for discogs_release_id=%d sequence=%d "
-                "(no per-track credit and a blank resolved release artist) -- dropping "
-                "this track from tracks[] rather than 500ing the whole batch",
+                "derived tracks: blank artist echo or blank resolved release artist for "
+                "discogs_release_id=%d sequence=%d -- dropping this track from tracks[] "
+                "rather than shipping an invalid wire value or 500ing the whole batch",
                 derivation.discogs_release_id,
                 rows[0].sequence,
             )
