@@ -5,15 +5,16 @@ exactly as the sibling recall index colocates its read helper:
 
 * the D1 two-statement writer -- ``write_compilation_track_identity_verdict``
   (statement 1, the attempt row, never overwritten once ``external_id`` is
-  non-null) and ``write_compilation_track_identity_position`` (statement 2,
-  fills a NULL ``track_position`` on ANY row -- resolved or not -- and never
-  touches a verdict column). Split into two functions (not one) because D1's
-  finding is that position and verdict arrive on different schedules: a
-  credit resolved before its comp entered the LML#1019 recall index must
-  still be able to gain a position on a LATER run, with no verdict fields to
-  resupply.
+  non-null) and ``fill_compilation_track_identity_positions_from_recall_index``
+  (statement 2, set-based: fills NULL ``track_position``s from the LML#1019
+  recall index on ANY row -- resolved or not -- and never touches a verdict
+  column). Split into two statements (not one) because D1's finding is that
+  position and verdict arrive on different schedules: a credit resolved
+  before its comp entered the recall index must still be able to gain a
+  position on a LATER run, with no verdict fields to resupply.
 * ``get_compilation_track_identity_misses`` -- the ``WHERE external_id IS
-  NULL`` retry-cohort reader the backfill's ``--retry-misses`` mode drains.
+  NULL`` retry-cohort reader; the ONE definition of the miss cohort, which
+  the backfill's ``--retry-misses`` mode drains through ``load_miss_keys``.
 * ``get_compilation_track_identity_for_library`` -- the per-``library_id``
   read LML#1021 will consume to compose ``tracks[]``.
 
@@ -33,9 +34,9 @@ from wxyc_etl.text import to_match_form
 
 from entity.compilation_track_identity import (
     CompilationTrackIdentityRow,
+    fill_compilation_track_identity_positions_from_recall_index,
     get_compilation_track_identity_for_library,
     get_compilation_track_identity_misses,
-    write_compilation_track_identity_position,
     write_compilation_track_identity_verdict,
 )
 from entity.sources import PgSource
@@ -124,56 +125,43 @@ class TestWriteVerdict:
 
 
 @pytest.mark.asyncio
-class TestWritePosition:
-    async def test_updates_with_normalized_key_and_no_recast_of_inputs(self):
+class TestFillPositions:
+    async def test_single_set_based_statement_with_the_never_overwrite_guards(self):
+        # One UPDATE ... FROM with the LATERAL inside it -- not a SELECT plus a
+        # round-trip per recovered row. Both never-overwrite guards must be in
+        # the statement itself: the inner candidate scan's and the outer
+        # UPDATE's `track_position IS NULL` (the outer one is what makes a
+        # concurrent fill race-safe), and no verdict column in the SET list.
         pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="UPDATE 1")
+        pg.fetchall = AsyncMock(return_value=[])
 
-        await write_compilation_track_identity_position(
-            pg,
-            library_id=1,
-            track_artist="juana molina",
-            track_title="la paradoja",
-            source="discogs",
-            track_position="A1",
-        )
+        await fill_compilation_track_identity_positions_from_recall_index(pg, [1, 2])
 
-        sql, *binds = pg.execute.await_args.args
+        sql, *binds = pg.fetchall.await_args.args
         assert "UPDATE lml_cache.compilation_track_identity" in sql
-        assert "track_position = $5::text" in sql
-        assert "track_position IS NULL" in sql
-        assert binds == [1, "juana molina", "la paradoja", "discogs", "A1"]
+        assert "JOIN LATERAL" in sql
+        assert "ORDER BY ctl.track_position" in sql
+        assert sql.count("track_position IS NULL") == 2
+        assert "SET src" not in sql
+        assert "external_id" not in sql.split("SET")[1].split("FROM")[0]
+        assert "RETURNING" in sql
+        assert binds == [[1, 2]]
 
-    async def test_none_position_is_a_no_op(self):
-        # $5::text IS NOT NULL already guards this server-side, but a None
-        # short-circuits before the round-trip entirely.
+    async def test_empty_library_ids_short_circuits(self):
         pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="UPDATE 0")
+        pg.fetchall = AsyncMock(return_value=[])
 
-        await write_compilation_track_identity_position(
-            pg,
-            library_id=1,
-            track_artist="juana molina",
-            track_title="la paradoja",
-            source="discogs",
-            track_position=None,
-        )
+        filled = await fill_compilation_track_identity_positions_from_recall_index(pg, [])
 
-        pg.execute.assert_not_awaited()
+        assert filled == []
+        pg.fetchall.assert_not_awaited()
 
     async def test_write_failure_propagates(self):
         pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(side_effect=RuntimeError("pg down"))
+        pg.fetchall = AsyncMock(side_effect=RuntimeError("pg down"))
 
         with pytest.raises(RuntimeError):
-            await write_compilation_track_identity_position(
-                pg,
-                library_id=1,
-                track_artist="juana molina",
-                track_title="la paradoja",
-                source="discogs",
-                track_position="A1",
-            )
+            await fill_compilation_track_identity_positions_from_recall_index(pg, [1])
 
 
 _SAMPLE_ROW = {
@@ -202,7 +190,21 @@ class TestGetMisses:
         assert rows == [CompilationTrackIdentityRow(**_SAMPLE_ROW)]
         sql, *binds = pg.fetchall.await_args.args
         assert "WHERE external_id IS NULL" in sql
-        assert binds == [500]
+        assert binds == [None, 500]
+
+    async def test_source_scopes_the_cohort_and_none_limit_is_unbounded(self):
+        # --retry-misses evaluates per (credit, source) -- D2's grain -- so
+        # the reader must scope by source; and a full retry pass needs the
+        # WHOLE cohort, which LIMIT NULL gives (unbounded in PostgreSQL).
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[_SAMPLE_ROW])
+
+        rows = await get_compilation_track_identity_misses(pg, source="discogs")
+
+        assert rows == [CompilationTrackIdentityRow(**_SAMPLE_ROW)]
+        sql, *binds = pg.fetchall.await_args.args
+        assert "source = $1::text" in sql
+        assert binds == ["discogs", None]
 
     async def test_empty_on_no_misses(self):
         pg = AsyncMock(spec=PgSource)
