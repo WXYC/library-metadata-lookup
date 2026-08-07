@@ -3028,6 +3028,33 @@ class TestGetArtistDetails:
         assert result.members[2].active is True
 
     @pytest.mark.asyncio
+    async def test_null_namevariations_and_urls_normalize_to_empty(self, service):
+        """Same present-but-null hazard as the release parse's ``genres``:
+        an explicit ``"namevariations": null`` or ``"urls": null`` would
+        raise at ``ArtistDetails`` construction (both fields non-Optional),
+        and the surrounding except would swallow it into ``return None`` —
+        degrading a perfectly good artist read into a cache miss."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "id": 388,
+            "name": "Stereolab",
+            "namevariations": None,
+            "urls": None,
+            "images": [],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_artist_details(388)
+
+        assert result is not None
+        assert result.name_variations == []
+        assert result.urls == []
+
+    @pytest.mark.asyncio
     async def test_handles_minimal_response(self, service):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
