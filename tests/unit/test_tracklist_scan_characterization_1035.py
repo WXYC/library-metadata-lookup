@@ -51,7 +51,7 @@ class ScanCase:
     id: str
     release_artist: str
     release_track_title: str
-    release_track_artists: list[str] | None
+    release_track_artists: list[str]
     query_track: str
     query_artist: str
     expected: bool
@@ -73,7 +73,7 @@ CASES: list[ScanCase] = [
         id="title_fuzzy_only_dropped_word",
         release_artist="Chuquimamani-Condori",
         release_track_title="Call Your Name",
-        release_track_artists=None,
+        release_track_artists=[],
         query_track="call name",
         query_artist="Chuquimamani-Condori",
         expected=True,
@@ -88,7 +88,7 @@ CASES: list[ScanCase] = [
         id="title_miss_unrelated",
         release_artist="Juana Molina",
         release_track_title="Call Your Name",
-        release_track_artists=None,
+        release_track_artists=[],
         query_track="Aluminum Tunes",
         query_artist="Juana Molina",
         expected=False,
@@ -134,7 +134,7 @@ CASES: list[ScanCase] = [
         id="fuzzy_reject_unrelated_artist",
         release_artist="Duke Ellington & John Coltrane",
         release_track_title="In A Sentimental Mood",
-        release_track_artists=None,
+        release_track_artists=[],
         query_track="In A Sentimental Mood",
         query_artist="Thelonious Monk",
         expected=False,
@@ -162,7 +162,7 @@ CASES: list[ScanCase] = [
         id="anv_suffix_release_level_artist_match",
         release_artist="Large Professor*",
         release_track_title="1st Class",
-        release_track_artists=None,
+        release_track_artists=[],
         query_track="1st Class",
         query_artist="Large Professor",
         expected=True,
