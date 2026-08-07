@@ -164,6 +164,42 @@ class TestRunBackfill:
         assert stats.rows_written == 25  # page 1 persisted BEFORE page 2 ran
         assert pg.execute.await_count == 25
 
+    async def test_a_4xx_reraises_instead_of_masquerading_as_a_partial_pass(self):
+        # run_drain's full posture (PR#780): a 4xx is a misconfig -- bad
+        # --api-key (401), oversized page (413) -- not "couldn't ask".
+        # Swallowing it would log one WARNING on the first page and exit 0
+        # having resolved nothing. It must surface; pages persisted before
+        # it still count (the durable-row guarantee is unaffected).
+        credits = [_credit(i, f"Artist {i:02d}", "Track") for i in range(26)]
+        verdicts = {f"Artist {i:02d}": _resolved(f"Artist {i:02d}") for i in range(26)}
+        calls = []
+
+        async def post_batch(names: list[str], dry_run: bool) -> list[dict]:
+            calls.append(list(names))
+            if len(calls) > 1:
+                request = httpx.Request("POST", "http://lml/api/v1/artists/resolve/bulk")
+                raise httpx.HTTPStatusError(
+                    "401 Unauthorized",
+                    request=request,
+                    response=httpx.Response(401, request=request),
+                )
+            return [verdicts[name] for name in names]
+
+        pg = AsyncMock()
+        pg.execute = AsyncMock(return_value="OK")
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await run_backfill(
+                credits=credits,
+                post_batch=post_batch,
+                mb_pg=None,
+                pg=pg,
+                dry_run_write=False,
+                dry_run_http=True,
+            )
+
+        assert pg.execute.await_count == 25  # page 1's rows landed before the misconfig surfaced
+
     async def test_invalid_credit_gets_a_musicbrainz_miss_row_not_eternal_reselection(self):
         # The MB leg applies the same structural gate as the Discogs leg: an
         # invalid credit gets a deterministic MB miss row without touching
