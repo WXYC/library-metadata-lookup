@@ -53,8 +53,10 @@ caller needs ordering, and -- as with the sibling -- this DDL is entirely
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from wxyc_etl.text import to_match_form
 
@@ -192,52 +194,68 @@ async def write_compilation_track_identity_verdict(
     return normalized_artist, normalized_title
 
 
-_UPDATE_POSITION_SQL = """\
-UPDATE lml_cache.compilation_track_identity
-   SET track_position = $5::text
- WHERE library_id = $1 AND track_artist = $2
-   AND track_title = $3 AND source = $4
-   AND track_position IS NULL AND $5::text IS NOT NULL\
+# D1 statement 2, in its set-based form. The fan-out-collapse LATERAL (D5) is
+# part of the statement rather than a preceding SELECT: the recall index's PK
+# is (library_id, track_position, track_artist) -- track_title is NOT in it --
+# so one (library_id, track_artist, track_title) triple can legitimately match
+# several recall-index rows (the same artist credited at two positions on one
+# comp, or two titles that collapse to the same normalized form). A plain join
+# would fan out and land as conflicting writes on THIS table's PK from a single
+# credit; ORDER BY + LIMIT 1 picks one row deterministically (content-derived,
+# so re-runs are stable). Doing it in one statement rather than a SELECT plus a
+# round-trip per recovered row is what keeps a whole-population recovery pass
+# to a single query instead of tens of thousands.
+_FILL_POSITIONS_SQL = """\
+UPDATE lml_cache.compilation_track_identity AS cti
+   SET track_position = src.track_position
+  FROM (
+    SELECT c.library_id, c.track_artist, c.track_title, c.source, loc.track_position
+    FROM lml_cache.compilation_track_identity c
+    JOIN LATERAL (
+        SELECT ctl.track_position
+        FROM lml_cache.compilation_track_location ctl
+        WHERE ctl.library_id = c.library_id
+          AND ctl.track_artist = c.track_artist
+          AND ctl.track_title = c.track_title
+        ORDER BY ctl.track_position
+        LIMIT 1
+    ) loc ON true
+    WHERE c.track_position IS NULL
+      AND c.library_id = ANY($1::int[])
+  ) AS src
+ WHERE cti.library_id = src.library_id
+   AND cti.track_artist = src.track_artist
+   AND cti.track_title = src.track_title
+   AND cti.source = src.source
+   AND cti.track_position IS NULL
+RETURNING cti.library_id, cti.track_artist, cti.track_title, cti.source, cti.track_position\
 """
 
 
-async def write_compilation_track_identity_position(
-    pg: PgSource,
-    *,
-    library_id: int,
-    track_artist: str,
-    track_title: str,
-    source: str,
-    track_position: str | None,
-) -> None:
-    """Write D1 statement 2 -- fills a NULL ``track_position``, never overwrites one.
+async def fill_compilation_track_identity_positions_from_recall_index(
+    pg: PgSource, library_ids: Sequence[int]
+) -> list[dict[str, Any]]:
+    """Write D1 statement 2 -- fills NULL ``track_position``s, never overwrites one.
 
-    Fills on resolved and unresolved rows alike; never touches a verdict
-    column. ``track_artist``/``track_title`` are the ALREADY-NORMALIZED key
-    (from :func:`write_compilation_track_identity_verdict`'s return, or from
-    the D5 recall-index join, which stores normalized values already) -- this
-    function does not re-normalize.
+    Recovers positions for every NULL-position row on ``library_ids`` from the
+    LML#1019 recall index (``lml_cache.compilation_track_location``), which is
+    the ONLY source of position LML has (F1 -- library.db's
+    ``compilation_track_artist`` export carries no position column at all).
+    Fills on resolved and unresolved rows alike; the ``cti.track_position IS
+    NULL`` guard means a populated position is never overwritten, and no
+    verdict column is in the SET list at all, so a late-arriving position
+    cannot disturb a verdict written on an earlier run.
 
-    A ``None`` position short-circuits before the round-trip: the
-    ``$5::text IS NOT NULL`` guard would make the statement a no-op server-side
-    anyway, but there is no reason to pay for it. The ``::text`` cast on the
-    guard is required, not cosmetic -- a bare ``$5 IS NOT NULL`` gives asyncpg
-    nothing to infer a type from and raises "could not determine data type of
-    parameter $5".
+    Returns the rows it actually filled (via ``RETURNING``), so the caller can
+    report the D5 credit-string-agreement yield without a second query. An
+    empty ``library_ids`` short-circuits before the round-trip.
 
     Deliberately does NOT swallow PG failures, matching the verdict writer's
     abort-on-outage posture (D3).
     """
-    if track_position is None:
-        return
-    await pg.execute(
-        _UPDATE_POSITION_SQL,
-        library_id,
-        track_artist,
-        track_title,
-        source,
-        track_position,
-    )
+    if not library_ids:
+        return []
+    return await pg.fetchall(_FILL_POSITIONS_SQL, list(library_ids))
 
 
 @dataclass(frozen=True)
@@ -264,23 +282,31 @@ SELECT library_id, track_artist, track_title, source, external_id, confidence,
        track_position, attempted_at
 FROM lml_cache.compilation_track_identity
 WHERE external_id IS NULL
+  AND ($1::text IS NULL OR source = $1::text)
 ORDER BY library_id
-LIMIT $1\
+LIMIT $2::bigint\
 """
 
 
 async def get_compilation_track_identity_misses(
-    pg: PgSource, *, limit: int
+    pg: PgSource, *, source: str | None = None, limit: int | None = None
 ) -> list[CompilationTrackIdentityRow]:
     """The retry cohort (D2): every attempt row still missing a resolution.
 
-    Backs the backfill's ``--retry-misses`` mode via the partial
-    ``idx_compilation_track_identity_misses`` index. PG failures propagate
-    (matching the write helpers' abort-on-outage posture) rather than
-    degrading to an empty cohort, which would silently make a re-run believe
-    there was nothing left to retry.
+    The single reader of this cohort: the backfill's ``--retry-misses`` mode
+    drains exactly this query (per source, via ``source=``) rather than
+    carrying a second copy of the predicate, so there is one place where "what
+    counts as a miss" is defined. Rides the partial
+    ``idx_compilation_track_identity_misses`` index.
+
+    ``source=None`` spans both sources; ``limit=None`` is the whole cohort
+    (``LIMIT NULL`` is unbounded in PostgreSQL), which is what a full
+    ``--retry-misses`` pass needs. PG failures propagate (matching the write
+    helpers' abort-on-outage posture) rather than degrading to an empty
+    cohort, which would silently make a re-run believe there was nothing left
+    to retry.
     """
-    rows = await pg.fetchall(_SELECT_MISSES_SQL, limit)
+    rows = await pg.fetchall(_SELECT_MISSES_SQL, source, limit)
     return [CompilationTrackIdentityRow(**row) for row in rows]
 
 
