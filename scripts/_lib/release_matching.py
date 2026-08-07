@@ -1,33 +1,37 @@
-"""Match VA compilations from streaming_availability.db to Discogs releases and extract track artists.
+"""Shared VA-compilation-to-Discogs-release matching cascade (LML#1020 D6).
 
-Usage:
-    .venv/bin/python scripts/match_compilations.py [--dry-run] [--limit N]
+Extracted from the former ``scripts/match_compilations.py`` one-off, which
+had grown two consumers -- ``scripts/build_compilation_track_location.py``
+(LML#1019's recall-index builder) and the tests pinning both -- making it a
+genuine shared-script-helper per this package's own scope ("shared helpers
+... extracted to remove cross-script duplication"). Only the matching cascade
+moved here: the module's original standalone JSON-writing CLI (``main()``,
+its argparse wrapper, ``load_compilations``, and the
+``streaming_availability.db``-sourced comp loader) was retired outright with
+it, since neither surviving consumer calls any of that -- see
+``docs/plans/lml-1020-per-track-identity-matcher.md`` D6 for the full
+retirement inventory.
+
+Exact -> prefix-strip -> trigram cascade: try an exact (then normalized)
+case-insensitive title match against ``va_release`` first, fall back to
+stripping a label/series prefix before the first ``" - "``/``": "``, and
+finally a ``pg_trgm`` similarity search. ``enrich_with_track_artists`` then
+pulls per-track credits (``rta.extra = 0`` primary credits only) for
+whatever matched.
 """
 
 from __future__ import annotations
 
-import argparse
-import asyncio
-import json
 import logging
 import re
 from dataclasses import dataclass
 
-import aiosqlite
 import asyncpg
 from rapidfuzz import fuzz
 
 from clients.streaming.matching import _FORMAT_SUFFIX_RE
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
 log = logging.getLogger(__name__)
-
-DISCOGS_URL = "postgresql://jake@localhost/discogs"
-SQLITE_PATH = "streaming_availability.db"
 
 # Strip annotations: [techno comp], (14 cds), etc. Deliberately unconditional
 # (LML#1096 audit), unlike clients/streaming/matching.py's conservative
@@ -70,24 +74,6 @@ class DiscogsMatch:
     discogs_title: str
     confidence: float
     track_count: int
-
-
-async def load_compilations(db_path: str) -> list[CompAlbum]:
-    """Load compilation albums from streaming_availability.db."""
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        rows = await db.execute_fetchall(
-            "SELECT id, display_title, display_artist FROM albums WHERE is_compilation = 1"
-        )
-        return [
-            CompAlbum(
-                id=r["id"],
-                title=r["display_title"],
-                display_artist=r["display_artist"],
-                normalized_title=normalize_comp_title(r["display_title"]),
-            )
-            for r in rows
-        ]
 
 
 async def exact_match(
@@ -330,69 +316,3 @@ async def enrich_with_track_artists(
         f"Enriched: {with_tracks:,} releases have track artist data, {len(results) - with_tracks:,} do not"
     )
     return results
-
-
-async def main(args: argparse.Namespace) -> None:
-    comps = await load_compilations(SQLITE_PATH)
-    log.info(f"Loaded {len(comps):,} compilations from {SQLITE_PATH}")
-
-    if args.limit:
-        comps = comps[: args.limit]
-        log.info(f"Limited to {args.limit}")
-
-    conn = await asyncpg.connect(DISCOGS_URL)
-    try:
-        # Set trigram threshold
-        await conn.execute("SET pg_trgm.similarity_threshold = 0.3")
-
-        # Phase 1: Exact match
-        exact_matches, remaining, title_map = await exact_match(conn, comps)
-
-        # Phase 2: Prefix-stripping exact match (label/series name before dash or colon)
-        prefix_matches, remaining = await prefix_strip_match(title_map, remaining)
-
-        # Phase 3: Trigram fuzzy match
-        fuzzy_matches, still_unmatched = await trigram_match(conn, remaining)
-
-        all_matches = exact_matches + prefix_matches + fuzzy_matches
-        log.info(
-            f"Total matched: {len(all_matches):,} / {len(comps):,} "
-            f"({len(all_matches) / len(comps) * 100:.1f}%)"
-        )
-
-        if not args.dry_run:
-            # Phase 3: Enrich with track artists
-            results = await enrich_with_track_artists(conn, all_matches)
-
-            # Save results
-            output_path = "compilation_track_artists.json"
-            with open(output_path, "w") as f:
-                json.dump(results, f, indent=2)
-            log.info(f"Saved {len(results):,} results to {output_path}")
-
-            # Also save unmatched for review
-            unmatched_path = "compilation_unmatched.json"
-            unmatched_data = [
-                {"id": c.id, "title": c.title, "display_artist": c.display_artist}
-                for c in still_unmatched
-            ]
-            with open(unmatched_path, "w") as f:
-                json.dump(unmatched_data, f, indent=2)
-            log.info(f"Saved {len(still_unmatched):,} unmatched to {unmatched_path}")
-
-        # Sample unmatched
-        if still_unmatched:
-            log.info("Sample unmatched titles:")
-            for c in still_unmatched[:20]:
-                log.info(f"  {c.title}")
-
-    finally:
-        await conn.close()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Match compilations to Discogs")
-    parser.add_argument("--dry-run", action="store_true", help="Only show match stats")
-    parser.add_argument("--limit", type=int, help="Limit to first N compilations")
-    args = parser.parse_args()
-    asyncio.run(main(args))

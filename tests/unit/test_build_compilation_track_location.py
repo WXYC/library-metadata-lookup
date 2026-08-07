@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import aiosqlite
 import pytest
 
+from scripts._lib.release_matching import DiscogsMatch
 from scripts.build_compilation_track_location import (
     CompCandidate,
     build_compilation_track_location,
@@ -21,7 +22,6 @@ from scripts.build_compilation_track_location import (
     match_comp_release,
     tier_credit_role,
 )
-from scripts.match_compilations import DiscogsMatch
 
 
 class TestTierCreditRole:

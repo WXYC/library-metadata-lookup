@@ -1,8 +1,9 @@
 """Tests that release_track_artist JOINs filter out extra (non-performer) credits.
 
 Regression tests for issue #473 (va_disambiguate/discogs_lookup.py),
-issue #474 (match_compilations.py), and issue #475
-(track_streaming/__main__.py).  Each function that queries
+issue #474 (scripts/_lib/release_matching.py, formerly match_compilations.py --
+moved by LML#1020's D6), and issue #475 (track_streaming/__main__.py). Each
+function that queries
 release_track_artist must include AND rta.extra = 0 (or equivalent) in the
 JOIN condition so that producers, remixers, and writers are excluded from
 track-level artist attribution.
@@ -124,7 +125,7 @@ class TestCollectTrackArtistsForReleaseExtraFilter:
 
 
 # ---------------------------------------------------------------------------
-# Issue #474 — scripts/match_compilations.py
+# Issue #474 — scripts/_lib/release_matching.py
 # ---------------------------------------------------------------------------
 
 
@@ -133,7 +134,7 @@ class TestEnrichWithTrackArtistsExtraFilter:
 
     @pytest.mark.asyncio
     async def test_sql_contains_extra_zero_filter(self):
-        from scripts.match_compilations import DiscogsMatch, enrich_with_track_artists
+        from scripts._lib.release_matching import DiscogsMatch, enrich_with_track_artists
 
         conn = AsyncMock()
         conn.fetch = AsyncMock(return_value=[])

@@ -229,6 +229,42 @@ LML_API_KEY=... LML_BASE_URL=https://<prod-lml> \
 
 `--base-url` defaults to `$LML_BASE_URL` then `$PRODUCTION_URL`; `--api-key` to `$LML_API_KEY`. Other flags: `--page-size` (default/cap 25), `--max-retries` (default 2), `--cooldown` (seconds between retry rounds, default 60), `--spot-check` (sample size, default 20), `--seed` (spot-check RNG seed — the sample is reproducible from the JSONL), `--timeout` (per-request seconds, default 120; a fully-escalating page can take ~30s). The report is printed to stdout and, with `--report`, written to a markdown file for pasting into WXYC/Backend-Service#1614.
 
+## Compilation Track Identity Backfill (`scripts/backfill_compilation_track_identity.py`)
+
+Populates `lml_cache.compilation_track_identity` (LML#1020, Layer 2 of #271's Option B split): for each `library.db` `compilation_track_artist` (CTA) credit, resolves the credited artist to a Discogs identity — and, where `DATABASE_URL_MUSICBRAINZ` is configured, a MusicBrainz identity — and writes an attempt row per source, misses included, so `--retry-misses` is a `WHERE external_id IS NULL` predicate rather than a separate failure-tracking table. Full design (the F1–F4 findings that corrected the ticket's stated premises, the D1–D6 decisions) is in `docs/plans/lml-1020-per-track-identity-matcher.md`.
+
+The Discogs leg reuses `BareNameArtistResolver` — but over HTTP, via `POST /api/v1/artists/resolve/bulk` against the running LML service, never by importing `DiscogsService`/`DiscogsCacheService` directly: the shared Discogs rate bucket, the LML#927 bulk-reservation semaphore, and the LML#755 saturation breaker all live inside that process, so a standalone script holding its own Discogs client would be an uncoordinated N+1th limiter against the same token. A joint credit ("The Bug feat. Flowdan") is attempted whole first (joint credits are frequently real Discogs entities) and only split on a miss. The MusicBrainz leg is cache-local trigram (`lookup/external_search.py`'s `fetch_mb_artist_candidates`), never a live MB API call, gated by a similarity floor and an ambiguity band so a near-tied pair records a miss rather than a coin-flip.
+
+Position recovery (D5) is a separate deterministic `LATERAL` join against the LML#1019 recall index (`lml_cache.compilation_track_location`) — CTA carries no position column at all (F1), so 100% of positions come from this join, never from CTA. Yield is reported along two independent axes: recall-index coverage (did the comp match a Discogs release) and CTA↔Discogs credit-string agreement within a covered comp.
+
+**Two independent switches, two distinct names**:
+
+| Flag | Controls | Default |
+|---|---|---|
+| `--dry-run` | Whether the run writes `lml_cache.compilation_track_identity` rows | off (rows **are** written) |
+| `--live` | Whether the resolve endpoint mints into `entity.identity` | off (**no** minting) |
+
+`--live` matches the sibling artist-resolve drain's spelling. A default run populates this backfill's own table and mints nothing into the discogs-cache-owned `entity.identity` — the useful default, and the safe one, since a wrong mint is COALESCE-never-clobber and does not self-correct. **The production drain is a human-triggered post-merge step**, run off-peak against prod for the same reason the sibling drain is (`docs/scripts.md`'s Bulk Artist-Resolve Drain section above): prod is the only place all Discogs traffic coordinates through the shared limiter + breaker.
+
+```bash
+# Daily cadence: only credits with no existing row for a source yet.
+LML_API_KEY=... LML_BASE_URL=https://<prod-lml> DATABASE_URL_DISCOGS=... \
+  uv run python -m scripts.backfill_compilation_track_identity --incremental
+
+# Monthly cadence: reprocess every CTA credit against both sources.
+uv run python -m scripts.backfill_compilation_track_identity --full
+
+# Re-attempt only credits whose existing row is a miss.
+uv run python -m scripts.backfill_compilation_track_identity --retry-misses
+
+# Authorize minting after a dry-HTTP run's spot-check:
+uv run python -m scripts.backfill_compilation_track_identity --incremental --live
+```
+
+Exactly one of `--incremental` / `--full` / `--retry-misses` is required. Other flags: `--library-db` (path to `library.db`, default `library.db`), `--limit` (cap the number of CTA credits loaded), `--base-url`/`--api-key` (default to `$LML_BASE_URL`/`$PRODUCTION_URL` and `$LML_API_KEY`, matching the sibling drain), `--timeout` (per-request seconds, default 120). Unlike the sibling artist-resolve drain, this script does not drive `run_drain`'s JSONL-logged resume: every attempt is already a durable PG row (D2), so a crash loses at most one in-flight page (≤25 credits) and the next `--incremental` invocation picks up exactly where the process left off — see the module docstring for the full reasoning.
+
+Retires `scripts/match_compilations.py` (its matching cascade moved to `scripts/_lib/release_matching.py`, a genuine shared-script helper once `scripts/build_compilation_track_location.py` became its second consumer; its standalone JSON-writing CLI had no remaining caller) and `scripts/merge_cta.py` outright (it SSH-wrote to tubafrenzy MySQL, which the cross-cache-identity pivot's no-cross-service-writes rule forbids).
+
 ## Track-Cache V/A Purge (`scripts/purge_va_apple_track_cache.py`)
 
 Clears pre-LML#1139 Various-Artists rows from `lml_cache.track_streaming_url_cache` (the LML#893 L1 track-URL cache). **This runs in the same deploy as the LML#1139 guard, not after it.** The table is hit-only and TTL-less and is peeked in `lookup/enrichment/apple_probe.py` *before* the live Apple probe, so a wrong V/A deep-link cached before the guard shipped would serve forever — on exactly the repeat-play traffic that recurs most — and the guard would never get a chance to re-adjudicate it. Ship the guard without the purge and the bug stays fully live from cache.

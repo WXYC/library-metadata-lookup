@@ -115,8 +115,6 @@ module = [
     "scripts.canonicalize_albums",
     "scripts.canonicalize_compilations",
     "scripts.enrich_discogs_matches",
-    "scripts.match_compilations",
-    "scripts.merge_cta",
     "scripts.musicbrainz_matching",
     "scripts.revalidate_misses",
     "scripts.revalidate_spotify",
