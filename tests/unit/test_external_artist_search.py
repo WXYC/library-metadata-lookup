@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from discogs.cache_service import CacheUnavailableError
-from lookup.external_search import search_external_artists
+from lookup.external_search import fetch_mb_artist_candidates, search_external_artists
 
 
 @pytest.fixture
@@ -264,3 +264,59 @@ class TestMbArtistFunaccentSymmetry:
 
         assert source == "musicbrainz"
         assert candidates == [{"id": "mb-uuid-csgr", "name": "Csillagrablók"}]
+
+
+class TestFetchMbArtistCandidates:
+    """LML#1020 slice 3 extraction: a public helper carrying the raw ``score``
+    column ``search_external_artists``'s id/name-only projection drops. The
+    per-track matcher's similarity floor / ambiguity rule needs the score;
+    this is the one place both callers share the query.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_rows_with_score(self, mock_mb_pg):
+        mock_mb_pg.fetchall.return_value = [
+            {"id": "mb-uuid-1", "name": "Csillagrablók", "score": 0.83},
+        ]
+
+        candidates = await fetch_mb_artist_candidates(mock_mb_pg, "Csillagrablok")
+
+        assert candidates == [{"id": "mb-uuid-1", "name": "Csillagrablók", "score": 0.83}]
+        sql, *binds = mock_mb_pg.fetchall.await_args.args
+        assert "mb_artist" in sql
+        assert binds == ["Csillagrablok", 5]
+
+    @pytest.mark.asyncio
+    async def test_respects_limit(self, mock_mb_pg):
+        await fetch_mb_artist_candidates(mock_mb_pg, "Csillagrablok", limit=2)
+
+        _sql, _skeleton, limit = mock_mb_pg.fetchall.await_args.args
+        assert limit == 2
+
+    @pytest.mark.asyncio
+    async def test_pg_failure_propagates(self, mock_mb_pg):
+        # Unlike search_external_artists (which swallows at its own call
+        # site to preserve its degrade-to-empty contract), this helper does
+        # not swallow -- the LML#1020 matcher needs to distinguish "PG error,
+        # no row at all" from "queried, zero candidates" (a miss row), which
+        # a swallow-to-[] would collapse.
+        mock_mb_pg.fetchall.side_effect = RuntimeError("pg unreachable")
+
+        with pytest.raises(RuntimeError):
+            await fetch_mb_artist_candidates(mock_mb_pg, "Whoever")
+
+    @pytest.mark.asyncio
+    async def test_search_external_artists_still_swallows_at_its_call_site(
+        self, mock_discogs_cache, mock_mb_pg
+    ):
+        # Regression guard for the extraction: the existing degrade-to-empty
+        # contract at the search_external_artists call site must survive.
+        mock_discogs_cache.search_artists_by_name.return_value = []
+        mock_mb_pg.fetchall.side_effect = RuntimeError("pg unreachable")
+
+        candidates, source = await search_external_artists(
+            "Whoever", discogs_cache=mock_discogs_cache, mb_pg=mock_mb_pg
+        )
+
+        assert candidates == []
+        assert source is None

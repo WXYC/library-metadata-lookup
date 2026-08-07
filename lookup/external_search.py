@@ -106,6 +106,27 @@ def _is_blank(value: str | None) -> bool:
     return value is None or not value.strip()
 
 
+async def fetch_mb_artist_candidates(
+    mb_pg: PgSourceProtocol, skeleton: str, limit: int = 5
+) -> list[dict[str, Any]]:
+    """Trigram-fuzzy MB artist candidates for ``skeleton``, ranked by score.
+
+    Extracted (LML#1020 slice 3) so both ``search_external_artists`` and the
+    per-track compilation-identity matcher (``scripts/backfill_compilation_track_identity.py``)
+    share one query. Unlike ``search_external_artists``'s id/name-only
+    projection, this returns the raw ``score`` column too -- the matcher's
+    similarity floor and ambiguity rule need it, and dropping it would force
+    a second, duplicate query just to get it back.
+
+    Raises on a PG failure rather than degrading to ``[]``: callers that want
+    the swallow-to-empty posture (``search_external_artists``) wrap this call
+    themselves, because a swallow here would collapse "PG error, could not
+    ask" into "asked, zero candidates" -- two outcomes the matcher's D2/D3
+    attempt-row design must keep distinct.
+    """
+    return await mb_pg.fetchall(_MB_ARTIST_FUZZY_SQL, skeleton, limit)
+
+
 async def search_external_artists(
     skeleton: str,
     *,
@@ -143,7 +164,7 @@ async def search_external_artists(
 
     if mb_pg is not None:
         try:
-            rows = await mb_pg.fetchall(_MB_ARTIST_FUZZY_SQL, skeleton, limit)
+            rows = await fetch_mb_artist_candidates(mb_pg, skeleton, limit)
             if rows:
                 logger.info(
                     "External fallback: musicbrainz cache returned %d artists for %r",
