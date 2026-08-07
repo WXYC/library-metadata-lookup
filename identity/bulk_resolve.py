@@ -22,21 +22,41 @@ NOT here. Rules 2-6 execute here:
 
 V/A detection uses `wxyc_etl.text.is_compilation_artist`. `kind: compilation`
 returns empty `provenance: []`; its `(tracks_attempted, tracks)` pair follows
-the request's `include_tracks` flag — absent/NULL when off, `(False, [])`
-("asked, matcher not yet visited") when on — until per-track resolution lands
-in WXYC/library-metadata-lookup#1021 (V/A) and #1138 (non-V/A).
+the request's `include_tracks` flag — absent/NULL when off; when on, real
+per-track identity read out of `lml_cache.compilation_track_identity`
+(LML#1020's store) as of LML#1021 — `(False, [])` when the release has zero
+store rows (the per-track matcher hasn't visited it), `(True, tracks)`
+otherwise, misses included. Non-V/A rows (`kind: single_artist`) still emit
+the placeholder `(False, [])` pending WXYC/library-metadata-lookup#1138.
+
+LML#1021's per-track composition (`compilation_result`'s `store_rows`
+parameter) applies Rule 4 (MIN-of-confidences) only, deliberately NOT Rule 2
+(cross-source agreement boost) — see `_compose_confidence_and_method`'s
+`allow_agreement` parameter and the LML#1021 PR body for why: the album-grain
+`_has_cross_source_agreement` proxy below is honest only because
+`entity.identity` rows are pre-cross-resolved via wikidata `discogs_mapping`
+(`scripts/entity_resolution/`) before being written, and the per-track
+Discogs/MusicBrainz legs run independently with no such cross-reference step
+— `lml_cache.compilation_track_identity` stores no wikidata QID to check one.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 
+from entity.compilation_track_identity import (
+    CompilationTrackIdentityRow,
+    get_compilation_track_identity_for_libraries,
+)
+from entity.sources import PgSource
 from entity.store import EntityStore, Identity, ProvenanceRow
 from generated.api_models import (
     BulkResolveProvenanceEntry,
     BulkResolveResult,
     BulkResolveResultKind,
+    BulkResolveTrackIdentity,
     IdentityMethod,
     IdentitySource,
     ReconciledIdentity,
@@ -133,6 +153,13 @@ class _ComposedRow:
     confidence: float
     external_id: str
     is_inherited: bool
+    # Track-grain-only (LML#1021). Album grain's per-source rows never set
+    # this -- ReconciledIdentity (built separately in _compose_main) is the
+    # album-grain per-source-id-to-response mapping; there is no per-source
+    # "canonical name" concept at that grain. Defaults to None so every
+    # existing _ComposedRow(...) call site in _build_per_source_rows needs
+    # no change.
+    resolved_artist_name: str | None = None
 
 
 def _normalize_method(raw: str) -> IdentityMethod | None:
@@ -252,6 +279,37 @@ def _has_cross_source_agreement(rows: list[_ComposedRow]) -> bool:
     return len(independent) >= 2
 
 
+def _compose_confidence_and_method(
+    rows: list[_ComposedRow], *, allow_agreement: bool
+) -> tuple[IdentityMethod, float]:
+    """Rules 2 + 4 of §3.4.1.1: MIN-of-confidences, optionally boosted by
+    cross-source agreement.
+
+    Shared by the album-grain `_compose_main` (`allow_agreement=True`, its
+    original behavior, unchanged) and LML#1021's track-grain composer
+    (`allow_agreement=False`, always) — see the module docstring and the
+    LML#1021 PR body for why the agreement boost is not reused at track
+    grain: `_has_cross_source_agreement`'s ">=2 independent legs" proxy is
+    honest at album grain only because `entity.identity` rows are already
+    cross-resolved via wikidata `discogs_mapping` before being written; the
+    per-track Discogs and MusicBrainz legs run independently with no such
+    cross-reference step, and the store carries no wikidata QID to check
+    one. Requires a non-empty `rows`.
+    """
+    confidences = [r.confidence for r in rows]
+    min_confidence = min(confidences)
+
+    if allow_agreement and _has_cross_source_agreement(rows):
+        return IdentityMethod.cross_source_agreement, max(AGREEMENT_FLOOR, min_confidence)
+
+    # Rule 4: MIN-of-confidences. The method is the per-source method of the
+    # row whose confidence is minimal — matches §3.4.1.1's worked example
+    # "Two sources, exact_match 1.00 + name_variation 0.92 -> name_variation
+    # 0.92".
+    weakest = min(rows, key=lambda r: r.confidence)
+    return weakest.method, min_confidence
+
+
 def _compose_main(
     rows: list[_ComposedRow],
 ) -> tuple[ReconciledIdentity | None, IdentityMethod | None, float | None]:
@@ -280,22 +338,11 @@ def _compose_main(
         elif row.source is IdentitySource.bandcamp:
             main.bandcamp_id = row.external_id
 
-    confidences = [r.confidence for r in rows]
-    min_confidence = min(confidences)
-
-    # Rule 2: cross-source agreement boost. (Rule 1 — manual override —
-    # is Backend's responsibility per the pivot decision; not applied here.)
-    if _has_cross_source_agreement(rows):
-        composed_confidence = max(AGREEMENT_FLOOR, min_confidence)
-        composed_method = IdentityMethod.cross_source_agreement
-    else:
-        # Rule 4: MIN-of-confidences. The method is the per-source method
-        # of the row whose confidence is minimal — matches §3.4.1.1's
-        # worked example "Two sources, exact_match 1.00 + name_variation
-        # 0.92 -> name_variation 0.92".
-        composed_confidence = min_confidence
-        weakest = min(rows, key=lambda r: r.confidence)
-        composed_method = weakest.method
+    # Rule 1 (manual override) is Backend's responsibility per the pivot
+    # decision; not applied here.
+    composed_method, composed_confidence = _compose_confidence_and_method(
+        rows, allow_agreement=True
+    )
 
     return main, composed_method, composed_confidence
 
@@ -381,18 +428,246 @@ async def compose_for_identity(
     )
 
 
-def compilation_result(library_id: int, *, include_tracks: bool = False) -> BulkResolveResult:
+# --------------------------------------------------------------------------- #
+# LML#1021: per-track composition for `kind: compilation`'s `tracks[]`.
+#
+# `compilation_result` never queries PG itself — the batched pre-fetch
+# (`load_compilation_track_rows_by_legacy_id`) is the router's job, run ONCE
+# per request before the per-input fan-out, keyed on
+# `BulkResolveInput.legacy_release_id` (wxyc-shared#315's id-space bridge —
+# NOT `library_id`, which is Backend's own serial and a DIFFERENT id space;
+# see the F2 finding on LML#1021 and `entity/compilation_track_identity.py`'s
+# module docstring). The composer here only groups and composes whatever the
+# caller already fetched for one release.
+# --------------------------------------------------------------------------- #
+
+
+async def load_compilation_track_rows_by_legacy_id(
+    pg: PgSource, legacy_release_ids: Sequence[int]
+) -> dict[int, list[CompilationTrackIdentityRow]]:
+    """The batched pre-fan-out read: ONE query for a whole bulk-resolve
+    batch's compilation `legacy_release_id`s, grouped in memory per id.
+
+    Called once per request (not per input) from `identity/router.py`,
+    before `asyncio.gather` dispatches the per-input coroutines — bulk-
+    resolve batches up to 1,000 inputs, and a per-input query against this
+    table would be exactly the N+1 the ticket's hard requirement forbids.
+
+    `legacy_release_ids` must already be `BulkResolveInput.legacy_release_id`
+    values (library.db's / `lml_cache.compilation_track_identity`'s id
+    space), collected from the request's compilation inputs that actually
+    carry one — never `BulkResolveInput.library_id`. An empty sequence
+    short-circuits before the round-trip (a batch with no compilation rows,
+    or none carrying the bridge field, is common). PG failures propagate;
+    the router's existing `TRANSIENT_PG_ERRORS` handling around the whole
+    per-request setup covers this the same way it covers every other
+    pre-fan-out PG call.
+    """
+    if not legacy_release_ids:
+        return {}
+    rows = await get_compilation_track_identity_for_libraries(pg, legacy_release_ids)
+    grouped: dict[int, list[CompilationTrackIdentityRow]] = {}
+    for row in rows:
+        grouped.setdefault(row.library_id, []).append(row)
+    return grouped
+
+
+def _merge_track_position(rows: Sequence[CompilationTrackIdentityRow]) -> str | None:
+    """Pick one `track_position` across a credit's per-source rows.
+
+    D5's recall-index fill (`fill_compilation_track_identity_positions_from_recall_index`)
+    is keyed on `(library_id, track_artist, track_title)` with no `source`
+    filter, so both source rows for one credit are filled from the same
+    LATERAL pick in the same pass and should agree whenever both are
+    non-NULL. This never overwrites anything — it only picks deterministically
+    (sorted by source) which of possibly-differing populated values reaches
+    the wire, guarding the rare case where the two rows were filled on
+    different runs.
+    """
+    for row in sorted(rows, key=lambda r: r.source):
+        if row.track_position is not None:
+            return row.track_position
+    return None
+
+
+def _pick_raw_credit(rows: Sequence[CompilationTrackIdentityRow]) -> tuple[str, str | None]:
+    """Pick one `(track_artist_raw, track_title_raw)` echo across a credit's
+    per-source rows — deterministic (sorted by source), matching
+    `_merge_track_position`. Every source row for one credit is written from
+    the same `CtaCredit` in a single backfill pass (`write_fan_back` in
+    `scripts/backfill_compilation_track_identity.py`), so the raw echoes
+    should already agree; this only breaks a tie deterministically if they
+    ever don't.
+    """
+    chosen = min(rows, key=lambda r: r.source)
+    return chosen.track_artist_raw, chosen.track_title_raw
+
+
+def _store_row_to_composed(row: CompilationTrackIdentityRow) -> _ComposedRow | None:
+    """Map one per-source `compilation_track_identity` row to a `_ComposedRow`,
+    or `None` for a miss (or an unmappable method).
+
+    **A miss row cannot be represented on the wire, full stop — this is a
+    flagged contract gap, not a design choice.** `BulkResolveProvenanceEntry
+    .method` is REQUIRED and non-nullable in api.yaml 1.33.0 (unlike
+    `confidence`/`external_id` on the same schema, both `nullable: true`) —
+    confirmed empirically: constructing one with `method=None` or omitted
+    raises a pydantic `ValidationError`. D1's CHECK constraint on
+    `lml_cache.compilation_track_identity` makes `method` NULL exactly when
+    `external_id` is NULL (a miss), so a miss row's method is never available
+    to put there anyway. The only choices are fabricating a method value
+    (dishonest) or omitting the leg (this function's choice, via `None`) —
+    flagged in the LML#1021 PR body as a wxyc-shared follow-up:
+    `BulkResolveProvenanceEntry.method` should gain `nullable: true` to
+    mirror its siblings, at which point miss legs can be restored to
+    `sources[]`. This affects `sources[]` (audit detail) only — the
+    load-bearing resolved-signal fields (`tracks_attempted`,
+    `BulkResolveTrackIdentity.resolved_artist_name`) are computed
+    independently and are unaffected.
+    """
+    if row.external_id is None or row.confidence is None or row.method is None:
+        return None
+    try:
+        method = IdentityMethod(row.method)
+    except ValueError:
+        logger.warning(
+            "compilation_track_identity: unmappable method %r for library_id=%d "
+            "track_artist=%r source=%s",
+            row.method,
+            row.library_id,
+            row.track_artist,
+            row.source,
+        )
+        return None
+    return _ComposedRow(
+        source=IdentitySource(row.source),
+        method=method,
+        confidence=row.confidence,
+        external_id=row.external_id,
+        is_inherited=False,
+        resolved_artist_name=row.resolved_artist_name,
+    )
+
+
+def _compose_track_row(rows: Sequence[CompilationTrackIdentityRow]) -> BulkResolveTrackIdentity:
+    """Compose one `BulkResolveTrackIdentity` from one credit's per-source
+    store rows (all rows sharing the same normalized `(track_artist,
+    track_title)` key — i.e. every source's attempt at the SAME CTA credit).
+
+    Rule 4 (MIN-of-confidences) only — see `_compose_confidence_and_method`
+    and the module docstring for why the Rule 2 agreement boost is not
+    reused at this grain. A credit whose every leg is a miss (or has no
+    resolved legs at all) composes to a null verdict with a populated (or
+    empty) `sources[]` per `_store_row_to_composed`'s documented gap.
+    """
+    raw_artist, raw_title = _pick_raw_credit(rows)
+    position = _merge_track_position(rows)
+    composed = [c for c in (_store_row_to_composed(r) for r in rows) if c is not None]
+
+    if not composed:
+        return BulkResolveTrackIdentity(
+            track_position=position,
+            artist_name=raw_artist,
+            track_title=raw_title,
+            resolved_artist_name=None,
+            confidence=None,
+            method=None,
+            sources=[],
+        )
+
+    method, confidence = _compose_confidence_and_method(composed, allow_agreement=False)
+    weakest = min(composed, key=lambda r: r.confidence)
+
+    return BulkResolveTrackIdentity(
+        track_position=position,
+        artist_name=raw_artist,
+        track_title=raw_title,
+        resolved_artist_name=weakest.resolved_artist_name,
+        confidence=confidence,
+        method=method,
+        sources=[_row_to_provenance(c) for c in composed],
+    )
+
+
+def _compose_track_entries(
+    store_rows: Sequence[CompilationTrackIdentityRow],
+) -> list[BulkResolveTrackIdentity]:
+    """Group a release's attempt rows (D2 — every CTA credit the matcher
+    visited, source per row) by CTA credit and compose one
+    `BulkResolveTrackIdentity` per credit.
+
+    Grouping key is the normalized `(track_artist, track_title)` pair — the
+    first two columns of the store's PK, already `to_match_form`-normalized
+    by the writer — which is what brings a credit's Discogs and MusicBrainz
+    rows together regardless of which source(s) actually produced a row.
+    Sorted for a deterministic, reproducible order (the store's `WHERE
+    library_id = ANY(...)` carries no `ORDER BY`). Payload discipline
+    (2026-08-06 amendment): no cap, no truncation — every credit-shaped
+    group becomes one entry, however large.
+    """
+    grouped: dict[tuple[str, str], list[CompilationTrackIdentityRow]] = {}
+    for row in store_rows:
+        grouped.setdefault((row.track_artist, row.track_title), []).append(row)
+    return [_compose_track_row(rows) for _, rows in sorted(grouped.items())]
+
+
+def compilation_result(
+    library_id: int,
+    *,
+    include_tracks: bool = False,
+    store_rows: Sequence[CompilationTrackIdentityRow] | None = None,
+) -> BulkResolveResult:
     """Build a `kind: compilation` verdict.
 
     The `(tracks_attempted, tracks)` pair follows the four-state contract
     (1.30.0): flag off keeps both absent/NULL (the always-empty `tracks: []`
-    the pre-1.30.0 wire shipped is retired); flag on emits `(False, [])` —
-    "asked, matcher hasn't visited" — until WXYC/library-metadata-lookup#1021
-    reads real per-track verdicts out of `lml_cache.compilation_track_identity`.
-    Emitting `False` here is honest per-row truth today (the #1020 backfill
-    has not run in production), and the consumer keeps re-asking, which is
-    exactly the behavior the pair exists to make possible.
+    the pre-1.30.0 wire shipped is retired). Flag on reads real per-track
+    identity out of `lml_cache.compilation_track_identity` as of LML#1021:
+
+    - `store_rows` is `None` or empty — the release has zero attempt rows,
+      meaning either the per-track matcher hasn't visited it yet, or the
+      caller had no `legacy_release_id` bridge to look it up with (an
+      un-upgraded caller, or the rare un-upgraded-producer residual —
+      wxyc-shared#315). Both degrade to the same honest `(False, [])`
+      "asked, not yet visited" state — LML genuinely cannot tell these two
+      apart from here, and both keep the consumer re-asking rather than
+      mis-marking anything resolved.
+    - `store_rows` is non-empty — the matcher visited this release (D2: an
+      attempt row exists for every credit, misses included). Emits
+      `(True, tracks)` where `tracks` echoes EVERY credit-shaped group,
+      including all-miss ones (`resolved_artist_name`/`confidence`/`method`
+      all `None`) — "we looked, the answer is no" is itself the resolved
+      signal WXYC/Backend-Service#1991 needs to exit its retry sweep.
+
+    `store_rows` must already be scoped to this one release — the caller
+    (`identity/router.py`) does the batched multi-release read
+    (`load_compilation_track_rows_by_legacy_id`) once per request and passes
+    in this release's slice; this function never queries PG itself.
     """
+    if not include_tracks:
+        return BulkResolveResult(
+            kind=BulkResolveResultKind.compilation,
+            library_id=library_id,
+            main=None,
+            method=None,
+            confidence=None,
+            provenance=[],
+            tracks=None,
+            tracks_attempted=None,
+        )
+
+    if not store_rows:
+        return BulkResolveResult(
+            kind=BulkResolveResultKind.compilation,
+            library_id=library_id,
+            main=None,
+            method=None,
+            confidence=None,
+            provenance=[],
+            tracks=[],
+            tracks_attempted=False,
+        )
+
     return BulkResolveResult(
         kind=BulkResolveResultKind.compilation,
         library_id=library_id,
@@ -400,6 +675,6 @@ def compilation_result(library_id: int, *, include_tracks: bool = False) -> Bulk
         method=None,
         confidence=None,
         provenance=[],
-        tracks=[] if include_tracks else None,
-        tracks_attempted=False if include_tracks else None,
+        tracks=_compose_track_entries(store_rows),
+        tracks_attempted=True,
     )

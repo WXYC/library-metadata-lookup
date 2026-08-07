@@ -1191,7 +1191,18 @@ class TestIncludeTracksWire:
     @pytest.mark.asyncio
     async def test_flag_on_mixed_batch(self, app_client, mock_entity_store):
         """Flag on: resolved kinds emit (false, []), unresolved emits the
-        absent pair, and the response carries the capability marker."""
+        absent pair.
+
+        `tracks_contract_version` stays None even though `include_tracks`
+        was understood-true: api.yaml 1.32.0 (wxyc-shared#314) tightened
+        the marker so it may be `1` only once BOTH producer arms emit
+        `tracks_attempted` -- `kind: compilation` (LML#1021, this repo) AND
+        `kind: single_artist` (LML#1138, not yet). `compose_for_identity`
+        still hardcodes `tracks=None` on the `single_artist` arm above, so
+        setting the marker here would tell a BS consumer to trust
+        `tracks_attempted` on rows where it is still meaningless. See
+        `identity/router.py`'s `bulk_resolve_libraries` for the gate.
+        """
         mock_entity_store.resolve_library_name.side_effect = [
             _identity("Stereolab", id=1, discogs_artist_id=2154),
             None,
@@ -1212,7 +1223,7 @@ class TestIncludeTracksWire:
 
         assert resp.status_code == 200
         data = resp.json()
-        assert data["tracks_contract_version"] == 1
+        assert data["tracks_contract_version"] is None
 
         by_id = {r["library_id"]: r for r in data["results"]}
         assert by_id[1]["kind"] == "single_artist"
@@ -1274,3 +1285,171 @@ class TestIncludeTracksWire:
         assert data["tracks_contract_version"] is None
         assert data["results"][0]["tracks"] is None
         assert data["results"][0]["tracks_attempted"] is None
+
+
+class TestIncludeTracksCompilationStore:
+    """LML#1021: the compilation arm's `tracks[]` read against
+    `lml_cache.compilation_track_identity`, via the router's batched
+    pre-fan-out read (`identity.bulk_resolve.load_compilation_track_rows_by_legacy_id`).
+
+    `entity.identity`/PG access here is exercised through a fake `PgSource`
+    override on `core.dependencies.get_discogs_cache_pg` — the real batched
+    SQL round-trip is covered by the `pg`-marked integration suite.
+    """
+
+    async def _post(self, app, body):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            return await ac.post("/api/v1/identity/bulk-resolve-libraries", json=body)
+
+    @pytest.mark.asyncio
+    async def test_batched_read_is_exactly_one_query_for_a_multi_compilation_batch(
+        self, app_client, mock_entity_store
+    ):
+        """Hard requirement: bulk-resolve batches up to 1,000 inputs, and a
+        per-input store query would be an N+1 regression. Spy on the
+        router's batched-read call and assert it fires exactly once per
+        request, however many compilation inputs the batch carries.
+        """
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.sources import PgSource
+
+        call_count = 0
+
+        async def counting_load(pg, legacy_release_ids):
+            nonlocal call_count
+            call_count += 1
+            return {}
+
+        router_module_load = router_module.load_compilation_track_rows_by_legacy_id
+        router_module.load_compilation_track_rows_by_legacy_id = counting_load
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        # The one single_artist input just needs to resolve cleanly; its
+        # exact result isn't what this test is about.
+        mock_entity_store.resolve_library_name.return_value = None
+        try:
+            resp = await self._post(
+                app_client,
+                {
+                    "include_tracks": True,
+                    "inputs": [
+                        {
+                            "library_id": 1,
+                            "legacy_release_id": 101,
+                            "artist_name": "Various Artists",
+                            "album_title": "VA One",
+                        },
+                        {
+                            "library_id": 2,
+                            "legacy_release_id": 102,
+                            "artist_name": "Soundtracks",
+                            "album_title": "VA Two",
+                        },
+                        {
+                            "library_id": 3,
+                            "legacy_release_id": 103,
+                            "artist_name": "Various Artists",
+                            "album_title": "VA Three",
+                        },
+                        {"library_id": 4, "artist_name": "Stereolab", "album_title": "AT"},
+                    ],
+                },
+            )
+        finally:
+            router_module.load_compilation_track_rows_by_legacy_id = router_module_load
+
+        assert resp.status_code == 200
+        assert call_count == 1, (
+            f"Expected exactly one batched store read per request; got {call_count}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_wire_shape_of_a_mixed_batch(self, app_client, mock_entity_store):
+        """One compilation input with a legacy_release_id and store hits,
+        one compilation input with no legacy_release_id (unvisited
+        fallback), one single_artist input (unaffected)."""
+        from core.dependencies import get_discogs_cache_pg
+        from entity.compilation_track_identity import CompilationTrackIdentityRow
+
+        rows_by_id = {
+            201: [
+                CompilationTrackIdentityRow(
+                    library_id=201,
+                    track_artist="juana molina",
+                    track_title="la paradoja",
+                    source="discogs",
+                    external_id="305253",
+                    confidence=1.0,
+                    method="exact_match",
+                    resolved_artist_name="Juana Molina",
+                    track_artist_raw="Juana Molina",
+                    track_title_raw="La Paradoja",
+                    track_position="A1",
+                )
+            ]
+        }
+
+        async def fake_load(pg, legacy_release_ids):
+            return {lid: rows_by_id[lid] for lid in legacy_release_ids if lid in rows_by_id}
+
+        import identity.router as router_module
+        from entity.sources import PgSource
+
+        router_module_load = router_module.load_compilation_track_rows_by_legacy_id
+        router_module.load_compilation_track_rows_by_legacy_id = fake_load
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Stereolab", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+        try:
+            resp = await self._post(
+                app_client,
+                {
+                    "include_tracks": True,
+                    "inputs": [
+                        {
+                            "library_id": 1,
+                            "legacy_release_id": 201,
+                            "artist_name": "Various Artists",
+                            "album_title": "Edits",
+                        },
+                        {
+                            "library_id": 2,
+                            "artist_name": "Soundtracks",
+                            "album_title": "No Bridge",
+                        },
+                        {
+                            "library_id": 3,
+                            "legacy_release_id": 301,
+                            "artist_name": "Stereolab",
+                            "album_title": "Dots and Loops",
+                        },
+                    ],
+                },
+            )
+        finally:
+            router_module.load_compilation_track_rows_by_legacy_id = router_module_load
+
+        assert resp.status_code == 200
+        data = resp.json()
+        by_id = {r["library_id"]: r for r in data["results"]}
+
+        resolved = by_id[1]
+        assert resolved["kind"] == "compilation"
+        assert resolved["tracks_attempted"] is True
+        assert len(resolved["tracks"]) == 1
+        track = resolved["tracks"][0]
+        assert track["artist_name"] == "Juana Molina"
+        assert track["track_position"] == "A1"
+        assert track["resolved_artist_name"] == "Juana Molina"
+
+        unbridged = by_id[2]
+        assert unbridged["kind"] == "compilation"
+        assert unbridged["tracks_attempted"] is False
+        assert unbridged["tracks"] == []
+
+        single_artist = by_id[3]
+        assert single_artist["kind"] == "single_artist"
+        assert single_artist["tracks_attempted"] is False
+        assert single_artist["tracks"] == []

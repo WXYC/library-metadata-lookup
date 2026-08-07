@@ -331,3 +331,42 @@ async def get_compilation_track_identity_for_library(
     """
     rows = await pg.fetchall(_SELECT_BY_LIBRARY_SQL, library_id)
     return [CompilationTrackIdentityRow(**row) for row in rows]
+
+
+_SELECT_BY_LIBRARIES_SQL = """\
+SELECT library_id, track_artist, track_title, source, external_id, confidence,
+       method, resolved_artist_name, track_artist_raw, track_title_raw,
+       track_position, attempted_at
+FROM lml_cache.compilation_track_identity
+WHERE library_id = ANY($1::int[])\
+"""
+
+
+async def get_compilation_track_identity_for_libraries(
+    pg: PgSource, library_ids: Sequence[int]
+) -> list[CompilationTrackIdentityRow]:
+    """The batched analogue of :func:`get_compilation_track_identity_for_library`.
+
+    ONE query for a whole BATCH of ``library_id``s -- the LML#1021 hard
+    requirement: bulk-resolve batches up to 1,000 inputs, and a per-row
+    query against this table would be exactly the N+1 that ticket forbids.
+    The caller groups the flat result by ``library_id`` in memory (see
+    ``identity.bulk_resolve.load_compilation_track_rows_by_legacy_id``).
+
+    ``library_ids`` here is library.db's legacy MySQL ``LIBRARY_RELEASE_ID``
+    space -- the same space this whole module's ``library_id`` column lives
+    in (see the module docstring). LML#1021's caller must pass
+    ``BulkResolveInput.legacy_release_id`` values, never
+    ``BulkResolveInput.library_id`` (Backend's own serial, a DIFFERENT id
+    space per that ticket's F2 finding) -- this function has no way to
+    detect a caller that gets this wrong, since both are plain ints.
+
+    An empty ``library_ids`` short-circuits before the round-trip (a batch
+    with no compilation rows, or none carrying a ``legacy_release_id``, is
+    common and should not touch PG at all). PG failures propagate, matching
+    every other reader in this module.
+    """
+    if not library_ids:
+        return []
+    rows = await pg.fetchall(_SELECT_BY_LIBRARIES_SQL, list(library_ids))
+    return [CompilationTrackIdentityRow(**row) for row in rows]

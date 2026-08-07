@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from entity.compilation_track_identity import CompilationTrackIdentityRow
 from entity.store import Identity, ProvenanceRow
 from generated.api_models import (
     BulkResolveResultKind,
@@ -23,6 +24,36 @@ from identity.bulk_resolve import (
     compilation_result,
     compose_for_identity,
 )
+
+
+def _track_row(
+    *,
+    library_id: int = 99,
+    track_artist: str,
+    track_title: str,
+    source: str,
+    external_id: str | None,
+    confidence: float | None,
+    method: str | None,
+    resolved_artist_name: str | None,
+    track_artist_raw: str,
+    track_title_raw: str | None,
+    track_position: str | None = None,
+) -> CompilationTrackIdentityRow:
+    """Build one lml_cache.compilation_track_identity row for composer tests."""
+    return CompilationTrackIdentityRow(
+        library_id=library_id,
+        track_artist=track_artist,
+        track_title=track_title,
+        source=source,
+        external_id=external_id,
+        confidence=confidence,
+        method=method,
+        resolved_artist_name=resolved_artist_name,
+        track_artist_raw=track_artist_raw,
+        track_title_raw=track_title_raw,
+        track_position=track_position,
+    )
 
 
 def _make_identity(
@@ -425,6 +456,297 @@ class TestIncludeTracksPlumbing:
         assert not_visited != visited_nothing
         assert '"tracks_attempted":false' in not_visited
         assert '"tracks_attempted":true' in visited_nothing
+
+
+class TestCompilationTracksFromStore:
+    """LML#1021: compilation_result() reads real per-track identity out of
+    pre-fetched lml_cache.compilation_track_identity rows (``store_rows``).
+
+    The batched read itself lives in
+    ``identity.bulk_resolve.load_compilation_track_rows_by_legacy_id`` and is
+    the router's job (one query per request, per-library_id grouping in
+    memory) -- ``compilation_result`` never queries; it only composes
+    whatever the caller already fetched. ``store_rows=None`` and
+    ``store_rows=[]`` are the same "unvisited" state on the wire.
+    """
+
+    def test_unvisited_release_is_false_and_empty(self):
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=[])
+        assert result.tracks_attempted is False
+        assert result.tracks == []
+
+    def test_store_rows_none_is_the_same_unvisited_state(self):
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=None)
+        assert result.tracks_attempted is False
+        assert result.tracks == []
+
+    def test_flag_off_ignores_store_rows_entirely(self):
+        """include_tracks=False stays absent/NULL even with rows available --
+        the flag, not data availability, gates the pair (per #1151)."""
+        rows = [
+            _track_row(
+                track_artist="stereolab",
+                track_title="brakhage",
+                source="discogs",
+                external_id="1",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Stereolab",
+                track_artist_raw="Stereolab",
+                track_title_raw="Brakhage",
+            )
+        ]
+        result = compilation_result(library_id=99, include_tracks=False, store_rows=rows)
+        assert result.tracks is None
+        assert result.tracks_attempted is None
+
+    def test_visited_with_a_resolved_hit(self):
+        rows = [
+            _track_row(
+                track_artist="chuquimamani-condori",
+                track_title="call your name",
+                source="discogs",
+                external_id="9001",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Chuquimamani-Condori",
+                track_artist_raw="Chuquimamani-Condori",
+                track_title_raw="Call Your Name",
+                track_position="A1",
+            )
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        assert result.tracks_attempted is True
+        assert len(result.tracks) == 1
+        track = result.tracks[0]
+        assert track.artist_name == "Chuquimamani-Condori"
+        assert track.track_title == "Call Your Name"
+        assert track.track_position == "A1"
+        assert track.resolved_artist_name == "Chuquimamani-Condori"
+        assert track.confidence == 1.0
+        assert track.method is IdentityMethod.exact_match
+        assert len(track.sources) == 1
+        assert track.sources[0].source is IdentitySource.discogs
+        assert track.sources[0].external_id == "9001"
+
+    def test_visited_all_miss_release_has_non_empty_tracks_with_null_resolutions(self):
+        """Explicit AC (2026-08-06 amendments): 'we looked, the answer is
+        no' is itself an answer -- an all-miss release still returns a
+        non-empty tracks[] with null per-track resolutions, distinct from
+        the unvisited (False, []) state."""
+        rows = [
+            _track_row(
+                track_artist="unknown artist",
+                track_title="unknown track",
+                source="discogs",
+                external_id=None,
+                confidence=None,
+                method=None,
+                resolved_artist_name=None,
+                track_artist_raw="Unknown Artist",
+                track_title_raw="Unknown Track",
+            )
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        assert result.tracks_attempted is True
+        assert len(result.tracks) == 1
+        track = result.tracks[0]
+        assert track.artist_name == "Unknown Artist"
+        assert track.track_title == "Unknown Track"
+        assert track.resolved_artist_name is None
+        assert track.confidence is None
+        assert track.method is None
+
+    def test_min_of_confidences_no_agreement_boost(self):
+        """Two independent legs resolve to different confidences -> the
+        composed confidence is their MIN, never a Rule-2 boost.
+
+        This is the track-grain honest-v1 decision from the LML#1021 PR
+        body: the album-grain `_has_cross_source_agreement` proxy treats
+        >=2 independent legs as agreement, but that proxy is honest only
+        because `entity.identity` rows are pre-cross-resolved via wikidata
+        `discogs_mapping` (`scripts/entity_resolution/`) before being
+        written. The per-track Discogs (BareNameArtistResolver) and
+        MusicBrainz (raw trigram) legs run independently with no such
+        cross-reference step, and `lml_cache.compilation_track_identity`
+        stores no wikidata QID at all -- reusing the album-grain proxy here
+        would assert an agreement that was never checked. Rule 4 (MIN) only.
+        """
+        rows = [
+            _track_row(
+                track_artist="juana molina",
+                track_title="la paradoja",
+                source="discogs",
+                external_id="1234",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Juana Molina",
+                track_artist_raw="Juana Molina",
+                track_title_raw="La Paradoja",
+            ),
+            _track_row(
+                track_artist="juana molina",
+                track_title="la paradoja",
+                source="musicbrainz",
+                external_id="mbid-1",
+                confidence=0.80,
+                method="trigram",
+                resolved_artist_name="Juana Molina",
+                track_artist_raw="Juana Molina",
+                track_title_raw="La Paradoja",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        track = result.tracks[0]
+        assert track.method is not IdentityMethod.cross_source_agreement
+        assert track.confidence == 0.80  # MIN(1.00, 0.80), no AGREEMENT_FLOOR boost
+        assert track.method is IdentityMethod.trigram  # the weakest leg's method
+        assert len(track.sources) == 2
+
+    def test_partial_miss_composes_from_the_resolved_leg_alone(self):
+        """One leg resolves, the other misses -> composed fields come from
+        the resolved leg (MIN over one value); the miss leg is excluded
+        from sources[] -- see identity.bulk_resolve._store_row_to_composed
+        for why: BulkResolveProvenanceEntry.method is required and
+        non-nullable on the wire (api.yaml 1.33.0), but D1's CHECK
+        constraint on the store makes a miss row's method NULL. There is no
+        way to echo a miss leg into sources[] without either fabricating a
+        method value or a wxyc-shared change making `method` nullable
+        (mirroring `confidence`/`external_id`) -- flagged as an open
+        follow-up in the LML#1021 PR body, not silently worked around.
+        """
+        rows = [
+            _track_row(
+                track_artist="stereolab",
+                track_title="brakhage",
+                source="discogs",
+                external_id="5501",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Stereolab",
+                track_artist_raw="Stereolab",
+                track_title_raw="Brakhage",
+            ),
+            _track_row(
+                track_artist="stereolab",
+                track_title="brakhage",
+                source="musicbrainz",
+                external_id=None,
+                confidence=None,
+                method=None,
+                resolved_artist_name=None,
+                track_artist_raw="Stereolab",
+                track_title_raw="Brakhage",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+
+        track = result.tracks[0]
+        assert track.resolved_artist_name == "Stereolab"
+        assert track.confidence == 1.0
+        assert track.method is IdentityMethod.exact_match
+        assert len(track.sources) == 1
+        assert track.sources[0].source is IdentitySource.discogs
+
+    def test_position_merged_from_whichever_source_has_it(self):
+        rows = [
+            _track_row(
+                track_artist="cat power",
+                track_title="moon pix",
+                source="discogs",
+                external_id="7001",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Cat Power",
+                track_artist_raw="Cat Power",
+                track_title_raw="Moon Pix",
+                track_position=None,
+            ),
+            _track_row(
+                track_artist="cat power",
+                track_title="moon pix",
+                source="musicbrainz",
+                external_id="mbid-2",
+                confidence=0.80,
+                method="trigram",
+                resolved_artist_name="Cat Power",
+                track_artist_raw="Cat Power",
+                track_title_raw="Moon Pix",
+                track_position="3",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+        assert result.tracks[0].track_position == "3"
+
+    def test_null_title_credit_round_trips_as_none(self):
+        rows = [
+            _track_row(
+                track_artist="various",
+                track_title="",
+                source="discogs",
+                external_id="1",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Various",
+                track_artist_raw="Various",
+                track_title_raw=None,
+            )
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+        assert result.tracks[0].track_title is None
+
+    def test_multiple_distinct_credits_each_get_their_own_entry(self):
+        rows = [
+            _track_row(
+                track_artist="stereolab",
+                track_title="brakhage",
+                source="discogs",
+                external_id="1",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Stereolab",
+                track_artist_raw="Stereolab",
+                track_title_raw="Brakhage",
+            ),
+            _track_row(
+                track_artist="cat power",
+                track_title="moon pix",
+                source="discogs",
+                external_id="2",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name="Cat Power",
+                track_artist_raw="Cat Power",
+                track_title_raw="Moon Pix",
+            ),
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+        assert len(result.tracks) == 2
+        assert {t.artist_name for t in result.tracks} == {"Stereolab", "Cat Power"}
+
+    def test_no_truncation_of_a_large_synthetic_release(self):
+        """Payload discipline (2026-08-06 amendment): never cap or truncate
+        tracks[] server-side -- BS#1989 measured mean 56/release, p99 483,
+        max 2,364; an 11 MB page is the consumer's paging problem."""
+        rows = [
+            _track_row(
+                track_artist=f"artist {i}",
+                track_title=f"track {i}",
+                source="discogs",
+                external_id=str(i),
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name=f"Artist {i}",
+                track_artist_raw=f"Artist {i}",
+                track_title_raw=f"Track {i}",
+            )
+            for i in range(2500)
+        ]
+        result = compilation_result(library_id=99, include_tracks=True, store_rows=rows)
+        assert len(result.tracks) == 2500
 
 
 def test_floors_are_what_the_spec_says():

@@ -35,6 +35,7 @@ from wxyc_etl.text import to_match_form
 from entity.compilation_track_identity import (
     CompilationTrackIdentityRow,
     fill_compilation_track_identity_positions_from_recall_index,
+    get_compilation_track_identity_for_libraries,
     get_compilation_track_identity_for_library,
     get_compilation_track_identity_misses,
     write_compilation_track_identity_verdict,
@@ -227,3 +228,32 @@ class TestGetForLibrary:
         sql, *binds = pg.fetchall.await_args.args
         assert "WHERE library_id = $1" in sql
         assert binds == [1]
+
+
+@pytest.mark.asyncio
+class TestGetForLibraries:
+    """The LML#1021 batched read: ONE query for a whole bulk-resolve batch's
+    compilation ``library_id``s (here, the legacy-space id the store is keyed
+    on -- see the module docstring's F2 id-space warning), not one per row.
+    """
+
+    async def test_one_query_for_multiple_library_ids(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[_SAMPLE_ROW])
+
+        rows = await get_compilation_track_identity_for_libraries(pg, [1, 2, 3])
+
+        assert rows == [CompilationTrackIdentityRow(**_SAMPLE_ROW)]
+        assert pg.fetchall.await_count == 1
+        sql, *binds = pg.fetchall.await_args.args
+        assert "WHERE library_id = ANY($1::int[])" in sql
+        assert binds == [[1, 2, 3]]
+
+    async def test_empty_library_ids_short_circuits_before_the_round_trip(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[_SAMPLE_ROW])
+
+        rows = await get_compilation_track_identity_for_libraries(pg, [])
+
+        assert rows == []
+        pg.fetchall.assert_not_awaited()
