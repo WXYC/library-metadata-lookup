@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from entity.compilation_track_identity import CompilationTrackIdentityRow
+from entity.release_tracklist import ReleaseTracklistRow
 from entity.store import Identity, ProvenanceRow
 from generated.api_models import (
     BulkResolveResultKind,
@@ -21,6 +22,7 @@ from generated.api_models import (
 from identity.bulk_resolve import (
     AGREEMENT_FLOOR,
     SIDECAR_FLOOR,
+    SingleArtistTrackDerivation,
     compilation_result,
     compose_for_identity,
 )
@@ -1130,6 +1132,291 @@ class TestCompilationTracksFromStore:
         track = result.tracks[0]
         assert track.resolved_artist_name is None
         assert track.sources == []
+
+
+def _tracklist_row(
+    *,
+    release_id: int = 555,
+    sequence: int,
+    position: str | None = None,
+    title: str | None,
+    credit_artist_name: str | None = None,
+) -> ReleaseTracklistRow:
+    """Build one discogs-cache tracklist row for the LML#1138 derived-track tests."""
+    return ReleaseTracklistRow(
+        release_id=release_id,
+        sequence=sequence,
+        position=position,
+        title=title,
+        credit_artist_name=credit_artist_name,
+    )
+
+
+class TestSingleArtistDerivedTracks:
+    """LML#1138: `compose_for_identity`'s `single_artist` arm derives
+    `tracks[]` at read time from the discogs-cache tracklist of the release
+    the `lml_cache.library_release_override` pin resolved (the 2026-08-08
+    decision record on the issue — v1 mapping source is the pin table; the
+    ~77% `streaming_album` leg ships with LML#842).
+
+    Per-track `confidence`/`method` inherit the PIN's provenance —
+    `manual` / 1.0 (a hand-verified release mapping) — and
+    `resolved_artist_name` is the release's resolved artist (the identity
+    row's `library_name`): on a single-artist release, per-track
+    attribution is derivative of the release match.
+    """
+
+    async def _compose(
+        self,
+        derivation: SingleArtistTrackDerivation | None,
+        *,
+        include_tracks: bool = True,
+        library_name: str = "Stereolab",
+    ):
+        identity = _make_identity(library_name=library_name, discogs_artist_id=2154)
+        return await compose_for_identity(
+            library_id=42,
+            identity=identity,
+            entity_store=_store(),
+            include_tracks=include_tracks,
+            track_derivation=derivation,
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_derivation_stays_not_yet_visited(self):
+        """No pin (or a degraded read) → the honest `(False, [])` state, so
+        the consumer keeps re-asking and coverage self-heals as pins and the
+        #842 leg grow."""
+        result = await self._compose(None)
+        assert result.kind is BulkResolveResultKind.single_artist
+        assert result.tracks_attempted is False
+        assert result.tracks == []
+
+    @pytest.mark.asyncio
+    async def test_pinned_release_composes_inherited_entries(self):
+        derivation = SingleArtistTrackDerivation(
+            discogs_release_id=555,
+            rows=[
+                _tracklist_row(sequence=1, position="A1", title="Metronomic Underground"),
+                _tracklist_row(sequence=2, position="A2", title="Cybele's Reverie"),
+            ],
+        )
+        result = await self._compose(derivation)
+
+        assert result.tracks_attempted is True
+        assert len(result.tracks) == 2
+        first, second = result.tracks
+        assert first.track_position == "A1"
+        assert first.track_title == "Metronomic Underground"
+        assert second.track_position == "A2"
+        assert second.track_title == "Cybele's Reverie"
+        for track in result.tracks:
+            # No per-track credit on a plain single-artist release: the echo
+            # falls back to the release's resolved artist, and the resolved
+            # name IS the release artist.
+            assert track.artist_name == "Stereolab"
+            assert track.resolved_artist_name == "Stereolab"
+            # The pin's provenance, inherited per the decision record.
+            assert track.method is IdentityMethod.manual
+            assert track.confidence == pytest.approx(1.0)
+            assert len(track.sources) == 1
+            leg = track.sources[0]
+            assert leg.source is IdentitySource.discogs
+            assert leg.method is IdentityMethod.manual
+            assert leg.confidence == pytest.approx(1.0)
+            assert leg.external_id == "555"
+
+    @pytest.mark.asyncio
+    async def test_pinned_release_with_empty_tracklist_is_attempted_nothing(self):
+        """A pinned release whose cached tracklist is empty is a genuine
+        attempt that found nothing — `(True, [])`, NOT the unvisited state."""
+        result = await self._compose(SingleArtistTrackDerivation(discogs_release_id=555, rows=[]))
+        assert result.tracks_attempted is True
+        assert result.tracks == []
+
+    @pytest.mark.asyncio
+    async def test_flag_off_ignores_derivation_entirely(self):
+        result = await self._compose(
+            SingleArtistTrackDerivation(
+                discogs_release_id=555,
+                rows=[_tracklist_row(sequence=1, title="Anamorphose")],
+            ),
+            include_tracks=False,
+        )
+        assert result.tracks is None
+        assert result.tracks_attempted is None
+
+    @pytest.mark.asyncio
+    async def test_per_track_credit_overrides_the_release_artist_echo(self):
+        """A track carrying its own Discogs credit (feature / split) echoes
+        that credit; `resolved_artist_name` stays the release's resolved
+        artist (per-track attribution is derivative of the release match)."""
+        derivation = SingleArtistTrackDerivation(
+            discogs_release_id=555,
+            rows=[
+                _tracklist_row(
+                    sequence=1,
+                    position="A1",
+                    title="Photo Jenny",
+                    credit_artist_name="Lætitia Sadier",
+                ),
+                _tracklist_row(sequence=2, position="A2", title="Anamorphose"),
+            ],
+        )
+        result = await self._compose(derivation)
+
+        credited, plain = result.tracks
+        assert credited.artist_name == "Lætitia Sadier"
+        assert credited.resolved_artist_name == "Stereolab"
+        assert plain.artist_name == "Stereolab"
+
+    @pytest.mark.asyncio
+    async def test_split_credits_on_one_track_join_into_one_entry(self):
+        """Two extra=0 credits on one track (a split) are ONE tracklist entry
+        with a joined echo — never two entries for one physical track."""
+        derivation = SingleArtistTrackDerivation(
+            discogs_release_id=555,
+            rows=[
+                _tracklist_row(sequence=1, title="Split Side", credit_artist_name="Juana Molina"),
+                _tracklist_row(sequence=1, title="Split Side", credit_artist_name="Sessa"),
+            ],
+        )
+        result = await self._compose(derivation)
+
+        assert len(result.tracks) == 1
+        assert result.tracks[0].artist_name == "Juana Molina, Sessa"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_credit_rows_dedupe(self):
+        derivation = SingleArtistTrackDerivation(
+            discogs_release_id=555,
+            rows=[
+                _tracklist_row(sequence=1, title="Doubled", credit_artist_name="Sessa"),
+                _tracklist_row(sequence=1, title="Doubled", credit_artist_name="Sessa"),
+            ],
+        )
+        result = await self._compose(derivation)
+        assert len(result.tracks) == 1
+        assert result.tracks[0].artist_name == "Sessa"
+
+    @pytest.mark.asyncio
+    async def test_entries_are_ordered_by_sequence_regardless_of_row_order(self):
+        derivation = SingleArtistTrackDerivation(
+            discogs_release_id=555,
+            rows=[
+                _tracklist_row(sequence=2, position="A2", title="Second"),
+                _tracklist_row(sequence=1, position="A1", title="First"),
+            ],
+        )
+        result = await self._compose(derivation)
+        assert [t.track_title for t in result.tracks] == ["First", "Second"]
+
+    @pytest.mark.asyncio
+    async def test_empty_position_and_title_round_trip_as_none(self):
+        """Discogs heading/index rows carry empty positions; an empty string
+        is not a position (or a title) on the wire — NULL is."""
+        derivation = SingleArtistTrackDerivation(
+            discogs_release_id=555,
+            rows=[_tracklist_row(sequence=1, position="", title="")],
+        )
+        result = await self._compose(derivation)
+        track = result.tracks[0]
+        assert track.track_position is None
+        assert track.track_title is None
+
+    @pytest.mark.asyncio
+    async def test_blank_credit_falls_back_to_release_artist(self):
+        """A blank/whitespace per-track credit is no credit at all — the echo
+        falls back rather than emitting an unusable join key."""
+        derivation = SingleArtistTrackDerivation(
+            discogs_release_id=555,
+            rows=[_tracklist_row(sequence=1, title="Anamorphose", credit_artist_name="   ")],
+        )
+        result = await self._compose(derivation)
+        assert result.tracks[0].artist_name == "Stereolab"
+
+    @pytest.mark.asyncio
+    async def test_blank_release_artist_drops_the_entry_not_the_batch(self, caplog):
+        """`artist_name` is required `minLength: 1` on the wire; with no
+        credit AND a blank resolved release artist there is nothing valid to
+        echo — the entry is dropped with a warning (mirroring the LML#1021
+        blank-credit guard), never a pydantic 500 for the whole batch."""
+        derivation = SingleArtistTrackDerivation(
+            discogs_release_id=555,
+            rows=[
+                _tracklist_row(sequence=1, title="Unechoable"),
+                _tracklist_row(sequence=2, title="Fine", credit_artist_name="Sessa"),
+            ],
+        )
+        with caplog.at_level("WARNING"):
+            result = await self._compose(derivation, library_name="   ")
+
+        assert result.tracks_attempted is True
+        assert [t.track_title for t in result.tracks] == ["Fine"]
+        assert any("blank" in r.message.lower() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_unresolved_ignores_derivation(self):
+        """`kind: unresolved` never carries the pair, derivation or not."""
+        result = await compose_for_identity(
+            library_id=42,
+            identity=None,
+            entity_store=_store(),
+            include_tracks=True,
+            track_derivation=SingleArtistTrackDerivation(
+                discogs_release_id=555,
+                rows=[_tracklist_row(sequence=1, title="Anything")],
+            ),
+        )
+        assert result.kind is BulkResolveResultKind.unresolved
+        assert result.tracks is None
+        assert result.tracks_attempted is None
+
+    @pytest.mark.asyncio
+    async def test_unresolved_via_empty_composition_ignores_derivation(self):
+        """The all-sources-below-floor unresolved arm behaves identically."""
+        identity = _make_identity(discogs_artist_id=2154)
+        store = _store(
+            {
+                IdentitySource.discogs.value: ProvenanceRow(
+                    source=IdentitySource.discogs.value,
+                    external_id="2154",
+                    method=IdentityMethod.trigram.value,
+                    confidence=0.10,
+                )
+            }
+        )
+        result = await compose_for_identity(
+            library_id=42,
+            identity=identity,
+            entity_store=store,
+            include_tracks=True,
+            track_derivation=SingleArtistTrackDerivation(
+                discogs_release_id=555,
+                rows=[_tracklist_row(sequence=1, title="Anything")],
+            ),
+        )
+        assert result.kind is BulkResolveResultKind.unresolved
+        assert result.tracks is None
+        assert result.tracks_attempted is None
+
+    @pytest.mark.asyncio
+    async def test_never_emits_false_with_populated_tracks(self):
+        """The forbidden pairing, checked on every derivation-reachable state."""
+        reachable = [
+            await self._compose(None),
+            await self._compose(SingleArtistTrackDerivation(discogs_release_id=555, rows=[])),
+            await self._compose(
+                SingleArtistTrackDerivation(
+                    discogs_release_id=555,
+                    rows=[_tracklist_row(sequence=1, title="Anamorphose")],
+                )
+            ),
+        ]
+        for result in reachable:
+            assert not (result.tracks_attempted is False and result.tracks), (
+                "forbidden (False, populated) pairing emitted on the single_artist arm"
+            )
 
 
 def test_floors_are_what_the_spec_says():

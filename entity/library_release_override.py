@@ -105,3 +105,26 @@ async def get_library_release_overrides(pg: PgSource, library_ids: list[int]) ->
         many=True,
     )
     return {row["library_id"]: row["discogs_release_id"] for row in rows}
+
+
+async def get_library_release_overrides_strict(
+    pg: PgSource, library_ids: list[int]
+) -> dict[int, int]:
+    """The same single-query prefetch, with the OPPOSITE failure posture.
+
+    LML#1138's bulk-resolve arm reads the pins as its v1 release-identity
+    mapping (the 2026-08-08 decision record on that issue) and must be able
+    to TELL a PG outage apart from "these rows simply have no pin": the
+    router degrades the affected inputs to the unvisited
+    ``(tracks_attempted: false, tracks: [])`` state either way, but only a
+    visible failure can fire the ``single_artist_track_read_fail_open``
+    counter that distinguishes "PG is unhappy" from "the catalog isn't
+    pinned yet" (the same rationale as LML#1021's
+    ``compilation_track_read_fail_open``). The swallowing reader above —
+    correct for the best-effort ``/lookup`` path it serves — would blind
+    that counter, so PG failures PROPAGATE here instead.
+    """
+    if not library_ids:
+        return {}
+    rows = await pg.fetchall(_SELECT_SQL, library_ids)
+    return {row["library_id"]: row["discogs_release_id"] for row in rows}

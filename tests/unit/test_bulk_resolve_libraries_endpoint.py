@@ -1179,9 +1179,9 @@ class TestIncludeTracksWire:
     at the HTTP boundary, plus the `tracks_contract_version` marker
     (wxyc-shared#307, per the #303 decision).
 
-    Pre-#1021/#1138 the only reachable flag-on state is `(false, [])` —
-    the honest "asked, matcher hasn't visited" answer that keeps the
-    consumer re-asking until the emitters land.
+    With no pins/store rows reachable, the flag-on state for resolved kinds
+    is `(false, [])` — the honest "asked, matcher hasn't visited" answer
+    that keeps the consumer re-asking.
     """
 
     async def _post(self, app, body):
@@ -1193,15 +1193,12 @@ class TestIncludeTracksWire:
         """Flag on: resolved kinds emit (false, []), unresolved emits the
         absent pair.
 
-        `tracks_contract_version` stays None even though `include_tracks`
-        was understood-true: api.yaml 1.32.0 (wxyc-shared#314) tightened
-        the marker so it may be `1` only once BOTH producer arms emit
-        `tracks_attempted` -- `kind: compilation` (LML#1021, this repo) AND
-        `kind: single_artist` (LML#1138, not yet). `compose_for_identity`
-        still hardcodes `tracks=None` on the `single_artist` arm above, so
-        setting the marker here would tell a BS consumer to trust
-        `tracks_attempted` on rows where it is still meaningless. See
-        `identity/router.py`'s `bulk_resolve_libraries` for the gate.
+        `tracks_contract_version` is `1`: api.yaml 1.32.0's (wxyc-shared#314)
+        both-arms producer rule is satisfied as of LML#1138 -- BOTH
+        `kind: compilation` (LML#1021) and `kind: single_artist` (LML#1138)
+        emit real `tracks_attempted` under the flag, so the marker flips
+        whenever the producer understood `include_tracks: true`, regardless
+        of how many rows in this particular batch carry entries.
         """
         mock_entity_store.resolve_library_name.side_effect = [
             _identity("Stereolab", id=1, discogs_artist_id=2154),
@@ -1223,7 +1220,7 @@ class TestIncludeTracksWire:
 
         assert resp.status_code == 200
         data = resp.json()
-        assert data["tracks_contract_version"] is None
+        assert data["tracks_contract_version"] == 1
 
         by_id = {r["library_id"]: r for r in data["results"]}
         assert by_id[1]["kind"] == "single_artist"
@@ -1585,4 +1582,385 @@ class TestIncludeTracksCompilationStore:
         assert event["event"] == "compilation_track_read_fail_open"
         assert event["properties"]["error_type"] == "PostgresError"
         assert event["properties"]["legacy_release_id_count"] == 1
+        assert event["properties"]["environment"] == "unit-test-env"
+
+
+class TestIncludeTracksSingleArtistDerivation:
+    """LML#1138: the single_artist arm's derived `tracks[]`, wired through
+    the router's two batched pre-fan-out reads — `lml_cache.library_release_override`
+    pins (`identity.bulk_resolve.load_single_artist_release_pins`) and the
+    pinned releases' discogs-cache tracklists
+    (`identity.bulk_resolve.load_release_tracklists_by_release_id`).
+
+    PG access is exercised through a fake `PgSource` override on
+    `core.dependencies.get_discogs_cache_pg` plus monkeypatched loaders —
+    the real SQL round-trips are covered by the `pg`-marked integration
+    suite, mirroring the LML#1021 compilation-store class above.
+    """
+
+    async def _post(self, app, body):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            return await ac.post("/api/v1/identity/bulk-resolve-libraries", json=body)
+
+    @pytest.mark.asyncio
+    async def test_batched_reads_fire_once_per_request(self, app_client, mock_entity_store):
+        """Hard requirement: one pins read + one tracklist read per REQUEST,
+        however many single-artist inputs the batch carries — never per
+        input (the N+1 the ticket forbids)."""
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.release_tracklist import ReleaseTracklistRow
+        from entity.sources import PgSource
+
+        pins_calls = 0
+        tracklist_calls = 0
+
+        async def counting_pins(pg, legacy_release_ids):
+            nonlocal pins_calls
+            pins_calls += 1
+            return {lid: 5000 + lid for lid in legacy_release_ids}
+
+        async def counting_tracklists(pg, release_ids):
+            nonlocal tracklist_calls
+            tracklist_calls += 1
+            return {
+                rid: [
+                    ReleaseTracklistRow(
+                        release_id=rid,
+                        sequence=1,
+                        position="A1",
+                        title="Only Track",
+                        credit_artist_name=None,
+                    )
+                ]
+                for rid in release_ids
+            }
+
+        saved_pins = router_module.load_single_artist_release_pins
+        saved_tracklists = router_module.load_release_tracklists_by_release_id
+        router_module.load_single_artist_release_pins = counting_pins
+        router_module.load_release_tracklists_by_release_id = counting_tracklists
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Stereolab", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+        try:
+            resp = await self._post(
+                app_client,
+                {
+                    "include_tracks": True,
+                    "inputs": [
+                        {
+                            "library_id": 1,
+                            "legacy_release_id": 101,
+                            "artist_name": "Stereolab",
+                            "album_title": "Dots and Loops",
+                        },
+                        {
+                            "library_id": 2,
+                            "legacy_release_id": 102,
+                            "artist_name": "Juana Molina",
+                            "album_title": "DOGA",
+                        },
+                        {
+                            "library_id": 3,
+                            "legacy_release_id": 103,
+                            "artist_name": "Sessa",
+                            "album_title": "Estrela Acesa",
+                        },
+                        {
+                            "library_id": 4,
+                            "legacy_release_id": 104,
+                            "artist_name": "Various Artists",
+                            "album_title": "VA One",
+                        },
+                    ],
+                },
+            )
+        finally:
+            router_module.load_single_artist_release_pins = saved_pins
+            router_module.load_release_tracklists_by_release_id = saved_tracklists
+
+        assert resp.status_code == 200
+        assert pins_calls == 1, f"Expected exactly one batched pins read; got {pins_calls}"
+        assert tracklist_calls == 1, (
+            f"Expected exactly one batched tracklist read; got {tracklist_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_wire_shape_pinned_unpinned_and_bridgeless(self, app_client, mock_entity_store):
+        """One pinned single-artist input (derived entries), one un-pinned
+        (unvisited fallback), one with no legacy_release_id bridge at all
+        (unvisited), plus the marker flipped to 1."""
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.release_tracklist import ReleaseTracklistRow
+        from entity.sources import PgSource
+
+        async def fake_pins(pg, legacy_release_ids):
+            return {101: 555} if 101 in legacy_release_ids else {}
+
+        async def fake_tracklists(pg, release_ids):
+            assert list(release_ids) == [555]
+            return {
+                555: [
+                    ReleaseTracklistRow(
+                        release_id=555,
+                        sequence=1,
+                        position="A1",
+                        title="Metronomic Underground",
+                        credit_artist_name=None,
+                    ),
+                    ReleaseTracklistRow(
+                        release_id=555,
+                        sequence=2,
+                        position="A2",
+                        title="Photo Jenny",
+                        credit_artist_name="Lætitia Sadier",
+                    ),
+                ]
+            }
+
+        saved_pins = router_module.load_single_artist_release_pins
+        saved_tracklists = router_module.load_release_tracklists_by_release_id
+        router_module.load_single_artist_release_pins = fake_pins
+        router_module.load_release_tracklists_by_release_id = fake_tracklists
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Stereolab", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+        try:
+            resp = await self._post(
+                app_client,
+                {
+                    "include_tracks": True,
+                    "inputs": [
+                        {
+                            "library_id": 1,
+                            "legacy_release_id": 101,
+                            "artist_name": "Stereolab",
+                            "album_title": "Dots and Loops",
+                        },
+                        {
+                            "library_id": 2,
+                            "legacy_release_id": 999,
+                            "artist_name": "Stereolab",
+                            "album_title": "Aluminum Tunes",
+                        },
+                        {
+                            "library_id": 3,
+                            "artist_name": "Stereolab",
+                            "album_title": "Transient Random-Noise",
+                        },
+                    ],
+                },
+            )
+        finally:
+            router_module.load_single_artist_release_pins = saved_pins
+            router_module.load_release_tracklists_by_release_id = saved_tracklists
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["tracks_contract_version"] == 1
+        by_id = {r["library_id"]: r for r in data["results"]}
+
+        pinned = by_id[1]
+        assert pinned["kind"] == "single_artist"
+        assert pinned["tracks_attempted"] is True
+        assert len(pinned["tracks"]) == 2
+        first, second = pinned["tracks"]
+        assert first["track_position"] == "A1"
+        assert first["artist_name"] == "Stereolab"
+        assert first["resolved_artist_name"] == "Stereolab"
+        assert first["confidence"] == pytest.approx(1.0)
+        assert first["method"] == "manual"
+        assert first["sources"] == [
+            {
+                "source": "discogs",
+                "method": "manual",
+                "confidence": 1.0,
+                "external_id": "555",
+            }
+        ]
+        assert second["artist_name"] == "Lætitia Sadier"
+        assert second["resolved_artist_name"] == "Stereolab"
+
+        unpinned = by_id[2]
+        assert unpinned["tracks_attempted"] is False
+        assert unpinned["tracks"] == []
+
+        bridgeless = by_id[3]
+        assert bridgeless["tracks_attempted"] is False
+        assert bridgeless["tracks"] == []
+
+    @pytest.mark.asyncio
+    async def test_pinned_release_with_no_cached_tracklist_is_attempted_nothing(
+        self, app_client, mock_entity_store
+    ):
+        """The pin resolved but the cache holds no tracks: a genuine attempt
+        that found nothing — (true, []), NOT the unvisited state."""
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.sources import PgSource
+
+        async def fake_pins(pg, legacy_release_ids):
+            return {101: 555}
+
+        async def fake_tracklists(pg, release_ids):
+            return {}
+
+        saved_pins = router_module.load_single_artist_release_pins
+        saved_tracklists = router_module.load_release_tracklists_by_release_id
+        router_module.load_single_artist_release_pins = fake_pins
+        router_module.load_release_tracklists_by_release_id = fake_tracklists
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Stereolab", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+        try:
+            resp = await self._post(
+                app_client,
+                {
+                    "include_tracks": True,
+                    "inputs": [
+                        {
+                            "library_id": 1,
+                            "legacy_release_id": 101,
+                            "artist_name": "Stereolab",
+                            "album_title": "Dots and Loops",
+                        },
+                    ],
+                },
+            )
+        finally:
+            router_module.load_single_artist_release_pins = saved_pins
+            router_module.load_release_tracklists_by_release_id = saved_tracklists
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["tracks_attempted"] is True
+        assert result["tracks"] == []
+
+    @pytest.mark.asyncio
+    async def test_batched_read_pg_failure_degrades_to_unvisited_not_503(
+        self, app_client, mock_entity_store
+    ):
+        """Same posture as the LML#1021 compilation read: this is an optional
+        `include_tracks` enrichment, so a TRANSIENT_PG_ERRORS failure on the
+        batched reads degrades the affected single_artist rows to the honest
+        unvisited (false, []) state — never a 503 for the whole batch, and
+        the core resolution fields are untouched."""
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.sources import PgSource
+
+        async def failing_pins(pg, legacy_release_ids):
+            raise PostgresError("simulated library_release_override read failure")
+
+        saved_pins = router_module.load_single_artist_release_pins
+        router_module.load_single_artist_release_pins = failing_pins
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Stereolab", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+        try:
+            resp = await self._post(
+                app_client,
+                {
+                    "include_tracks": True,
+                    "inputs": [
+                        {
+                            "library_id": 1,
+                            "legacy_release_id": 101,
+                            "artist_name": "Stereolab",
+                            "album_title": "Dots and Loops",
+                        },
+                    ],
+                },
+            )
+        finally:
+            router_module.load_single_artist_release_pins = saved_pins
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["kind"] == "single_artist"
+        assert result["main"]["discogs_artist_id"] == 2154
+        assert result["tracks_attempted"] is False
+        assert result["tracks"] == []
+
+    @pytest.mark.asyncio
+    async def test_batched_read_pg_failure_emits_fail_open_counter(
+        self, app_client, mock_entity_store, monkeypatch
+    ):
+        """The degrade arm's unsampled counter, mirroring
+        `compilation_track_read_fail_open`: the degraded wire shape is
+        byte-identical to the routine un-pinned case, so only the counter
+        can distinguish "PG is unhappy" from "the catalog isn't pinned yet"."""
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.sources import PgSource
+
+        monkeypatch.setenv("ENABLE_TELEMETRY", "true")
+        monkeypatch.setenv("ENVIRONMENT", "unit-test-env")
+        from config.settings import get_settings
+
+        get_settings.cache_clear()
+        events: list[dict] = []
+
+        class _FakePosthog:
+            def capture(self, *, distinct_id, event, properties):
+                events.append(
+                    {"distinct_id": distinct_id, "event": event, "properties": properties}
+                )
+
+        monkeypatch.setattr(
+            "identity.router.get_posthog_client", lambda event_prefix: _FakePosthog()
+        )
+
+        async def failing_pins(pg, legacy_release_ids):
+            raise PostgresError("simulated library_release_override read failure")
+
+        saved_pins = router_module.load_single_artist_release_pins
+        router_module.load_single_artist_release_pins = failing_pins
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Stereolab", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+        try:
+            resp = await self._post(
+                app_client,
+                {
+                    "include_tracks": True,
+                    "inputs": [
+                        {
+                            "library_id": 1,
+                            "legacy_release_id": 101,
+                            "artist_name": "Stereolab",
+                            "album_title": "Dots and Loops",
+                        },
+                        {
+                            "library_id": 2,
+                            "legacy_release_id": 102,
+                            "artist_name": "Juana Molina",
+                            "album_title": "DOGA",
+                        },
+                    ],
+                },
+            )
+        finally:
+            router_module.load_single_artist_release_pins = saved_pins
+            get_settings.cache_clear()
+
+        assert resp.status_code == 200
+        assert len(events) == 1
+        event = events[0]
+        assert event["distinct_id"] == "library-metadata-lookup-service"
+        assert event["event"] == "single_artist_track_read_fail_open"
+        assert event["properties"]["error_type"] == "PostgresError"
+        assert event["properties"]["legacy_release_id_count"] == 2
         assert event["properties"]["environment"] == "unit-test-env"

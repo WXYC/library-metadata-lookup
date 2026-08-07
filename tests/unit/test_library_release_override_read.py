@@ -10,8 +10,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from asyncpg.exceptions import PostgresError
 
-from entity.library_release_override import get_library_release_overrides
+from entity.library_release_override import (
+    get_library_release_overrides,
+    get_library_release_overrides_strict,
+)
 from entity.sources import PgSource
 
 
@@ -54,3 +58,46 @@ class TestGetLibraryReleaseOverrides:
         result = await get_library_release_overrides(pg, [42])
 
         assert result == {}
+
+
+@pytest.mark.asyncio
+class TestGetLibraryReleaseOverridesStrict:
+    """LML#1138: the bulk-resolve arm needs the SAME single-query prefetch
+    with the OPPOSITE failure posture — PG errors propagate so the router
+    can degrade to the unvisited `(False, [])` state AND emit the
+    `single_artist_track_read_fail_open` counter. The swallowing reader
+    above would silently map an outage to "no pins", indistinguishable
+    from the routine un-pinned case, blinding the counter."""
+
+    async def test_returns_id_to_release_map(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(
+            return_value=[
+                {"library_id": 42, "discogs_release_id": 1000},
+                {"library_id": 77, "discogs_release_id": 2000},
+            ]
+        )
+
+        result = await get_library_release_overrides_strict(pg, [42, 77, 99])
+
+        assert result == {42: 1000, 77: 2000}
+        assert pg.fetchall.await_count == 1
+        query = pg.fetchall.await_args.args[0]
+        assert "library_release_override" in query
+        assert "ANY(" in query
+
+    async def test_empty_id_list_short_circuits_without_query(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[])
+
+        result = await get_library_release_overrides_strict(pg, [])
+
+        assert result == {}
+        pg.fetchall.assert_not_awaited()
+
+    async def test_pg_error_propagates(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(side_effect=PostgresError("pool exhausted"))
+
+        with pytest.raises(PostgresError):
+            await get_library_release_overrides_strict(pg, [42])

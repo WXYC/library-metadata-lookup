@@ -127,17 +127,18 @@ class TestBulkResolveLibrariesEndpoint:
 
     @pytest.mark.asyncio
     async def test_include_tracks_pair_and_marker_end_to_end(self, pg_app_client):
-        """1.31.0 wire against real PG: flag on -> resolved kinds carry
-        (false, []); flag omitted -> null pair everywhere (the un-upgraded
-        caller's byte-compatible view, minus the retired V/A empty array).
+        """The pair + marker wire against real PG: flag on -> resolved kinds
+        with no store rows / no pins carry (false, []); flag omitted -> null
+        pair everywhere (the un-upgraded caller's byte-compatible view, minus
+        the retired V/A empty array).
 
-        `tracks_contract_version` stays None on BOTH paths: api.yaml 1.32.0
-        (wxyc-shared#314) requires both producer arms (`kind: compilation` --
-        LML#1021, done -- and `kind: single_artist` -- LML#1138, not yet) to
-        emit real `tracks_attempted` before the marker may be `1`. Setting it
-        on `include_tracks` alone (the pre-1.32.0 behavior) would tell a
-        consumer to trust `tracks_attempted` on `single_artist` rows where
-        it's still meaningless.
+        `tracks_contract_version` is `1` on the flag-on path as of LML#1138:
+        api.yaml 1.32.0's (wxyc-shared#314) both-arms rule -- real
+        `tracks_attempted` on `kind: compilation` (LML#1021) AND
+        `kind: single_artist` (LML#1138) -- is satisfied, and the rule gates
+        on emitting the pair, not on coverage (the 2026-08-08 decision
+        record), so un-pinned rows answering (false, []) don't hold it back.
+        Flag off keeps the marker null.
         """
         inputs = [
             {"library_id": 100, "artist_name": "Various Artists", "album_title": "VA"},
@@ -151,7 +152,7 @@ class TestBulkResolveLibrariesEndpoint:
         )
         assert flag_on.status_code == 200
         data = flag_on.json()
-        assert data["tracks_contract_version"] is None
+        assert data["tracks_contract_version"] == 1
         by_id = {r["library_id"]: r for r in data["results"]}
         assert (by_id[100]["tracks_attempted"], by_id[100]["tracks"]) == (False, [])
         assert (by_id[200]["tracks_attempted"], by_id[200]["tracks"]) == (False, [])
@@ -560,3 +561,270 @@ class TestIncludeTracksCompilationStoreEndToEnd:
         assert track["resolved_artist_name"] == "Sessa"  # raw-credit fallback, never null
         assert track["confidence"] == pytest.approx(1.0)
         assert track["method"] == "exact_match"
+
+
+@pytest_asyncio.fixture
+async def set_up_single_artist_tracklist_schema(pg_pool, pg_source):
+    """Fresh `lml_cache.library_release_override` + discogs-cache `release_track`
+    tables for the LML#1138 end-to-end suite.
+
+    The LML-owned override table gets the stricter populated-table veto (a
+    mispointed ``DATABASE_URL_TEST`` would risk real hand-verified pins);
+    the shared public `release*` fixtures mirror
+    `test_build_compilation_track_location_pg.py`'s pattern for the same
+    tables.
+    """
+    from entity.library_release_override import set_up_library_release_override_schema
+    from tests.integration.conftest import skip_if_named_tables_populated
+
+    async with pg_pool.acquire() as conn:
+        await skip_if_named_tables_populated(conn, (("lml_cache", "library_release_override"),))
+        await conn.execute("DROP TABLE IF EXISTS lml_cache.library_release_override")
+        for table in ("release_track_artist", "release_track", "release"):
+            await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+        await conn.execute("""
+            CREATE TABLE release (
+                id    integer PRIMARY KEY,
+                title text NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE release_track (
+                release_id integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
+                sequence   integer NOT NULL,
+                position   text,
+                title      text NOT NULL,
+                duration   text
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE release_track_artist (
+                release_id     integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
+                track_sequence integer NOT NULL,
+                artist_name    text NOT NULL,
+                extra          integer DEFAULT 0,
+                role           text
+            )
+        """)
+    await set_up_library_release_override_schema(pg_source)
+    yield
+    async with pg_pool.acquire() as conn:
+        for table in (
+            "lml_cache.library_release_override",
+            "release_track_artist",
+            "release_track",
+            "release",
+        ):
+            await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+
+
+@pytest.mark.pg
+class TestIncludeTracksSingleArtistEndToEnd:
+    """LML#1138 end-to-end: `kind: single_artist` `tracks[]` derived from a
+    real `lml_cache.library_release_override` pin joined to real
+    `release_track` / `release_track_artist` rows, through the router's two
+    batched reads. `legacy_release_id` is deliberately a DIFFERENT number
+    from `library_id` in every test (the wxyc-shared#315 id-space bridge is
+    what's doing the join, same discipline as the LML#1021 suite above).
+    """
+
+    async def _seed_pin_and_tracklist(self, pg_pool):
+        """Legacy library row 777000 -> pinned Discogs release 555 with a
+        three-row tracklist: two plain tracks and one carrying an extra=0
+        per-track credit plus an extra=1 writer credit (which must NOT leak
+        into the echo)."""
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO lml_cache.library_release_override "
+                "(library_id, discogs_release_id, source) VALUES (777000, 555, 'test-seed')"
+            )
+            await conn.execute("INSERT INTO release (id, title) VALUES (555, 'Dots and Loops')")
+            await conn.executemany(
+                "INSERT INTO release_track (release_id, sequence, position, title) "
+                "VALUES ($1, $2, $3, $4)",
+                [
+                    (555, 1, "A1", "Brakhage"),
+                    (555, 2, "A2", "Miss Modular"),
+                    (555, 3, "A3", "Photo Jenny"),
+                ],
+            )
+            await conn.executemany(
+                "INSERT INTO release_track_artist "
+                "(release_id, track_sequence, artist_name, extra, role) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                [
+                    (555, 3, "Lætitia Sadier", 0, None),
+                    (555, 3, "Sean O'Hagan", 1, "Written-By"),
+                ],
+            )
+
+    @pytest.mark.asyncio
+    async def test_pinned_release_derives_inherited_tracks(
+        self, pg_app_client, pg_pool, set_up_single_artist_tracklist_schema
+    ):
+        await self._seed_pin_and_tracklist(pg_pool)
+
+        resp = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "include_tracks": True,
+                "inputs": [
+                    {
+                        "library_id": 42,
+                        "legacy_release_id": 777000,
+                        "artist_name": "Stereolab",
+                        "album_title": "Dots and Loops",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["tracks_contract_version"] == 1
+        result = data["results"][0]
+        assert result["kind"] == "single_artist"
+        assert result["library_id"] == 42
+        # The core artist-identity composition is untouched by the derivation.
+        assert result["main"]["discogs_artist_id"] == 2154
+        assert result["tracks_attempted"] is True
+        assert len(result["tracks"]) == 3
+
+        by_position = {t["track_position"]: t for t in result["tracks"]}
+        plain = by_position["A1"]
+        assert plain["track_title"] == "Brakhage"
+        # No per-track credit: the echo falls back to the release's resolved
+        # artist, which is also the resolved name.
+        assert plain["artist_name"] == "Stereolab"
+        assert plain["resolved_artist_name"] == "Stereolab"
+        # The pin's provenance, inherited (2026-08-08 decision record).
+        assert plain["confidence"] == pytest.approx(1.0)
+        assert plain["method"] == "manual"
+        assert len(plain["sources"]) == 1
+        leg = plain["sources"][0]
+        assert leg["source"] == "discogs"
+        assert leg["method"] == "manual"
+        assert leg["external_id"] == "555"
+
+        credited = by_position["A3"]
+        assert credited["track_title"] == "Photo Jenny"
+        # The extra=0 per-track credit is echoed; the extra=1 writer credit
+        # (Sean O'Hagan) must not leak into it.
+        assert credited["artist_name"] == "Lætitia Sadier"
+        assert credited["resolved_artist_name"] == "Stereolab"
+
+    @pytest.mark.asyncio
+    async def test_unpinned_release_stays_false_and_empty(
+        self, pg_app_client, set_up_single_artist_tracklist_schema
+    ):
+        """No override pin for this legacy id -> the honest unvisited state,
+        so the consumer keeps re-asking and coverage self-heals as pins and
+        the LML#842 leg grow."""
+        resp = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "include_tracks": True,
+                "inputs": [
+                    {
+                        "library_id": 42,
+                        "legacy_release_id": 999999,
+                        "artist_name": "Stereolab",
+                        "album_title": "Never Pinned",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["kind"] == "single_artist"
+        assert result["tracks_attempted"] is False
+        assert result["tracks"] == []
+
+    @pytest.mark.asyncio
+    async def test_pinned_release_with_no_cached_tracks_is_attempted_nothing(
+        self, pg_app_client, pg_pool, set_up_single_artist_tracklist_schema
+    ):
+        """A pin whose release has no cached tracklist rows: a genuine
+        attempt that found nothing -> (true, []), distinct from unvisited."""
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO lml_cache.library_release_override "
+                "(library_id, discogs_release_id, source) VALUES (777000, 556, 'test-seed')"
+            )
+            await conn.execute("INSERT INTO release (id, title) VALUES (556, 'Tracklistless')")
+
+        resp = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "include_tracks": True,
+                "inputs": [
+                    {
+                        "library_id": 42,
+                        "legacy_release_id": 777000,
+                        "artist_name": "Stereolab",
+                        "album_title": "Tracklistless",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["tracks_attempted"] is True
+        assert result["tracks"] == []
+
+    @pytest.mark.asyncio
+    async def test_missing_legacy_release_id_degrades_to_unvisited(
+        self, pg_app_client, pg_pool, set_up_single_artist_tracklist_schema
+    ):
+        """No bridge on the input (un-upgraded caller): unvisited, even when
+        a pin exists that LML simply has no key to find."""
+        await self._seed_pin_and_tracklist(pg_pool)
+
+        resp = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "include_tracks": True,
+                "inputs": [
+                    {
+                        "library_id": 42,
+                        "artist_name": "Stereolab",
+                        "album_title": "No Bridge",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["tracks_attempted"] is False
+        assert result["tracks"] == []
+
+    @pytest.mark.asyncio
+    async def test_flag_off_never_touches_the_derivation(
+        self, pg_app_client, pg_pool, set_up_single_artist_tracklist_schema
+    ):
+        """Flag off: null pair, null marker, pin or no pin."""
+        await self._seed_pin_and_tracklist(pg_pool)
+
+        resp = await pg_app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "inputs": [
+                    {
+                        "library_id": 42,
+                        "legacy_release_id": 777000,
+                        "artist_name": "Stereolab",
+                        "album_title": "Dots and Loops",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["tracks_contract_version"] is None
+        result = data["results"][0]
+        assert result["tracks_attempted"] is None
+        assert result["tracks"] is None
