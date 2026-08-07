@@ -30,8 +30,10 @@ and ``main`` is the operator entry point.
 **On reuse of ``scripts.artist_resolve_drain.drain``:** the plan's slice 5
 names ``run_drain`` (JSONL-logged resume + escalation-cooldown retry) as an
 import candidate alongside ``make_post_batch``/``resolve_batch``/``PAGE_SIZE``.
-This module imports the latter three but deliberately does NOT drive
-``run_drain``'s outer loop. D2 already gives this backfill a STRONGER,
+This module imports ``make_post_batch`` and ``PAGE_SIZE`` (plus ``chunk`` and
+``_TERMINAL_REASONS``, and ``report.sample_spot_check``); ``resolve_batch``
+is reached transitively inside ``make_post_batch`` rather than imported.
+It deliberately does NOT drive ``run_drain``'s outer loop. D2 already gives this backfill a STRONGER,
 cross-process resumability mechanism than a local JSONL file: every attempt
 IS a durable PG row, so a crash mid-page loses at most one in-flight page
 (<=25 credits), and a subsequent ``--incremental`` / ``--retry-misses`` run
@@ -807,13 +809,16 @@ async def run_backfill(
     page's fan-back rows are written before the next page is fetched, and
     each MusicBrainz verdict is written as it is produced -- that is what
     makes the module docstring's loss bound ("a crash loses at most one
-    in-flight page") true rather than aspirational. For the same reason an
-    ``httpx.HTTPError`` from the Discogs leg is caught at the page boundary
-    and ends the pass gracefully (mirroring ``run_drain``'s
-    degrade-not-crash posture): the pages already resolved are already in
-    PG, and the rest of the population stays in the ``--incremental``
-    cohort. ``raw_results``, when given, collects the endpoint's verbatim
-    whole-string verdicts for the ``sample_spot_check`` review table.
+    in-flight page") true rather than aspirational. For the same reason a
+    TRANSIENT ``httpx.HTTPError`` from the Discogs leg (timeout, transport
+    failure, 5xx) is caught at the page boundary and ends the pass
+    gracefully: the pages already resolved are already in PG, and the rest
+    of the population stays in the ``--incremental`` cohort. A 4xx
+    ``HTTPStatusError`` re-raises instead -- ``run_drain``'s full posture
+    (PR#780): a misconfig like a bad key or an oversized page must surface,
+    not masquerade as a routine partial pass. ``raw_results``, when given,
+    collects the endpoint's verbatim whole-string verdicts for the
+    ``sample_spot_check`` review table.
     """
     discogs_credits = list(credits if discogs_credits is None else discogs_credits)
     musicbrainz_credits = list(credits if musicbrainz_credits is None else musicbrainz_credits)
@@ -856,6 +861,13 @@ async def run_backfill(
                 post_batch, page, dry_run=dry_run_http, raw_results=raw_results
             )
         except httpx.HTTPError as exc:
+            # run_drain's actual posture (drain.py, PR#780): a 4xx is a
+            # misconfig -- bad key, oversized page -- not "couldn't ask", so
+            # it re-raises rather than degrades. Swallowing it here would let
+            # a bad --api-key log one WARNING on the first page and exit 0
+            # having resolved nothing.
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+                raise
             logger.warning(
                 "Discogs pass aborted at a page boundary (%s: %s). Pages resolved before "
                 "this one are already persisted; this page's credits and the rest of the "
