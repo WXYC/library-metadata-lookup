@@ -28,7 +28,10 @@ from entity.compilation_track_identity import (
     write_compilation_track_identity_verdict,
 )
 from entity.compilation_track_location import set_up_compilation_track_location_schema
-from scripts.backfill_compilation_track_identity import recover_track_positions
+from scripts.backfill_compilation_track_identity import (
+    load_null_position_library_ids,
+    recover_track_positions,
+)
 from tests.integration.conftest import skip_if_named_tables_populated
 
 _INSERT_LOCATION_SQL = """\
@@ -162,9 +165,9 @@ class TestRecoverTrackPositions:
         position_first = rows_first[0].track_position
 
         # track_position is now non-NULL, so a second run must be a no-op
-        # (write_compilation_track_identity_position never overwrites a
-        # populated position) -- and if it DID re-pick, the LATERAL's
-        # ORDER BY makes the pick deterministic either way.
+        # (the set-based fill's `track_position IS NULL` guard never
+        # overwrites a populated position) -- and if it DID re-pick, the
+        # LATERAL's ORDER BY makes the pick deterministic either way.
         stats_second = await recover_track_positions(pg_source, [1])
         rows_second = await get_compilation_track_identity_for_library(pg_source, 1)
 
@@ -210,5 +213,68 @@ class TestRecoverTrackPositions:
     @pytest.mark.asyncio
     async def test_empty_library_ids_is_a_no_op(self, pg_source):
         stats = await recover_track_positions(pg_source, [])
-        assert stats.candidate_rows == 0
+        assert stats.covered_candidate_rows == 0
         assert stats.recovered_rows == 0
+
+    @pytest.mark.asyncio
+    async def test_the_agreement_denominator_counts_only_covered_comps(self, pg_source, pg_pool):
+        # The conflation D5 forbids, pinned end-to-end: comp 1 is COVERED but
+        # its credit string disagrees with the recall index's spelling; comp 2
+        # is entirely UNCOVERED. Folding comp 2's row into the agreement
+        # denominator would report 0/2 string agreement (a normalization
+        # problem) when the real reading is 0/1 agreement + 1/2 coverage (a
+        # recall-index problem).
+        for library_id, artist, title in ((1, "Sessa", "Grandeza"), (2, "The Bug", "Pressure")):
+            await write_compilation_track_identity_verdict(
+                pg_source,
+                library_id=library_id,
+                track_artist_raw=artist,
+                track_title_raw=title,
+                source="discogs",
+                external_id="9",
+                confidence=1.0,
+                method="exact_match",
+                resolved_artist_name=artist,
+            )
+        async with pg_pool.acquire() as conn:
+            await conn.execute(_INSERT_LOCATION_SQL, 1, "A1", "sessa", "a different spelling", 1)
+
+        stats = await recover_track_positions(pg_source, [1, 2])
+
+        assert stats.candidate_library_ids == 2
+        assert stats.recall_index_covered_library_ids == 1
+        assert stats.covered_candidate_rows == 1  # comp 2's row is NOT in this denominator
+        assert stats.recovered_rows == 0
+
+    @pytest.mark.asyncio
+    async def test_recovery_reaches_a_fully_attempted_population(self, pg_source, pg_pool):
+        # The --recover-positions path (the fix for "position recovery is
+        # unreachable once a population is fully attempted"): every credit
+        # already has its row, no resolve session runs, and the recall index
+        # gains the comp only LATER. load_null_position_library_ids must find
+        # the row and the recovery pass must fill it -- with zero external
+        # calls, driven purely off stored state.
+        await write_compilation_track_identity_verdict(
+            pg_source,
+            library_id=7,
+            track_artist_raw="Chuquimamani-Condori",
+            track_title_raw="Call Your Name",
+            source="discogs",
+            external_id="777",
+            confidence=1.0,
+            method="exact_match",
+            resolved_artist_name="Chuquimamani-Condori",
+        )
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                _INSERT_LOCATION_SQL, 7, "B1", "chuquimamani-condori", "call your name", 1
+            )
+
+        library_ids = await load_null_position_library_ids(pg_source)
+        assert library_ids == [7]
+
+        stats = await recover_track_positions(pg_source, library_ids)
+
+        rows = await get_compilation_track_identity_for_library(pg_source, 7)
+        assert rows[0].track_position == "B1"
+        assert stats.recovered_rows == 1

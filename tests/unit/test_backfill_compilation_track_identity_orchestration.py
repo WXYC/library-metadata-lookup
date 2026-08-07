@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from wxyc_etl.text import to_match_form
 
@@ -127,6 +128,93 @@ class TestRunBackfill:
         assert stats.rows_written == 2  # one discogs row per fanned-back credit
         assert stats.distinct_credits == 1
         assert pg.execute.await_count == 2
+
+    async def test_verdicts_persist_page_by_page_so_an_abort_keeps_prior_pages(self):
+        # The all-or-nothing defect: verdicts must be written as each page
+        # resolves, NOT accumulated until both legs finish -- otherwise a
+        # crash ten hours into a drain discards every verdict the shared
+        # Discogs budget already paid for. 26 distinct artists = two pages
+        # (PAGE_SIZE 25); the second page's POST dies with a transport error.
+        # Page 1's 25 rows must already be in PG, and the error must end the
+        # pass gracefully (run_drain's degrade-not-crash posture), not
+        # propagate.
+        credits = [_credit(i, f"Artist {i:02d}", "Track") for i in range(26)]
+        verdicts = {f"Artist {i:02d}": _resolved(f"Artist {i:02d}") for i in range(26)}
+        calls = []
+
+        async def post_batch(names: list[str], dry_run: bool) -> list[dict]:
+            calls.append(list(names))
+            if len(calls) > 1:
+                raise httpx.ConnectError("stream reset mid-drain")
+            return [verdicts[name] for name in names]
+
+        pg = AsyncMock()
+        pg.execute = AsyncMock(return_value="OK")
+
+        stats = await run_backfill(
+            credits=credits,
+            post_batch=post_batch,
+            mb_pg=None,
+            pg=pg,
+            dry_run_write=False,
+            dry_run_http=True,
+        )
+
+        assert len(calls) == 2  # page 2 was attempted and aborted the pass
+        assert stats.rows_written == 25  # page 1 persisted BEFORE page 2 ran
+        assert pg.execute.await_count == 25
+
+    async def test_invalid_credit_gets_a_musicbrainz_miss_row_not_eternal_reselection(self):
+        # The MB leg applies the same structural gate as the Discogs leg: an
+        # invalid credit gets a deterministic MB miss row without touching
+        # the MB PG at all. Without the gate, the credit would raise inside
+        # the PG bind, be classified "not consulted" (no row), and be
+        # re-selected -- and re-paid -- by every --incremental run forever.
+        credits = [_credit(1, "(2)", "Track")]
+        post_batch = _fake_post_batch({})  # KeyErrors if any HTTP call happens
+        mb_pg = AsyncMock()
+        pg = AsyncMock()
+        pg.execute = AsyncMock(return_value="OK")
+
+        stats = await run_backfill(
+            credits=credits,
+            post_batch=post_batch,
+            mb_pg=mb_pg,
+            pg=pg,
+            dry_run_write=False,
+            dry_run_http=True,
+        )
+
+        mb_pg.fetchall.assert_not_awaited()
+        sources_written = {call.args[4] for call in pg.execute.await_args_list}
+        external_ids = {call.args[5] for call in pg.execute.await_args_list}
+        assert sources_written == {"discogs", "musicbrainz"}
+        assert external_ids == {None}  # both rows are misses -- attempted, resolved nothing
+        assert stats.rows_written == 2
+
+    async def test_library_id_binds_hold_the_library_db_id_space_verbatim(self):
+        # F2's fixture proof: the id this pipeline stores is library.db's
+        # library.id (the legacy MySQL LIBRARY_RELEASE_ID), flowing verbatim
+        # from CtaCredit into the write binds with no remapping. 424242 is
+        # deliberately unlike any small Backend serial -- a consumer that
+        # joins it against wxyc_schema.library.id gets zero rows, which is
+        # exactly why the sidecar comment names the legacy_release_id bridge.
+        credits = [_credit(424242, "Sessa", "Grandeza")]
+        post_batch = _fake_post_batch({"Sessa": _resolved("Sessa")})
+        pg = AsyncMock()
+        pg.execute = AsyncMock(return_value="OK")
+
+        await run_backfill(
+            credits=credits,
+            post_batch=post_batch,
+            mb_pg=None,
+            pg=pg,
+            dry_run_write=False,
+            dry_run_http=True,
+        )
+
+        library_id_binds = {call.args[1] for call in pg.execute.await_args_list}
+        assert library_id_binds == {424242}
 
     async def test_dry_run_write_never_touches_pg(self):
         credits = [_credit(1, "Sessa", "Musica")]
@@ -296,6 +384,9 @@ class TestSelectCreditPopulation:
         assert mb_credits == credits  # never attempted on MB -- still a candidate
 
     async def test_retry_misses_selects_only_miss_rows(self):
+        # The fake returns a FULL store row: the mode now drains the cohort
+        # through get_compilation_track_identity_misses (the store helper is
+        # the one definition of "miss"), not a script-local key query.
         credits = [_credit(1, "Sessa", "Musica"), _credit(2, "Juana Molina", "La Paradoja")]
         pg = AsyncMock()
         pg.fetchall = AsyncMock(
@@ -304,6 +395,14 @@ class TestSelectCreditPopulation:
                     "library_id": 1,
                     "track_artist": to_match_form("Sessa"),
                     "track_title": to_match_form("Musica"),
+                    "source": "discogs",
+                    "external_id": None,
+                    "confidence": None,
+                    "method": None,
+                    "resolved_artist_name": None,
+                    "track_artist_raw": "Sessa",
+                    "track_title_raw": "Musica",
+                    "track_position": None,
                 }
             ]
         )

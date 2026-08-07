@@ -257,11 +257,15 @@ uv run python -m scripts.backfill_compilation_track_identity --full
 # Re-attempt only credits whose existing row is a miss.
 uv run python -m scripts.backfill_compilation_track_identity --retry-misses
 
+# Re-run ONLY the D5 position-recovery join (zero external calls, no library.db
+# needed) after the recall index grows:
+uv run python -m scripts.backfill_compilation_track_identity --recover-positions
+
 # Authorize minting after a dry-HTTP run's spot-check:
 uv run python -m scripts.backfill_compilation_track_identity --incremental --live
 ```
 
-Exactly one of `--incremental` / `--full` / `--retry-misses` is required. Other flags: `--library-db` (path to `library.db`, default `library.db`), `--limit` (cap the number of CTA credits loaded), `--base-url`/`--api-key` (default to `$LML_BASE_URL`/`$PRODUCTION_URL` and `$LML_API_KEY`, matching the sibling drain), `--timeout` (per-request seconds, default 120). Unlike the sibling artist-resolve drain, this script does not drive `run_drain`'s JSONL-logged resume: every attempt is already a durable PG row (D2), so a crash loses at most one in-flight page (≤25 credits) and the next `--incremental` invocation picks up exactly where the process left off — see the module docstring for the full reasoning.
+Exactly one of `--incremental` / `--full` / `--retry-misses` / `--recover-positions` is required. Other flags: `--library-db` (path to `library.db`, default `library.db`), `--limit` (per-session work budget: cap the SELECTED credits processed per source this run — applied after population selection, so `--incremental --limit 5000` does the next 5,000 unattempted credits), `--base-url`/`--api-key` (default to `$LML_BASE_URL`/`$PRODUCTION_URL` and `$LML_API_KEY`, matching the sibling drain), `--timeout` (per-request seconds, default 120). Every run ends by logging the sibling drain's seeded `sample_spot_check` table over this run's `api_search` resolutions — that emitted sample is what the human review before a `--live` run reviews. Unlike the sibling artist-resolve drain, this script does not drive `run_drain`'s JSONL-logged resume: every attempt is already a durable PG row written page-by-page (D2), so a crash loses at most one in-flight page (≤25 credits) and the next `--incremental` invocation picks up exactly where the process left off — see the module docstring for the full reasoning.
 
 Retires `scripts/match_compilations.py` (its matching cascade moved to `scripts/_lib/release_matching.py`, a genuine shared-script helper once `scripts/build_compilation_track_location.py` became its second consumer; its standalone JSON-writing CLI had no remaining caller) and `scripts/merge_cta.py` outright (it SSH-wrote to tubafrenzy MySQL, which the cross-cache-identity pivot's no-cross-service-writes rule forbids).
 
