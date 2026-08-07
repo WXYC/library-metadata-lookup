@@ -65,6 +65,7 @@ echo "Generating Python models..."
     --target-python-version 3.12 \
     --use-standard-collections \
     --use-union-operator \
+    --strict-nullable \
     --disable-timestamp \
     --custom-file-header "# Generated from wxyc-shared/api.yaml -- do not edit manually.
 # Regenerate with: bash scripts/generate_api_models.sh"
