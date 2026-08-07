@@ -1518,3 +1518,71 @@ class TestIncludeTracksCompilationStore:
         single_artist = by_id[2]
         assert single_artist["kind"] == "single_artist"
         assert single_artist["main"]["discogs_artist_id"] == 2154
+
+    @pytest.mark.asyncio
+    async def test_batched_read_pg_failure_emits_fail_open_counter(
+        self, app_client, mock_entity_store, monkeypatch
+    ):
+        """Review finding: the degrade-to-unvisited arm's only signal was a
+        `logger.warning` -- indistinguishable, from the outside, between a
+        PERSISTENT read failure (worth paging on) and the routine "this
+        release just hasn't been backfilled yet" case that produces the
+        exact same `(false, [])` wire shape. An unsampled PostHog counter
+        (mirroring `discogs_rate_gate_fail_open` / `discogs_artist_breaker_shed`)
+        fires on every degrade, so a sustained failure is queryable
+        independent of trace sampling.
+        """
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.sources import PgSource
+
+        monkeypatch.setenv("ENABLE_TELEMETRY", "true")
+        monkeypatch.setenv("ENVIRONMENT", "unit-test-env")
+        from config.settings import get_settings
+
+        get_settings.cache_clear()
+        events: list[dict] = []
+
+        class _FakePosthog:
+            def capture(self, *, distinct_id, event, properties):
+                events.append(
+                    {"distinct_id": distinct_id, "event": event, "properties": properties}
+                )
+
+        monkeypatch.setattr(
+            "identity.router.get_posthog_client", lambda event_prefix: _FakePosthog()
+        )
+
+        async def failing_load(pg, legacy_release_ids):
+            raise PostgresError("simulated compilation_track_identity read failure")
+
+        router_module_load = router_module.load_compilation_track_rows_by_legacy_id
+        router_module.load_compilation_track_rows_by_legacy_id = failing_load
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        try:
+            resp = await self._post(
+                app_client,
+                {
+                    "include_tracks": True,
+                    "inputs": [
+                        {
+                            "library_id": 1,
+                            "legacy_release_id": 201,
+                            "artist_name": "Various Artists",
+                            "album_title": "Edits",
+                        },
+                    ],
+                },
+            )
+        finally:
+            router_module.load_compilation_track_rows_by_legacy_id = router_module_load
+            get_settings.cache_clear()
+
+        assert resp.status_code == 200
+        assert len(events) == 1
+        event = events[0]
+        assert event["distinct_id"] == "library-metadata-lookup-service"
+        assert event["event"] == "compilation_track_read_fail_open"
+        assert event["properties"]["error_type"] == "PostgresError"
+        assert event["properties"]["legacy_release_id_count"] == 1
+        assert event["properties"]["environment"] == "unit-test-env"

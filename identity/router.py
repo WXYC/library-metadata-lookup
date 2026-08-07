@@ -19,7 +19,9 @@ from collections import Counter
 
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from wxyc_fastapi.observability import get_posthog_client
 
+from config.settings import get_settings
 from core.bulk_body import (
     TRANSIENT_PG_ERRORS,
     parse_bulk_body,
@@ -67,6 +69,57 @@ from identity.release_validation import (
 # generated model's JSON schema so a regenerated `maxItems` moves the 413
 # gate in lockstep (LML#767 drift guard — the artists routes' pattern).
 _BULK_RESOLVE_INPUT_CAP = resolve_input_cap(BulkResolveLibrariesRequest, "inputs")
+
+# Unsampled PostHog counter for the LML#1021 compilation_track_identity
+# batched-read degrade path (review finding). Mirrors
+# discogs.ratelimit._capture_fail_open (LML#879) / discogs.service
+# ._capture_artist_breaker_shed (LML#1049) / bandcamp_probe._capture_shed
+# (LML#1098) — same unsampled-counter pattern, documented alongside its
+# siblings in docs/observability-rowless-flag.md. A `logger.warning` alone
+# is not queryable across a sampled trace pipeline, and — because a
+# degraded read produces the SAME wire shape (`tracks_attempted: false`,
+# `tracks: []`) as a release the matcher simply hasn't visited yet — there
+# is no way to tell "PG is unhappy" apart from "the catalog isn't
+# backfilled yet" from the response alone. A persistently non-zero rate
+# here means the former; a catalog that's merely mid-backfill produces
+# zero of these (it never touches this code path at all — see
+# `compilation_result`'s docstring on the two `(False, [])` causes).
+_COMPILATION_TRACK_READ_FAIL_OPEN_EVENT = "compilation_track_read_fail_open"
+_COMPILATION_TRACK_READ_POSTHOG_EVENT_PREFIX = "compilation_track_read"
+_COMPILATION_TRACK_READ_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
+
+
+def _capture_compilation_track_read_fail_open(
+    exc: BaseException, *, legacy_release_id_count: int
+) -> None:
+    """Emit the unsampled PostHog counter for one degraded
+    ``compilation_track_identity`` batched-read failure.
+
+    Best-effort, gated by ``Settings.enable_telemetry``, wired through the
+    shared ``wxyc_fastapi.observability.get_posthog_client`` accessor. Every
+    branch is wrapped so a telemetry failure can never turn the graceful
+    degrade into something worse.
+    """
+    try:
+        settings = get_settings()
+        if not settings.enable_telemetry:
+            return
+        client = get_posthog_client(event_prefix=_COMPILATION_TRACK_READ_POSTHOG_EVENT_PREFIX)
+        if client is None:
+            return
+        client.capture(
+            distinct_id=_COMPILATION_TRACK_READ_POSTHOG_DISTINCT_ID,
+            event=_COMPILATION_TRACK_READ_FAIL_OPEN_EVENT,
+            properties={
+                "error_type": type(exc).__name__,
+                "legacy_release_id_count": legacy_release_id_count,
+                "environment": settings.environment,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Failed to emit %s counter", _COMPILATION_TRACK_READ_FAIL_OPEN_EVENT, exc_info=True
+        )
 
 
 def _bulk_resolve_default_concurrency() -> int:
@@ -313,13 +366,22 @@ async def bulk_resolve_libraries(
                 track_rows_by_legacy_id = await load_compilation_track_rows_by_legacy_id(
                     discogs_cache_pg, legacy_release_ids
                 )
-            except TRANSIENT_PG_ERRORS:
+            except TRANSIENT_PG_ERRORS as exc:
                 logger.warning(
                     "compilation_track_identity batched read failed mid-bulk-resolve for "
                     "%d legacy_release_id(s); degrading every affected compilation row to "
                     "the unvisited state (false, []) rather than failing the whole batch",
                     len(legacy_release_ids),
                     exc_info=True,
+                )
+                # A plain warning log alone can't distinguish this (a
+                # PERSISTENT read failure, worth paging on) from the
+                # ordinary case the same (false, []) wire shape also
+                # covers (this release just hasn't been backfilled yet) --
+                # the unsampled counter is that distinguishing signal (see
+                # its docstring + docs/observability-rowless-flag.md).
+                _capture_compilation_track_read_fail_open(
+                    exc, legacy_release_id_count=len(legacy_release_ids)
                 )
                 # track_rows_by_legacy_id stays {} -- every affected
                 # compilation input degrades to (False, []) below, same as
