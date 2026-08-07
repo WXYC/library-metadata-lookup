@@ -5,7 +5,7 @@ shaped like discogs-cache's ``va_release`` / ``release`` / ``release_track`` /
 ``release_track_artist``, plus a real (tmp-file) SQLite ``library.db``. Unit
 coverage (``tests/unit/test_build_compilation_track_location.py``) mocks
 every collaborator; this file is the round-trip proof that the real
-``match_compilations`` cascade, the real credit-fetch join, and the real
+``scripts/_lib/release_matching`` cascade, the real credit-fetch join, and the real
 ``ON CONFLICT DO NOTHING`` insert compose correctly -- including the
 data-safety invariant that a successfully-populated row is never overwritten.
 

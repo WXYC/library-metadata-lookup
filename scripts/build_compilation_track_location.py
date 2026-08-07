@@ -6,7 +6,7 @@ Answers "which library shelf locations contain track *T* credited to artist
 and "Soundtracks - *" shelf buckets alike), matching it to a Discogs release
 -- preferring a hand-verified ``lml_cache.library_release_override`` pin
 (LML#850/#858) and falling back to the same normalized-title cascade
-``scripts/match_compilations.py`` uses against ``va_release`` for comps the
+``scripts/_lib/release_matching.py`` uses against ``va_release`` for comps the
 override table doesn't cover (LML#1082) -- and persisting every
 ``release_track_artist`` credit for that release -- not just the primary
 artist -- tiered into a coarse ``credit_role``. Precision ranking is
@@ -55,7 +55,7 @@ from wxyc_etl.text import is_compilation_artist, to_match_form
 from entity.compilation_track_location import set_up_compilation_track_location_schema
 from entity.sources import PgSource
 from lookup.artwork import _resolve_fallback_artwork
-from scripts.match_compilations import (
+from scripts._lib.release_matching import (
     CompAlbum,
     exact_match,
     normalize_comp_title,
@@ -158,8 +158,8 @@ async def match_comp_release(
     ``_OVERRIDE_SQL`` guard) -- the same "no cached tracklist" skip class the
     caller already logs for a cascade hit with an empty tracklist. Comps
     left unclaimed by a (guarded) override fall through to the same exact ->
-    prefix-strip -> trigram cascade ``match_compilations.py`` runs against
-    ``va_release``, so this build still doesn't reinvent comp-title matching
+    prefix-strip -> trigram cascade ``scripts/_lib/release_matching.py`` runs
+    against ``va_release``, so this build still doesn't reinvent comp-title matching
     for the comps the override table doesn't cover. The override always wins
     on conflict -- an override-claimed comp is removed from the candidate
     pool before the cascade runs, so it can never be reassigned by a

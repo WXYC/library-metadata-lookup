@@ -1,4 +1,4 @@
-"""Unit tests for scripts/match_compilations.py's normalize_comp_title.
+"""Unit tests for scripts/_lib/release_matching.py's normalize_comp_title.
 
 LML#1096: characterizes current behavior before consolidating the duplicated
 ``_FORMAT_SUFFIX_RE`` with clients/streaming/matching.py's canonical copy.
@@ -8,11 +8,16 @@ module-level comment on them) -- compilation-title annotations like
 legitimately carries, unlike an album title where similar bracket content
 (e.g. "[Live]"/"[Disc One]") can be meaningful, so this domain intentionally
 strips more aggressively than the conservative canonical regex.
+
+This module lived at ``scripts/match_compilations.py`` until LML#1020's D6
+moved its matching cascade to ``scripts/_lib/release_matching.py`` (the
+module's only other consumer, ``scripts/build_compilation_track_location.py``,
+made it a genuine shared-script helper).
 """
 
 import pytest
 
-from scripts.match_compilations import normalize_comp_title
+from scripts._lib.release_matching import normalize_comp_title
 
 
 @pytest.mark.parametrize(
