@@ -1453,3 +1453,68 @@ class TestIncludeTracksCompilationStore:
         assert single_artist["kind"] == "single_artist"
         assert single_artist["tracks_attempted"] is False
         assert single_artist["tracks"] == []
+
+    @pytest.mark.asyncio
+    async def test_batched_read_pg_failure_degrades_to_unvisited_not_503(
+        self, app_client, mock_entity_store
+    ):
+        """Review finding: a TRANSIENT_PG_ERRORS failure from the batched
+        pre-fan-out read used to 503 the WHOLE batch -- inconsistent with
+        the adjacent `discogs_cache_pg is None` arm, which already degrades
+        gracefully, and needlessly punitive since this read is an optional
+        `include_tracks` enrichment. Compilation rows the read would have
+        covered degrade to the honest unvisited `(false, [])` state instead
+        (self-healing -- BS's retry semantics re-ask on the next pass);
+        single_artist/unresolved rows in the SAME batch are entirely
+        unaffected and the response is still 200.
+        """
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.sources import PgSource
+
+        async def failing_load(pg, legacy_release_ids):
+            raise PostgresError("simulated compilation_track_identity read failure")
+
+        router_module_load = router_module.load_compilation_track_rows_by_legacy_id
+        router_module.load_compilation_track_rows_by_legacy_id = failing_load
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Stereolab", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+        try:
+            resp = await self._post(
+                app_client,
+                {
+                    "include_tracks": True,
+                    "inputs": [
+                        {
+                            "library_id": 1,
+                            "legacy_release_id": 201,
+                            "artist_name": "Various Artists",
+                            "album_title": "Edits",
+                        },
+                        {
+                            "library_id": 2,
+                            "legacy_release_id": 301,
+                            "artist_name": "Stereolab",
+                            "album_title": "Dots and Loops",
+                        },
+                    ],
+                },
+            )
+        finally:
+            router_module.load_compilation_track_rows_by_legacy_id = router_module_load
+
+        assert resp.status_code == 200
+        data = resp.json()
+        by_id = {r["library_id"]: r for r in data["results"]}
+
+        compilation = by_id[1]
+        assert compilation["kind"] == "compilation"
+        assert compilation["tracks_attempted"] is False
+        assert compilation["tracks"] == []
+
+        single_artist = by_id[2]
+        assert single_artist["kind"] == "single_artist"
+        assert single_artist["main"]["discogs_artist_id"] == 2154

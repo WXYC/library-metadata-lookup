@@ -229,6 +229,20 @@ class TestGetForLibrary:
         assert "WHERE library_id = $1" in sql
         assert binds == [1]
 
+    async def test_orders_deterministically_by_the_full_pk(self):
+        """No ORDER BY means Postgres may return rows in any physical order
+        -- LML#1021's per-track composer needs a deterministic base order
+        for `sources[]` wire stability (review finding), independent of
+        query plan. Ordering by the whole PK (library_id, track_artist,
+        track_title, source) is a total order -- no two rows can tie."""
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[_SAMPLE_ROW])
+
+        await get_compilation_track_identity_for_library(pg, library_id=1)
+
+        sql, *_ = pg.fetchall.await_args.args
+        assert "ORDER BY library_id, track_artist, track_title, source" in sql
+
 
 @pytest.mark.asyncio
 class TestGetForLibraries:
@@ -248,6 +262,19 @@ class TestGetForLibraries:
         sql, *binds = pg.fetchall.await_args.args
         assert "WHERE library_id = ANY($1::int[])" in sql
         assert binds == [[1, 2, 3]]
+
+    async def test_orders_deterministically_by_the_full_pk(self):
+        """Same determinism requirement as the singular reader -- LML#1021's
+        composer sorts `sources[]` off this base order (review finding: a
+        cross-source confidence tie must not depend on database row order
+        or query plan)."""
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[_SAMPLE_ROW])
+
+        await get_compilation_track_identity_for_libraries(pg, [1, 2, 3])
+
+        sql, *_ = pg.fetchall.await_args.args
+        assert "ORDER BY library_id, track_artist, track_title, source" in sql
 
     async def test_empty_library_ids_short_circuits_before_the_round_trip(self):
         pg = AsyncMock(spec=PgSource)

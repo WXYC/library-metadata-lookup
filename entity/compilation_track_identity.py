@@ -276,10 +276,17 @@ class CompilationTrackIdentityRow:
     attempted_at: datetime | None = None
 
 
-_SELECT_MISSES_SQL = """\
-SELECT library_id, track_artist, track_title, source, external_id, confidence,
+# The 12-column projection every reader below selects. Extracted once
+# (review finding, LML#1021 review round) so a future column add pays the
+# toll in exactly one place rather than three hand-copies drifting apart.
+_TRACK_IDENTITY_COLUMNS = """\
+library_id, track_artist, track_title, source, external_id, confidence,
        method, resolved_artist_name, track_artist_raw, track_title_raw,
-       track_position, attempted_at
+       track_position, attempted_at\
+"""
+
+_SELECT_MISSES_SQL = f"""\
+SELECT {_TRACK_IDENTITY_COLUMNS}
 FROM lml_cache.compilation_track_identity
 WHERE external_id IS NULL
   AND ($1::text IS NULL OR source = $1::text)
@@ -310,12 +317,11 @@ async def get_compilation_track_identity_misses(
     return [CompilationTrackIdentityRow(**row) for row in rows]
 
 
-_SELECT_BY_LIBRARY_SQL = """\
-SELECT library_id, track_artist, track_title, source, external_id, confidence,
-       method, resolved_artist_name, track_artist_raw, track_title_raw,
-       track_position, attempted_at
+_SELECT_BY_LIBRARY_SQL = f"""\
+SELECT {_TRACK_IDENTITY_COLUMNS}
 FROM lml_cache.compilation_track_identity
-WHERE library_id = $1\
+WHERE library_id = $1
+ORDER BY library_id, track_artist, track_title, source\
 """
 
 
@@ -333,12 +339,11 @@ async def get_compilation_track_identity_for_library(
     return [CompilationTrackIdentityRow(**row) for row in rows]
 
 
-_SELECT_BY_LIBRARIES_SQL = """\
-SELECT library_id, track_artist, track_title, source, external_id, confidence,
-       method, resolved_artist_name, track_artist_raw, track_title_raw,
-       track_position, attempted_at
+_SELECT_BY_LIBRARIES_SQL = f"""\
+SELECT {_TRACK_IDENTITY_COLUMNS}
 FROM lml_cache.compilation_track_identity
-WHERE library_id = ANY($1::int[])\
+WHERE library_id = ANY($1::int[])
+ORDER BY library_id, track_artist, track_title, source\
 """
 
 
