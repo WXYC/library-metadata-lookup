@@ -50,7 +50,7 @@ If `server_timing_present` comes back `false` in a **real `/lookup` run** (not `
 
 ## API Model Generation (`scripts/generate_api_models.sh`)
 
-Generates Pydantic v2 models from `wxyc-shared/api.yaml`. Uses a local sibling `wxyc-shared` directory if available, otherwise downloads from GitHub. The generated file (`generated/api_models.py`) is committed to git. Re-run after api.yaml changes.
+Generates Pydantic v2 models from `wxyc-shared/api.yaml`. Uses a local sibling `wxyc-shared` directory if available, otherwise downloads from GitHub. The generated file (`generated/api_models.py`) is committed to git. Re-run after api.yaml changes. Note that the committed file is a snapshot, not a live view: the Codegen Freshness CI job regenerates against wxyc-shared `main` at run time and diffs against what's committed here, so it can go red purely because upstream `api.yaml` moved since the last regen here, with no defect in this repo -- see [#1117](https://github.com/WXYC/library-metadata-lookup/issues/1117) for the currently-tracked instance of that drift.
 
 **Usage:**
 ```bash
@@ -58,6 +58,19 @@ bash scripts/generate_api_models.sh
 ```
 
 Requires `datamodel-code-generator` (included in dev dependencies).
+
+### Strict-nullable field-shape semantics
+
+The generator runs with `--strict-nullable` (adopted in PR #1154, merge commit `0bc5a40`, following [WXYC/wxyc-shared#302](https://github.com/WXYC/wxyc-shared/issues/302)). It reshapes two different kinds of `api.yaml` property in opposite directions, and both directions matter to anyone debugging an unexpected `ValidationError` or an inbound 422 on the `/lookup` hot path:
+
+- **Required + `nullable: true` -> widened.** A property that is both `required` and `nullable: true` now generates as `X | None = Field(...)` -- the *value* is nullable, the *key* stays required. Read the trailing `...` as pydantic's required-field marker, not a default; there is no default here. `BulkResolveTrackIdentity.resolved_artist_name` is the canonical example in the generated tree: `None` is a real, constructible verdict ("the matcher ran and resolved nothing for this track"), not a validation failure.
+- **Optional + schema default -> narrowed.** A property that is optional with a schema-level default (no `nullable: true`) now generates *without* `Optional` -- e.g. `LookupRequest.include_identity: bool = Field(False, ...)`. Explicitly passing `None` to one of these now raises a `ValidationError` at construction time, and an inbound request body with an explicit JSON `null` for that field now 422s where it previously validated silently. This was a byproduct of the pre-flag defaulting bug, not part of the contract.
+
+The full enumerated list (36 widened, 36 narrowed, measured at api.yaml 1.30.0) lives on [WXYC/wxyc-shared#302](https://github.com/WXYC/wxyc-shared/issues/302); the canonical semantics writeup is wxyc-shared's `CLAUDE.md` under "Python codegen and `nullable` on required fields". This section covers only what's specific to LML.
+
+**`generated/api_models.py` is generated and must never be hand-edited.** LML-local additions and overrides live one layer up instead. `lookup/models.py` subclasses the generated request/response models -- `class LookupRequest(_GeneratedLookupRequest)`, `class LookupResponse(_GeneratedLookupResponse)`, `class LookupResultItem(_GeneratedLookupResultItem)` -- to add fields and serialization behavior ahead of the next api.yaml regen. `discogs/models.py` takes the alias form for schemas that need no LML-local additions (`TrackItem = DiscogsTrackItem`, `ArtistCredit = DiscogsArtistCredit`, and similar). Either way, a `--strict-nullable` reshape in the generated layer propagates through: a subclass or alias built on a narrowed or widened generated field is exactly as narrow or wide as its parent, so the effect doesn't stop at `generated/api_models.py`.
+
+**The failure mode to recognize:** a present-but-null value from an external API or a nullable PostgreSQL column reaching a model constructor. Discogs can send an explicit JSON `null` where it usually omits the key entirely, and `dict.get(key, default)` only applies its default on an *absent* key -- a present-but-null `genres`/`styles`/`join` used to sail straight through into the pre-narrowing model, which tolerated it. Post-`--strict-nullable`, the narrowed models don't. `discogs/service.py`'s live-API parse guards these sites with an `or` fallback for list/string fields (`data.get("genres") or []`), and with an explicit `is None` check for boolean fields where an `or` guard would corrupt a legitimate `False` (`True if v.get("embed") is None else v["embed"]`). `discogs/cache_service.py` applies the same `is None` guard to `artist_member.active`, which is nullable in the discogs-cache DDL. A new call site that hits this should follow the same split: `or` where `None` and "absent/empty" mean the same thing, `is None` where they don't.
 
 ## VA Disambiguation (`scripts/va_disambiguate/`)
 
