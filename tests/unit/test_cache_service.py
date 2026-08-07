@@ -1989,6 +1989,11 @@ class TestGetArtistDetails:
         assert result is not None
         assert result.fetched_at == stamp
 
+        sql = mock_asyncpg_pool.fetchrow.call_args.args[0]
+        assert "fetched_at" in sql, (
+            f"get_artist_details SELECT must project fetched_at; got: {sql!r}"
+        )
+
     @pytest.mark.asyncio
     async def test_member_active_null_defaults_true_and_false_survives(
         self, cache_service, mock_asyncpg_pool
@@ -2024,11 +2029,6 @@ class TestGetArtistDetails:
         assert result is not None
         assert result.members[0].active is True
         assert result.members[1].active is False
-
-        sql = mock_asyncpg_pool.fetchrow.call_args.args[0]
-        assert "fetched_at" in sql, (
-            f"get_artist_details SELECT must project fetched_at; got: {sql!r}"
-        )
 
     @pytest.mark.asyncio
     async def test_stub_row_has_null_fetched_at(self, cache_service, mock_asyncpg_pool):

@@ -1712,7 +1712,7 @@ class DiscogsService:
                     name=data.get("name", ""),
                     profile=data.get("profile") or None,
                     image_url=image_url,
-                    name_variations=data.get("namevariations", []),
+                    name_variations=data.get("namevariations") or [],
                     aliases=[
                         ArtistRef(id=a["id"], name=a["name"])
                         for a in data.get("aliases", [])
@@ -1729,7 +1729,7 @@ class DiscogsService:
                         for m in data.get("members", [])
                         if "id" in m and "name" in m
                     ],
-                    urls=data.get("urls", []),
+                    urls=data.get("urls") or [],
                     cached=False,
                 )
 
