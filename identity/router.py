@@ -36,6 +36,7 @@ from core.bulk_concurrency import (
 from core.dependencies import discogs_pool_max_size, get_discogs_cache_pg
 from discogs.ratelimit import set_discogs_low_priority
 from entity.compilation_track_identity import CompilationTrackIdentityRow
+from entity.release_tracklist import ReleaseTracklistRow
 from entity.sources import PgSource
 from entity.store import EntityStore, Identity
 from generated.api_models import (
@@ -45,11 +46,15 @@ from generated.api_models import (
     BulkResolveResult,
     ReleaseIdentityResolveRequest,
     ReleaseIdentityResolveResponse,
+    TracksContractVersion,
 )
 from identity.bulk_resolve import (
+    SingleArtistTrackDerivation,
     compilation_result,
     compose_for_identity,
     load_compilation_track_rows_by_legacy_id,
+    load_release_tracklists_by_release_id,
+    load_single_artist_release_pins,
 )
 from identity.dependencies import get_entity_store, require_entity_store
 from identity.models import (
@@ -119,6 +124,51 @@ def _capture_compilation_track_read_fail_open(
     except Exception:
         logger.warning(
             "Failed to emit %s counter", _COMPILATION_TRACK_READ_FAIL_OPEN_EVENT, exc_info=True
+        )
+
+
+# Sibling counter for the LML#1138 single_artist derivation's batched reads
+# (the `lml_cache.library_release_override` pins read + the discogs-cache
+# tracklist read). Same unsampled-counter pattern and the same rationale as
+# `compilation_track_read_fail_open` above: the degraded wire shape
+# (`tracks_attempted: false`, `tracks: []`) is byte-identical to the routine
+# un-pinned case, so only this counter distinguishes "PG is unhappy" from
+# "the catalog isn't pinned yet". Documented alongside its sibling in
+# docs/observability-rowless-flag.md.
+_SINGLE_ARTIST_TRACK_READ_FAIL_OPEN_EVENT = "single_artist_track_read_fail_open"
+_SINGLE_ARTIST_TRACK_READ_POSTHOG_EVENT_PREFIX = "single_artist_track_read"
+_SINGLE_ARTIST_TRACK_READ_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
+
+
+def _capture_single_artist_track_read_fail_open(
+    exc: BaseException, *, legacy_release_id_count: int
+) -> None:
+    """Emit the unsampled PostHog counter for one degraded single-artist
+    derivation batched-read failure (pins or tracklists — one counter for
+    the pair, since either failing degrades the same rows the same way).
+
+    Best-effort, gated by ``Settings.enable_telemetry`` — same posture as
+    ``_capture_compilation_track_read_fail_open`` above.
+    """
+    try:
+        settings = get_settings()
+        if not settings.enable_telemetry:
+            return
+        client = get_posthog_client(event_prefix=_SINGLE_ARTIST_TRACK_READ_POSTHOG_EVENT_PREFIX)
+        if client is None:
+            return
+        client.capture(
+            distinct_id=_SINGLE_ARTIST_TRACK_READ_POSTHOG_DISTINCT_ID,
+            event=_SINGLE_ARTIST_TRACK_READ_FAIL_OPEN_EVENT,
+            properties={
+                "error_type": type(exc).__name__,
+                "legacy_release_id_count": legacy_release_id_count,
+                "environment": settings.environment,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Failed to emit %s counter", _SINGLE_ARTIST_TRACK_READ_FAIL_OPEN_EVENT, exc_info=True
         )
 
 
@@ -269,19 +319,28 @@ async def bulk_resolve_libraries(
       below). Absent ``legacy_release_id`` degrades to the unvisited
       ``(false, [])`` state — LML has no bridge to look the row up with.
     - Otherwise we look up ``artist_name`` in ``entity.identity`` and
-      compose per-source provenance via ``identity.bulk_resolve``.
+      compose per-source provenance via ``identity.bulk_resolve``. When
+      ``include_tracks`` is set and the input carries a ``legacy_release_id``
+      whose ``lml_cache.library_release_override`` pin resolves a Discogs
+      release, the ``kind: single_artist`` result's `tracks[]` is DERIVED
+      from that release's cached tracklist (LML#1138, BS#801 D13 option (c)
+      — no store, no matcher; see ``load_single_artist_release_pins`` /
+      ``load_release_tracklists_by_release_id``). No pin — the ordinary
+      case at v1's ~29% pin coverage; LML#842's ``streaming_album`` leg
+      lifts it to ~77% — or no bridge degrades to the unvisited
+      ``(false, [])`` state so the consumer keeps re-asking and coverage
+      self-heals.
     - When the lookup misses we return ``kind: unresolved`` so Backend
       can cache the no-match verdict (with TTL) and avoid re-asking.
 
     ``include_tracks`` (1.30.0, wxyc-shared#297) gates the
     ``(tracks_attempted, tracks)`` pair on both resolved kinds; ``None``
-    and ``false`` are one state. ``tracks_contract_version`` stays absent
-    even when the flag is understood-true: api.yaml 1.32.0 (wxyc-shared#314)
-    requires BOTH producer arms (`kind: compilation` — this ticket, LML#1021
-    — and `kind: single_artist` — LML#1138) to emit real `tracks_attempted`
-    before the marker may be `1`; the `single_artist` arm still hardcodes
-    `tracks=None` via `compose_for_identity`, so setting the marker now would
-    misrepresent those rows as trustworthy. #1138 flips it once its arm ships.
+    and ``false`` are one state. ``tracks_contract_version`` echoes ``1``
+    whenever the flag is understood-true: api.yaml 1.32.0's (wxyc-shared#314)
+    both-arms producer rule — real `tracks_attempted` on BOTH
+    `kind: compilation` (LML#1021) and `kind: single_artist` (LML#1138) —
+    is satisfied as of LML#1138, and the rule is an emit-the-pair gate, not
+    a coverage bar (the 2026-08-08 decision record on LML#1138).
 
     Response order matches request input order, as per the api.yaml
     contract.
@@ -387,6 +446,55 @@ async def bulk_resolve_libraries(
                 # compilation input degrades to (False, []) below, same as
                 # a missing legacy_release_id or an unavailable pool.
 
+    # LML#1138: the single_artist siblings of the read above -- TWO batched
+    # pre-fan-out reads (pins, then the pinned releases' tracklists), each
+    # ONE query per request regardless of batch width. Candidates are the
+    # NON-compilation inputs carrying the wxyc-shared#315 bridge; the pins
+    # read keys `lml_cache.library_release_override` in the same legacy id
+    # space. Degrade posture mirrors the compilation read exactly (this is
+    # the same optional `include_tracks` enrichment, not core resolution):
+    # a TRANSIENT_PG_ERRORS failure on EITHER read clears both maps, so
+    # every affected single_artist row emits the honest unvisited
+    # (false, []) state and BS#1991's sweep re-asks on its own schedule --
+    # never a 503 that would also fail the batch's unrelated rows.
+    single_artist_pins: dict[int, int] = {}
+    tracklists_by_release: dict[int, list[ReleaseTracklistRow]] = {}
+    single_artist_track_candidates = 0
+    if include_tracks and discogs_cache_pg is not None:
+        single_artist_legacy_ids = sorted(
+            {
+                input_row.legacy_release_id
+                for input_row in request.inputs
+                if input_row.legacy_release_id is not None
+                and not is_compilation_artist(input_row.artist_name)
+            }
+        )
+        single_artist_track_candidates = len(single_artist_legacy_ids)
+        if single_artist_legacy_ids:
+            try:
+                single_artist_pins = await load_single_artist_release_pins(
+                    discogs_cache_pg, single_artist_legacy_ids
+                )
+                if single_artist_pins:
+                    tracklists_by_release = await load_release_tracklists_by_release_id(
+                        discogs_cache_pg, sorted(set(single_artist_pins.values()))
+                    )
+            except TRANSIENT_PG_ERRORS as exc:
+                logger.warning(
+                    "single-artist track derivation batched read failed mid-bulk-resolve for "
+                    "%d legacy_release_id(s); degrading every affected single_artist row to "
+                    "the unvisited state (false, []) rather than failing the whole batch",
+                    len(single_artist_legacy_ids),
+                    exc_info=True,
+                )
+                # Same warning-alone-is-not-queryable rationale as the
+                # compilation counter above -- see the sibling docstring.
+                _capture_single_artist_track_read_fail_open(
+                    exc, legacy_release_id_count=len(single_artist_legacy_ids)
+                )
+                single_artist_pins = {}
+                tracklists_by_release = {}
+
     # Per-input lookups dispatch concurrently under a semaphore (LML#278).
     # Worst case drops from ~3,000 sequential PG round-trips for a 1,000-row
     # miss-heavy batch to ~``ceil(N / max_concurrent)`` waves. The semaphore is
@@ -449,13 +557,31 @@ async def bulk_resolve_libraries(
                     status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
                 ) from None
 
+            # LML#1138: bind this input's derivation slice from the batched
+            # pre-fan-out reads above -- pure dict lookups, no PG here. A
+            # pinned release absent from the tracklist map still gets a
+            # derivation with empty rows ("the pin resolved, the cache holds
+            # no tracks" is attempted-nothing, not unvisited).
+            track_derivation: SingleArtistTrackDerivation | None = None
+            if include_tracks and input_row.legacy_release_id is not None:
+                pinned_release_id = single_artist_pins.get(input_row.legacy_release_id)
+                if pinned_release_id is not None:
+                    track_derivation = SingleArtistTrackDerivation(
+                        discogs_release_id=pinned_release_id,
+                        rows=tracklists_by_release.get(pinned_release_id, []),
+                    )
+
             try:
                 # `compose_for_identity` issues its own
                 # `get_latest_provenance_by_source` query — that second round-trip
                 # is covered by the same permit, so a resolved input never holds
                 # two pool connections at once.
                 return await compose_for_identity(
-                    input_row.library_id, identity, store, include_tracks=include_tracks
+                    input_row.library_id,
+                    identity,
+                    store,
+                    include_tracks=include_tracks,
+                    track_derivation=track_derivation,
                 )
             except TRANSIENT_PG_ERRORS:
                 logger.exception(
@@ -538,36 +664,46 @@ async def bulk_resolve_libraries(
         kinds = Counter(r.kind.value for r in results)
         logger.info(
             "bulk resolve complete: inputs=%d single_artist=%d compilation=%d unresolved=%d"
-            " include_tracks=%s",
+            " include_tracks=%s single_artist_tracks_asked=%d single_artist_tracks_pinned=%d",
             inputs_count,
             kinds.get("single_artist", 0),
             kinds.get("compilation", 0),
             kinds.get("unresolved", 0),
             include_tracks,
+            single_artist_track_candidates,
+            len(single_artist_pins),
         )
         http_span.set_data("lml.bulk_resolve.single_artist", kinds.get("single_artist", 0))
         http_span.set_data("lml.bulk_resolve.compilation", kinds.get("compilation", 0))
         http_span.set_data("lml.bulk_resolve.unresolved", kinds.get("unresolved", 0))
         http_span.set_data("lml.bulk_resolve.include_tracks", include_tracks)
+        # LML#1138's coverage counter: asked = distinct non-V/A legacy ids
+        # eligible for derivation this batch; pinned = how many an override
+        # pin resolved (== how many emit tracks_attempted=true). The spread
+        # IS the v1 coverage gap (the un-pinned + MB tail the issue's
+        # decision record documents) -- observable per request here rather
+        # than inferred from consumer re-ask rates.
+        http_span.set_data(
+            "lml.bulk_resolve.single_artist_tracks_asked", single_artist_track_candidates
+        )
+        http_span.set_data("lml.bulk_resolve.single_artist_tracks_pinned", len(single_artist_pins))
         http_span.set_data("http.status_code", 200)
 
     return BulkResolveLibrariesResponse(
         results=results,
-        # The producer-echoed capability marker (wxyc-shared#303 Q1 option A)
-        # -- always None today, deliberately, not merely "not yet wired up".
-        # api.yaml 1.32.0 (wxyc-shared#314) tightened its producer rule: `1`
-        # is valid only once BOTH arms emit real `tracks_attempted` --
-        # `kind: compilation` (LML#1021, done above) AND `kind: single_artist`
-        # (LML#1138, not yet -- `compose_for_identity` still hardcodes
-        # `tracks=None` there). Setting it on `include_tracks` alone (the
-        # pre-1.32.0 behavior this reverts) would tell a BS consumer to trust
-        # `tracks_attempted` on `single_artist` rows where it is still
-        # meaningless. #1138 flips this to `TracksContractVersion.integer_1`
-        # once its arm ships; coordinate the flip with whoever lands it.
-        # When None, the wire spells it "tracks_contract_version": null (no
-        # exclude_none on this response_model) — consumers use the
-        # null-tolerant check; the nullability doc fix is wxyc-shared#313.
-        tracks_contract_version=None,
+        # The producer-echoed capability marker (wxyc-shared#303 Q1 option A).
+        # api.yaml 1.32.0's (wxyc-shared#314) producer rule -- `1` only once
+        # BOTH arms emit real `tracks_attempted` -- is satisfied as of
+        # LML#1138: `kind: compilation` reads the LML#1021 store and
+        # `kind: single_artist` derives from the pinned release's tracklist
+        # above. The rule gates on EMITTING THE PAIR, not on coverage (the
+        # 2026-08-08 decision record on LML#1138): an un-pinned row's honest
+        # `(false, [])` is exactly the state the pair exists to express, so
+        # the marker echoes `1` whenever the flag was understood-true. Flag
+        # off (or omitted) keeps it None, spelled "tracks_contract_version":
+        # null on the wire (no exclude_none on this response_model) --
+        # consumers value-probe `=== 1`, never key presence (wxyc-shared#310).
+        tracks_contract_version=(TracksContractVersion.integer_1 if include_tracks else None),
     )
 
 

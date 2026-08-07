@@ -26,8 +26,14 @@ the request's `include_tracks` flag — absent/NULL when off; when on, real
 per-track identity read out of `lml_cache.compilation_track_identity`
 (LML#1020's store) as of LML#1021 — `(False, [])` when the release has zero
 store rows (the per-track matcher hasn't visited it), `(True, tracks)`
-otherwise, misses included. Non-V/A rows (`kind: single_artist`) still emit
-the placeholder `(False, [])` pending WXYC/library-metadata-lookup#1138.
+otherwise, misses included. Non-V/A rows (`kind: single_artist`) derive their
+`tracks[]` at read time as of LML#1138 (BS#801 decision D13, option (c) — no
+store, no matcher): the `lml_cache.library_release_override` pin resolves the
+row's Discogs release, the discogs-cache tracklist supplies the entries, and
+per-track `confidence`/`method` inherit the pin's provenance (`manual`/1.0).
+`(False, [])` when the row has no pin (or the batched reads degraded),
+`(True, tracks)` when it does — see `SingleArtistTrackDerivation` below and
+the 2026-08-08 decision record on LML#1138.
 
 LML#1021's per-track composition (`compilation_result`'s `store_rows`
 parameter) applies Rule 4 (MIN-of-confidences) only, deliberately NOT Rule 2
@@ -49,6 +55,11 @@ from dataclasses import dataclass
 from entity.compilation_track_identity import (
     CompilationTrackIdentityRow,
     get_compilation_track_identity_for_libraries,
+)
+from entity.library_release_override import get_library_release_overrides_strict
+from entity.release_tracklist import (
+    ReleaseTracklistRow,
+    get_release_tracklists_for_releases,
 )
 from entity.sources import PgSource
 from entity.store import EntityStore, Identity, ProvenanceRow
@@ -426,6 +437,7 @@ async def compose_for_identity(
     entity_store: EntityStore,
     *,
     include_tracks: bool = False,
+    track_derivation: SingleArtistTrackDerivation | None = None,
 ) -> BulkResolveResult:
     """Compose a single-artist verdict for one library row.
 
@@ -435,10 +447,25 @@ async def compose_for_identity(
     apply §3.4.1.1 composition.
 
     `include_tracks` gates the `(tracks_attempted, tracks)` pair per the
-    four-state contract (both fields 1.30.0; the response marker is 1.31.0): flag off (or `kind: unresolved` on either
-    flag path) keeps both absent/NULL; flag on emits `(False, [])` — the
-    "asked, not yet visited" state — until WXYC/library-metadata-lookup#1138
-    wires real tracklist derivation for the `single_artist` arm.
+    four-state contract (both fields 1.30.0; the response marker is 1.31.0):
+    flag off (or `kind: unresolved` on either flag path) keeps both
+    absent/NULL. Flag on reads `track_derivation` (LML#1138):
+
+    - `None` — no `lml_cache.library_release_override` pin resolved this
+      row's Discogs release (or the caller had no `legacy_release_id`
+      bridge, or the batched reads degraded on a transient PG failure).
+      Emits the honest `(False, [])` "asked, not yet visited" state — LML
+      genuinely cannot look yet, and the consumer keeps re-asking, so
+      coverage self-heals as pins and the LML#842 `streaming_album` leg
+      grow (the 2026-08-08 decision record on LML#1138).
+    - present — the pin resolved a release; emits `(True, entries)` derived
+      from its cached tracklist, or `(True, [])` when the tracklist join
+      genuinely returned no tracks ("we looked, the answer is nothing").
+
+    `track_derivation` is the composer-side seam of the derivation: the
+    router builds it per input from the batched pre-fan-out reads
+    (`load_single_artist_release_pins` + `load_release_tracklists_by_release_id`
+    below); this function never queries PG for it.
 
     TODO(WXYC/library-metadata-lookup#274): the caller of this function
     looks up `identity` via exact `library_name = $1` against the
@@ -479,6 +506,16 @@ async def compose_for_identity(
     main, method, confidence = _compose_main(composed)
     provenance = [_row_to_provenance(r) for r in composed]
 
+    tracks: list[BulkResolveTrackIdentity] | None
+    tracks_attempted: bool | None
+    if not include_tracks:
+        tracks, tracks_attempted = None, None
+    elif track_derivation is None:
+        tracks, tracks_attempted = [], False
+    else:
+        tracks = _compose_derived_track_entries(track_derivation, identity.library_name)
+        tracks_attempted = True
+
     return BulkResolveResult(
         kind=BulkResolveResultKind.single_artist,
         library_id=library_id,
@@ -486,8 +523,8 @@ async def compose_for_identity(
         method=method,
         confidence=confidence,
         provenance=provenance,
-        tracks=[] if include_tracks else None,
-        tracks_attempted=False if include_tracks else None,
+        tracks=tracks,
+        tracks_attempted=tracks_attempted,
     )
 
 
@@ -830,3 +867,183 @@ def compilation_result(
         tracks=_compose_track_entries(store_rows),
         tracks_attempted=True,
     )
+
+
+# --------------------------------------------------------------------------- #
+# LML#1138: read-time track derivation for `kind: single_artist`'s `tracks[]`.
+#
+# BS#801 decision D13, option (c): NO new store, NO matcher, NO backfill —
+# non-V/A per-track data is derivative of the release match, so it is derived
+# per request from two batched pre-fan-out reads (both the router's job, run
+# ONCE per request before the `asyncio.gather` fan-out, mirroring the LML#1021
+# compilation read above):
+#
+#   1. `load_single_artist_release_pins` — `legacy_release_id` →
+#      `discogs_release_id` via `lml_cache.library_release_override` (the v1
+#      mapping source per the 2026-08-08 decision record on LML#1138; this
+#      function is THE seam LML#842 extends with the `lml_cache.streaming_album`
+#      leg once that table is seeded, lifting coverage from the pins' ~29% of
+#      non-V/A rows to the re-match's ~77% with no composer change).
+#   2. `load_release_tracklists_by_release_id` — the pinned releases'
+#      tracklists from the discogs-cache `release_track` /
+#      `release_track_artist` tables.
+#
+# Per-track `confidence`/`method` inherit the PIN's provenance — `manual`/1.0,
+# an honest description of a hand-verified release mapping (D13's "inherit the
+# release-level identity", resolved to the mapping's own provenance because no
+# reachable store carries release-level confidence/method — see the decision
+# record). `resolved_artist_name` is the release's resolved artist
+# (`entity.identity.library_name`): on a single-artist release, per-track
+# attribution is derivative of the release match. The `artist_name` echo is
+# the per-track Discogs credit where one exists (features, splits), else the
+# release artist — the issue's dual-mode echo rule.
+# --------------------------------------------------------------------------- #
+
+# The inherited pin provenance. `manual` is the api.yaml IdentityMethod for a
+# human-verified decision, which is exactly what an override pin is (WXYC DJ
+# Alex L.'s card-by-card walk, LML#850/#858); 1.0 is `manual`'s locked §3.4.1
+# confidence. These satisfy `BulkResolveProvenanceEntry.method`'s
+# required-non-nullable constraint without fabrication.
+_PIN_METHOD = IdentityMethod.manual
+_PIN_CONFIDENCE = 1.0
+
+
+@dataclass(frozen=True)
+class SingleArtistTrackDerivation:
+    """One pinned release's derivation input, already scoped to one input row.
+
+    Built by the router from the batched reads; `rows` may be empty — a
+    pinned release whose tracklist join returned nothing is still a genuine
+    attempt (`(True, [])` on the wire), distinct from "no pin" (`None`
+    derivation → `(False, [])`, the not-yet-visited state).
+    """
+
+    discogs_release_id: int
+    rows: Sequence[ReleaseTracklistRow]
+
+
+async def load_single_artist_release_pins(
+    pg: PgSource, legacy_release_ids: Sequence[int]
+) -> dict[int, int]:
+    """Batched `legacy_release_id` → pinned `discogs_release_id` mapping.
+
+    THE mapping seam of the LML#1138 derivation (see the section comment
+    above): v1 reads `lml_cache.library_release_override` — the only
+    populated, request-path-reachable store keyed in library.db's legacy id
+    space (the override table's `library_id` == tubafrenzy
+    `LIBRARY_RELEASE.ID`, the same space `BulkResolveInput.legacy_release_id`
+    bridges per wxyc-shared#315). LML#842's `streaming_album` leg augments
+    this function — not the composer, not the router — when it lands.
+
+    ONE query per request; ids without a pin are absent from the map and
+    degrade to the unvisited state downstream. PG failures propagate to the
+    router's `TRANSIENT_PG_ERRORS` handler (degrade + the
+    `single_artist_track_read_fail_open` counter) via the strict reader —
+    the swallowing `/lookup` reader would blind that counter.
+    """
+    if not legacy_release_ids:
+        return {}
+    return await get_library_release_overrides_strict(pg, list(legacy_release_ids))
+
+
+async def load_release_tracklists_by_release_id(
+    pg: PgSource, release_ids: Sequence[int]
+) -> dict[int, list[ReleaseTracklistRow]]:
+    """Batched tracklist read for the pinned releases, grouped per release.
+
+    ONE query for the whole batch's distinct pinned Discogs release ids
+    (`entity.release_tracklist.get_release_tracklists_for_releases`), grouped
+    in memory — the same no-N+1 shape as
+    `load_compilation_track_rows_by_legacy_id` above. A pinned release with
+    no cached tracklist is simply absent from the map; the router still
+    builds a derivation for it (empty `rows`), because "the pin resolved but
+    the cache holds no tracks" is an attempted-nothing answer, not an
+    unvisited one. PG failures propagate, same as the pins read.
+    """
+    if not release_ids:
+        return {}
+    rows = await get_release_tracklists_for_releases(pg, release_ids)
+    grouped: dict[int, list[ReleaseTracklistRow]] = {}
+    for row in rows:
+        grouped.setdefault(row.release_id, []).append(row)
+    return grouped
+
+
+def _derived_row_sort_key(row: ReleaseTracklistRow) -> tuple[int, bool, str]:
+    """Deterministic order for one release's tracklist rows: sequence, then
+    credited rows before uncredited, then credit name — so grouping and the
+    multi-credit join order never depend on the caller's list order (the
+    same caller-order-independence discipline as `_composed_row_sort_key`)."""
+    return (row.sequence, row.credit_artist_name is None, row.credit_artist_name or "")
+
+
+def _compose_derived_track_entries(
+    derivation: SingleArtistTrackDerivation, resolved_artist_name: str
+) -> list[BulkResolveTrackIdentity]:
+    """Compose one `BulkResolveTrackIdentity` per physical track of the
+    pinned release.
+
+    Groups the credit-fanned rows by `sequence` (one release_track row per
+    group; N extra=0 credits fan it into N rows — see `ReleaseTracklistRow`),
+    so a split/feature track becomes ONE entry with a joined echo, never N
+    entries. Every field inherits per the section comment above: the echo is
+    the per-track credit(s) where present else `resolved_artist_name`; the
+    verdict fields are `resolved_artist_name` + the pin's `manual`/1.0; the
+    single `sources[]` leg is the pin itself (`discogs`, `external_id` = the
+    pinned release id) — audit provenance for where the tracklist came from,
+    with confidence equal to the entry's own, satisfying the
+    `BulkResolveProvenanceEntry.confidence` ≥-referent contract.
+
+    Empty-string `position`/`title` round-trip as NULL ("no position is
+    recoverable" per api.yaml — Discogs heading rows carry empty positions),
+    never as empty strings. A track whose computed echo is blank — no usable
+    credit AND a blank `resolved_artist_name` (a data-quality anomaly; the
+    entity store's `library_name` is non-null in practice) — is dropped with
+    a warning rather than 500ing the whole batch on the wire model's
+    `minLength: 1`, mirroring LML#1021's blank-credit guard. No cap, no
+    truncation (the payload-discipline rule): every track becomes one entry.
+    """
+    grouped: dict[int, list[ReleaseTracklistRow]] = {}
+    for row in sorted(derivation.rows, key=_derived_row_sort_key):
+        grouped.setdefault(row.sequence, []).append(row)
+
+    entries: list[BulkResolveTrackIdentity] = []
+    for _sequence, rows in sorted(grouped.items()):
+        credits: list[str] = []
+        for row in rows:
+            name = (row.credit_artist_name or "").strip()
+            if name and name not in credits:
+                credits.append(name)
+        artist_name = ", ".join(credits) if credits else resolved_artist_name
+        if not artist_name.strip():
+            logger.warning(
+                "derived tracks: blank artist echo for discogs_release_id=%d sequence=%d "
+                "(no per-track credit and a blank resolved release artist) -- dropping "
+                "this track from tracks[] rather than 500ing the whole batch",
+                derivation.discogs_release_id,
+                rows[0].sequence,
+            )
+            continue
+
+        position = next((r.position for r in rows if r.position and r.position.strip()), None)
+        title = next((r.title for r in rows if r.title and r.title.strip()), None)
+
+        entries.append(
+            BulkResolveTrackIdentity(
+                track_position=position,
+                artist_name=artist_name,
+                track_title=title,
+                resolved_artist_name=resolved_artist_name,
+                confidence=_PIN_CONFIDENCE,
+                method=_PIN_METHOD,
+                sources=[
+                    BulkResolveProvenanceEntry(
+                        source=IdentitySource.discogs,
+                        method=_PIN_METHOD,
+                        confidence=_PIN_CONFIDENCE,
+                        external_id=str(derivation.discogs_release_id),
+                    )
+                ],
+            )
+        )
+    return entries
