@@ -59,7 +59,7 @@ jobs:
       # entity/*.sql are the canonical-DDL sidecars for the lml_cache.* store
       # modules (LML#1038): generated from the Python DDL constants, never
       # hand-edited. Two generators (streaming_catalog.py's own, plus the
-      # shared one for its seven siblings) cover all 8.
+      # shared one for its eight siblings) cover all 9.
       - run: python -m scripts.regenerate_streaming_catalog_sql
       - run: python -m scripts.regenerate_lml_cache_sql
       - name: Check for drift
