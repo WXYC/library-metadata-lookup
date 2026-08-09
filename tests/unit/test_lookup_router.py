@@ -179,6 +179,55 @@ class TestHandleLookup:
         assert events == ["lookup_completed"]
 
     @pytest.mark.asyncio
+    async def test_lookup_capture_budget_real_orchestrator(self, mock_library_db, mock_settings):
+        """WXYC/library-metadata-lookup#1169: pins the per-lookup PostHog
+        capture budget through the REAL orchestrator (``perform_lookup`` is
+        not patched here, unlike the sibling test above) using
+        ``wxyc_fastapi.testing.capture_budget`` — a flow that captures more
+        than the budget raises loudly. The orchestrator tracks ~9 steps
+        internally; only ``emit_step_events=False`` on the ``/lookup``
+        construction site keeps that from fanning out into ~9 extra PostHog
+        events per request, which is exactly the shape of the 2026-08-04
+        quota incident. ``discogs_service=None`` isolates the library-hit
+        path, mirroring ``test_structured_body_without_raw_message_returns_200``.
+        """
+        from wxyc_fastapi.testing import CountingPosthog, as_posthog, capture_budget
+
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        mock_library_db.search.return_value = [
+            make_library_item(
+                id=42,
+                artist="Jessica Pratt",
+                title="On Your Own Love Again",
+                call_letters="RO",
+                genre="Rock",
+            )
+        ]
+
+        counting_client = CountingPosthog()
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_library_db,
+                get_discogs_service: None,
+                get_posthog_client: as_posthog(counting_client),
+                get_settings: mock_settings,
+            },
+        ):
+            with capture_budget(1, client=counting_client):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        assert counting_client.events == ["lookup_completed"]
+
+    @pytest.mark.asyncio
     async def test_error_returns_500(self, app_client):
         with patch(
             "lookup.router.perform_lookup",

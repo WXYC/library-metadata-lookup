@@ -334,10 +334,16 @@ async def resolve_bulk(
     # resolution cache or the event-loop-lag gauge, so seeding those keys
     # here would add permanently-zero noise instead of a stable series.
     init_cache_stats(extra_keys=(BREAKER_OPEN_STAT_KEY,))
+    # emit_step_events=False (WXYC/library-metadata-lookup#1169 audit): this
+    # is a bulk endpoint (up to `_RESOLVE_INPUT_CAP` names per call) whose
+    # telemetry never has `.track_step()` called on it today, so the flag is
+    # currently a no-op -- pinned explicitly so "summary-only" is a code
+    # guarantee rather than an accident of no step being tracked yet.
     telemetry = RequestTelemetry(
         api_call_keys=["discogs"],
         distinct_id="library-metadata-lookup-service",
         event_prefix="artist_resolve",
+        emit_step_events=False,
     )
     with sentry_sdk.start_span(
         op="http.server",

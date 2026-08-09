@@ -978,10 +978,16 @@ async def handle_bulk_lookup(
 
     max_concurrent = max_concurrency_from_env(_BULK_LOOKUP_DEFAULT_CONCURRENCY)
     semaphore = asyncio.Semaphore(max_concurrent)
+    # emit_step_events=False (WXYC/library-metadata-lookup#1169 audit): this
+    # instance never has `.track_step()` called on it today (batch-level only,
+    # not threaded into `perform_lookup`), so the flag is currently a no-op —
+    # pinned explicitly so "summary-only" is a code guarantee, not an
+    # accident of no step being tracked yet.
     batch_telemetry = RequestTelemetry(
         api_call_keys=["discogs"],
         distinct_id="library-metadata-lookup-service",
         event_prefix="lookup.bulk",
+        emit_step_events=False,
     )
 
     async def _run_one(index: int, item: LookupRequest) -> BulkLookupResultItem:
@@ -1018,10 +1024,21 @@ async def handle_bulk_lookup(
             # Per-item telemetry instance: required by perform_lookup's signature
             # and avoids the `_current_step` race that would happen with a shared
             # instance across concurrent items.
+            #
+            # emit_step_events=False (WXYC/library-metadata-lookup#1169 audit):
+            # this instance genuinely tracks ~9 steps per item inside
+            # perform_lookup/orchestrator.py, but no call site ever invokes
+            # `.send_to_posthog()` on it (only `batch_telemetry`, above, is
+            # sent) -- so today the flag is a no-op. Pinned explicitly as
+            # defense-in-depth: without it, a future refactor that wires
+            # `.send_to_posthog()` onto this per-item instance would silently
+            # reintroduce a ~9x-per-item fan-out on the highest-cardinality
+            # path in this file -- the exact shape of the 2026-08-04 incident.
             telemetry = RequestTelemetry(
                 api_call_keys=["discogs"],
                 distinct_id="library-metadata-lookup-service",
                 event_prefix="lookup.bulk",
+                emit_step_events=False,
             )
             try:
                 with sentry_sdk.start_span(op="lml.bulk.item", name=f"item {index}"):

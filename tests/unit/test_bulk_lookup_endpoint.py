@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 import sentry_sdk
 from httpx import ASGITransport, AsyncClient
+from wxyc_fastapi.testing import CountingPosthog, as_posthog, capture_budget
 
 from config.settings import get_settings
 from core.dependencies import (
@@ -1573,3 +1574,66 @@ class TestBulkNeverRunsLocationUnion:
 
         assert resp.status_code == 200
         probe.assert_not_awaited()
+
+
+class TestBulkLookupCaptureBudget:
+    """WXYC/library-metadata-lookup#1169: the bulk path emits O(1) PostHog
+    events per batch, not O(N) per item.
+
+    Unlike ``TestBulkLookupEndpoint.test_posthog_batch_event_emitted`` (which
+    mocks ``perform_lookup`` entirely), this drives the REAL orchestrator per
+    item — each item's own ``lookup.bulk``-prefixed ``RequestTelemetry``
+    genuinely tracks ~9 steps internally (``lookup/orchestrator.py``). Only
+    two things keep those from reaching PostHog: no call site ever invokes
+    ``.send_to_posthog()`` on a per-item telemetry instance, and
+    ``emit_step_events=False`` is now pinned explicitly on both bulk
+    construction sites (the per-item instance and the batch-level
+    ``batch_telemetry``) as defense-in-depth. ``wxyc_fastapi.testing.
+    capture_budget`` fails loudly if a future change (e.g. wiring
+    ``send_to_posthog`` onto the per-item instance) reintroduces a per-item
+    fan-out — the exact shape of the 2026-08-04 quota incident, just on the
+    bulk path instead of ``/lookup``.
+    """
+
+    @pytest.fixture
+    def app_client_live_orchestrator_with_posthog(
+        self, mock_library_db, mock_discogs_service, mock_settings
+    ):
+        """Real ``perform_lookup``, with a `CountingPosthog` wired through the
+        same DI seam ``_live_orchestrator_overrides`` uses for every other
+        dependency."""
+        counting_client = CountingPosthog()
+        overrides = _live_orchestrator_overrides(
+            mock_library_db, mock_discogs_service, mock_settings
+        )
+        overrides[get_posthog_client] = as_posthog(counting_client)
+        with override_deps(app, overrides):
+            yield app, counting_client
+
+    @pytest.mark.asyncio
+    async def test_multi_item_batch_emits_exactly_one_posthog_event(
+        self, app_client_live_orchestrator_with_posthog, mock_discogs_service
+    ):
+        """A 3-item batch — each running the full real pipeline — still emits
+        exactly one ``lookup.bulk_completed`` summary, never one per item."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        app_client, counting_client = app_client_live_orchestrator_with_posthog
+
+        with capture_budget(1, client=counting_client):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={
+                        "items": [
+                            {"artist": "Juana Molina", "album": "DOGA"},
+                            {"artist": "Jessica Pratt", "album": "On Your Own Love Again"},
+                            {"artist": "Cat Power", "album": "Moon Pix"},
+                        ]
+                    },
+                )
+
+        assert resp.status_code == 200
+        assert counting_client.count() == 1
+        assert counting_client.events == ["lookup.bulk_completed"]
