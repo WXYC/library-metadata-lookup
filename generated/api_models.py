@@ -45,12 +45,30 @@ class DateTimeEntry(BaseModel):
 
 
 class Status(StrEnum):
+    """
+    Service-reported health. `healthy` = fully operational; `degraded`
+    = serving but with reduced capability; `unhealthy` = should not
+    receive traffic.
+
+    """
+
     healthy = "healthy"
     degraded = "degraded"
     unhealthy = "unhealthy"
 
 
 class HealthCheckResponse(BaseModel):
+    """
+    Liveness response shape for `GET /health` (and equivalent) endpoints.
+    Cross-language contract owned by `wxyc-fastapi` (Python) and adopted
+    by Backend-Service (Node) via generated TS types.
+
+    `additionalProperties: true` lets services attach extra fields without
+    breaking consumers; semantic-index, for example, returns `artist_count`
+    alongside `status`.
+
+    """
+
     model_config = ConfigDict(
         extra="allow",
     )
@@ -67,6 +85,20 @@ class Services(StrEnum):
 
 
 class ReadinessResponse(HealthCheckResponse):
+    """
+    Readiness response shape for `GET /ready` (and equivalent) endpoints.
+    Extends `HealthCheckResponse` with a per-dependency status map.
+    Each entry in `services` reports the live state of one external
+    dependency (database, upstream HTTP service, queue, etc.).
+
+    Status values:
+      - `ok`          — dependency reachable and responsive
+      - `unavailable` — dependency reachable but reporting an error,
+                        or the connection itself failed
+      - `timeout`     — dependency exceeded the readiness probe deadline
+
+    """
+
     services: dict[str, Services] = Field(
         ..., description="Per-dependency readiness map keyed by dependency name."
     )
@@ -92,6 +124,10 @@ class Format(StrEnum):
 
 
 class RotationBin(StrEnum):
+    """
+    Rotation bin levels: H=Heavy, M=Medium, L=Light, S=Single
+    """
+
     H = "H"
     M = "M"
     L = "L"
@@ -115,6 +151,10 @@ class FlowsheetEntryBase(BaseModel):
 
 
 class FlowsheetSongEntry(FlowsheetEntryBase):
+    """
+    Song entry in the flowsheet
+    """
+
     track_title: str
     artist_name: str
     album_title: str
@@ -132,16 +172,26 @@ class FlowsheetSongEntry(FlowsheetEntryBase):
 
 
 class FlowsheetShowBlockEntry(FlowsheetEntryBase, DateTimeEntry):
+    """
+    Show block entry (start or end of a DJ's show)
+    """
+
     dj_name: str
     isStart: bool
 
 
 class FlowsheetMessageEntry(FlowsheetEntryBase):
+    """
+    Message entry (talkset, etc.)
+    """
+
     message: str
 
 
 class FlowsheetBreakpointEntry(FlowsheetMessageEntry, DateTimeEntry):
-    pass
+    """
+    Breakpoint entry (marks time boundaries)
+    """
 
 
 class FlowsheetCreateSongFromCatalog(BaseModel):
@@ -172,6 +222,10 @@ class FlowsheetCreateSongFreeform(BaseModel):
 
 
 class EntryType(StrEnum):
+    """
+    Explicit entry type. If omitted, the backend infers from message content.
+    """
+
     talkset = "talkset"
     breakpoint = "breakpoint"
     message = "message"
@@ -246,6 +300,10 @@ class PlaylistSearchResponse(BaseModel):
 
 
 class FlowsheetEntryType(StrEnum):
+    """
+    Discriminator for V2 flowsheet entry types
+    """
+
     track = "track"
     show_start = "show_start"
     show_end = "show_end"
@@ -257,6 +315,10 @@ class FlowsheetEntryType(StrEnum):
 
 
 class FlowsheetV2Base(BaseModel):
+    """
+    Base fields shared by all V2 flowsheet entries
+    """
+
     id: int
     show_id: int | None = Field(...)
     play_order: int
@@ -272,6 +334,10 @@ class EntryType2(StrEnum):
 
 
 class FlowsheetV2ShowStartEntry(FlowsheetV2Base):
+    """
+    V2 show start event - when a show begins
+    """
+
     entry_type: Literal["show_start"]
     dj_name: str
     timestamp: AwareDatetime
@@ -282,6 +348,10 @@ class EntryType3(StrEnum):
 
 
 class FlowsheetV2ShowEndEntry(FlowsheetV2Base):
+    """
+    V2 show end event - when a show ends
+    """
+
     entry_type: Literal["show_end"]
     dj_name: str
     timestamp: AwareDatetime
@@ -292,6 +362,10 @@ class EntryType4(StrEnum):
 
 
 class FlowsheetV2DJJoinEntry(FlowsheetV2Base):
+    """
+    V2 DJ join event - when a DJ joins an active show
+    """
+
     entry_type: Literal["dj_join"]
     dj_name: str
 
@@ -301,6 +375,10 @@ class EntryType5(StrEnum):
 
 
 class FlowsheetV2DJLeaveEntry(FlowsheetV2Base):
+    """
+    V2 DJ leave event - when a DJ leaves an active show
+    """
+
     entry_type: Literal["dj_leave"]
     dj_name: str
 
@@ -310,6 +388,10 @@ class EntryType6(StrEnum):
 
 
 class FlowsheetV2TalksetEntry(FlowsheetV2Base):
+    """
+    V2 talkset entry - DJ talk segment
+    """
+
     entry_type: Literal["talkset"]
     message: str
 
@@ -319,6 +401,10 @@ class EntryType7(StrEnum):
 
 
 class FlowsheetV2BreakpointEntry(FlowsheetV2Base):
+    """
+    V2 breakpoint entry - hour marker
+    """
+
     entry_type: Literal["breakpoint"]
     radio_hour: AwareDatetime | None = Field(
         None,
@@ -332,11 +418,19 @@ class EntryType8(StrEnum):
 
 
 class FlowsheetV2MessageEntry(FlowsheetV2Base):
+    """
+    V2 message entry - custom/arbitrary message
+    """
+
     entry_type: Literal["message"]
     message: str
 
 
 class OnAirInfo(BaseModel):
+    """
+    Minimal, name-only on-air DJ shape for the `on_air` field. Deliberately separate from `OnAirDJ`, which additionally carries an `id` (a nullable `auth_user.id` string) that the `on_air` banner has no use for.
+    """
+
     dj_name: str = Field(..., description="Display name of the DJ currently on air.")
 
 
@@ -415,6 +509,22 @@ class Album(BaseModel):
 
 
 class UpdateAlbumRequest(BaseModel):
+    """
+    Partial-update payload for `PATCH /library/{id}` (BS#1154). Mirrors
+    Backend-Service's wire-level `UpdateAlbumRequest` type
+    (apps/backend/controllers/library.controller.ts) exactly: only fields
+    present in the body are validated and written. The 8 legacy fields
+    are snake_case (matching AddAlbumRequest / the DB columns); the two
+    BS#1281 discogs fields are camelCase, per the whitelist BS's
+    `UPDATABLE_ALBUM_FIELDS` actually reads from `req.body`.
+    `artist_name` and `code_number` are deliberately absent — they are
+    server-derived (re-attribution side effects of an `artist_id`
+    change), never read from the client body. `lastDiscogsRecheckAt` is
+    also absent — it is server-write-only (the recheck cron writes it
+    directly).
+
+    """
+
     album_title: str | None = None
     label: str | None = None
     label_id: int | None = None
@@ -428,6 +538,13 @@ class UpdateAlbumRequest(BaseModel):
 
 
 class CatalogExportRow(BaseModel):
+    """
+    One row of the WXYC library catalog as served by GET /library/catalog for offline cloning (BS#1468, Epic F #1466). A query-independent snapshot of the core catalog row. Deliberately NOT AlbumSearchResult: it drops the search-only decoration (matched_via, matched_via_alias, album_dist, artist_dist) and the fields the export omits (add_date, label_id, rotation_id, date_lost, date_found), and instead ships rotation RAW (rotation_bin + rotation_kill_date) so the client evaluates rotation expiry against its own clock. See the rotation_bin description for the load-bearing semantic difference from AlbumSearchResult.
+    BS#1965 adds the fields the Backend-sourced library.db producer (discogs-etl#351) needs to build a library.db over HTTP instead of a direct Postgres read: legacy_release_id (the producer emits it AS the library.db id, since BS serials collide with the tubafrenzy id space), album_artist, alternate_artist_name, and cross_reference_names.
+    All four are producer-facing and OPTIONAL on the wire — none is in `required`, so the pre-BS#1965 15-field body still decodes cleanly against a client generated from this spec. That leniency is deliberate and load-bearing: this row is also the iOS Spotlight clone's shape, and wxyc-ios-64 regenerates from this SSOT on its own cadence. A required key the server does not yet emit would not degrade one field — it would fail EVERY NDJSON line and take the whole on-device clone with it. Same reasoning as `popularity` (BS#1486 Phase-2 Track 3). Note that oasdiff does NOT flag adding a required response property, so a green `check:breaking` is not evidence of safety here.
+
+    """
+
     id: int = Field(
         ...,
         description="BS serial library.id — the existing on-device clone key for the iOS Spotlight consumer. NOT the library.db id: the library.db producer uses legacy_release_id instead (see below), so BS serials never leak into the tubafrenzy id space.\n",
@@ -490,6 +607,11 @@ class CatalogExportRow(BaseModel):
 
 
 class CatalogCompilationTrackRow(BaseModel):
+    """
+    One compilation_track_artist (CTA) row as served by GET /library/catalog/compilation-tracks for the Backend-sourced library.db producer (BS#1965 / discogs-etl#351). The sibling of CatalogExportRow: where that endpoint feeds library.db's `library` table, this feeds its `compilation_track_artist` table (3 columns: library_release_id, artist_name, track_title). Keyed on legacy_release_id — the library row's surrogate key that the producer also emits AS library.db's library.id — so the producer maps legacy_release_id -> compilation_track_artist.library_release_id. Deliberately drops the CTA row id and track_position: library.db's 3-column CTA table carries neither, so shipping them would break parity. Distinct from CompilationTrack (the BS#1964 dj-site read shape, which keeps id + track_position and is keyed on the BS serial library_id).
+
+    """
+
     legacy_release_id: int = Field(
         ...,
         description="The owning library row's legacy_release_id (BS#1963). Becomes library.db's compilation_track_artist.library_release_id, which joins to library.db's library.id.\n",
@@ -601,6 +723,15 @@ class TrackSearchParams(BaseModel):
 
 
 class CompilationTrackInput(BaseModel):
+    """
+    A per-track artist entry to write to a compilation (BS#1964). The
+    durable, table-agnostic shape: only the librarian-meaningful free-text
+    fields, so it survives the future compilation_track_artist ->
+    library_track generalization (BS#801), which adds the canonical artist
+    link server-side rather than as a wire field.
+
+    """
+
     artist_name: constr(min_length=1, max_length=255) = Field(
         ..., description="Per-track performing artist (CTA.artist_name)."
     )
@@ -613,6 +744,10 @@ class CompilationTrackInput(BaseModel):
 
 
 class CompilationTrack(BaseModel):
+    """
+    A stored compilation_track_artist row (BS#1964).
+    """
+
     id: int = Field(..., description="Server-assigned CTA row id.")
     artist_name: str
     track_title: str | None = None
@@ -629,6 +764,16 @@ class CompilationTracksWriteRequest(BaseModel):
 
 
 class CompilationTracksWriteResponse(BaseModel):
+    """
+    Result of an additive CTA write (BS#1964). `inserted + skipped` equals
+    the number of input rows — a row that duplicates one already inserted
+    earlier in the same request counts toward `skipped` (matched against the
+    just-inserted row on the CTA uniqueness key), so the identity always
+    holds even when the request carries intra-batch duplicates. `tracks` is
+    the release's full stored set after the write.
+
+    """
+
     library_id: int
     inserted: int = Field(..., description="Rows newly created.")
     skipped: int = Field(
@@ -639,6 +784,13 @@ class CompilationTracksWriteResponse(BaseModel):
 
 
 class CompilationTrackSuggestions(BaseModel):
+    """
+    Proposed (unwritten) compilation tracklist derived from the linked
+    Discogs release (BS#1964). `discogs_release_id: null` + empty `tracks`
+    signals no resolvable upstream release -> manual entry.
+
+    """
+
     library_id: int
     discogs_release_id: int | None = Field(
         ..., description="The resolved Discogs release id, or null if none resolved."
@@ -843,6 +995,14 @@ class DeviceToken(BaseModel):
 
 
 class Venue(BaseModel):
+    """
+    A live-music venue whose calendar WXYC ingests (Backend-Service
+    `venues` table). Embedded whole in `Concert` — the venue set is tiny
+    (~21 rows), so clients get name/city in one call with no follow-up
+    join.
+
+    """
+
     id: int
     slug: str = Field(..., description='Stable scraper seed key (e.g. "cats-cradle").')
     name: str
@@ -852,6 +1012,10 @@ class Venue(BaseModel):
 
 
 class ConcertStatus(StrEnum):
+    """
+    Lifecycle state of a concert as observed at the source. Listener surfaces read this to grey out / strike through cancelled or sold-out shows.
+    """
+
     on_sale = "on_sale"
     sold_out = "sold_out"
     cancelled = "cancelled"
@@ -859,6 +1023,10 @@ class ConcertStatus(StrEnum):
 
 
 class SimilarArtist(BaseModel):
+    """
+    One affinity neighbor of a resolved concert headliner, drawn from the semantic-index graph. `artist_id` shares the WXYC catalog artist-id keyspace with `Concert.headlining_artist_id` (and `FlowsheetV2TrackEntry.artist_id`), so on-device For You matching can intersect it against liked-artist ids in one id space.
+    """
+
     artist_id: int = Field(
         ...,
         description="WXYC catalog artist id, same keyspace as `Concert.headlining_artist_id`.",
@@ -870,6 +1038,20 @@ class SimilarArtist(BaseModel):
 
 
 class Concert(BaseModel):
+    """
+    One upcoming (or recent) concert, as served by `GET /concerts`.
+
+    Date semantics: `starts_on` is the venue-local (America/New_York)
+    calendar date and is always present — clients should window and sort
+    on it. `starts_at` is the exact start instant and is null for
+    date-only events (many sources publish no start time; WXYC never
+    fabricates one).
+
+    Internal ingestion columns (`source`, `source_id`, `raw_data`,
+    `scraped_at`, `first_scraped_at`) are deliberately not exposed.
+
+    """
+
     id: int
     venue: Venue
     starts_on: date_aliased = Field(
@@ -935,11 +1117,29 @@ class Concert(BaseModel):
 
 
 class ConcertsResponse(BaseModel):
+    """
+    Paginated list of concerts, ordered by `starts_on` ascending.
+    """
+
     concerts: list[Concert]
     pagination: PaginationInfo
 
 
 class AlbumReview(BaseModel):
+    """
+    One archived DJ album review, sourced from the WXYC album-review
+    Google Form (collected since March 2021) and synced nightly by
+    Backend-Service's album-reviews ETL.
+
+    Distinct from ADR 0006's in-app Review model (one-per-album,
+    author-owned, `/reviews`): submissions here are append-only, may
+    number several per album, and identify albums by free text with a
+    best-effort `album_id` link. Reviewer identity is deliberately not
+    exposed — the form promised reviewers their names would not be
+    shared.
+
+    """
+
     id: int
     album_id: int | None = Field(
         ...,
@@ -988,6 +1188,10 @@ class AlbumReview(BaseModel):
 
 
 class AlbumReviewsResponse(BaseModel):
+    """
+    Paginated list of album-review submissions, ordered by `submitted_at` descending (nulls last).
+    """
+
     album_reviews: list[AlbumReview]
     pagination: PaginationInfo
 
@@ -1021,6 +1225,10 @@ class DeviceAuthCodeResponse(BaseModel):
 
 
 class GrantType(StrEnum):
+    """
+    RFC 8628 device-flow grant type (fixed value).
+    """
+
     urn_ietf_params_oauth_grant_type_device_code = "urn:ietf:params:oauth:grant-type:device_code"
 
 
@@ -1045,6 +1253,10 @@ class DeviceAuthTokenResponse(BaseModel):
 
 
 class DeviceAuthStatus(StrEnum):
+    """
+    Current status of a device authorization (GET /auth/device).
+    """
+
     pending = "pending"
     approved = "approved"
     denied = "denied"
@@ -1074,6 +1286,10 @@ class DeviceAuthActionResponse(BaseModel):
 
 
 class DeviceAuthCodeErrorCode(StrEnum):
+    """
+    Error codes for POST /auth/device/code.
+    """
+
     invalid_request = "invalid_request"
     invalid_client = "invalid_client"
 
@@ -1084,6 +1300,11 @@ class DeviceAuthCodeError(BaseModel):
 
 
 class DeviceAuthTokenErrorCode(StrEnum):
+    """
+    Error codes for POST /auth/device/token — the RFC 8628 polling vocabulary the browser switches on. `server_error` is emitted at runtime (HTTP 500) though it is absent from the plugin's declared zod enum.
+
+    """
+
     authorization_pending = "authorization_pending"
     slow_down = "slow_down"
     expired_token = "expired_token"
@@ -1099,6 +1320,11 @@ class DeviceAuthTokenError(BaseModel):
 
 
 class DeviceAuthVerifyErrorCode(StrEnum):
+    """
+    Error codes for GET /auth/device. `expired_token` is emitted at runtime (HTTP 400) though the plugin's declared zod enum lists only invalid_request.
+
+    """
+
     invalid_request = "invalid_request"
     expired_token = "expired_token"
 
@@ -1109,6 +1335,11 @@ class DeviceAuthVerifyError(BaseModel):
 
 
 class DeviceAuthActionErrorCode(StrEnum):
+    """
+    Error codes for POST /auth/device/approve and POST /auth/device/deny (shared — both routes emit the same set). `device_code_already_processed` is declared in the plugin's approve zod enum but is NEVER emitted on the wire — the already-processed branch throws `invalid_request` — so it is intentionally omitted here (mirror runtime).
+
+    """
+
     invalid_request = "invalid_request"
     expired_token = "expired_token"
     unauthorized = "unauthorized"
@@ -1142,6 +1373,12 @@ class MetadataSource(StrEnum):
 
 
 class MetadataStatus(StrEnum):
+    """
+    Enrichment lifecycle for a track row in the V2 flowsheet response. Source-of-truth is the `metadata_status_enum` Postgres type in Backend-Service (see WXYC/Backend-Service#891). Set to `pending` on insert; the enrichment worker (WXYC/Backend-Service#892) flips it to `enriching` while a Discogs lookup is in flight, then to one of the three terminal states. iOS branches on this to decide whether to render inline metadata or fall back to the proxy-fetch path (WXYC/wxyc-ios-64#270). Only emitted on track entries.
+    Two surfaces reference this schema and must move together: the V2 flowsheet track entry's `metadata_status`, and `AlbumMetadataResponse.metadataStatus` — the latter a local-first echo of the same column off the linked flowsheet row (wxyc-shared#318, WXYC/Backend-Service#1827), so a client can reconcile a proxy response against the feed row it came from. Add a value here, not in a copy of the list.
+
+    """
+
     pending = "pending"
     enriching = "enriching"
     enriched_match = "enriched_match"
@@ -1238,6 +1475,11 @@ class DiscogsRelease(BaseModel):
 
 
 class StreamingLinks(BaseModel):
+    """
+    Streaming service URLs for a release. Used across multiple schemas (DiscogsMatchResult, AlbumMetadata, etc.) to canonicalize the set of streaming fields.
+
+    """
+
     spotify_url: str | None = Field(None, description="Spotify album URL")
     apple_music_url: str | None = Field(None, description="Apple Music album URL")
     youtube_music_url: str | None = Field(None, description="YouTube Music search URL")
@@ -1246,18 +1488,33 @@ class StreamingLinks(BaseModel):
 
 
 class StreamingResolutionStatus(StrEnum):
+    """
+    Per-service streaming resolution verdict for one release on a lookup result. `verified` — the service was consulted and a URL was found (accompanies a non-null sibling `*_url`). `absent` — the service was consulted and returned no match; the null `*_url` is terminal and must NOT be re-probed. `unresolved` — a probe was attempted but was inconclusive (timed out, the enrichment tail was shed, or the cache was a cold miss); the null `*_url` is transient and MAY resolve on a later retry. A service that was never consulted at all is represented by the ABSENCE of its key from `StreamingResolution` (never by `absent`), so a consumer never negative-caches a service that was simply never asked. Reuses the per-service verdict vocabulary of `/api/v1/streaming-check` (LML#376). See LML#1053 / BS#1819.
+
+    """
+
     verified = "verified"
     absent = "absent"
     unresolved = "unresolved"
 
 
 class StreamingResolution(BaseModel):
+    """
+    Per-service streaming resolution status for one lookup result, keyed by streaming service (keys match the `*_url` prefixes on `DiscogsMatchResult`). A service's key is PRESENT only when that service was consulted during this lookup; an omitted service was never probed and must NOT be treated as `absent` (the never-consulted state — key omission is its sole encoding, so a consumer has one rule, not two). Additive and independent of the `*_url` fields: it annotates why a `*_url` is null (transient `unresolved` vs terminal `absent`) without changing the meaning of the url fields themselves. Mirrors the per-service shape of `StreamingCheckSources` (LML#376), except a consulted-but-absent service is the explicit `absent` verdict rather than a null, so these per-service fields are non-nullable. Covers the services with a genuine probe/absence distinction on the lookup path (`spotify`, `apple_music`, `bandcamp`); YouTube Music and SoundCloud are search-URL-only and carry no resolution verdict.
+
+    """
+
     spotify: StreamingResolutionStatus | None = None
     apple_music: StreamingResolutionStatus | None = None
     bandcamp: StreamingResolutionStatus | None = None
 
 
 class ReconciledIdentity(BaseModel):
+    """
+    External identifiers for a real-world artist, suitable for joining records across services. All fields are bare platform IDs; URL construction is the consumer's responsibility (templates are stable for Spotify, Apple Music, and Bandcamp; YouTube Music and SoundCloud do not have stable per-ID URLs and are intentionally absent — those belong on `StreamingLinks`, which serves the playback/result layer).
+
+    """
+
     discogs_artist_id: int | None = Field(None, description="Discogs artist ID")
     musicbrainz_artist_id: str | None = Field(None, description="MusicBrainz artist UUID")
     wikidata_qid: str | None = Field(None, description='Wikidata QID (e.g. "Q12345")')
@@ -1293,6 +1550,12 @@ class LookupRequest(BaseModel):
 
 
 class LibraryCatalogItem(BaseModel):
+    """
+    A single item from the WXYC library catalog. Mirrors request-parser's LibraryItem with computed properties serialized as regular fields.
+    Library identity is the `id` field alone — there is deliberately no `album_id`. An `id` of `0` is the "no catalog row" marker: the release is not shelved in the WXYC library, but the result may still carry a real Discogs identity in its `LookupResultItem.artwork`. See `LookupResultItem` for that row-less shape and its discriminator.
+
+    """
+
     id: int = Field(
         ...,
         description='Unique identifier in the library database. `0` means there is no WXYC catalog row for this result (a row-less / "(external)" item, e.g. a Discogs-only library miss); any positive value is a real shelved release.\n',
@@ -1324,6 +1587,11 @@ class LibraryCatalogItem(BaseModel):
 
 
 class CacheStats(BaseModel):
+    """
+    Cache hit/miss statistics for a single lookup operation. Populated by LML's `core/telemetry.py:get_cache_stats()` and forwarded onto Sentry trace data by both the LML transaction (LML#213) and the BS-side client span wrapping `lookupMetadata` (BS#646).
+
+    """
+
     memory_hits: conint(ge=0) = Field(
         ..., description="Hits in LML's per-process in-memory TTL cache"
     )
@@ -1344,10 +1612,22 @@ class CacheStats(BaseModel):
 
 
 class ApiVersion(IntEnum):
+    """
+    Present and equal to 2 only when the request set `include_identity: true` and the producer understands the flag. No `LookupResponse(...)` construction site in the producer sets this field anywhere yet — not even when the request sets `include_identity: true` — and the endpoint is served through FastAPI's `response_model` without `response_model_exclude_none`, so it ships `null` — never an omitted key — on every `/lookup` response in production today (WXYC/wxyc-shared#316); `nullable: true` documents that wire instead of describing one nobody emits.
+
+    Because of that, a consumer MUST test for the value `2` and must never test for key presence — `!== undefined` against the generated TypeScript reads TRUE for a producer that implements none of this, the inverse of what the marker exists to signal. Absent, `null`, and a producer that hasn't implemented `include_identity` at all must all read "not supported", and only the literal value `2` reads "supported" — which keeps the check immune to whether any given producer omits or nulls its unset optionals.
+
+    """
+
     integer_2 = 2
 
 
 class SearchType(StrEnum):
+    """
+    The search strategy that produced results: direct, fallback, alternative, compilation, song_as_artist, or none
+
+    """
+
     direct = "direct"
     fallback = "fallback"
     alternative = "alternative"
@@ -1357,12 +1637,22 @@ class SearchType(StrEnum):
 
 
 class DegradedReason(StrEnum):
+    """
+    Why the response was degraded. Present only when `degraded: true`; omitted otherwise. Non-exhaustive — LML may add reasons in a later minor version. The Swift and Kotlin codegen decode an unknown value into an `unknownDefault` case and TypeScript consumers see a widened string-literal union, but the Python (datamodel-codegen → pydantic) consumers use strict enums and must regenerate against the new `@wxyc/shared` minor before LML emits a newly added reason. `deadline_exceeded` — the caller's budget or LML's spine deadline elapsed and the enrichment tail was skipped; `cache_only` — LML served cached data without refreshing from upstream; `upstream_unavailable` — an upstream (Discogs, streaming providers) was rate limited or down and its contribution was omitted. Set by LML#930's caller-deadline / admission path; read by LML#931 (`degraded-mode-result` telemetry) and wxyc-canary#82.
+
+    """
+
     deadline_exceeded = "deadline_exceeded"
     cache_only = "cache_only"
     upstream_unavailable = "upstream_unavailable"
 
 
 class IdentitySource(StrEnum):
+    """
+    The metadata source whose external ID is being recorded. The set of sources matches the columns on `library_identity_source` per plan §3.2.0. Add new sources by appending to this enum and to the `library_identity_source` schema in lockstep.
+
+    """
+
     discogs = "discogs"
     musicbrainz = "musicbrainz"
     wikidata = "wikidata"
@@ -1372,6 +1662,11 @@ class IdentitySource(StrEnum):
 
 
 class IdentityMethod(StrEnum):
+    """
+    The matcher method that produced this resolution, drawn from plan §3.4.1's locked confidence-method enum. The order in this list also reflects descending confidence ceilings (manual = 1.00, cross_source_agreement up to 1.00, exact_match = 1.00, name_variation 0.90-0.99, member_group 0.80-0.89, alias_match 0.75-0.84, trigram 0.70+, llm 0.60-0.79). Backend's writer rejects rows where confidence falls outside the method's locked range (§3.2.2 sanity check).
+
+    """
+
     manual = "manual"
     cross_source_agreement = "cross_source_agreement"
     exact_match = "exact_match"
@@ -1383,6 +1678,11 @@ class IdentityMethod(StrEnum):
 
 
 class IdentitySkipReason(StrEnum):
+    """
+    Why a source's leg of the cascade did not run. Set on `IdentityResolution.reason` when `attempted: false`. Order is irrelevant; values are mutually exclusive per leg.
+
+    """
+
     error = "error"
     manual_override_protected = "manual_override_protected"
     disabled = "disabled"
@@ -1390,6 +1690,11 @@ class IdentitySkipReason(StrEnum):
 
 
 class IdentityResolution(BaseModel):
+    """
+    One source's leg of the §3.2.5 cascade for a single library row. Either resolved (`attempted: true` and `external_id` populated when a match was found, NULL when the source ran but found no match) or skipped (`attempted: false` with `reason` populated and the rest nullable). The full `LookupIdentityBlock.resolved` array is complete (one entry per known source), not sparse — consumers can tell apart "leg ran, no match" from "leg didn't run" without guessing.
+
+    """
+
     source: IdentitySource
     attempted: bool = Field(
         ...,
@@ -1414,6 +1719,15 @@ class IdentityResolution(BaseModel):
 
 
 class LookupIdentityBlock(BaseModel):
+    """
+    Per-source identity resolution detail for a single library row. Meant to be returned on `LookupResponse.identity` when the request set `include_identity: true` and the producer understands the flag. Per §3.2.2, the `resolved` array is complete (one entry per source LML knows about, including the sources whose legs didn't run with `attempted: false`) — consumers get a deterministic shape regardless of which legs were available, whenever this block is actually populated.
+
+    No `LookupResponse(...)` construction site in the producer sets `LookupResponse.identity` anywhere yet — not even when the request sets `include_identity: true` — and the endpoint is served through FastAPI's `response_model` without `response_model_exclude_none`, so `identity` ships `null` — never an omitted key — on every `/lookup` response in production today (WXYC/wxyc-shared#316). `nullable: true` documents that wire instead of describing a shape nobody emits. A consumer distinguishes "identity resolution ran and found nothing" from "the producer hasn't implemented `include_identity`" the same way as `LookupResponse.api_version` — by reading `api_version`, not by probing `identity` for presence or nullness. `identity` alone cannot make that distinction: it is `null` in both cases.
+
+    `nullable: true` lives here, on the schema, rather than as an `allOf`-wrapped sibling on `LookupResponse.identity` — the two are equivalent where oasdiff can see through the composition, but an `allOf`-wrapped nullable ref to an object schema with its own `required` list cascaded into a spurious `response-required-property-removed` finding that the direct schema-level `nullable: true` does not, and marking a bare `$ref` nullable by writing the keyword next to it does nothing at all (OpenAPI 3.0 ignores sibling keys next to a `$ref`). This is safe only because `LookupIdentityBlock` is referenced exactly once in this spec, from `LookupResponse.identity` — a second reference would inherit this nullability unconditionally, so re-examine whether `null` is correct there too before adding one.
+
+    """
+
     resolved: list[IdentityResolution] = Field(
         ...,
         description="One entry per known source. Order is stable (matches the `IdentitySource` enum order). Always populated even when no source resolved — the array carries `attempted: false` entries in that case.\n",
@@ -1421,6 +1735,11 @@ class LookupIdentityBlock(BaseModel):
 
 
 class BulkResolveInput(BaseModel):
+    """
+    One library row to resolve. Uniform shape — LML auto-detects V/A from the row and discriminates the response on `kind`. The denormalized hint fields (`artist_name`, `album_title`) are not required to be canonical; LML may use them as matcher hints or ignore them in favour of its own mirror of Backend's library data. They are present so LML doesn't need a Backend DB read to resolve.
+
+    """
+
     library_id: int = Field(..., description="Backend `wxyc_schema.library.id` (FK target).")
     legacy_release_id: int | None = Field(
         None,
@@ -1435,12 +1754,22 @@ class BulkResolveInput(BaseModel):
 
 
 class BulkResolveResultKind(StrEnum):
+    """
+    Discriminator for `BulkResolveResult`. `single_artist` carries a composed `main` identity; `compilation` carries none (a V/A row has no album-level artist anchor). Either may carry `tracks` and `tracks_attempted` — per-track identity is gated by the request's `include_tracks` flag, not by `kind` (#297). `unresolved` is a first-class outcome — caching it (with TTL) prevents repeated re-asking for unresolvable rows — and never carries `main`, `tracks`, or `tracks_attempted`.
+
+    """
+
     single_artist = "single_artist"
     compilation = "compilation"
     unresolved = "unresolved"
 
 
 class BulkResolveProvenanceEntry(BaseModel):
+    """
+    One per-source row in LML's reconciliation log for a single result. Surfaces the (source, method, confidence, external_id) tuple that fed §3.4.1.1 composition. Always returned (empty provenance array on `BulkResolveResult` means LML attempted the cascade and no source produced a row).
+
+    """
+
     source: IdentitySource
     method: IdentityMethod
     confidence: confloat(ge=0.0, le=1.0) | None = Field(
@@ -1454,6 +1783,13 @@ class BulkResolveProvenanceEntry(BaseModel):
 
 
 class BulkResolveTrackIdentity(BaseModel):
+    """
+    Per-track resolution for one library row — V/A or not. Returned only when the request set `include_tracks: true`; one entry per track LML's per-track matcher visited. `sources` reflects the per-source rows LML composed the track identity from — audit provenance, not a storage instruction: LML's per-track store is the per-source system of record, and consumers persist only the composed verdict fields on this entry. `1.29.0` said instead that Backend writes these rows verbatim into `library_track_identity_source`; that table was never built. WXYC/Backend-Service#792 — the Backend-side ticket that would have created it — closed as a design decision and the schema half never happened, confirmed against prod and all 136 migrations in https://github.com/WXYC/Backend-Service/issues/801#issuecomment-5187348795. (`1.29.0` attributed that instruction to WXYC/library-metadata-lookup#271, which is open and scopes LML's own per-track identity work, not Backend storage.) The chosen identifiers are not lifted into a per-track `external_ids` block at this contract version.
+
+    The entry is addressable without `track_position`: 78% of Backend's `compilation_track_artist` rows carry a NULL position (WXYC/Backend-Service#1989), so `artist_name` + `track_title` are the join-back key a consumer can actually use. `1.29.0` shipped `track_position` as the only row identifier plus per-source legs, with no composed verdict and no canonical artist — unconsumable for WXYC/Backend-Service#1991, which went unnoticed because the array has only ever shipped empty. The four added fields below close that gap.
+
+    """
+
     track_position: str | None = Field(
         ...,
         description='Track position as the source has it ("A1", "3", …). Required-but-nullable: the key is always present, and NULL says "no position is recoverable for this track" rather than "not echoed". Not a usable row identifier on its own — most of Backend\'s compilation-track rows are position-NULL (WXYC/Backend-Service#1989); join on `artist_name` + `track_title` instead.\n',
@@ -1485,6 +1821,11 @@ class BulkResolveTrackIdentity(BaseModel):
 
 
 class BulkResolveResult(BaseModel):
+    """
+    One verdict per request input, in the same order as the request. `kind` discriminates the body shape. `library_id` echoes the request input so consumers can re-key the response without relying on positional ordering.
+
+    """
+
     kind: BulkResolveResultKind
     library_id: int = Field(..., description="Backend `library.id` for this result.")
     main: ReconciledIdentity | None = Field(
@@ -1514,10 +1855,24 @@ class BulkResolveResult(BaseModel):
 
 
 class TracksContractVersion(IntEnum):
+    """
+    Present and equal to 1 only when the request set `include_tracks: true`, the producer understands the flag, AND the producer has emitted `tracks_attempted` for both `kind: single_artist` and `kind: compilation` results — see `BulkResolveResult.tracks_attempted`. The two producer arms ship independently (LML#1138, LML#1021); setting the marker with one arm unimplemented tells a consumer to trust `tracks_attempted` on rows where it is still meaningless.
+
+    Absent or NULL otherwise: both when `include_tracks` was false or omitted, and when the producer predates this field entirely, or has implemented only one of the two arms above. LML does not set this field anywhere yet and serves this endpoint without `response_model_exclude_none`, so it ships `null` — never an omitted key — on every response in production today (WXYC/wxyc-shared#310); `nullable: true` documents that wire instead of describing one nobody emits, the same treatment as `tracks` / `tracks_attempted` above.
+
+    Because of that, a consumer MUST test for the value `1` and must never test for key presence — `!== undefined` against the generated TypeScript reads TRUE for a producer that implements none of this, the inverse of what the marker exists to signal. Absent, `null`, and a producer that predates this field must all read "not supported", and only the literal value `1` reads "supported" — which keeps the check immune to whether any given producer omits or nulls its unset optionals. Same precedent as `LookupResponse.api_version` (`LookupRequest.include_identity`): a producer-echoed capability marker that lets a consumer distinguish "the producer understood my flag and the answer is genuinely nothing" from "the producer predates my flag" — a distinction `tracks_attempted`/`tracks` cannot make alone, because both are spelled `null` in either case (WXYC/wxyc-shared#303). No schema-level `default`, for the same `openapi-typescript` `defaultNonNullable` reason documented on `BulkResolveLibrariesRequest.include_tracks`.
+
+    """
+
     integer_1 = 1
 
 
 class BulkResolveLibrariesResponse(BaseModel):
+    """
+    Response to `POST /api/v1/identity/bulk-resolve-libraries`. Order of `results` matches the order of the request's `inputs`. The example below is the `include_tracks: true` shape; with the flag false or omitted, every result's `tracks` and `tracks_attempted` are the absent/NULL state (LML spells both `null`). Per-source `method`/`confidence` pairs in the example sit inside `IdentityMethod`'s locked bands — Backend's writer rejects rows that don't, so an example that violated them would hand LML#1021 an unwritable row to copy. The example also carries `tracks_contract_version: 1`, echoing that the producer that emitted it understood `include_tracks`; see that field for the rollout-window ambiguity it exists to resolve.
+
+    """
+
     tracks_contract_version: TracksContractVersion | None = Field(
         None,
         description='Present and equal to 1 only when the request set `include_tracks: true`, the producer understands the flag, AND the producer has emitted `tracks_attempted` for both `kind: single_artist` and `kind: compilation` results — see `BulkResolveResult.tracks_attempted`. The two producer arms ship independently (LML#1138, LML#1021); setting the marker with one arm unimplemented tells a consumer to trust `tracks_attempted` on rows where it is still meaningless.\n\nAbsent or NULL otherwise: both when `include_tracks` was false or omitted, and when the producer predates this field entirely, or has implemented only one of the two arms above. LML does not set this field anywhere yet and serves this endpoint without `response_model_exclude_none`, so it ships `null` — never an omitted key — on every response in production today (WXYC/wxyc-shared#310); `nullable: true` documents that wire instead of describing one nobody emits, the same treatment as `tracks` / `tracks_attempted` above.\n\nBecause of that, a consumer MUST test for the value `1` and must never test for key presence — `!== undefined` against the generated TypeScript reads TRUE for a producer that implements none of this, the inverse of what the marker exists to signal. Absent, `null`, and a producer that predates this field must all read "not supported", and only the literal value `1` reads "supported" — which keeps the check immune to whether any given producer omits or nulls its unset optionals. Same precedent as `LookupResponse.api_version` (`LookupRequest.include_identity`): a producer-echoed capability marker that lets a consumer distinguish "the producer understood my flag and the answer is genuinely nothing" from "the producer predates my flag" — a distinction `tracks_attempted`/`tracks` cannot make alone, because both are spelled `null` in either case (WXYC/wxyc-shared#303). No schema-level `default`, for the same `openapi-typescript` `defaultNonNullable` reason documented on `BulkResolveLibrariesRequest.include_tracks`.\n',
@@ -1527,10 +1882,20 @@ class BulkResolveLibrariesResponse(BaseModel):
 
 
 class IdentityKind(StrEnum):
+    """
+    Discriminator for the identity being resolved. v1 of the `/api/v1/identity/resolve` endpoint accepts only `release`; the `artist` value is reserved for the planned symmetric extension.
+
+    """
+
     release = "release"
 
 
 class ReleaseIdentitySource(StrEnum):
+    """
+    Source whose external ID is being resolved into a release identity. Matches the v1 source list from LML#526; new sources land in lockstep with their column on `entity.release_identity` and a matching sentinel rule on the LML side.
+
+    """
+
     discogs_release = "discogs_release"
     discogs_master = "discogs_master"
     bandcamp = "bandcamp"
@@ -1538,6 +1903,11 @@ class ReleaseIdentitySource(StrEnum):
 
 
 class ReleaseIdentityResolveRequest(BaseModel):
+    """
+    Request body for `POST /api/v1/identity/resolve`. The triple `(kind, source, external_id)` is the identity key — the same triple always returns the same identity_id.
+
+    """
+
     kind: IdentityKind
     source: ReleaseIdentitySource
     external_id: str = Field(
@@ -1547,6 +1917,11 @@ class ReleaseIdentityResolveRequest(BaseModel):
 
 
 class ReleaseIdentityResolveResponse(BaseModel):
+    """
+    Response to `POST /api/v1/identity/resolve`. `identity_id` is stable across calls; `minted` distinguishes the first call (true) from subsequent lookups (false). Re-resolves do not write a new reconciliation log row — the resolver only logs the act of minting.
+
+    """
+
     identity_id: int = Field(
         ...,
         description="`entity.release_identity.id` for the resolved row. Stable across calls with the same `(kind, source, external_id)`.\n",
@@ -1559,6 +1934,11 @@ class ReleaseIdentityResolveResponse(BaseModel):
 
 
 class ArtistSearchAliasSource(StrEnum):
+    """
+    Origin of an artist search alias variant. Opaque to BS storage (just a tag); used by future read-path ranking and audit. Open enum — new sources can be added by LML without a wire-format break.
+
+    """
+
     discogs_name_variation = "discogs_name_variation"
     discogs_alias = "discogs_alias"
     discogs_member = "discogs_member"
@@ -1566,6 +1946,11 @@ class ArtistSearchAliasSource(StrEnum):
 
 
 class ArtistSearchAliasMethod(StrEnum):
+    """
+    Semantic classification of how this variant relates to the subject artist. Distinct from source — multiple sources can emit the same method.
+
+    """
+
     name_variation = "name_variation"
     alias = "alias"
     member = "member"
@@ -1573,6 +1958,11 @@ class ArtistSearchAliasMethod(StrEnum):
 
 
 class ArtistSearchAliasVariant(BaseModel):
+    """
+    One alias variant for an artist. The `variant` string is what gets matched against search queries via trigram similarity. The `source` tag identifies where the row came from; `method` classifies the semantic relationship.
+
+    """
+
     source: ArtistSearchAliasSource
     variant: str = Field(..., description='The searchable string (e.g. "Thee Oh Sees").')
     related_external_id: str | None = Field(
@@ -1619,11 +2009,21 @@ class ArtistSearchAliasesBulkResponse(BaseModel):
 
 
 class ArtistResolveMethod(StrEnum):
+    """
+    What decided a resolved verdict. `identity_store` — a pre-existing `entity.identity` row short-circuited resolution (unverified: the store's resolved-at-most-once promise). `api_search` — a single-page live Discogs API artist search returned exactly one artist whose fixed-point identity-match form equals the input's, whose own title qualifier matches the input's (a "(N)"-titled singleton answering a bare input — or vice versa — is family evidence, not a resolution), and with no equality-leg cache conflict. Cache legs never decide; their evidence appears in `cache_corroboration`.
+
+    """
+
     identity_store = "identity_store"
     api_search = "api_search"
 
 
 class ArtistResolveCacheLeg(StrEnum):
+    """
+    A discogs-cache candidate-generation leg that produced at least one candidate for the input name. Mirrors the entity-resolution reconciler cascade's legs (exact / member / alias / name-variation / trigram — the cascade subset of `IdentityMethod`), but as candidate sets used for corroboration and conflict detection — never as verdicts. The four equality legs can veto a mint into `ambiguous`; fuzzy `cache_trigram` neighbors never veto.
+
+    """
+
     cache_exact = "cache_exact"
     cache_member = "cache_member"
     cache_alias = "cache_alias"
@@ -1632,12 +2032,22 @@ class ArtistResolveCacheLeg(StrEnum):
 
 
 class ArtistResolveUnresolvedReason(StrEnum):
+    """
+    Why a name did not resolve. `not_found` — the API tier ran and observed zero exact-form candidates on its single search page (terminal in v1; a search observation, not proof no such artist exists — cache legs, including `cache_exact`, may still show yield in `cache_corroboration`). `ambiguous` — two or more exact-form Discogs artists (including "(N)" disambiguation families, which normalize to the same form); an equality-leg cache candidate (exact / member / alias / name-variation — never a fuzzy `cache_trigram` neighbor) pointing at a different artist id than the API's single candidate; a lone API candidate whose own title qualifier mismatches the input's; or conflicting identity-store rows across one deduplicated group's spellings (`candidate_count` null — nothing was measured); ambiguous names never mint (terminal). `escalation_unavailable` — the Discogs API tier couldn't answer: saturation breaker open, outage cool-down, 429 or 5xx after retries, network errors, other non-2xx responses, a distrusted/unparseable page, or a deployment with no Discogs credentials configured. It means "couldn't ask," not "asked and missed" — consumers must not apply a no-match TTL. Retry with bounded attempts and backoff: most causes are transient, but a persistent `escalation_unavailable` across attempts indicates a configuration or upstream condition that retrying will not move.
+
+    """
+
     not_found = "not_found"
     ambiguous = "ambiguous"
     escalation_unavailable = "escalation_unavailable"
 
 
 class ArtistResolveResult(BaseModel):
+    """
+    Verdict for one input name, index-aligned with `ArtistResolveBulkRequest.names`. Exactly one of `discogs_artist_id` (resolved, with `method`) or `unresolved_reason` is present.
+
+    """
+
     name: str = Field(..., description="Verbatim echo of the input name at this index.")
     discogs_artist_id: int | None = Field(
         None,
@@ -1683,10 +2093,20 @@ class ArtistResolveBulkRequest(BaseModel):
 
 
 class ArtistResolveBulkResponse(BaseModel):
+    """
+    Response to `POST /api/v1/artists/resolve/bulk`. `results` is index-aligned with the request's `names`.
+
+    """
+
     results: list[ArtistResolveResult]
 
 
 class ArtistGenresSource(StrEnum):
+    """
+    Where an artist's genre/style answer came from, so the caller can distinguish a genuine "Discogs has no genre data for this artist" (safe to negative-cache) from a transient "couldn't ask Discogs" (retry). `cache` — served from the discogs-cache `release_genre` rows. `discogs_api` — cache miss; the Discogs API fallback produced genres. `not_found` — cache miss; the API answered but the artist has no release/genre data (safe to negative-cache). `unavailable` — cache miss and the API could not be consulted (no Discogs token, saturation breaker open, or a transient fetch failure); retry, do NOT negative-cache.
+
+    """
+
     cache = "cache"
     discogs_api = "discogs_api"
     not_found = "not_found"
@@ -1694,6 +2114,10 @@ class ArtistGenresSource(StrEnum):
 
 
 class ArtistGenresInput(BaseModel):
+    """
+    One artist to aggregate genres/styles for.
+    """
+
     artist_name: constr(min_length=1) = Field(..., description="Artist display name.")
     discogs_artist_id: int | None = Field(
         None,
@@ -1702,10 +2126,20 @@ class ArtistGenresInput(BaseModel):
 
 
 class BulkArtistGenresRequest(BaseModel):
+    """
+    Request body for `POST /api/v1/artists/genres/bulk`. The per-request artist cap is enforced at the router (413, before validation); an empty batch returns 422.
+
+    """
+
     artists: list[ArtistGenresInput] = Field(..., max_length=25, min_length=1)
 
 
 class ArtistGenresResultItem(BaseModel):
+    """
+    Per-artist aggregation, index-aligned with the request `artists` list.
+
+    """
+
     artist_name: str = Field(..., description="Echoed from the request for index alignment.")
     discogs_artist_id: int | None = Field(
         None,
@@ -1723,16 +2157,31 @@ class ArtistGenresResultItem(BaseModel):
 
 
 class BulkArtistGenresResponse(BaseModel):
+    """
+    Response to `POST /api/v1/artists/genres/bulk`. `results` is index-aligned with the request's `artists`. No top-level counters — the caller derives them via `Counter(r.source for r in results)`.
+
+    """
+
     results: list[ArtistGenresResultItem]
 
 
 class CacheRefreshSourceOutcome(StrEnum):
+    """
+    Per-source release-leg outcome. `success` covers both cache hits and fresh fetches AND tombstones (Discogs 404s — the cache state is still current). `error` is transport / 5xx / parse failure. The leg did not complete. `not_implemented` is for sources whose cache layer doesn't exist yet (discogs_master pre-`MasterRelease.artists`, musicbrainz_release pre-LML#217, etc.). Consumers that need to distinguish "warm-real" from "warm-tombstone" should read the cache row's `not_found` flag directly, not infer from this enum.
+
+    """
+
     success = "success"
     error = "error"
     not_implemented = "not_implemented"
 
 
 class CacheRefreshItemStatus(StrEnum):
+    """
+    Per-identity rollup of the per-source outcomes. Release-leg-gated: any source `success` → `warmed` (artist failures inside a release walk are partial value, not a retry trigger). Only `not_implemented` sources → `not_implemented`. All sources errored → `error`. Row absent in `entity.release_identity` → `not_found` (with `sources` as null). Only `error` is a retry signal.
+
+    """
+
     warmed = "warmed"
     not_found = "not_found"
     not_implemented = "not_implemented"
@@ -1740,6 +2189,11 @@ class CacheRefreshItemStatus(StrEnum):
 
 
 class CacheRefreshArtistOutcome(BaseModel):
+    """
+    Per-artist outcome inside the walk-to-artists step of a per-source release refresh. `external_id` is string-typed for future source-agnosticism — Discogs IDs serialize as decimal strings.
+
+    """
+
     external_id: str
     outcome: CacheRefreshSourceOutcome
     message: str | None = Field(
@@ -1749,12 +2203,22 @@ class CacheRefreshArtistOutcome(BaseModel):
 
 
 class CacheRefreshSourceResult(BaseModel):
+    """
+    Per-source outcome for one identity. `artists` is the walk-to-artists fan-out result for the Discogs release leg — empty list on tombstone-success (no artists to walk) and on legs that don't do a walk (every non-Discogs source today).
+
+    """
+
     release_outcome: CacheRefreshSourceOutcome
     artists: list[CacheRefreshArtistOutcome] = Field([], validate_default=True)
     message: str | None = None
 
 
 class CacheRefreshResultItem(BaseModel):
+    """
+    Per-identity verdict. `sources` is null when `status == not_found` (no row to dispatch against). Otherwise it is keyed by source vocabulary (`discogs_release`, `discogs_master`, …); see `RELEASE_SOURCE_COLUMN` on the LML side for the canonical set.
+
+    """
+
     identity_id: int
     status: CacheRefreshItemStatus
     sources: dict[str, CacheRefreshSourceResult] | None = None
@@ -1762,14 +2226,28 @@ class CacheRefreshResultItem(BaseModel):
 
 
 class BulkCacheRefreshRequest(BaseModel):
+    """
+    Request body. The 50-id batch cap is enforced server-side with HTTP 400 on overflow (not 422 — LML's `/api/v1/lookup/bulk` precedent). Downstream callers should encode 50 as a hard constant or assert at startup, not expose it as an env knob — the cap is bounded by Discogs rate-limit × cold-cache fan-out ≤ Railway's request-timeout ceiling, and recalibration must land alongside any ingress change. Empty `identity_ids` returns 422 (Pydantic `min_length=1`). Duplicate identity_ids are allowed; each runs independently and shows up as a separate result.
+
+    """
+
     identity_ids: list[int] = Field(..., min_length=1)
 
 
 class BulkCacheRefreshResponse(BaseModel):
+    """
+    Per-identity verdicts in input order. No top-level counters — callers derive them via `Counter(r.status for r in results)`, matching the `BulkLookupResultItem` precedent.
+
+    """
+
     results: list[CacheRefreshResultItem]
 
 
 class DiscogsTrackItem(BaseModel):
+    """
+    A track on a release, with optional per-track artist credits (for compilations).
+    """
+
     position: str
     title: str
     duration: str | None = None
@@ -1777,6 +2255,10 @@ class DiscogsTrackItem(BaseModel):
 
 
 class DiscogsArtistCredit(BaseModel):
+    """
+    An artist credit on a release (performer, producer, etc.).
+    """
+
     artist_id: int | None = None
     name: str
     join: str = Field("", description='Join phrase (e.g. " & ", ", ")')
@@ -1786,11 +2268,21 @@ class DiscogsArtistCredit(BaseModel):
 
 
 class Provenance(StrEnum):
+    """
+    `track` = scoped to the resolved track's per-track credits (precise); `release` = a release-level credit applied to the whole release (approximate for an individual track, mirroring tubafrenzy's auto-fill-from-artist fallback). Populated as `release` in the initial rollout; `track` is added when per-track resolution lands.
+
+    """
+
     track = "track"
     release = "release"
 
 
 class DiscogsWriterCredits(BaseModel):
+    """
+    Songwriter/composer credits for the resolved playcut, derived from the Discogs writer-role credits already fetched at resolution time (the `extra=1` artist credits whose `role` is a writer role — e.g. "Written-By", "Composed By", "Music By", "Lyrics By", "Songwriter", "Words By", including hyphen/space, bracketed, and comma-compound variants). Surfaced on `DiscogsMatchResult.writer_credits` for BMI performance-list reporting; populated only when `extended` is true and a writer credit resolves, and omitted entirely when nothing resolves — names are never fabricated. A consumer with no resolved composer falls back to artist-as-proxy.
+
+    """
+
     names: list[str] = Field(
         ..., description="Distinct songwriter/composer names for the resolved track."
     )
@@ -1822,6 +2314,10 @@ class DiscogsReleaseVideo(BaseModel):
 
 
 class DiscogsReleaseMetadata(BaseModel):
+    """
+    Full release metadata from LML, including tracklist and enriched credits.
+    """
+
     release_id: int
     master_id: int | None = Field(
         None,
@@ -1867,6 +2363,10 @@ class Type1(StrEnum):
 
 
 class DiscogsResolvedToken(BaseModel):
+    """
+    A single resolved token from Discogs markup parsing. Discriminated by the `type` field.
+    """
+
     type: Type1
     text: str | None = Field(None, description="Content for plainText tokens")
     name: str | None = Field(None, description="Name for artistLink and labelName tokens")
@@ -1894,6 +2394,10 @@ class Member(BaseModel):
 
 
 class DiscogsArtistDetails(BaseModel):
+    """
+    Full artist details from Discogs, including bio, aliases, and group members.
+    """
+
     artist_id: int
     name: str
     profile: str | None = None
@@ -1909,6 +2413,10 @@ class DiscogsArtistDetails(BaseModel):
 
 
 class DiscogsReleaseInfo(BaseModel):
+    """
+    A single release from the track-releases search.
+    """
+
     album: str
     artist: str
     release_id: int
@@ -1917,6 +2425,10 @@ class DiscogsReleaseInfo(BaseModel):
 
 
 class DiscogsTrackReleasesResponse(BaseModel):
+    """
+    Response from LML's track-releases search endpoint.
+    """
+
     track: str | None = None
     artist: str | None = None
     releases: list[DiscogsReleaseInfo] = Field([], validate_default=True)
@@ -1925,6 +2437,11 @@ class DiscogsTrackReleasesResponse(BaseModel):
 
 
 class TrackMatchSource(StrEnum):
+    """
+    Provenance of a TrackMatchHint. `cta` indicates Backend's local `compilation_track_artist` lookup (Track 1, BS-local). `discogs_release` indicates LML matched via a Discogs release_id (Track 2; pre-cross-cache-identity, this is a direct CEI release-format hit; post-cross-cache-identity, it's a `library_identity.discogs_release_id` hit). `discogs_master` indicates LML matched via a Discogs master_id (Track 2; the more common pre-cross-cache-identity path, since ~90% of CEI rows are master-format). `library_identity` indicates an explicit substrate match — emitted post-cross-cache-identity when LML's pipeline exposes the distinction in its response.
+
+    """
+
     cta = "cta"
     discogs_release = "discogs_release"
     discogs_master = "discogs_master"
@@ -1932,6 +2449,11 @@ class TrackMatchSource(StrEnum):
 
 
 class TrackMatchHint(BaseModel):
+    """
+    Populated on library search / lookup result items when a track-title match drove the inclusion of this release into the results. The `source` field distinguishes the underlying match pathway so consumers can render appropriate UX (e.g., qualitative "matched via Discogs (verified)" tooltips) and downstream audits can break coverage down by source.
+
+    """
+
     title: str = Field(..., description="The track title as stored in the source.")
     artist_credit: str | None = Field(
         None,
@@ -1949,6 +2471,11 @@ class TrackMatchHint(BaseModel):
 
 
 class ArtistMatchHint(BaseModel):
+    """
+    Populated on library search result items when an artist-alias match from the BS-local `artist_search_alias` cache drove the inclusion of this release into the results (artist-search-alias plan PR 5). Sibling to TrackMatchHint — track hints carry title + position + artist_credit which have no meaning for alias matches; alias hints carry the variant string that scored and its source tag for UX rendering and audit.
+
+    """
+
     matched_variant: str = Field(
         ..., description="The cached alias string that trigram-matched the query."
     )
@@ -1956,6 +2483,10 @@ class ArtistMatchHint(BaseModel):
 
 
 class LibrarySearchItem(BaseModel):
+    """
+    A single item from LML's library catalog search.
+    """
+
     id: int
     title: str | None = None
     artist: str | None = None
@@ -1994,11 +2525,19 @@ class StreamingCheckRequest(BaseModel):
 
 
 class StreamingSourceMatch(BaseModel):
+    """
+    A match found on a single streaming service.
+    """
+
     url: str = Field(..., description="URL to the matched album on the service")
     confidence: float = Field(..., description="Match confidence score (0-100)")
 
 
 class StreamingCheckSources(BaseModel):
+    """
+    Per-service streaming match results.
+    """
+
     spotify: StreamingSourceMatch | None = None
     deezer: StreamingSourceMatch | None = None
     apple_music: StreamingSourceMatch | None = None
@@ -2067,6 +2606,18 @@ class WxycReviewItem(BaseModel):
 
 
 class AlbumMetadataResponse(BaseModel):
+    """
+    Response body for `GET /proxy/metadata/album`. Two tiers of field share one flat wire shape, with no `base`/`enriched` wrapper to tell them apart.
+
+    **Base** — durable Backend-Service state, never an upstream read (WXYC/Backend-Service#1827). Six fields in the handler. Three are declared here — `recordLabel`, `labelId`, `metadataStatus`, resolved from the linked flowsheet row. The other three are emitted but not yet declared: `artistName`, `releaseTitle` and `trackTitle`, echoed straight back from the request and therefore present on every response, including one where every upstream call failed (`artistName` unconditionally, the other two whenever the caller supplied them). Contracting those three is follow-up work on wxyc-shared#318 — read their absence from this schema as undeclared, not as unemitted.
+
+    **Enriched** — `artworkUrl`, `discogsUrl`, `genres`, `label`, the streaming URLs and the rest, resolved from Discogs via library-metadata-lookup.
+
+    The split is the guarantee: a library-metadata-lookup timeout can blank every enriched field but can never blank a base one.
+
+    **Freshness caveat — the base fields are memoized, so they are not re-read per request.** The handler memoizes the assembled response for 1h (WXYC/Backend-Service#988), keyed on the normalized `(artistName, releaseTitle, trackTitle)` plus the critic-reviews flag bit. Only the three request-echoed fields are excluded from the cached value; `recordLabel`, `labelId` and `metadataStatus` are part of it. A cache hit short-circuits the flowsheet read entirely, so these three describe the linked row as it was when the entry was written rather than as it is now. Two consequences worth designing around: for up to an hour after a DJ links a previously free-text play, the response can still omit all three even though a linked row now exists; and a librarian's label correction can be shadowed by the old `recordLabel` for the same window. `metadataStatus` is bounded more tightly than its two siblings — a `pending` or `enriching` snapshot is never memoized (WXYC/Backend-Service#1893), so a cached value is always one of the three terminal states. None of this weakens the tier guarantee above: an upstream failure still cannot blank a base field. It bounds a different property — recency, not presence-on-failure.
+    """
+
     recordLabel: str | None = Field(
         None,
         description="Local-first base field. The catalog record label Backend-Service wrote onto the flowsheet row at play time (`flowsheet.record_label`), read back off the linked flowsheet row — durable BS state, never a Discogs/LML read. Distinct from `label`, which is the Discogs *release* label; the two carry genuinely different values with different provenance and must not be merged, because collapsing them would make the catalog label blankable by an upstream timeout. Omitted in three cases: the key resolved to no linked flowsheet row (a free-text entry that never linked to an `album_id` has no local source for it); the resolved row's `record_label` was null or empty; or the response was served from the 1h memo and the entry was written under either of those conditions — see this schema's freshness caveat, which also covers the stale-value case where a memoized `recordLabel` outlives a librarian's correction.",
@@ -2144,6 +2695,10 @@ class ArtworkSearchResponse(BaseModel):
 
 
 class Type2(StrEnum):
+    """
+    Discogs entity type
+    """
+
     artist = "artist"
     release = "release"
     master = "master"
@@ -2177,6 +2732,11 @@ class Payload(BaseModel):
 
 
 class LiveFsRefetchEvent(BaseModel):
+    """
+    SSE event emitted on the `live-fs-topic` when bulk state changes (ETL runs, schema migrations) make targeted patches impractical. Consumers respond with a coarse cache invalidation. `payload.source` is a free-text label for telemetry only (`etl`, `migration`, etc.) — clients must not branch on it.
+
+    """
+
     type: Literal["refetch"]
     payload: Payload
     timestamp: AwareDatetime
@@ -2433,6 +2993,10 @@ class AutoDJDeactivateResponse(BaseModel):
 
 
 class FlowsheetEntryResponse(FlowsheetEntryBase):
+    """
+    Flowsheet entry as returned by the API with all possible fields
+    """
+
     album_id: int | None = None
     track_title: str | None = None
     album_title: str | None = None
@@ -2481,6 +3045,10 @@ class FlowsheetEntryResponse(FlowsheetEntryBase):
 
 
 class FlowsheetV2TrackEntry(FlowsheetV2Base):
+    """
+    V2 track entry - a song that was played
+    """
+
     entry_type: Literal["track"]
     album_id: int | None = None
     rotation_id: int | None = None
@@ -2654,6 +3222,12 @@ class EnhancedRequest(SongRequest):
 
 
 class DiscogsMatchResult(BaseModel):
+    """
+    A processed Discogs search result with artwork and enriched metadata. Distinct from the raw DiscogsSearchResult which mirrors the Discogs API response directly. Streaming URL fields match the StreamingLinks schema and will be migrated to use $ref in a future version.
+    Two distinct states share this shape, told apart by `release_id`: a real Discogs identity has `release_id > 0` with a non-empty `release_url`; the streaming-only sentinel (BS#1185) has `release_id == 0` and `release_url == ""`, signalling "I carry only streaming URLs, there is no Discogs release to link or to fetch album metadata from." A consumer keying "has Discogs identity" on `release_id != 0` therefore handles both states correctly, including the row-less identity described on `LookupResultItem`.
+
+    """
+
     album: str | None = Field(None, description="Release title")
     artist: str | None = Field(None, description="Release artist")
     release_id: int = Field(
@@ -2718,6 +3292,13 @@ class DiscogsMatchResult(BaseModel):
 
 
 class LookupResultItem(BaseModel):
+    """
+    A single lookup result pairing a library item with optional artwork and reconciled identity.
+    `artwork` is optional and independent of `library_item`. This makes the *row-less* shape valid and first-class: `library_item.id == 0` (no WXYC catalog row) paired with a present `artwork` carrying `release_id > 0` and a non-empty `release_url` is a "Discogs identity, no catalog row" result — the album isn't shelved in the library, but Discogs confidently identifies the release, so the link, artwork, and downstream streaming buttons still render. LML emits this shape both from a library-miss Discogs search and from a non-library track carry-through (a confidently-resolved release for a track whose album isn't shelved).
+    This is distinct from the `artwork.release_id == 0` / `release_url == ""` streaming-only sentinel (BS#1185), which carries streaming URLs but no linkable Discogs release. The discriminator is `artwork.release_id > 0 && library_item.id == 0`: unambiguous against the sentinel and backward-compatible with any consumer keying "has Discogs identity" on `release_id != 0`.
+
+    """
+
     library_item: LibraryCatalogItem
     artwork: DiscogsMatchResult | None = None
     reconciled_identity: ReconciledIdentity | None = None
@@ -2732,6 +3313,11 @@ class LookupResultItem(BaseModel):
 
 
 class LookupResponse(BaseModel):
+    """
+    Response from the lookup service containing library search results and metadata. When the request sets `include_identity: true` and the producer understands the flag, the response is meant to additionally carry `api_version: 2` and the `identity` block (per cross-cache-identity plan §3.2.2). Neither side is implemented in the producer yet, so in production today both fields ship `null` — never an omitted key — on every response, regardless of what the request set `include_identity` to (WXYC/wxyc-shared#316). A consumer MUST test `api_version === 2`, never key presence: absent, `null`, and a producer that hasn't implemented this at all must all read "not supported", and only the literal value `2` reads "supported". See `api_version` below for the full rule, and `LookupIdentityBlock` for `identity`'s.
+
+    """
+
     api_version: ApiVersion | None = Field(
         None,
         description='Present and equal to 2 only when the request set `include_identity: true` and the producer understands the flag. No `LookupResponse(...)` construction site in the producer sets this field anywhere yet — not even when the request sets `include_identity: true` — and the endpoint is served through FastAPI\'s `response_model` without `response_model_exclude_none`, so it ships `null` — never an omitted key — on every `/lookup` response in production today (WXYC/wxyc-shared#316); `nullable: true` documents that wire instead of describing one nobody emits.\n\nBecause of that, a consumer MUST test for the value `2` and must never test for key presence — `!== undefined` against the generated TypeScript reads TRUE for a producer that implements none of this, the inverse of what the marker exists to signal. Absent, `null`, and a producer that hasn\'t implemented `include_identity` at all must all read "not supported", and only the literal value `2` reads "supported" — which keeps the check immune to whether any given producer omits or nulls its unset optionals.\n',
@@ -2771,6 +3357,11 @@ class LookupResponse(BaseModel):
 
 
 class BulkResolveLibrariesRequest(BaseModel):
+    """
+    Bulk identity-resolution request. Order is preserved in the response. Up to 1,000 inputs per call (see endpoint cap).
+
+    """
+
     inputs: list[BulkResolveInput] = Field(
         ...,
         description="Inputs to resolve. Order preserved in `BulkResolveLibrariesResponse.results`.\n",
@@ -2784,12 +3375,22 @@ class BulkResolveLibrariesRequest(BaseModel):
 
 
 class LiveFsUpdateEvent(BaseModel):
+    """
+    SSE event emitted on the `live-fs-topic` when an enrichment-worker (BS#892) finalizes the metadata for a flowsheet row. Payload carries the client-facing flowsheet row (the `FlowsheetEntryResponse` fields) so a newly-mounted client (e.g. a /live viewer that just opened the page) can surface the post-enrichment fields (`artwork_url`, `release_year`, ...) without a follow-up GET. The `live-fs-topic` is anonymous, so Backend projects the raw CDC row through its client-facing allow-list (BS#1534) — internal columns (`search_doc`, `composer`, `legacy_*`, ...) do not ride this stream. Provider: Backend-Service/apps/backend/services/metadata-broadcast/metadata-broadcast.ts (`filterMetadataUpdate`). Consumer: dj-site `live-updates-listener.ts`. Contract: `CONTRACTS.LIVE_FS_UPDATE_INCLUDES_FULL_ROW`.
+
+    """
+
     type: Literal["update"]
     payload: FlowsheetEntryResponse
     timestamp: AwareDatetime
 
 
 class LiveFsInsertEvent(BaseModel):
+    """
+    SSE event emitted on the `live-fs-topic` the instant a new flowsheet row is created (BS#1888), before enrichment runs. Payload carries the same client-facing flowsheet row (`FlowsheetEntryResponse`) as `LiveFsUpdateEvent`, but at insert time the row is `metadata_status: 'pending'` with the enrichment fields (`artwork_url`, `release_year`, `discogs_url`, ...) still null — all of which `FlowsheetEntryResponse` already models as nullable, so a not-yet-enriched row is valid. A subscriber appends the row immediately; the enrichment fields arrive seconds later as the existing `LiveFsUpdateEvent`. Same anonymous `live-fs-topic` allow-list projection as `update` (BS#1534) — internal columns (`search_doc`, `composer`, `legacy_*`, ...) do not ride this stream. Removes Epic C's ([WXYC/Backend-Service#877]) polling latency floor: consumers (WXYC/wxyc-ios-64#269, dj-site) learn of a new track on the SSE push instead of the next reconciliation poll.
+
+    """
+
     type: Literal["insert"]
     payload: FlowsheetEntryResponse
     timestamp: AwareDatetime
