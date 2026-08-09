@@ -1615,7 +1615,15 @@ class TestBulkLookupCaptureBudget:
         self, app_client_live_orchestrator_with_posthog, mock_discogs_service
     ):
         """A 3-item batch — each running the full real pipeline — still emits
-        exactly one ``lookup.bulk_completed`` summary, never one per item."""
+        exactly one ``lookup.bulk_completed`` summary, never one per item.
+
+        Scope note: the ``emit_step_events=False`` pins on the batch and
+        per-item construction sites are defense-in-depth no-ops today (the
+        batch telemetry tracks no steps; nothing sends the per-item one), so
+        no test can enforce the kwargs themselves — this test pins the
+        surrounding invariant instead, and fails on the refactor that would
+        actually cost money: wiring per-item ``send_to_posthog`` back up.
+        """
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
         app_client, counting_client = app_client_live_orchestrator_with_posthog
 
