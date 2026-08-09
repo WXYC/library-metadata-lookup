@@ -54,10 +54,30 @@ Generates Pydantic v2 models from `wxyc-shared/api.yaml`. Uses a local sibling `
 
 **Usage:**
 ```bash
-bash scripts/generate_api_models.sh
+bash scripts/generate_api_models.sh                 # sibling checkout, else wxyc-shared main
+bash scripts/generate_api_models.sh --ref <sha>     # pin to an upstream revision
+WXYC_SHARED_REF=<sha> bash scripts/generate_api_models.sh
 ```
 
-Requires `datamodel-code-generator` (included in dev dependencies).
+Requires `datamodel-code-generator` and `ruff` (both in dev dependencies). Neither is optional: `ruff format` + `ruff check --fix` run over the generator's output, and byte-equality against that formatted result is exactly what the Codegen Freshness gate diffs, so the script fails loudly rather than emitting unformatted models if either binary is missing.
+
+### Pinning the upstream revision
+
+`--ref` (or `WXYC_SHARED_REF`) downloads one exact wxyc-shared revision and bypasses any sibling checkout, which is what you want when reproducing a past regen or bisecting a contract change. Without it the script prefers a local sibling `wxyc-shared/api.yaml` and otherwise tracks `main` at run time; it prints the sibling's branch and `git describe` so a stale or unpulled checkout is visible in the log rather than showing up later as a phantom CI drift failure.
+
+**CI deliberately stays unpinned.** The Codegen Freshness job exists to diff the committed snapshot against whatever upstream `main` currently says, so pinning it would silence the very signal it is there to raise. The cost is that the job goes red on every open PR the moment wxyc-shared merges an api.yaml change, with no defect in the PR that tripped it -- see [#1117](https://github.com/WXYC/library-metadata-lookup/issues/1117). Reach for `--ref` locally, not in the workflow. Adopting wxyc-shared's consolidated generator (which carries `--ref` plus a `uvx`-pinned toolchain, an ancestor-walking venv probe, and empty-argument guards) is tracked at [#1159](https://github.com/WXYC/library-metadata-lookup/issues/1159); until that lands, a codegen fix made upstream has to be re-applied to this copy by hand.
+
+### Schema descriptions become class docstrings
+
+The generator runs with `--use-schema-description`, so an `api.yaml` schema-level `description` lands as the generated class's docstring. This is load-bearing rather than cosmetic: upstream field descriptions cross-reference their schema's prose (`AlbumMetadataResponse.recordLabel` says "see this schema's freshness caveat", and the caveat -- base fields are memoized for 1h, so a librarian's label correction can be shadowed for that window -- exists *only* at the schema level). Without the flag every such pointer dangles, and a Codegen Freshness pass certifies only that field *shapes* match upstream, not that the documented contract came with them.
+
+### Enum fields are a closed set in Python
+
+The org treats adding a response-enum value as non-breaking (oasdiff WARN, minor version bump). **That holds for the generated TypeScript and not for the generated Python.** Enum-typed fields generate as `StrEnum` subclasses, and pydantic raises `ValidationError` on an unrecognized member -- so a purely additive upstream enum value breaks every Python consumer pinned to the committed `api_models.py` until it regenerates, on responses the contract classifies as compatible. `MetadataStatus` currently reaches LML on three fields -- `AlbumMetadataResponse.metadataStatus`, `FlowsheetEntryResponse.metadata_status`, and `FlowsheetV2TrackEntry.metadata_status` -- and `tests/unit/test_generated_models.py` pins both the closed-set behavior and the coupling to the shared enum (api.yaml `$ref`s one schema across all three so they move together; a regen that widened any of them back to `str` would silently decouple them). When upstream adds an enum member, LML needs a regen PR, not just a version bump.
+
+### Known contract residue
+
+`AlbumMetadataResponse` declares three of its six local-first base fields. `artistName`, `releaseTitle` and `trackTitle` are on every Backend-Service response but declared nowhere in `api.yaml`, so pydantic's default `extra="ignore"` silently drops them on decode -- including `artistName`, the one field guaranteed present when every upstream call fails. Do not work around this by loosening `extra` on the generated models: the fix belongs in `api.yaml`, tracked upstream at [WXYC/wxyc-shared#324](https://github.com/WXYC/wxyc-shared/issues/324). `tests/unit/test_generated_models.py` characterizes today's dropping behavior so the regen that fixes it turns that test red on purpose.
 
 ### Strict-nullable field-shape semantics
 
