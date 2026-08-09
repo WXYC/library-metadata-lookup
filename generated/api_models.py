@@ -2067,6 +2067,18 @@ class WxycReviewItem(BaseModel):
 
 
 class AlbumMetadataResponse(BaseModel):
+    recordLabel: str | None = Field(
+        None,
+        description="Local-first base field. The catalog record label Backend-Service wrote onto the flowsheet row at play time (`flowsheet.record_label`), read back off the linked flowsheet row — durable BS state, never a Discogs/LML read. Distinct from `label`, which is the Discogs *release* label; the two carry genuinely different values with different provenance and must not be merged, because collapsing them would make the catalog label blankable by an upstream timeout. Omitted in three cases: the key resolved to no linked flowsheet row (a free-text entry that never linked to an `album_id` has no local source for it); the resolved row's `record_label` was null or empty; or the response was served from the 1h memo and the entry was written under either of those conditions — see this schema's freshness caveat, which also covers the stale-value case where a memoized `recordLabel` outlives a librarian's correction.",
+    )
+    labelId: int | None = Field(
+        None,
+        description="Local-first base field. Backend-Service's `label` table id for `recordLabel`, read off the same linked flowsheet row (`flowsheet.label_id`). Lets a client join to the catalog label record instead of string-matching the name. Omitted in the same three cases as `recordLabel`: no linked flowsheet row resolved, the resolved row's `label_id` was null, or the response came from the 1h memo of a request where one of those held. Presence is independent of `recordLabel`'s — the handler tests the two columns separately, so a row can supply one without the other.",
+    )
+    metadataStatus: MetadataStatus | None = Field(
+        None,
+        description="Local-first base field. A faithful echo of the linked flowsheet row's `metadata_status` column — the same enrichment-lifecycle value the V2 flowsheet feed reports for that row, which is why it shares the `MetadataStatus` schema rather than restating the literals (the two must move together). It reports the row's stored state; the terminal-vs-non-terminal interpretation belongs to the client (WXYC/wxyc-ios-64#685). Omitted only when the key resolved to no linked flowsheet row, or when the response came from the 1h memo of such a request. Unlike `recordLabel` and `labelId`, it is never omitted for an empty column: `flowsheet.metadata_status` is `NOT NULL DEFAULT 'pending'` in Backend-Service, so a linked row always carries a value. A memoized value is additionally always terminal — non-terminal snapshots are excluded from the memo (WXYC/Backend-Service#1893) — so a `pending` or `enriching` reading here is always freshly read, never a stale echo.",
+    )
     discogsReleaseId: int | None = Field(None, description="Discogs release ID")
     discogsUrl: str | None = Field(None, description="Discogs release page URL")
     releaseYear: int | None = Field(None, description="Release year from Discogs")
@@ -2075,7 +2087,10 @@ class AlbumMetadataResponse(BaseModel):
     styles: list[str] | None = Field(
         None, description="Discogs style classifications (more specific than genres)"
     )
-    label: str | None = Field(None, description="Primary record label name")
+    label: str | None = Field(
+        None,
+        description="Primary label on the Discogs *release*, from the cached `album_metadata` row or an LML fallthrough. Enriched, not base: absent when the upstream lookup fails, and still null on `album_metadata` rows enriched before WXYC/Backend-Service#1336 (see WXYC/Backend-Service#1442). Not the same field as `recordLabel`, which is the catalog label from the linked flowsheet row and survives an upstream failure.",
+    )
     discogsArtistId: int | None = Field(
         None, description="Discogs artist ID, for linking to artist metadata"
     )
