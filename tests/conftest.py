@@ -253,12 +253,18 @@ def make_lml_telemetry() -> RequestTelemetry:
     """Build a `RequestTelemetry` with LML's production parameters.
 
     Single source of truth so the per-call kwargs in `lookup/router.py` and
-    every test that constructs telemetry stay in sync.
+    every test that constructs telemetry stay in sync. `emit_step_events=False`
+    mirrors the `/lookup` construction site (commit 204a86b,
+    WXYC/library-metadata-lookup#1169 audit) -- this fixture builds telemetry
+    for direct `perform_lookup()` calls, not `.send_to_posthog()` assertions,
+    so no test depends on the value, but it stays in sync with prod per this
+    docstring's own contract.
     """
     return RequestTelemetry(
         api_call_keys=["discogs"],
         distinct_id="library-metadata-lookup-service",
         event_prefix="lookup",
+        emit_step_events=False,
     )
 
 
