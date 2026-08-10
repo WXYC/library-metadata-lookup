@@ -121,14 +121,7 @@ def make_app(mock_settings, mock_entity_store, mock_discogs_cache, mock_discogs_
     from identity.dependencies import get_entity_store
     from main import app
 
-    def _make(
-        *,
-        discogs_service=_UNSET,
-        entity_store=_UNSET,
-        discogs_cache=_UNSET,
-        posthog=None,
-        settings=_UNSET,
-    ):
+    def _make(*, discogs_service=_UNSET, entity_store=_UNSET, discogs_cache=_UNSET, posthog=None):
         deps = {
             get_library_db: AsyncMock(),
             get_discogs_service: (
@@ -136,7 +129,7 @@ def make_app(mock_settings, mock_entity_store, mock_discogs_cache, mock_discogs_
             ),
             get_posthog_client: None,
             get_artist_resolve_posthog_client: posthog,
-            get_settings: mock_settings if settings is _UNSET else settings,
+            get_settings: mock_settings,
             get_entity_store: mock_entity_store if entity_store is _UNSET else entity_store,
             get_discogs_cache_service_from_pool: (
                 mock_discogs_cache if discogs_cache is _UNSET else discogs_cache
@@ -403,17 +396,29 @@ class TestPostHogTelemetry:
 
     @pytest.mark.asyncio
     async def test_summary_event_carries_environment_property(
-        self, make_app, mock_entity_store, mock_posthog_client, mock_settings
+        self, make_app, mock_posthog_client, monkeypatch
     ):
         """WXYC/library-metadata-lookup#1170: `artist_resolve_completed` is one
         of the `RequestTelemetry`-backed summary events the new LML PostHog
         project's guard alert needs to slice by `environment` -- same rationale
         and property name as `lookup_completed` and the `discogs_rate_gate_*`
-        counters."""
-        env_settings = mock_settings.model_copy(update={"environment": "unit-test-env"})
-        ctx, app = make_app(posthog=mock_posthog_client, settings=env_settings)
-        with ctx:
-            resp = await _post(app, {"names": ["Wishy"]})
+        counters. `_emit_resolve_summary` reads `environment` directly via
+        `get_settings()` at the emit site (mirrors `discogs/ratelimit.py`'s
+        counters), not via FastAPI DI, so this drives it through env +
+        `cache_clear()` rather than an `app.dependency_overrides` swap --
+        the same pattern `test_discogs_service.py::
+        test_breaker_shed_emits_artist_breaker_shed_counter` uses.
+        """
+        from config.settings import get_settings
+
+        monkeypatch.setenv("ENVIRONMENT", "unit-test-env")
+        get_settings.cache_clear()
+        ctx, app = make_app(posthog=mock_posthog_client)
+        try:
+            with ctx:
+                resp = await _post(app, {"names": ["Wishy"]})
+        finally:
+            get_settings.cache_clear()
 
         assert resp.status_code == 200
         props = mock_posthog_client.capture.call_args.kwargs["properties"]
@@ -424,12 +429,18 @@ class TestPostHogTelemetry:
         `send_to_posthog`, whose `**extra_properties` merges LAST — a
         summary key colliding with a framework property silently replaces
         it. The `api_calls` collision was fixed by renaming the field at
-        its source; this pins the invariant for every future field."""
+        its source; this pins the invariant for every future field.
+
+        `environment` (LML#1170) is included in `framework_properties`
+        alongside the `send_to_posthog`-native four: `_emit_resolve_summary`
+        also merges it in unconditionally, so it is exactly as un-shadowable
+        as `total_duration_ms`/`steps`/`api_calls`/`cache`.
+        """
         import dataclasses
 
         from artists.resolver import ResolveStats
 
-        framework_properties = {"total_duration_ms", "steps", "api_calls", "cache"}
+        framework_properties = {"total_duration_ms", "steps", "api_calls", "cache", "environment"}
         summary_keys = {f.name for f in dataclasses.fields(ResolveStats)} | {"dry_run"}
         collisions = summary_keys & framework_properties
         assert not collisions, (

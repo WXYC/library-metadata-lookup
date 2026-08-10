@@ -197,30 +197,25 @@ async def test_summary_event_emitted_on_success(telemetry_app_client):
 
 
 @pytest.mark.asyncio
-async def test_summary_event_carries_environment_property(mock_settings):
+async def test_summary_event_carries_environment_property(telemetry_app_client, monkeypatch):
     """WXYC/library-metadata-lookup#1170: `streaming_check_completed` is one of
     the `RequestTelemetry`-backed summary events the new LML PostHog project's
     guard alert needs to slice by `environment` -- same rationale and property
-    name as `lookup_completed` and the `discogs_rate_gate_*` counters."""
-    from main import app
+    name as `lookup_completed` and the `discogs_rate_gate_*` counters.
+    `_emit_summary` reads `environment` directly via `get_settings()` at the
+    emit site (mirrors `discogs/ratelimit.py`'s counters), not via FastAPI DI,
+    so this drives it through env + `cache_clear()` rather than an
+    `app.dependency_overrides` swap.
+    """
+    app, mock_posthog = telemetry_app_client
+    monkeypatch.setenv("ENVIRONMENT", "unit-test-env")
+    get_settings.cache_clear()
 
-    mock_posthog = Mock()
-    mock_posthog.capture = Mock()
-    env_settings = mock_settings.model_copy(update={"environment": "unit-test-env"})
-
-    with override_deps(
-        app,
-        {
-            get_settings: env_settings,
-            get_spotify_client: None,
-            get_deezer_client: AsyncMock(),
-            get_apple_music_client: None,
-            get_bandcamp_client: None,
-            get_streaming_posthog_client: mock_posthog,
-        },
-    ):
+    try:
         response = StreamingCheckResponse(on_streaming=False, sources=StreamingCheckSources())
         resp = await _post_streaming_check(app, response)
+    finally:
+        get_settings.cache_clear()
 
     assert resp.status_code == 200
     props = _completed_props(mock_posthog)
@@ -324,26 +319,36 @@ async def test_telemetry_failure_does_not_fail_check(telemetry_app_client):
 
 
 @pytest.mark.asyncio
-async def test_failure_path_emits_error_summary(telemetry_app_client):
+async def test_failure_path_emits_error_summary(telemetry_app_client, monkeypatch):
     """A total failure (500 path) still emits a streaming_check_completed event.
 
     The orchestrator absorbs per-service failures into errored_sources (a 200);
     a raise out of check_streaming_availability is a total failure that 500s. We
     must report it too (LML#639) — outcome=error, error_type set, per-service
-    verdicts 'unknown' since no result was produced.
+    verdicts 'unknown' since no result was produced. Also pins `environment`
+    (LML#1170) on this path specifically: it is built by a different
+    `_emit_summary` call (positional `None` response, distinct arg list) than
+    the success path, so the property needs its own coverage here.
     """
     app, mock_posthog = telemetry_app_client
+    monkeypatch.setenv("ENVIRONMENT", "unit-test-env")
+    get_settings.cache_clear()
 
-    with patch(
-        "streaming.router.check_streaming_availability",
-        new_callable=AsyncMock,
-        side_effect=RuntimeError("upstream exploded"),
-    ):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(
-                "/api/v1/streaming-check",
-                json={"artist": "Stereolab", "title": "Aluminum Tunes"},
-            )
+    try:
+        with patch(
+            "streaming.router.check_streaming_availability",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("upstream exploded"),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/api/v1/streaming-check",
+                    json={"artist": "Stereolab", "title": "Aluminum Tunes"},
+                )
+    finally:
+        get_settings.cache_clear()
 
     assert resp.status_code == 500
     props = _completed_props(mock_posthog)
@@ -354,6 +359,7 @@ async def test_failure_path_emits_error_summary(telemetry_app_client):
     assert props["verdict_bandcamp"] == "unknown"
     # Timing is still captured even though the step raised.
     assert "availability_ms" in props["steps"]
+    assert props["environment"] == "unit-test-env"
 
 
 @pytest.mark.asyncio
