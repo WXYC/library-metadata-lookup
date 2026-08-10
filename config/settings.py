@@ -154,6 +154,39 @@ class Settings(BaseSettings):
 
     # Sentry Configuration
     sentry_dsn: str | None = Field(None, description="Sentry DSN for error tracking")
+    sentry_traces_sample_rate: float = Field(
+        default=1.0,
+        description=(
+            "Fraction of requests Sentry traces (head-based, per-trace sampling -- "
+            "it does not thin spans within a kept trace). Default 1.0 preserves "
+            "today's full-rate tracing; lookup/router.py's cache-hit-rate "
+            "measurement series (see the comment near track_step) relies on that "
+            "default, so lowering it is an operator trade-off, not this ticket's "
+            "job (LML#1174). Mirrors Backend-Service's resolveTracesSampleRate "
+            "(apps/backend/sentry-config.ts) so the two services parse "
+            "SENTRY_TRACES_SAMPLE_RATE identically. Unparseable or out-of-range "
+            "(<0 or >1) values fall back to the default via the field_validator "
+            "below rather than raising at boot -- an env-var typo must never crash "
+            "the process. See WXYC/library-metadata-lookup#1174."
+        ),
+    )
+
+    @field_validator("sentry_traces_sample_rate", mode="before")
+    @classmethod
+    def _validate_traces_sample_rate(cls, v: object) -> object:
+        """Fall back to the 1.0 default on any parse or range failure (LML#1174).
+
+        Runs in ``mode="before"`` so it sees the raw env-var string ahead of
+        pydantic's own float coercion, which would otherwise raise on a
+        non-numeric value before this validator ever ran.
+        """
+        try:
+            parsed = float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 1.0
+        if not (0.0 <= parsed <= 1.0):
+            return 1.0
+        return parsed
 
     # Discogs Cache Database Configuration
     database_url_discogs: str | None = Field(

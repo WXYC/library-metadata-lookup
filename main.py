@@ -64,6 +64,7 @@ init_sentry(
     service_name="library-metadata-lookup",
     environment=settings.environment,
     release=settings.app_version,
+    traces_sample_rate=settings.sentry_traces_sample_rate,
 )
 
 log_file = None
