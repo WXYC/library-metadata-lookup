@@ -194,6 +194,49 @@ class TestDiscogsRateBucketTimeoutBounds:
         assert Settings(discogs_rate_bucket_timeout_s=0.01).discogs_rate_bucket_timeout_s == 0.01
 
 
+class TestSentryTracesSampleRate:
+    """LML#1174: SENTRY_TRACES_SAMPLE_RATE is the runtime override for Sentry's
+    per-trace sampling. Default must stay 1.0 (lookup/router.py's measurement
+    series relies on full-rate tracing); an unparseable or out-of-range value
+    must fall back to 1.0 rather than raise at boot, mirroring Backend-Service's
+    ``resolveTracesSampleRate``."""
+
+    def test_defaults_to_one(self):
+        assert Settings().sentry_traces_sample_rate == 1.0
+
+    def test_unset_env_defaults_to_one(self, monkeypatch):
+        monkeypatch.delenv("SENTRY_TRACES_SAMPLE_RATE", raising=False)
+        assert Settings().sentry_traces_sample_rate == 1.0
+
+    def test_reads_valid_env(self, monkeypatch):
+        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")
+        assert Settings().sentry_traces_sample_rate == 0.1
+
+    def test_reads_boundary_zero(self, monkeypatch):
+        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "0")
+        assert Settings().sentry_traces_sample_rate == 0.0
+
+    def test_reads_boundary_one(self, monkeypatch):
+        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "1")
+        assert Settings().sentry_traces_sample_rate == 1.0
+
+    def test_above_range_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "1.5")
+        assert Settings().sentry_traces_sample_rate == 1.0
+
+    def test_below_range_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "-0.1")
+        assert Settings().sentry_traces_sample_rate == 1.0
+
+    def test_non_numeric_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "not-a-number")
+        assert Settings().sentry_traces_sample_rate == 1.0
+
+    def test_empty_string_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "")
+        assert Settings().sentry_traces_sample_rate == 1.0
+
+
 class TestGetSettings:
     def test_returns_settings_instance(self):
         get_settings.cache_clear()
