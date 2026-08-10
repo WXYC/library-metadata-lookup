@@ -165,7 +165,7 @@ ASYNCPG_POOL_RESET_STATEMENT = "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLI
 # the signal. What is lost is the ability to compute a percentile
 # distribution from a censored sample -- "count of slow resets" survives, and
 # is the better alarm input anyway.
-POOL_RESET_KEEP_ABOVE_MS = 50.0
+POOL_RESET_FLOOR_MS = 50.0
 
 
 def _span_duration_ms(span: dict[str, Any]) -> float | None:
@@ -176,18 +176,26 @@ def _span_duration_ms(span: dict[str, Any]) -> float | None:
     us. Datetimes are the shape the SDK produces today; epoch floats are
     accepted because some serialization paths use them and a silently
     unmeasurable span would quietly defeat the floor.
+
+    Subtraction failures are contained **here**, not at the event level: a
+    naive/aware datetime pair raises ``TypeError``, and letting that escape
+    would forward an entire transaction unfiltered -- and log a warning on
+    every transaction carrying one such span. Per-span problems stay per-span.
     """
     start = span.get("start_timestamp")
     end = span.get("timestamp")
-    if isinstance(start, datetime) and isinstance(end, datetime):
-        return (end - start).total_seconds() * 1000.0
-    if (
-        isinstance(start, (int, float))
-        and isinstance(end, (int, float))
-        and not isinstance(start, bool)
-        and not isinstance(end, bool)
-    ):
-        return (end - start) * 1000.0
+    try:
+        if isinstance(start, datetime) and isinstance(end, datetime):
+            return (end - start).total_seconds() * 1000.0
+        if (
+            isinstance(start, (int, float))
+            and isinstance(end, (int, float))
+            and not isinstance(start, bool)
+            and not isinstance(end, bool)
+        ):
+            return (end - start) * 1000.0
+    except (TypeError, ValueError, OverflowError):
+        return None
     return None
 
 
@@ -206,7 +214,7 @@ def _is_fast_pool_reset(span: Any) -> bool:
     duration_ms = _span_duration_ms(span)
     if duration_ms is None:
         return False
-    return duration_ms < POOL_RESET_KEEP_ABOVE_MS
+    return duration_ms < POOL_RESET_FLOOR_MS
 
 
 def drop_fast_pool_reset_spans(event: Event, hint: Hint | None = None) -> Event:

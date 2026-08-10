@@ -419,6 +419,31 @@ class TestDropFastPoolResetSpans:
 
         assert drop_fast_pool_reset_spans(event, None) is event
 
+    def test_one_unmeasurable_span_does_not_disable_filtering_for_the_event(self):
+        """Blast-radius guard. Subtracting a naive datetime from an aware one
+        raises, and if that escaped to the event-level guard a single odd span
+        would forward the whole transaction unfiltered -- and log a warning on
+        every transaction that carried one. Per-span failures stay per-span.
+        """
+        from datetime import UTC, datetime
+
+        from core.observability import drop_fast_pool_reset_spans
+
+        mixed: dict[str, Any] = {
+            "op": "db",
+            "description": self.RESET,
+            "start_timestamp": datetime(2026, 8, 10, 12, 0, 0),
+            "timestamp": datetime(2026, 8, 10, 12, 0, 0, 2000, tzinfo=UTC),
+        }
+        droppable = self._span(self.RESET)
+        event: Any = {"type": "transaction", "spans": [mixed, droppable]}
+
+        with patch("core.observability.logger") as mock_logger:
+            result = drop_fast_pool_reset_spans(event, None)
+
+        assert result["spans"] == [mixed], "the measurable reset should still have been dropped"
+        mock_logger.warning.assert_not_called()
+
     def test_trimmed_spans_sentinel_passes_through_without_warning(self):
         """When the SDK trims an oversized event it swaps the span list for an
         ``AnnotatedValue``, which is truthy but not iterable. That is a normal
