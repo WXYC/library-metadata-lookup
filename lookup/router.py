@@ -525,6 +525,7 @@ async def handle_lookup(
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     spotify: SpotifyClient | None = Depends(get_spotify_client),
     bandcamp: BandcampClient | None = Depends(get_bandcamp_client),
+    settings: Settings = Depends(get_settings),
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
         default=None,
@@ -793,6 +794,12 @@ async def handle_lookup(
                     ),
                     "endpoint_family": ENDPOINT_FAMILY_LOOKUP,
                     "low_priority": low_priority,
+                    # LML#1170: the new LML PostHog project's guard alert needs
+                    # to separate a staging soak (e.g. the LML#747 N=3
+                    # multi-worker run) from a prod regression -- mirrors the
+                    # `environment` property already carried by the
+                    # `discogs_rate_gate_*` counters (`discogs/ratelimit.py`).
+                    "environment": settings.environment,
                     **({"caller_reason": x_caller_reason} if x_caller_reason is not None else {}),
                 },
             )
@@ -1171,6 +1178,9 @@ async def handle_bulk_lookup(
                     "max_concurrent": max_concurrent,
                     "endpoint_family": ENDPOINT_FAMILY_LOOKUP_BULK,
                     "low_priority": True,
+                    # LML#1170: see the sibling comment on `handle_lookup`'s
+                    # `lookup_completed` emit above.
+                    "environment": settings.environment,
                     **({"caller_reason": x_caller_reason} if x_caller_reason is not None else {}),
                 },
             )

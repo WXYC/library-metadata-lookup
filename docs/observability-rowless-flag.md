@@ -30,15 +30,19 @@ Telemetry went live in prod 2026-06-27. Baseline pulled 2026-06-30 over the **3-
 
 **Sentry population** (all transaction types, EAP spans, 18,795 spans/3d — more diluted than PostHog because it includes non-lookup transactions): avg `api_calls` **0.483** (hourly avg maxes at **1.27**), `release_resolution_cache_miss` **0.010**, `release_resolution_cache_unavailable` **0.0**.
 
-## PostHog alerts — project [Request-O-Matic](https://us.posthog.com/project/293013) (id 293013)
+## PostHog alerts — project <!-- TODO(#1170): fill in new project name + id at cutover --> (LML's own project, per LML#1170)
 
-Backed by single-row HogQL insights (trailing-window, flag-on, `lookup_completed` only), checked **hourly**, delivered by email subscription (no Slack integration configured on this project yet — see [Routing](#routing)). [Alerts tab](https://us.posthog.com/project/293013/insights?tab=alerts).
+**Cutover status (LML#1170):** LML is moving off the shared Request-O-Matic PostHog project (id `293013`) — the shared key was silently absorbing LML's full event volume, the root cause of the 2026-08 quota blowout — onto a dedicated project of its own. **The project creation, the recreation of the insights and alert below, and the `POSTHOG_API_KEY` Railway flip are the outstanding infrastructure half of LML#1170** (tracked there, not done as part of this doc update); the guard insight + alert must go live in the new project **before** the key flips, so there is no unguarded window. This section documents the target end state so the runbook is correct the moment that work lands — fill in the `TODO(#1170)` placeholders below at cutover. The migration is **forward-only**: history from before the cutover date, and the three insights as they exist pre-cutover, remain queryable only in the [Request-O-Matic project](https://us.posthog.com/project/293013) (id `293013`) — see the "pre-cutover history" column. See [`env-vars.md`](env-vars.md) for the key-ownership note.
 
-| Alert | Metric (window) | Condition | Rationale | Insight |
-|-------|-----------------|-----------|-----------|---------|
-| **Discogs call-rate** | avg `api_calls`/req (trailing **6h**) | **> 3.0** | ~3–4× the 0.72–0.95/day baseline and 1.75× the worst observed 6h window (1.71). A sustained 6h avg > 3 means per-request Discogs fan-out roughly quadrupled and held — the LML#337 cold-cache signature. | [BcOGYggg](https://us.posthog.com/project/293013/insights/BcOGYggg) |
-| **Hit-rate collapse** | `hits/(hits+misses)` (trailing **12h**, guarded to `(hits+misses)≥15` else reports healthy) | **< 0.15** | Baseline 0.31–0.61 over 12h windows; floor 0.15 is ~2× below the warm-up low and only trips on a near-total hit collapse — the swallowed-error **Discogs-outage** proxy (misses keep coming, hits stop because nothing gets cached). | [fR5ol5u0](https://us.posthog.com/project/293013/insights/fR5ol5u0) |
-| **PG cache unavailable** | sum `release_resolution_cache_unavailable` (trailing **6h**) | **> 10** | Baseline is **exactly 0** across all 72 hours / 7,560 requests. > 10 in 6h means genuinely sustained Postgres positive-cache unavailability (tolerates a one-off transient). | [qNnAdLGl](https://us.posthog.com/project/293013/insights/qNnAdLGl) |
+Backed by single-row HogQL insights (trailing-window, flag-on, `lookup_completed` only), checked **hourly**, delivered by email subscription (no Slack integration configured on the pre-cutover project — see [Routing](#routing)). [Alerts tab](<!-- TODO(#1170): fill in new project alerts-tab URL at cutover -->).
+
+| Alert | Metric (window) | Condition | Rationale | Insight (new project) | Insight (pre-cutover history, project `293013`) |
+|-------|-----------------|-----------|-----------|------------------------|--------------------------------------------------|
+| **Discogs call-rate** | avg `api_calls`/req (trailing **6h**) | **> 3.0** | ~3–4× the 0.72–0.95/day baseline and 1.75× the worst observed 6h window (1.71). A sustained 6h avg > 3 means per-request Discogs fan-out roughly quadrupled and held — the LML#337 cold-cache signature. | <!-- TODO(#1170): fill in new insight id --> | [BcOGYggg](https://us.posthog.com/project/293013/insights/BcOGYggg) |
+| **Hit-rate collapse** | `hits/(hits+misses)` (trailing **12h**, guarded to `(hits+misses)≥15` else reports healthy) | **< 0.15** | Baseline 0.31–0.61 over 12h windows; floor 0.15 is ~2× below the warm-up low and only trips on a near-total hit collapse — the swallowed-error **Discogs-outage** proxy (misses keep coming, hits stop because nothing gets cached). | <!-- TODO(#1170): fill in new insight id --> | [fR5ol5u0](https://us.posthog.com/project/293013/insights/fR5ol5u0) |
+| **PG cache unavailable** | sum `release_resolution_cache_unavailable` (trailing **6h**) | **> 10** | Baseline is **exactly 0** across all 72 hours / 7,560 requests. > 10 in 6h means genuinely sustained Postgres positive-cache unavailability (tolerates a one-off transient). | <!-- TODO(#1170): fill in new insight id --> | [qNnAdLGl](https://us.posthog.com/project/293013/insights/qNnAdLGl) |
+
+The `qNnAdLGl` alert (PG cache unavailable) must be re-enabled in the new project at the same threshold (`> 10` over 6h), not just recreated as a dashboard insight. Thresholds, windows, and rationale are unchanged by the cutover; only the project (and therefore the insight ids) moves.
 
 ## Sentry alerts — project [`wxyc/library-metadata-lookup`](https://wxyc.sentry.io/alerts/rules/?project=4511363514302464)
 
@@ -145,7 +149,7 @@ Not part of the row-less flag, but documented here because it rides the same `ca
 
 ## Routing
 
-Delivery is email to jake@wxyc.org on both surfaces. There is **no Slack integration** on the Request-O-Matic PostHog project (`integrations-list kind=slack` → none), so PostHog Slack delivery would need the integration wired first (Settings → Integrations), after which an alert can route to a channel via a `cdp-functions-create` destination. Sentry likewise delivers by email; a Slack action can be added to each rule once a Slack integration exists on the Sentry org. Wire the team channel when available and swap/extend the actions.
+Delivery is email to jake@wxyc.org on both surfaces. There was **no Slack integration** on the pre-cutover Request-O-Matic PostHog project (`integrations-list kind=slack` → none); <!-- TODO(#1170): re-verify Slack-integration status on the new project at cutover, it does not inherit from 293013 -->. Either way, PostHog Slack delivery needs the integration wired first (Settings → Integrations), after which an alert can route to a channel via a `cdp-functions-create` destination. Sentry likewise delivers by email; a Slack action can be added to each rule once a Slack integration exists on the Sentry org. Wire the team channel when available and swap/extend the actions.
 
 ## Notes / gotchas
 

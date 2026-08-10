@@ -35,6 +35,7 @@ from artists.genre_models import (
     BulkArtistGenresResponse,
 )
 from artists.resolver import BareNameArtistResolver, InvalidNameError
+from config.settings import Settings, get_settings
 from core.bulk_body import TRANSIENT_PG_ERRORS, parse_bulk_body, resolve_input_cap
 from core.bulk_concurrency import run_bulk_gather, watch_disconnect
 from core.dependencies import (
@@ -251,6 +252,8 @@ def _emit_resolve_summary(
     posthog_client: Posthog | None,
     telemetry: RequestTelemetry,
     summary: dict,
+    *,
+    environment: str,
 ) -> None:
     """Best-effort aggregate emit — one `artist_resolve_completed` event per
     SUCCESSFULLY COMPLETED request, no per-name events. The entire emit path
@@ -263,11 +266,18 @@ def _emit_resolve_summary(
     ``cache``, ``total_duration_ms``): ``ResolveStats`` names its probe
     counter ``discogs_api_calls`` for exactly this reason, so the summary
     passes through verbatim.
+
+    ``environment`` (LML#1170) is added alongside — not folded into —
+    ``summary``, so ``summary`` itself (also used for the Sentry span data and
+    the exit log line) stays exactly the `ResolveStats` shape. Mirrors the
+    `environment` property already carried by the `discogs_rate_gate_*`
+    counters (``discogs/ratelimit.py``); lets the new LML PostHog project's
+    guard alert separate a staging soak from a prod regression.
     """
     if not posthog_client:
         return
     try:
-        telemetry.send_to_posthog(posthog_client, dict(summary))
+        telemetry.send_to_posthog(posthog_client, {**summary, "environment": environment})
     except Exception:
         logger.warning("artist-resolve telemetry emit failed", exc_info=True)
 
@@ -296,6 +306,7 @@ async def resolve_bulk(
     discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service_from_pool),
     discogs_service: DiscogsService | None = Depends(get_discogs_service),
     posthog_client: Posthog | None = Depends(get_artist_resolve_posthog_client),
+    settings: Settings = Depends(get_settings),
 ) -> ArtistResolveBulkResponse:
     """Resolve bare artist names to Discogs artist identities (LML#759).
 
@@ -423,7 +434,7 @@ async def resolve_bulk(
             http_span.set_data(f"lml.artist_resolve.{key}", value)
         http_span.set_data("http.status_code", 200)
 
-    _emit_resolve_summary(posthog_client, telemetry, summary)
+    _emit_resolve_summary(posthog_client, telemetry, summary, environment=settings.environment)
     logger.info(
         "artist-resolve bulk complete: %s",
         " ".join(f"{key}={value}" for key, value in summary.items()),
