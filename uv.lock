@@ -709,7 +709,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.6" },
     { name = "uvicorn", specifier = ">=0.24.0" },
     { name = "wxyc-etl", specifier = ">=0.10.0,<0.11.0" },
-    { name = "wxyc-fastapi", extras = ["posthog"], specifier = ">=1.4.0,<2.0.0" },
+    { name = "wxyc-fastapi", extras = ["posthog"], specifier = ">=1.5.0,<2.0.0" },
     { name = "ytmusicapi", marker = "extra == 'drain'", specifier = "==1.12.1" },
 ]
 provides-extras = ["dev", "drain"]
@@ -1542,16 +1542,16 @@ wheels = [
 
 [[package]]
 name = "wxyc-fastapi"
-version = "1.4.0"
+version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "sentry-sdk", extra = ["fastapi"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/95/bd/4da7356a8c5108d8eea9a95fc0b7732c3bf072f84ba8cbdc5d752d007ea9/wxyc_fastapi-1.4.0.tar.gz", hash = "sha256:2d0b03f0ce7a1be51e6379e8c56ff25378d16e6d7c19f7c8beb2f52c93adff39", size = 26686, upload-time = "2026-08-09T17:14:31.305Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/68/09/29e534081ca26b8b416af1aee30e56efb16409f6878106e07bb653d954b9/wxyc_fastapi-1.5.0.tar.gz", hash = "sha256:14bffc7c36a52eaef89b7908932440243373b4e32526eb18d3ac373507ee7f05", size = 27045, upload-time = "2026-08-10T17:30:13.246Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a2/a5/328ac08ca3fa3defa3127e1c668e203c67df87635f8bac68d73713ff28dd/wxyc_fastapi-1.4.0-py3-none-any.whl", hash = "sha256:5b7d52f108706444d0641272167ca8c298bf1d2c7056a3e3c34cc039c607e61f", size = 29419, upload-time = "2026-08-09T17:14:29.91Z" },
+    { url = "https://files.pythonhosted.org/packages/36/cf/6dfd75bbbdf08c4df5bc680ef0ada378e647bfe5b4e96739634742579ce7/wxyc_fastapi-1.5.0-py3-none-any.whl", hash = "sha256:ac37c17febca205e7364440d32cae7fd8385603c2e08e8d0bc2015ab6b9f3341", size = 29819, upload-time = "2026-08-10T17:30:11.832Z" },
 ]
 
 [package.optional-dependencies]

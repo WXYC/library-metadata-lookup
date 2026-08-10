@@ -24,7 +24,11 @@ dependencies = [
     "asyncpg>=0.29.0",
     "rapidfuzz>=3.0.0",
     "cachetools>=5.0.0",
-    "wxyc-fastapi[posthog]>=1.4.0,<2.0.0",
+    # 1.5.0 adds the keyword-only `before_send_transaction` passthrough on
+    # `init_sentry`, the only hook that can drop individual child spans (by
+    # filtering `event["spans"]`). Required by LML#1175 to shed the asyncpg
+    # connection-reset span. See WXYC/wxyc-fastapi#40.
+    "wxyc-fastapi[posthog]>=1.5.0,<2.0.0",
     "aiolimiter>=1.1.0",
     "python-multipart>=0.0.6",
     "wxyc-etl>=0.10.0,<0.11.0",
