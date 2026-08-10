@@ -32,6 +32,7 @@ from core.dependencies import (
 )
 from core.event_loop_lag import start_sampler, stop_sampler
 from core.logging import setup_logging
+from core.observability import drop_fast_pool_reset_spans
 from core.server_timing_middleware import LmlWallTimingMiddleware
 from discogs.router import router as discogs_router
 from generated.api_models import ApiErrorResponse
@@ -65,6 +66,13 @@ init_sentry(
     environment=settings.environment,
     release=settings.app_version,
     traces_sample_rate=settings.sentry_traces_sample_rate,
+    # Sheds asyncpg's sub-50ms pool-release bookkeeping span, which was 19% of
+    # the whole WXYC Sentry org's span budget on its own (LML#1175). Resets at
+    # or above the floor survive -- they are the pool-contention fingerprint,
+    # not bookkeeping. `traces_sample_rate` above cannot do this job: it is
+    # head-based and per-trace, so it drops whole requests rather than
+    # thinning one span family out of a kept trace.
+    before_send_transaction=drop_fast_pool_reset_spans,
 )
 
 log_file = None
