@@ -180,14 +180,22 @@ class TestHandleLookup:
 
     @pytest.mark.asyncio
     async def test_lookup_completed_carries_environment_property(
-        self, mock_db, mock_discogs, mock_settings
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
     ):
         """WXYC/library-metadata-lookup#1170: the new LML PostHog project's guard
         alert must be able to tell a staging soak (e.g. the LML#747 N=3
         multi-worker run) from a prod regression. `lookup_completed` is the
         dominant LML event and, unlike the `discogs_rate_gate_*` counters, did
         not carry `environment` — this pins that it now does, sourced from
-        `Settings.environment`, not hard-coded or omitted."""
+        `Settings.environment`, not hard-coded or omitted.
+
+        `environment` is read directly via `get_settings()` at the emit site
+        (mirrors `discogs/ratelimit.py`'s counters), not via FastAPI DI, so
+        this drives it through env + `cache_clear()` rather than an
+        `app.dependency_overrides` swap -- the same pattern
+        `test_discogs_service.py::test_breaker_shed_emits_artist_breaker_shed_counter`
+        uses.
+        """
         from config.settings import get_settings
         from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
         from main import app
@@ -197,23 +205,27 @@ class TestHandleLookup:
         mock_posthog.flush = Mock()
 
         response = LookupResponse(results=[], search_type="direct")
-        env_settings = mock_settings.model_copy(update={"environment": "unit-test-env"})
+        monkeypatch.setenv("ENVIRONMENT", "unit-test-env")
+        get_settings.cache_clear()
 
-        with override_deps(
-            app,
-            {
-                get_library_db: mock_db,
-                get_discogs_service: mock_discogs,
-                get_posthog_client: mock_posthog,
-                get_settings: env_settings,
-            },
-        ):
-            with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
-                mock_lookup.return_value = response
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as client:
-                    resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+        try:
+            with override_deps(
+                app,
+                {
+                    get_library_db: mock_db,
+                    get_discogs_service: mock_discogs,
+                    get_posthog_client: mock_posthog,
+                    get_settings: mock_settings,
+                },
+            ):
+                with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+                    mock_lookup.return_value = response
+                    async with AsyncClient(
+                        transport=ASGITransport(app=app), base_url="http://test"
+                    ) as client:
+                        resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+        finally:
+            get_settings.cache_clear()
 
         assert resp.status_code == 200
         calls = [

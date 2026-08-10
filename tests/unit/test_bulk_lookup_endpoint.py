@@ -844,39 +844,49 @@ class TestBulkLookupEndpoint:
 
     @pytest.mark.asyncio
     async def test_lookup_bulk_completed_carries_environment_property(
-        self, mock_db, mock_discogs, mock_settings
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
     ):
         """WXYC/library-metadata-lookup#1170: `lookup.bulk_completed` shares the
         `RequestTelemetry.send_to_posthog` extra-properties mechanism with the
         single-lookup summary, so it needs the same `environment` property for
         the new LML PostHog project's guard alert to separate a staging soak
-        (e.g. the LML#747 N=3 multi-worker run) from a prod regression."""
+        (e.g. the LML#747 N=3 multi-worker run) from a prod regression.
+
+        `environment` is read directly via `get_settings()` at the emit site
+        (mirrors `discogs/ratelimit.py`'s counters), not via FastAPI DI, so
+        this drives it through env + `cache_clear()` rather than an
+        `app.dependency_overrides` swap.
+        """
         mock_posthog = Mock()
         mock_posthog.capture = Mock()
         mock_posthog.flush = Mock()
-        env_settings = mock_settings.model_copy(update={"environment": "unit-test-env"})
+        monkeypatch.setenv("ENVIRONMENT", "unit-test-env")
+        get_settings.cache_clear()
 
-        with override_deps(
-            app,
-            {
-                get_library_db: mock_db,
-                get_discogs_service: mock_discogs,
-                get_posthog_client: mock_posthog,
-                get_settings: env_settings,
-            },
-        ):
-            with patch(
-                "lookup.router.perform_lookup",
-                new_callable=AsyncMock,
-                return_value=_no_match_response(),
+        try:
+            with override_deps(
+                app,
+                {
+                    get_library_db: mock_db,
+                    get_discogs_service: mock_discogs,
+                    get_posthog_client: mock_posthog,
+                    get_settings: mock_settings,
+                },
             ):
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as ac:
-                    resp = await ac.post(
-                        "/api/v1/lookup/bulk",
-                        json={"items": [{"artist": "Stereolab", "album": "Aluminum Tunes"}]},
-                    )
+                with patch(
+                    "lookup.router.perform_lookup",
+                    new_callable=AsyncMock,
+                    return_value=_no_match_response(),
+                ):
+                    async with AsyncClient(
+                        transport=ASGITransport(app=app), base_url="http://test"
+                    ) as ac:
+                        resp = await ac.post(
+                            "/api/v1/lookup/bulk",
+                            json={"items": [{"artist": "Stereolab", "album": "Aluminum Tunes"}]},
+                        )
+        finally:
+            get_settings.cache_clear()
 
         assert resp.status_code == 200
         assert mock_posthog.capture.call_count == 1
