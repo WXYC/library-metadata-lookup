@@ -14,6 +14,7 @@ from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.deezer import DeezerClient
 from clients.streaming.spotify import SpotifyClient
+from config.settings import Settings, get_settings
 from core.dependencies import get_streaming_posthog_client
 from core.observability import observability_guard, project_capped
 from core.search import resolve_positive_int_env
@@ -180,6 +181,7 @@ def _emit_summary(
     telemetry: RequestTelemetry,
     response: StreamingCheckResponse | None,
     *,
+    environment: str,
     error_type: str | None = None,
 ) -> None:
     """Best-effort summary emit, used on BOTH the success and failure paths.
@@ -188,12 +190,23 @@ def _emit_summary(
     too, not just the send — so the whole telemetry step (incl. deriving verdicts)
     can never change the handler's outcome: on success the response still returns,
     on failure the 500 still raises (LML#639). No-op when telemetry is disabled.
+
+    ``environment`` (LML#1170) rides alongside the derived verdict properties
+    rather than folding into ``_summary_properties``, so that function's shape
+    stays about the streaming-check outcome only — mirrors the `environment`
+    property already carried by the `discogs_rate_gate_*` counters
+    (``discogs/ratelimit.py``); lets the new LML PostHog project's guard alert
+    separate a staging soak from a prod regression.
     """
     if not posthog_client:
         return
     try:
         telemetry.send_to_posthog(
-            posthog_client, _summary_properties(response, error_type=error_type)
+            posthog_client,
+            {
+                **_summary_properties(response, error_type=error_type),
+                "environment": environment,
+            },
         )
     except Exception:
         logger.warning("streaming-check telemetry emit failed", exc_info=True)
@@ -219,6 +232,7 @@ async def handle_streaming_check(
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     bandcamp: BandcampClient = Depends(get_bandcamp_client),
     posthog_client: Posthog | None = Depends(get_streaming_posthog_client),
+    settings: Settings = Depends(get_settings),
 ) -> StreamingCheckResponse:
     """Check streaming availability across all configured services."""
     # Per-request telemetry (LML#639). The cache-stats bracket and api_calls map
@@ -263,8 +277,14 @@ async def handle_streaming_check(
             logger.exception("Streaming check failed for %s - %s", request.artist, request.title)
             # Report the total failure before raising. The emit is itself
             # swallowed, so it can neither suppress nor alter the 500 (LML#639).
-            _emit_summary(posthog_client, telemetry, None, error_type=type(e).__name__)
+            _emit_summary(
+                posthog_client,
+                telemetry,
+                None,
+                environment=settings.environment,
+                error_type=type(e).__name__,
+            )
             raise HTTPException(status_code=500, detail="Streaming check failed") from e
 
-    _emit_summary(posthog_client, telemetry, response)
+    _emit_summary(posthog_client, telemetry, response, environment=settings.environment)
     return response

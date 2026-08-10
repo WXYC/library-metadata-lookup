@@ -121,7 +121,14 @@ def make_app(mock_settings, mock_entity_store, mock_discogs_cache, mock_discogs_
     from identity.dependencies import get_entity_store
     from main import app
 
-    def _make(*, discogs_service=_UNSET, entity_store=_UNSET, discogs_cache=_UNSET, posthog=None):
+    def _make(
+        *,
+        discogs_service=_UNSET,
+        entity_store=_UNSET,
+        discogs_cache=_UNSET,
+        posthog=None,
+        settings=_UNSET,
+    ):
         deps = {
             get_library_db: AsyncMock(),
             get_discogs_service: (
@@ -129,7 +136,7 @@ def make_app(mock_settings, mock_entity_store, mock_discogs_cache, mock_discogs_
             ),
             get_posthog_client: None,
             get_artist_resolve_posthog_client: posthog,
-            get_settings: mock_settings,
+            get_settings: mock_settings if settings is _UNSET else settings,
             get_entity_store: mock_entity_store if entity_store is _UNSET else entity_store,
             get_discogs_cache_service_from_pool: (
                 mock_discogs_cache if discogs_cache is _UNSET else discogs_cache
@@ -393,6 +400,24 @@ class TestPostHogTelemetry:
         # The emit was ATTEMPTED and its failure swallowed — without this
         # pin, silently skipping the emit would also pass.
         assert mock_posthog_client.capture.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_summary_event_carries_environment_property(
+        self, make_app, mock_entity_store, mock_posthog_client, mock_settings
+    ):
+        """WXYC/library-metadata-lookup#1170: `artist_resolve_completed` is one
+        of the `RequestTelemetry`-backed summary events the new LML PostHog
+        project's guard alert needs to slice by `environment` -- same rationale
+        and property name as `lookup_completed` and the `discogs_rate_gate_*`
+        counters."""
+        env_settings = mock_settings.model_copy(update={"environment": "unit-test-env"})
+        ctx, app = make_app(posthog=mock_posthog_client, settings=env_settings)
+        with ctx:
+            resp = await _post(app, {"names": ["Wishy"]})
+
+        assert resp.status_code == 200
+        props = mock_posthog_client.capture.call_args.kwargs["properties"]
+        assert props["environment"] == "unit-test-env"
 
     def test_summary_keys_cannot_shadow_framework_properties(self):
         """`_emit_resolve_summary` passes the summary straight into

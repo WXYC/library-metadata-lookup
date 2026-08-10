@@ -179,6 +179,52 @@ class TestHandleLookup:
         assert events == ["lookup_completed"]
 
     @pytest.mark.asyncio
+    async def test_lookup_completed_carries_environment_property(
+        self, mock_db, mock_discogs, mock_settings
+    ):
+        """WXYC/library-metadata-lookup#1170: the new LML PostHog project's guard
+        alert must be able to tell a staging soak (e.g. the LML#747 N=3
+        multi-worker run) from a prod regression. `lookup_completed` is the
+        dominant LML event and, unlike the `discogs_rate_gate_*` counters, did
+        not carry `environment` — this pins that it now does, sourced from
+        `Settings.environment`, not hard-coded or omitted."""
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        mock_posthog = Mock()
+        mock_posthog.capture = Mock()
+        mock_posthog.flush = Mock()
+
+        response = LookupResponse(results=[], search_type="direct")
+        env_settings = mock_settings.model_copy(update={"environment": "unit-test-env"})
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: mock_posthog,
+                get_settings: env_settings,
+            },
+        ):
+            with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+                mock_lookup.return_value = response
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        calls = [
+            c
+            for c in mock_posthog.capture.call_args_list
+            if c.kwargs["event"] == "lookup_completed"
+        ]
+        assert len(calls) == 1
+        assert calls[0].kwargs["properties"]["environment"] == "unit-test-env"
+
+    @pytest.mark.asyncio
     async def test_lookup_capture_budget_real_orchestrator(self, mock_library_db, mock_settings):
         """WXYC/library-metadata-lookup#1169: pins the per-lookup PostHog
         capture budget through the REAL orchestrator (``perform_lookup`` is

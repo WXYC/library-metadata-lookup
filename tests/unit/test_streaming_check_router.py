@@ -197,6 +197,37 @@ async def test_summary_event_emitted_on_success(telemetry_app_client):
 
 
 @pytest.mark.asyncio
+async def test_summary_event_carries_environment_property(mock_settings):
+    """WXYC/library-metadata-lookup#1170: `streaming_check_completed` is one of
+    the `RequestTelemetry`-backed summary events the new LML PostHog project's
+    guard alert needs to slice by `environment` -- same rationale and property
+    name as `lookup_completed` and the `discogs_rate_gate_*` counters."""
+    from main import app
+
+    mock_posthog = Mock()
+    mock_posthog.capture = Mock()
+    env_settings = mock_settings.model_copy(update={"environment": "unit-test-env"})
+
+    with override_deps(
+        app,
+        {
+            get_settings: env_settings,
+            get_spotify_client: None,
+            get_deezer_client: AsyncMock(),
+            get_apple_music_client: None,
+            get_bandcamp_client: None,
+            get_streaming_posthog_client: mock_posthog,
+        },
+    ):
+        response = StreamingCheckResponse(on_streaming=False, sources=StreamingCheckSources())
+        resp = await _post_streaming_check(app, response)
+
+    assert resp.status_code == 200
+    props = _completed_props(mock_posthog)
+    assert props["environment"] == "unit-test-env"
+
+
+@pytest.mark.asyncio
 async def test_summary_event_carries_per_service_verdict(telemetry_app_client):
     """The summary event derives on_streaming + per-service verdicts from the response.
 
