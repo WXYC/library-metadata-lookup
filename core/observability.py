@@ -20,6 +20,9 @@ hand-rolled ``try/except`` at each site:
 - :func:`project_capped` -- the "in-flight cap engaged" tag+measurement pair
   duplicated (with small per-site variations) across ``lookup/router.py``,
   ``streaming/router.py``, and ``core/bulk_concurrency.py``.
+- :func:`drop_fast_pool_reset_spans` -- the ``before_send_transaction`` hook
+  wired at ``main.py``'s ``init_sentry`` call, which sheds asyncpg's
+  pool-release bookkeeping span before it leaves the process (LML#1175).
 
 Neither ``project_transaction`` nor ``project_capped`` swallows exceptions on
 its own -- compose them with :func:`observability_guard` at the call site.
@@ -37,9 +40,15 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Any
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 import sentry_sdk
+
+if TYPE_CHECKING:
+    from sentry_sdk.types import Event, Hint
+
+logger = logging.getLogger(__name__)
 
 
 @contextlib.contextmanager
@@ -137,3 +146,97 @@ def project_capped(
         transaction.set_measurement(measurement_key, wait_ms)
         if also_set_data:
             transaction.set_data(measurement_key, wait_ms)
+
+
+# asyncpg issues exactly this statement every time a pooled connection is
+# returned to the pool, and sentry-sdk's asyncpg instrumentation records each
+# one as a `db` span. Matched EXACTLY, never as a substring: `RESET ALL` and
+# `CLOSE ALL` are legal fragments of application SQL, and a loose match here
+# would silently delete real query spans.
+ASYNCPG_POOL_RESET_STATEMENT = "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;"
+
+# Reset spans at or above this floor are KEPT. The statement itself is trivial,
+# so its duration is almost entirely time spent waiting on the pool -- a slow
+# reset is the pool-contention fingerprint LML#803 used during the July 2026
+# saturation investigation. Measured over 24h on 2026-08-10: p50 2.32ms,
+# p95 4.69ms, p99 7.08ms, max 215ms, and only 35 of 113,906 spans (0.031%)
+# above 50ms. So the floor sheds 99.97% of the volume and keeps the entire
+# diagnostic tail; a flat drop would have bought 35 more spans/day and cost
+# the signal. What is lost is the ability to compute a percentile
+# distribution from a censored sample -- "count of slow resets" survives, and
+# is the better alarm input anyway.
+POOL_RESET_KEEP_ABOVE_MS = 50.0
+
+
+def _span_duration_ms(span: dict[str, Any]) -> float | None:
+    """Duration of a serialized span in milliseconds, or ``None`` if unknowable.
+
+    ``sentry_sdk.tracing.Span.to_json()`` emits ``start_timestamp`` and
+    ``timestamp`` and **no** pre-computed duration, so the subtraction is on
+    us. Datetimes are the shape the SDK produces today; epoch floats are
+    accepted because some serialization paths use them and a silently
+    unmeasurable span would quietly defeat the floor.
+    """
+    start = span.get("start_timestamp")
+    end = span.get("timestamp")
+    if isinstance(start, datetime) and isinstance(end, datetime):
+        return (end - start).total_seconds() * 1000.0
+    if (
+        isinstance(start, (int, float))
+        and isinstance(end, (int, float))
+        and not isinstance(start, bool)
+        and not isinstance(end, bool)
+    ):
+        return (end - start) * 1000.0
+    return None
+
+
+def _is_fast_pool_reset(span: Any) -> bool:
+    """True only for a pool-reset span we can prove is below the floor.
+
+    Fails **closed on dropping** (i.e. open on keeping): a span whose shape is
+    unexpected, or whose duration cannot be computed, is kept. Keeping costs
+    one span of budget; dropping risks deleting the contention signal the
+    floor exists to preserve.
+    """
+    if not isinstance(span, dict):
+        return False
+    if span.get("description") != ASYNCPG_POOL_RESET_STATEMENT:
+        return False
+    duration_ms = _span_duration_ms(span)
+    if duration_ms is None:
+        return False
+    return duration_ms < POOL_RESET_KEEP_ABOVE_MS
+
+
+def drop_fast_pool_reset_spans(event: Event, hint: Hint | None = None) -> Event:
+    """Strip sub-50ms asyncpg pool-reset spans from a transaction event.
+
+    Wired as ``init_sentry(before_send_transaction=...)`` in ``main.py``.
+    ``before_send_transaction`` is the only hook that can drop an individual
+    child span -- ``traces_sample_rate`` is head-based and per-*trace*, so it
+    would take whole requests (and their error trace context) rather than
+    thinning bookkeeping out of a kept trace.
+
+    **Always returns the event.** Returning ``None`` from this hook drops the
+    entire transaction, and the parent here is a real request. Every failure
+    mode in this function -- malformed event, unmeasurable span, an exception
+    raised while filtering -- degrades to "forward the event unchanged", so a
+    bug costs spans, never request visibility.
+
+    Returns the *same* object (not a rebuilt copy) when nothing matched, which
+    is the common case on the transactions that carry no pool reset at all.
+    """
+    try:
+        spans = event.get("spans")
+        # Not merely "is it empty": when the SDK trims an oversized event it
+        # replaces the list with an `AnnotatedValue` sentinel, which is truthy
+        # and not iterable. Nothing to filter in that case -- forward it.
+        if not isinstance(spans, list) or not spans:
+            return event
+        kept = [span for span in spans if not _is_fast_pool_reset(span)]
+        if len(kept) != len(spans):
+            event["spans"] = kept
+    except Exception as e:
+        logger.warning("Failed to %s: %s", "filter asyncpg pool-reset spans", e)
+    return event
