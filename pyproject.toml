@@ -1,6 +1,7 @@
 [project]
 name = "library-metadata-lookup"
 version = "0.1.0"
+license = "PolyForm-Noncommercial-1.0.0"
 description = "WXYC library catalog lookup service with Discogs integration"
 requires-python = ">=3.12"
 readme = "README.md"
@@ -76,7 +77,7 @@ drain = [
 ]
 
 [build-system]
-requires = ["setuptools>=65.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
