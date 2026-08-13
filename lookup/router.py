@@ -1052,11 +1052,19 @@ async def handle_bulk_lookup(
                         discogs_cache=discogs_cache,
                         mb_pg=mb_pg,
                         apple_music=apple_music,
+                        # Unconditional, unlike Bandcamp below: Spotify is a
+                        # cache-first post-process leg with no per-item live
+                        # probe on this path, so injecting it costs nothing when
+                        # lml_bulk_spotify_streaming_warm is off (the bulk
+                        # suppression keeps it cache-read-only) and is the
+                        # precondition for the LML#1052 rowless warm when it is
+                        # on — the flag alone can't wire an absent client.
                         spotify=spotify,
                         # Bandcamp on the bulk path is gated by the dedicated
-                        # lml_bulk_bandcamp_streaming_warm flag (default off,
-                        # extends #1052). With the flag OFF this is None — exactly
-                        # the LML#573 PR-3 posture: its client is rate-limited to
+                        # lml_bulk_bandcamp_streaming_warm flag (default off; the
+                        # sibling of #1052's Spotify flag, built first as #1087).
+                        # With the flag OFF this is None — exactly the LML#573
+                        # PR-3 posture: its client is rate-limited to
                         # 1 req/s, so a per-item live album probe would serialize
                         # the 35k-album drain into hours of requests against
                         # Bandcamp (and starve the shared singleton for the live

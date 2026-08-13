@@ -167,12 +167,18 @@ def _reset_warm_state():
 
 
 def _settings(
-    *enabled_services: str, master: bool = True, bulk_bandcamp_warm: bool = False
+    *enabled_services: str,
+    master: bool = True,
+    bulk_bandcamp_warm: bool = False,
+    bulk_spotify_warm: bool = False,
 ) -> SimpleNamespace:
     """A Settings-like stub with the AND-gate flags the post-process reads.
 
-    ``bulk_bandcamp_warm`` backs ``lml_bulk_bandcamp_streaming_warm`` — the
-    dedicated flag that exempts Bandcamp from the /lookup/bulk warm suppression.
+    ``bulk_bandcamp_warm`` / ``bulk_spotify_warm`` back
+    ``lml_bulk_bandcamp_streaming_warm`` / ``lml_bulk_spotify_streaming_warm``
+    — the per-service dedicated flags that exempt a ROWLESS item from the
+    /lookup/bulk warm suppression. They are deliberately independent knobs:
+    neither one exempts the other's service.
     """
     flags = {
         "lml_persist_streaming_urls": master,
@@ -180,6 +186,7 @@ def _settings(
         "lml_persist_streaming_url_spotify": False,
         "lml_persist_streaming_url_bandcamp": False,
         "lml_bulk_bandcamp_streaming_warm": bulk_bandcamp_warm,
+        "lml_bulk_spotify_streaming_warm": bulk_spotify_warm,
     }
     for service in enabled_services:
         flags[_FLAG_BY_SERVICE[service]] = True
@@ -987,25 +994,39 @@ class TestBulkSuppression:
 
 
 # ---------------------------------------------------------------------------
-# Bulk Bandcamp warm exemption (LML#1087, extending #1052): the dedicated
-# ``lml_bulk_bandcamp_streaming_warm`` flag lets a cold Bandcamp miss schedule
-# its bounded background warm on the otherwise-suppressed /lookup/bulk path, so
-# a brand-new/rotation NON-LIBRARY (rowless) album gets a DIRECT Bandcamp URL
-# warmed into the cache instead of Backend-Service synthesizing a
-# bandcamp.com/search?q= fallback. Scoped to rowless (item.id == 0) items only —
-# library albums already get Bandcamp via the offline #1069 drain, so warming
-# them at runtime (1 req/s) would re-introduce the hours-long serialized backfill
-# the bandcamp=None pin guarded against. Mirrors #1052's rowless-only Spotify
-# precedent. Default-off (ships dark, gated on the BS#642 backfill drain). The
-# exemption is Bandcamp-specific and does NOT touch Apple/Spotify bulk behavior.
+# Bulk ROWLESS warm exemption (LML#1052 for Spotify, LML#1087 for Bandcamp): a
+# per-service dedicated flag lets a cold miss schedule its bounded background
+# warm on the otherwise-suppressed /lookup/bulk path, so a NON-LIBRARY (rowless)
+# album gets a DIRECT URL warmed into the cache instead of Backend-Service
+# synthesizing a keyword-search fallback on every future play of the same
+# (artist, album). Scoped to rowless (item.id == 0) items only — library albums
+# are already covered by the offline drains (#1069 Bandcamp, #831 Spotify), so
+# warming them at request time would re-introduce the serialized backfill the
+# bulk suppression exists to prevent. Both flags ship default-off (gated on the
+# BS#642 backfill drain) and are INDEPENDENT knobs: one service's flag must never
+# exempt another's, and Apple (which has its own synchronous probe on this path)
+# is never exempt. The TRIGGERING response still returns null either way — the
+# warm is off the response path by design (#1052's self-heal boundary); the yield
+# accrues to the next lookup of the same (artist, album).
 # ---------------------------------------------------------------------------
+
+# (storage key, the ``_settings`` kwarg backing that service's dedicated bulk
+# flag). A future exempt service (YouTube Music, #1103) is one more row here and
+# one more row in the module-level mapping the post-process consults.
+_BULK_ROWLESS_WARM_CASES = [
+    pytest.param("spotify_album", "bulk_spotify_warm", id="spotify"),
+    pytest.param("bandcamp", "bulk_bandcamp_warm", id="bandcamp"),
+]
 
 
 @pytest.mark.asyncio
-class TestBulkBandcampWarmExemption:
-    async def test_flag_on_rowless_bandcamp_miss_enqueues_warm_despite_suppression(self):
+@pytest.mark.parametrize(("service", "flag_kwarg"), _BULK_ROWLESS_WARM_CASES)
+class TestBulkRowlessWarmExemption:
+    async def test_flag_on_rowless_miss_enqueues_warm_despite_suppression(
+        self, service, flag_kwarg
+    ):
         # The load-bearing behavior: suppress_warm is set (bulk), but for a
-        # ROWLESS item with the dedicated flag on, a genuine Bandcamp miss
+        # ROWLESS item with this service's dedicated flag on, a genuine miss
         # schedules the warm anyway — projecting cache_miss_enqueued (not
         # cache_miss_unwarmed).
         update = _blank_update()
@@ -1018,103 +1039,156 @@ class TestBulkBandcampWarmExemption:
             patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             result = await _run(
-                update, settings=_settings("bandcamp", bulk_bandcamp_warm=True), is_rowless=True
+                update, settings=_settings(service, **{flag_kwarg: True}), is_rowless=True
             )
             assert len(warm_mod._background_tasks) == 1
             await _drain_background_tasks()
 
         assert not warm_mod._background_tasks
         assert not warm_mod._streaming_warm_in_flight
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get("streaming_url.persistent_lookup.cache_miss_enqueued.bandcamp") is True
-        assert calls.get("streaming_url.persistent_lookup.cache_miss_unwarmed.bandcamp") is None
-        assert result == {"bandcamp": StreamingResolutionStatus.unresolved}
-
-    async def test_flag_on_nonrowless_library_item_stays_suppressed(self):
-        # The guard the #1087 review added: a NON-rowless (library, id != 0) item
-        # must NOT trip the exemption even with the flag on — library albums are
-        # warmed by the offline #1069 drain, so a runtime 1-req/s warm per bulk
-        # miss would re-create the ~65k-album serialized backfill the bulk
-        # suppression exists to prevent. Suppressed => cache_miss_unwarmed, no
-        # warm.
-        update = _blank_update()
-        scope, transaction = _sentry_scope()
-        set_suppress_streaming_warm(True)
-
-        with (
-            _patch_cache_peek(None),
-            _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
-        ):
-            await _run(
-                update, settings=_settings("bandcamp", bulk_bandcamp_warm=True), is_rowless=False
-            )
-
-        resolve.assert_not_called()
-        assert not warm_mod._background_tasks
-        assert not warm_mod._streaming_warm_in_flight
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get("streaming_url.persistent_lookup.cache_miss_unwarmed.bandcamp") is True
-
-    async def test_flag_off_bandcamp_stays_suppressed_and_inert(self):
-        # Bandcamp client present in ``clients`` and its per-service flag on, and
-        # even a ROWLESS item — but with the dedicated bulk flag OFF the
-        # suppression still applies: no live probe, no background warm — exactly
-        # today's bulk behavior. The flag dominates the rowless signal.
-        update = _blank_update()
-        scope, transaction = _sentry_scope()
-        set_suppress_streaming_warm(True)
-
-        with (
-            _patch_cache_peek(None),
-            _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
-        ):
-            await _run(
-                update, settings=_settings("bandcamp", bulk_bandcamp_warm=False), is_rowless=True
-            )
-
-        resolve.assert_not_called()
-        assert not warm_mod._background_tasks
-        assert not warm_mod._streaming_warm_in_flight
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get("streaming_url.persistent_lookup.cache_miss_unwarmed.bandcamp") is True
-
-    @pytest.mark.parametrize("service", ["apple_music_album", "spotify_album"])
-    async def test_flag_on_does_not_exempt_apple_or_spotify(self, service):
-        # The exemption is Bandcamp-only: even with the bulk-Bandcamp flag on, a
-        # suppressed Apple/Spotify miss still does cache-read-fill only (no warm).
-        update = _blank_update()
-        scope, transaction = _sentry_scope()
-        set_suppress_streaming_warm(True)
-
-        with (
-            _patch_cache_peek(None),
-            _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
-        ):
-            await _run(update, settings=_settings(service, bulk_bandcamp_warm=True))
-
-        resolve.assert_not_called()
-        assert not warm_mod._background_tasks
-        assert not warm_mod._streaming_warm_in_flight
         # Sentry keys use the storage key (``spotify_album``), not the catalog key.
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_enqueued.{service}") is True
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is None
+        # The warm is off the response path: the triggering pass still returns
+        # no URL for this service (#1052's AC — do not assert otherwise).
+        assert update[_CASES[service]["url_field"]] is None
+        catalog_key = _SERVICE_BY_STORAGE_KEY[service].catalog_key
+        assert result == {catalog_key: StreamingResolutionStatus.unresolved}
+
+    async def test_flag_on_nonrowless_library_item_stays_suppressed(self, service, flag_kwarg):
+        # The guard the #1087 review added, held for every exempt service: a
+        # NON-rowless (library, id != 0) item must NOT trip the exemption even
+        # with the flag on — library albums are warmed by the offline drains, so
+        # a runtime warm per bulk miss would re-create the serialized backfill the
+        # bulk suppression exists to prevent. Suppressed => cache_miss_unwarmed,
+        # no warm.
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+        set_suppress_streaming_warm(True)
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            await _run(update, settings=_settings(service, **{flag_kwarg: True}), is_rowless=False)
+
+        resolve.assert_not_called()
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
 
-    async def test_flag_only_consulted_under_suppression(self):
-        # The interactive /lookup path (no suppression) already warms Bandcamp on
-        # a miss; the dedicated flag must not gate that path — a Bandcamp miss
-        # with suppression OFF warms regardless of the flag's value.
+    async def test_flag_off_stays_suppressed_and_inert(self, service, flag_kwarg):
+        # The client is present in ``clients`` and the per-service persist flag is
+        # on, and the item is even ROWLESS — but with the dedicated bulk flag OFF
+        # the suppression still applies: no live probe, no background warm —
+        # exactly today's bulk behavior. The flag dominates the rowless signal.
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+        set_suppress_streaming_warm(True)
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            await _run(update, settings=_settings(service, **{flag_kwarg: False}), is_rowless=True)
+
+        resolve.assert_not_called()
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
+
+    async def test_master_kill_switch_restores_suppression(self, service, flag_kwarg):
+        # AND-gate term 1 (``lml_persist_streaming_urls``): the master kill switch
+        # short-circuits the whole post-process before the cache peek, so the
+        # dedicated flag cannot revive a warm on its own.
+        update = _blank_update()
+        set_suppress_streaming_warm(True)
+
+        with _patch_cache_peek(None) as peek, _patch_resolver() as resolve:
+            result = await _run(
+                update,
+                settings=_settings(service, master=False, **{flag_kwarg: True}),
+                is_rowless=True,
+            )
+
+        peek.assert_not_called()
+        resolve.assert_not_called()
+        assert not warm_mod._background_tasks
+        assert result == {}
+
+    async def test_per_service_kill_switch_restores_suppression(self, service, flag_kwarg):
+        # AND-gate term 2 (``lml_persist_streaming_url_<service>``): with the
+        # per-service persist flag off the service never enters ``active``, so the
+        # dedicated bulk flag has nothing to exempt. Apple is enabled here only to
+        # keep the post-process past its early return.
+        update = _blank_update()
+        set_suppress_streaming_warm(True)
+
+        with _patch_cache_peek(None), _patch_resolver() as resolve:
+            result = await _run(
+                update,
+                settings=_settings("apple_music_album", **{flag_kwarg: True}),
+                is_rowless=True,
+            )
+
+        resolve.assert_not_called()
+        assert not warm_mod._background_tasks
+        assert _SERVICE_BY_STORAGE_KEY[service].catalog_key not in result
+
+    async def test_flag_only_consulted_under_suppression(self, service, flag_kwarg):
+        # The interactive /lookup path (no suppression) already warms on a miss;
+        # the dedicated flag must not gate that path — a miss with suppression OFF
+        # warms regardless of the flag's value.
         update = _blank_update()
         with (
             _patch_cache_peek(None),
             _patch_resolver(return_value=ResolveOutcome(url=None, source="live_miss")),
         ):
-            await _run(update, settings=_settings("bandcamp", bulk_bandcamp_warm=False))
+            await _run(update, settings=_settings(service, **{flag_kwarg: False}))
             assert len(warm_mod._background_tasks) == 1
             await _drain_background_tasks()
         assert not warm_mod._background_tasks
+
+
+@pytest.mark.asyncio
+class TestBulkRowlessWarmExemptionIsPerService:
+    @pytest.mark.parametrize(
+        ("service", "other_flag_kwarg"),
+        [
+            pytest.param("spotify_album", "bulk_bandcamp_warm", id="bandcamp-flag-vs-spotify"),
+            pytest.param("bandcamp", "bulk_spotify_warm", id="spotify-flag-vs-bandcamp"),
+            pytest.param("apple_music_album", "bulk_bandcamp_warm", id="bandcamp-flag-vs-apple"),
+            pytest.param("apple_music_album", "bulk_spotify_warm", id="spotify-flag-vs-apple"),
+        ],
+    )
+    async def test_another_services_flag_does_not_exempt(self, service, other_flag_kwarg):
+        # The dedicated flags are independent: turning one on must not lift the
+        # bulk suppression for any other service — the #1052 regression guard on
+        # #1087's Bandcamp behavior and vice versa. Apple is never exempt at all
+        # (it has its own synchronous probe on the enrichment path).
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+        set_suppress_streaming_warm(True)
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            await _run(
+                update, settings=_settings(service, **{other_flag_kwarg: True}), is_rowless=True
+            )
+
+        resolve.assert_not_called()
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
 
 
 # ---------------------------------------------------------------------------
