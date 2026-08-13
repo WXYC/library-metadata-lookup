@@ -168,8 +168,11 @@ def should_suppress_streaming_warm() -> bool:
 # suppression. A service ABSENT here is never exempt — Apple Music is absent
 # because it already has its own synchronous probe on the enrichment path. One
 # row per service, deliberately: the flags are independent kill switches, so one
-# service's rollout can never widen another's blast radius, and a future service
-# (YouTube Music, LML#1103) is one row here plus its ``Settings`` field.
+# service's rollout can never widen another's blast radius. A row here is NOT
+# sufficient to onboard a service: it is only ever consulted for services in
+# ``STREAMING_URL_CACHE_CONFIG`` whose ``url_field`` is still None at this point.
+# YouTube Music satisfies neither today (``item.py`` pre-fills a templated
+# search URL), so a row for it would be a silent no-op — see LML#1103.
 _BULK_ROWLESS_WARM_FLAG_BY_SERVICE: dict[StreamingService, str] = {
     StreamingService.SPOTIFY: "lml_bulk_spotify_streaming_warm",
     StreamingService.BANDCAMP: "lml_bulk_bandcamp_streaming_warm",
