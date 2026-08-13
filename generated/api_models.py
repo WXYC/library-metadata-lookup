@@ -2598,6 +2598,25 @@ class AppConfig(BaseModel):
     posthogHost: str = Field(..., description="PostHog ingestion host")
     requestOMaticUrl: str = Field(..., description="Request-o-matic service URL for song requests")
     apiBaseUrl: str = Field(..., description="Backend API base URL")
+    donateUrl: str | None = Field(
+        None,
+        description="Canonical hosted donation page URL behind the \"Support the station\" entry point. Backend-Service serves `''` — never `null`, never an omitted key — whenever its `DONATE_URL` variable is unset (WXYC/Backend-Service#2111), so a client MUST treat an empty string exactly as it treats an absent field and fall through to its own fallback destination. That empty-string wire value is also why this carries no `format: uri`: `''` is a legitimate value here and would fail uri validation. An enabled entry point with an empty or otherwise unusable URL is a reachable server state, because `DONATE_URL` and `DONATE_ENABLED` are independent variables on one deploy — `donateEnabled` governs visibility alone and never implies this field is usable. A client that cannot resolve a usable destination from this field or from its own fallback MUST NOT render the entry point.\n",
+    )
+    donateEnabled: bool | None = Field(
+        None,
+        description='Whether clients should render the donate entry point. `false` hides it. The field carries no schema-level `default` on purpose, for the same reason as `BulkResolveLibrariesRequest.include_tracks`: `openapi-typescript` emits a default-bearing property as non-optional even when it is absent from `required`, which would arm the very decode-failure cascade both donate fields are kept optional to avoid. Absent therefore means "the producer predates this field", and each client applies its own bootstrap default — absence is NOT a kill switch and MUST NOT be read as one, so a client whose own default is "show" owns the validity of its fallback destination for that window. `false` is likewise a deploy-time switch rather than an instant one: `GET /config` is served `Cache-Control: public, max-age=3600` and clients may cache the decoded config for the life of a process, so an entry point can keep rendering for an hour or more after the variable flips. Anything needing a faster kill than that belongs at the destination, not here.\n',
+    )
+
+
+class AppSecrets(BaseModel):
+    discogsApiKey: str = Field(
+        ...,
+        description="Discogs API consumer key, for clients that call Discogs directly.",
+    )
+    discogsApiSecret: str = Field(
+        ...,
+        description="Discogs API consumer secret, for clients that call Discogs directly.",
+    )
 
 
 class TrackListItem(BaseModel):
