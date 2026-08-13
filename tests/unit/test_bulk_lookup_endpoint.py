@@ -507,6 +507,57 @@ class TestBulkLookupEndpoint:
         assert mock_lookup.await_args.kwargs.get("bandcamp") is sentinel
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("bulk_spotify_warm", [False, True])
+    async def test_bulk_always_forwards_spotify_client(
+        self, mock_db, mock_discogs, mock_settings, bulk_spotify_warm
+    ):
+        """LML#1052 precondition: the Spotify client flows into every per-item
+        ``perform_lookup`` **unconditionally** — unlike Bandcamp, which is pinned
+        to ``None`` behind its own flags above.
+
+        Spotify has no per-item live probe on this path; it is resolved by the
+        cache-first streaming-URL post-process, which the bulk suppression keeps
+        read-only while ``lml_bulk_spotify_streaming_warm`` is off. So injecting
+        it costs nothing with the flag off, and is what makes the flag *do*
+        anything when it is on: the post-process's ``active`` list skips any
+        service whose client is ``None``, so gating this dependency the way
+        Bandcamp is gated would silently make the flag a no-op in production with
+        nothing catching it.
+        """
+        from streaming.dependencies import get_spotify_client
+
+        sentinel = object()
+        flag_settings = mock_settings.model_copy(
+            update={"lml_bulk_spotify_streaming_warm": bulk_spotify_warm}
+        )
+        with (
+            override_deps(
+                app,
+                {
+                    get_library_db: mock_db,
+                    get_discogs_service: mock_discogs,
+                    get_posthog_client: None,
+                    get_settings: flag_settings,
+                    get_spotify_client: sentinel,
+                },
+            ),
+            patch(
+                "lookup.router.perform_lookup",
+                new_callable=AsyncMock,
+                return_value=_no_match_response(),
+            ) as mock_lookup,
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={"items": [{"artist": "Juana Molina", "album": "DOGA"}]},
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_count == 1
+        assert mock_lookup.await_args.kwargs.get("spotify") is sentinel
+
+    @pytest.mark.asyncio
     async def test_results_preserve_input_order(self, app_client):
         """Even with mixed match/no_match/error, response[i] corresponds to request[i]."""
 

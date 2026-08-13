@@ -136,13 +136,15 @@ the live ``/lookup`` path. Mirrors the bulk ``skip_cache`` ContextVar and the
 ``bandcamp=None`` pin — the offline warmer (#548) is the right tier for bulk
 cache fill. (``allow_release_resolution_fallback`` used to be a third always-off
 sibling here; since LML#920 it is a caller-controlled query flag, default off.
-The ``bandcamp=None`` pin is likewise now flag-gated: when
-``lml_bulk_bandcamp_streaming_warm`` is on, Bandcamp is injected and a cold miss
-on a ROWLESS (non-library) item is exempted from this suppression — see
-``_bulk_bandcamp_warm_exempt`` — so it warms even on bulk; library rows stay
-suppressed (the offline #1069 drain warms them); default off.) Backed by a
-ContextVar so setting it at the batch top propagates into each per-item task via
-the inherited context."""
+The suppression is likewise no longer absolute: a cold miss on a ROWLESS
+(non-library) item is exempted per-service by a dedicated default-off flag —
+``lml_bulk_spotify_streaming_warm`` (LML#1052) and
+``lml_bulk_bandcamp_streaming_warm`` (LML#1087), see
+``_bulk_rowless_warm_exempt`` — so those services warm even on bulk; library
+rows stay suppressed (the offline drains warm them). The ``bandcamp=None`` pin
+is part of the same gate: Bandcamp's client is only injected on bulk when its
+flag (or the LML#1098 live probe) is on.) Backed by a ContextVar so setting it
+at the batch top propagates into each per-item task via the inherited context."""
 
 
 def set_suppress_streaming_warm(suppress: bool) -> None:
@@ -160,47 +162,64 @@ def should_suppress_streaming_warm() -> bool:
     return _suppress_streaming_warm_var.get()
 
 
-def _bulk_bandcamp_warm_exempt(
+# Per-service dedicated kill switches for the bulk-path warm exemption: maps a
+# service to the ``Settings`` attribute that, when True, lets a ROWLESS
+# (non-library) cache miss schedule its background warm despite the /lookup/bulk
+# suppression. A service ABSENT here is never exempt — Apple Music is absent
+# because it already has its own synchronous probe on the enrichment path. One
+# row per service, deliberately: the flags are independent kill switches, so one
+# service's rollout can never widen another's blast radius, and a future service
+# (YouTube Music, LML#1103) is one row here plus its ``Settings`` field.
+_BULK_ROWLESS_WARM_FLAG_BY_SERVICE: dict[StreamingService, str] = {
+    StreamingService.SPOTIFY: "lml_bulk_spotify_streaming_warm",
+    StreamingService.BANDCAMP: "lml_bulk_bandcamp_streaming_warm",
+}
+
+
+def _bulk_rowless_warm_exempt(
     service: StreamingService, settings: Settings, *, is_rowless: bool
 ) -> bool:
     """Whether ``service`` may schedule a background warm despite bulk-path
     suppression.
 
-    Three AND-ed conditions: the service is Bandcamp, the item is **rowless**
-    (non-library, ``item.id == ROWLESS_LIBRARY_ID``), and
-    ``lml_bulk_bandcamp_streaming_warm`` is on. The master
+    Two AND-ed conditions: the item is **rowless** (non-library, ``item.id ==
+    ROWLESS_LIBRARY_ID``) and the service's dedicated flag in
+    ``_BULK_ROWLESS_WARM_FLAG_BY_SERVICE`` is on. The master
     (``lml_persist_streaming_urls``) and per-service
-    (``lml_persist_streaming_url_bandcamp``) kill switches are already enforced
+    (``lml_persist_streaming_url_*``) kill switches are already enforced
     upstream — the master short-circuits the whole post-process; the per-service
     flag gates entry into ``active`` — so the flag here is the third kill-switch
-    term on top of them.
+    term on top of them. Both flags ship default-off, gated on the BS#642
+    backfill drain; flipping one off restores exactly today's bulk behavior for
+    that service and touches nothing else (rollout prose: ``docs/env-vars.md``).
 
-    Why rowless-only: library albums are already warmed with direct Bandcamp
-    URLs by the offline #1069 drain, so warming them again at request time would
-    be pure redundant load — and at Bandcamp's 1 req/s limit a bulk pass over the
-    ~65k library albums the drain hasn't covered would serialize into an
-    hours-long backfill that starves the interactive path, exactly what the
-    ``bandcamp=None`` pin guarded against. Scoping to rowless items (the rotation
-    / non-library gap this targets) mirrors #1052's rowless-only Spotify
-    precedent.
+    Why rowless-only: library albums are already warmed by the offline drains
+    (#1069 Bandcamp, #831 Spotify), so a request-time warm is redundant load —
+    and a bulk pass over the albums a drain hasn't covered would serialize into
+    an hours-long backfill that starves the interactive path (every warm shares
+    ``LML_STREAMING_WARM_CONCURRENCY``), exactly what the bulk suppression
+    guards against. Rowless items are the non-library gap no drain can reach by
+    construction.
 
-    Rationale (LML#1052 extension): #1052 lifted the bulk warm suppression for
-    Spotify only (rowless non-library items) and deliberately kept Bandcamp
-    pinned off, citing #548's finding that runtime Bandcamp warming has near-zero
-    identity-reconciliation yield. This extends that to Bandcamp on two grounds
-    the identity-yield lens misses: the resolver is fast (~1.4s, well under the
-    9s Bandcamp warm ceiling), and a missing DIRECT Bandcamp URL is a visible
-    user-facing symptom on brand-new/rotation plays (the freeform-station core
-    case) — Backend-Service otherwise persists a bandcamp.com/search?q= fallback.
-    Kept default-off and independently flagged so it can be enabled only after
-    the BS#642 backfill drain completes; flipping the flag off restores exactly
-    today's bulk behavior.
+    Rationale, Spotify (LML#1052): the bulk path returns a null ``spotify_url``
+    for a resolved non-library playcut and Backend-Service persists a synthesized
+    keyword-search URL in its place, while the interactive ``/lookup`` path warms
+    that same population unsuppressed (~7.6k identity mints/month) — so this
+    reuses an already-hardened warm rather than adding a probe. Note what it does
+    NOT fix: the warm is off the response path, so the triggering pass still
+    returns null and (per BS#1747) is never re-asked — the yield accrues to the
+    NEXT lookup of the same normalized ``(artist, album)``.
+
+    Rationale, Bandcamp (LML#1087): #1052's original scoping kept Bandcamp
+    pinned off, citing #548's near-zero runtime identity-reconciliation yield.
+    #1087 admitted it on two grounds that lens misses: the resolver is fast
+    (~1.4s, well under the 9s Bandcamp warm ceiling), and a missing DIRECT
+    Bandcamp URL is a visible user-facing symptom on brand-new/rotation plays.
     """
-    return (
-        is_rowless
-        and service is StreamingService.BANDCAMP
-        and settings.lml_bulk_bandcamp_streaming_warm
-    )
+    if not is_rowless:
+        return False
+    flag = _BULK_ROWLESS_WARM_FLAG_BY_SERVICE.get(service)
+    return flag is not None and bool(getattr(settings, flag, False))
 
 
 # Default per-service wall-clock ceiling for a single live probe in the
@@ -351,11 +370,12 @@ async def apply_streaming_url_postprocess(
             and the per-service ``cfg.flag_setting`` flags (AND-gated).
         is_rowless: Whether this item is a rowless / non-library resolution
             (``item.id == ROWLESS_LIBRARY_ID``). Consulted only under bulk-path
-            warm suppression, and only for Bandcamp: it is the third AND-gate
-            term (with ``lml_bulk_bandcamp_streaming_warm``) that lets a rowless
-            Bandcamp miss warm on the bulk path while a library row stays
+            warm suppression, and only for the services carrying a dedicated
+            bulk-warm flag (``_BULK_ROWLESS_WARM_FLAG_BY_SERVICE``: Spotify per
+            LML#1052, Bandcamp per LML#1087): it is the AND-gate term that lets a
+            rowless miss warm on the bulk path while a library row stays
             suppressed. Irrelevant off the bulk path (no suppression to lift).
-            See ``_bulk_bandcamp_warm_exempt``.
+            See ``_bulk_rowless_warm_exempt``.
 
     Returns:
         LML#1053: the per-service resolution verdict for every service this
@@ -448,20 +468,21 @@ async def apply_streaming_url_postprocess(
             # couldn't-check, unlike the fresh-error-row case below.
             _project_sentry(storage_key, "cache_miss_recent")
             statuses[service.catalog_key] = StreamingResolutionStatus.absent
-        elif suppress_warm and not _bulk_bandcamp_warm_exempt(
+        elif suppress_warm and not _bulk_rowless_warm_exempt(
             service, settings, is_rowless=is_rowless
         ):
             # Bulk path: cache read-fill only. The offline warmer owns bulk fill;
             # spawning a warm here would decouple the drain's probes from the
             # request and starve the live /lookup path's own warms. No warm
             # means no confirmed verdict this request — transient, not terminal.
-            # Exception: a ROWLESS (non-library) Bandcamp miss, when
-            # lml_bulk_bandcamp_streaming_warm is on, is exempted from this
-            # suppression (see _bulk_bandcamp_warm_exempt) and falls through to
-            # the enqueue branch below. Library rows stay suppressed here — the
-            # offline #1069 drain already warms them. A fresh LML#1121 error
-            # row (below) is gated by this SAME bulk check — an outage during
-            # a bulk drain must not spawn request-time warms either.
+            # Exception: a ROWLESS (non-library) miss on a service whose
+            # dedicated bulk flag is on (Spotify per LML#1052, Bandcamp per
+            # LML#1087) is exempted from this suppression (see
+            # _bulk_rowless_warm_exempt) and falls through to the enqueue branch
+            # below. Library rows stay suppressed here — the offline drains
+            # already warm them. A fresh LML#1121 error row (below) is gated by
+            # this SAME bulk check — an outage during a bulk drain must not
+            # spawn request-time warms either.
             # LML#1121 FIX 7: project cache_error_recent AND the specific
             # sub-outcome (cache_miss_unwarmed) rather than letting the former
             # mask the latter — docs/env-vars.md designates cache_miss_unwarmed/
@@ -473,8 +494,8 @@ async def apply_streaming_url_postprocess(
             _project_sentry(storage_key, "cache_miss_unwarmed")
             statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
         else:
-            # Genuine miss (absent/stale), a rowless Bandcamp miss on the bulk
-            # path exempted from suppression, OR (LML#1115) a fresh error row
+            # Genuine miss (absent/stale), a rowless miss on the bulk path
+            # exempted from suppression, OR (LML#1115) a fresh error row
             # still inside its short error_ttl: all three defer the live probe
             # + UPSERT + mint to a bounded, deduplicated background task. A
             # fresh error row warms HERE unlike the known-recent-GENUINE-miss
