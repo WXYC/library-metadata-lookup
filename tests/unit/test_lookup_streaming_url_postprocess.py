@@ -62,6 +62,7 @@ import httpx
 import pytest
 
 from clients.bandcamp import BandcampClient
+from config.settings import Settings
 from entity.sources import PgSource
 from entity.store import EntityStore
 from entity.streaming_url_cache import ResolveOutcome
@@ -1153,6 +1154,27 @@ class TestBulkRowlessWarmExemption:
             assert len(warm_mod._background_tasks) == 1
             await _drain_background_tasks()
         assert not warm_mod._background_tasks
+
+
+class TestBulkRowlessWarmFlagMapping:
+    """Structural guard on ``_BULK_ROWLESS_WARM_FLAG_BY_SERVICE`` itself.
+
+    Sibling of ``test_every_flag_setting_is_a_real_settings_attribute`` below,
+    which makes the same guarantee for ``STREAMING_URL_CACHE_CONFIG``.
+    """
+
+    def test_every_mapped_flag_name_exists_on_settings(self):
+        # The mapping addresses flags by attribute NAME, resolved with getattr —
+        # so a typo in a future row (or a renamed Settings field) would fail
+        # CLOSED and silently, leaving that service permanently unexempt with no
+        # error to trace. Neither mypy nor the behavioral tests above can catch
+        # that: they only ever exercise names that happen to be spelled right.
+        # Checked against model_fields rather than a Settings() instance so the
+        # guard does not depend on the ambient env parsing cleanly.
+        for service, flag in mod._BULK_ROWLESS_WARM_FLAG_BY_SERVICE.items():
+            assert flag in Settings.model_fields, (
+                f"{service} maps to Settings.{flag}, which does not exist"
+            )
 
 
 @pytest.mark.asyncio
