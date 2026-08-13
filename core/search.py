@@ -82,6 +82,14 @@ Mirrored as the ``LookupState.search_type`` default and pinned to
 requires a wxyc-shared contract bump.
 """
 
+SEARCH_TYPE_FALLBACK = "fallback"
+"""Search type for "the artist was found, the song was not confirmed on any of it".
+
+Named as a constant because step 3b writes it too (LML#1184), not just
+:func:`get_search_type_from_state`. Same wire-contract pinning as
+:data:`SEARCH_TYPE_NONE`: ``generated.api_models.SearchType.fallback``.
+"""
+
 
 def resolve_positive_int_env(env_var: str, default: int) -> int:
     """Read a positive integer from ``env_var``, falling back to ``default`` with a WARN.
@@ -1053,7 +1061,7 @@ def get_search_type_from_state(state: SearchState) -> str:
     last_strategy = state.strategies_tried[-1]
 
     if last_strategy == SearchStrategyType.ARTIST_PLUS_ALBUM:
-        return "fallback" if state.song_not_found else "direct"
+        return SEARCH_TYPE_FALLBACK if state.song_not_found else "direct"
     elif last_strategy == SearchStrategyType.SWAPPED_INTERPRETATION:
         return "alternative"
     elif last_strategy == SearchStrategyType.TRACK_ON_COMPILATION:

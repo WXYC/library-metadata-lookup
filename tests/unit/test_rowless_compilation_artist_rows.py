@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core.search import SEARCH_TYPE_FALLBACK
 from lookup.matching import MAX_SEARCH_RESULTS
 from lookup.orchestrator import LookupState, _step_validate_tracks
 from lookup.validation import apply_track_validation_cascade
@@ -184,6 +185,70 @@ class TestCascadeRowlessCompilationTier:
         assert result.library_results[0] is rowless
         assert result.library_results[1:] == stash[: MAX_SEARCH_RESULTS - 1]
 
+    async def test_rowless_lane_bounds_the_discogs_probe_input(self):
+        """The new lane must not fan out a live probe over the whole un-truncated stash.
+
+        This shape reached step 3b never at all before LML#1184, so every probe here
+        is new load on a hot path — and the branch that consumes the verdict is by
+        construction the "nothing confirmed" one, so the fan-out is paid on every
+        firing. The pre-existing shelved-comp lane keeps the full list.
+        """
+        stash = [
+            make_library_item(id=1000 + n, artist=ARTIST, title=f"Album {n}") for n in range(40)
+        ]
+
+        with patch(
+            "lookup.validation.filter_results_by_track_validation",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as mock_validate:
+            await apply_track_validation_cascade(
+                real_results=[],
+                library_results=[_rowless_comp_item()],
+                found_on_compilation=True,
+                song_not_found=False,
+                discogs_titles={},
+                artist_fallback_results=stash,
+                song=SONG,
+                artist=ARTIST,
+                match_artist=ARTIST,
+                db=object(),
+                discogs_service=object(),
+                allow_release_resolution_fallback=True,
+            )
+
+        assert mock_validate.await_args.args[0] == stash[:MAX_SEARCH_RESULTS]
+
+    async def test_shelved_lane_still_validates_the_whole_stash(self):
+        """The pre-existing lane's probe budget is unchanged — narrowing it here
+        would be an unrelated behavior change riding along with a bug fix."""
+        shelved_comp = make_library_item(id=50018, artist="Various Artists - Hiphop", title="Comp")
+        stash = [
+            make_library_item(id=1000 + n, artist=ARTIST, title=f"Album {n}") for n in range(40)
+        ]
+
+        with patch(
+            "lookup.validation.filter_results_by_track_validation",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as mock_validate:
+            await apply_track_validation_cascade(
+                real_results=[shelved_comp],
+                library_results=[shelved_comp],
+                found_on_compilation=True,
+                song_not_found=False,
+                discogs_titles={},
+                artist_fallback_results=stash,
+                song=SONG,
+                artist=ARTIST,
+                match_artist=ARTIST,
+                db=object(),
+                discogs_service=object(),
+                allow_release_resolution_fallback=True,
+            )
+
+        assert mock_validate.await_args.args[0] == stash
+
     async def test_shelved_compilation_with_unconfirmed_fallback_is_untouched(self):
         """Regression guard: the append is scoped to the row-less case.
 
@@ -250,6 +315,12 @@ class TestStepValidateTracksGate:
         assert state.library_results == [rowless, *shelved]
         assert state.song_not_found is True
         assert state.found_on_compilation is False
+        # search_type must move with the verdict. It is what consumers actually
+        # gate on — Backend-Service's `isTrustedLmlTrackContextMatch` keys on
+        # `search_type in {direct, compilation}` and reads neither of the two
+        # flags above — so leaving it at "compilation" would tell BS to trust,
+        # as a confirmed track-context match, rows we just failed to confirm.
+        assert state.search_type == SEARCH_TYPE_FALLBACK
 
     async def test_rowless_hit_without_a_stash_still_skips(self):
         """Nothing to redeem: no cascade, no Discogs probes for an empty candidate list."""
@@ -276,6 +347,7 @@ class TestStepValidateTracksGate:
             found_on_compilation=True,
             song_not_found=False,
             artist_fallback_results=shelved,
+            search_type="compilation",
         )
 
         with patch(
@@ -291,3 +363,5 @@ class TestStepValidateTracksGate:
             await _step_validate_tracks(_parsed_stub(), state, _services_stub())
 
         assert state.found_on_compilation is True
+        # Not overturned, so search_type is left exactly as the pipeline stamped it.
+        assert state.search_type == "compilation"
