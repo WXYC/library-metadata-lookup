@@ -728,7 +728,8 @@ async def _step_validate_tracks(
 
     READS: ``library_results``, ``found_on_compilation``, ``song_not_found``,
     ``discogs_titles``, ``artist_fallback_results``, ``unranked_fallback_candidates``.
-    WRITES: ``library_results``, ``song_not_found``, ``discogs_titles``.
+    WRITES: ``library_results``, ``song_not_found``, ``discogs_titles``,
+    ``found_on_compilation``.
 
     Sequences the gate (should step 3b run at all, timed as "track_validation")
     and delegates the promotion/narrowing policy — per-result validation, the
@@ -746,14 +747,28 @@ async def _step_validate_tracks(
     of the truncated ``library_results``, so a high-rowid album can still
     reach ``filter_results_by_track_validation`` — safe now that its fan-out
     is bounded. A confirmed direct match skips the widen; no benefit to it.
+
+    LML#1184: the compilation tier validates ``artist_fallback_results``, not
+    ``library_results``, so it does not need a real row in the latter to run.
+    A row-less compilation hit leaves ``real_results`` empty *by construction*
+    (its only row is the id=0 carry-through), which used to veto the whole step
+    and strand the artist's own shelved albums in the stash. That shape gets its
+    own gate below.
     """
     real_results = [r for r in state.library_results if r.id != 0]
     if state.song_not_found and not state.found_on_compilation:
         widened = [r for r in state.unranked_fallback_candidates if r.id != 0]
         if len(widened) > len(real_results):
             real_results = widened
-    should_validate = bool(real_results and parsed.song and parsed.artist) and (
-        not state.found_on_compilation or bool(state.artist_fallback_results)
+    rowless_compilation_hit = (
+        state.found_on_compilation and not real_results and bool(state.artist_fallback_results)
+    )
+    should_validate = bool(parsed.song and parsed.artist) and (
+        rowless_compilation_hit
+        or (
+            bool(real_results)
+            and (not state.found_on_compilation or bool(state.artist_fallback_results))
+        )
     )
     if not should_validate:
         return
@@ -775,6 +790,8 @@ async def _step_validate_tracks(
     state.library_results = result.library_results
     state.song_not_found = result.song_not_found
     state.discogs_titles = result.discogs_titles
+    if result.found_on_compilation is not None:
+        state.found_on_compilation = result.found_on_compilation
 
 
 async def _step_populate_streaming_status(

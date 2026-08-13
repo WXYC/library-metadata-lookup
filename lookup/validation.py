@@ -340,6 +340,17 @@ class Step3bResult:
     song_not_found: bool
     discogs_titles: dict[int, ResolvedRelease]
 
+    found_on_compilation: bool | None = None
+    """Desired ``state.found_on_compilation`` after the caller rebinds this.
+
+    ``None`` means "leave alone" — the same convention
+    :attr:`core.search.Outcome.song_not_found_after` uses, and the value every
+    tier but one returns, because the cascade narrows and promotes *within* a
+    compilation verdict the search pipeline already reached. The exception is
+    the LML#1184 row-less append, which is the one tier that can invalidate
+    that verdict: see :func:`apply_track_validation_cascade`.
+    """
+
 
 async def apply_track_validation_cascade(
     *,
@@ -368,11 +379,15 @@ async def apply_track_validation_cascade(
 
     On-a-compilation tier: validates the artist-fallback rows saved before
     ``TRACK_ON_COMPILATION`` replaced them, and prepends any confirmed matches
-    ahead of the compilation results.
+    ahead of the compilation results. When nothing confirms *and* the matched
+    compilation is row-less (LML#1184), the stashed rows are appended behind it
+    rather than dropped, and ``Step3bResult.found_on_compilation`` comes back
+    ``False`` — the one case where this cascade overturns the search pipeline's
+    compilation verdict.
 
     Callers must apply the same gate ``_step_validate_tracks`` uses before
-    invoking this (``real_results`` non-empty and both ``song`` and ``artist``
-    typed, and — on the compilation tier — a non-empty
+    invoking this (both ``song`` and ``artist`` typed, plus either a non-empty
+    ``real_results`` or — on the compilation tier — a non-empty
     ``artist_fallback_results``); this function does not re-check it.
     """
     if not found_on_compilation:
@@ -424,9 +439,39 @@ async def apply_track_validation_cascade(
     validated = await filter_results_by_track_validation(
         artist_fallback_results, song, artist, discogs_service
     )
+    compilation_ids = {r.id for r in library_results}
     if validated:
-        compilation_ids = {r.id for r in library_results}
         merged = [r for r in validated if r.id not in compilation_ids]
         merged.extend(library_results)
         return Step3bResult(merged, song_not_found, discogs_titles)
+
+    # LML#1184: nothing confirmed, and the compilation that matched is one WXYC
+    # does not shelve — every row here is the id=0 carry-through (LML#628/#631).
+    # Dropping the stash now would answer "what does WXYC have by this artist?"
+    # with silence about albums that are physically on the shelf, so append them
+    # behind the row-less row instead. Failure to *confirm* the track on those
+    # albums is not evidence against the albums; it is frequently just a
+    # misspelled request, and the artist rows are what a DJ can act on either
+    # way. The comp keeps position 0 so top-1 artwork still binds to the release
+    # that actually carries the track (LML#628/#630).
+    #
+    # Scoped to the row-less case on purpose: when the matched compilation *is*
+    # shelved, the DJ can pull it, the response is already actionable, and an
+    # unconfirmed fallback stays suppressed exactly as before.
+    rowless_only = not any(r.id != 0 for r in library_results)
+    if rowless_only and artist_fallback_results:
+        merged = list(library_results)
+        merged.extend(r for r in artist_fallback_results if r.id not in compilation_ids)
+        # The stash is un-truncated (``search_library_with_fallback`` fetches at
+        # ``_FETCH_LIMIT`` = 10x this cap), and every row appended here costs a
+        # per-item artwork fetch, streaming probe and identity resolve
+        # downstream. The confirmed branch above inherits the same cap from
+        # ``filter_results_by_track_validation``; this one has to apply it.
+        merged = merged[:MAX_SEARCH_RESULTS]
+        # The only row carrying the track is unshelved, so the shelf-facing
+        # reading of "Found <song> on:" is false. Hand the caller the same
+        # song-not-found framing this request already gets when Discogs finds
+        # nothing at all — now with the artist's albums under it.
+        return Step3bResult(merged, True, discogs_titles, found_on_compilation=False)
+
     return Step3bResult(library_results, song_not_found, discogs_titles)
