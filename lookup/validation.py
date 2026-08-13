@@ -436,8 +436,24 @@ async def apply_track_validation_cascade(
     # Compilation found, but the artist's own album may also contain the
     # track. Validate the artist fallback results (saved before compilation
     # search replaced them) and prepend any confirmed matches.
+    rowless_only = not any(r.id != 0 for r in library_results)
+    # LML#1184 admitted a shape that previously reached step 3b never at all, so
+    # this leg goes from zero Discogs calls to a live probe per candidate. The
+    # stash is un-truncated (``_FETCH_LIMIT`` = 10x ``MAX_SEARCH_RESULTS``), and
+    # the branch that consumes the verdict is by construction the "nothing
+    # confirmed" one, so the full fan-out would be paid on *every* firing —
+    # 15-24 calls and 16-17s of wall-time per ``lookup/concurrency.py``, on a
+    # hot path the post-launch-hardening project exists to make faster.
+    # Bounding the input costs recall only for a confirmation sitting deeper
+    # than ``MAX_SEARCH_RESULTS`` in the stash; that is the trade this makes,
+    # deliberately. The pre-existing shelved-comp lane keeps the full list —
+    # its cost is not new and narrowing it here would be an unrelated behavior
+    # change.
+    fallback_candidates = (
+        artist_fallback_results[:MAX_SEARCH_RESULTS] if rowless_only else artist_fallback_results
+    )
     validated = await filter_results_by_track_validation(
-        artist_fallback_results, song, artist, discogs_service
+        fallback_candidates, song, artist, discogs_service
     )
     compilation_ids = {r.id for r in library_results}
     if validated:
@@ -458,7 +474,6 @@ async def apply_track_validation_cascade(
     # Scoped to the row-less case on purpose: when the matched compilation *is*
     # shelved, the DJ can pull it, the response is already actionable, and an
     # unconfirmed fallback stays suppressed exactly as before.
-    rowless_only = not any(r.id != 0 for r in library_results)
     if rowless_only and artist_fallback_results:
         merged = list(library_results)
         merged.extend(r for r in artist_fallback_results if r.id not in compilation_ids)

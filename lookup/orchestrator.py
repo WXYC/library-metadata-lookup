@@ -31,6 +31,7 @@ from config.settings import get_settings
 from core.event_loop_lag import get_event_loop_lag_ms
 from core.exceptions import BreakerOpenError
 from core.search import (
+    SEARCH_TYPE_FALLBACK,
     SEARCH_TYPE_NONE,
     execute_search_pipeline,
     get_search_type_from_state,
@@ -279,9 +280,11 @@ class LookupState:
 
     found_on_compilation: bool = False
     """True when TRACK_ON_COMPILATION surfaced the track on a compilation.
-    Written by the search pipeline (step 3); routes track validation (3b),
-    threads into artwork fetch (4) and enrichment (4b), and shapes the context
-    message (5); reported on the response
+    Written by the search pipeline (step 3) and overturned to False by track
+    validation (3b) when the matched compilation is row-less — WXYC doesn't
+    shelve it, so no returned row carries the track (LML#1184); routes track
+    validation (3b), threads into artwork fetch (4) and enrichment (4b), and
+    shapes the context message (5); reported on the response
     (``LookupResponse.found_on_compilation``)."""
 
     discogs_titles: dict[int, ResolvedRelease] = field(default_factory=dict)
@@ -292,7 +295,10 @@ class LookupState:
 
     search_type: str = SEARCH_TYPE_NONE
     """Which strategy resolved the request (telemetry + response). Written by
-    the search pipeline (step 3); read by the trace projection and the
+    the search pipeline (step 3) and re-derived by track validation (3b) when
+    it overturns ``found_on_compilation`` (LML#1184) — the two must not
+    disagree, because consumers gate on this field alone (Backend-Service's
+    ``isTrustedLmlTrackContextMatch``). Read by the trace projection and the
     response build."""
 
     library_miss_outcome: str | None = None
@@ -729,7 +735,7 @@ async def _step_validate_tracks(
     READS: ``library_results``, ``found_on_compilation``, ``song_not_found``,
     ``discogs_titles``, ``artist_fallback_results``, ``unranked_fallback_candidates``.
     WRITES: ``library_results``, ``song_not_found``, ``discogs_titles``,
-    ``found_on_compilation``.
+    ``found_on_compilation``, ``search_type``.
 
     Sequences the gate (should step 3b run at all, timed as "track_validation")
     and delegates the promotion/narrowing policy — per-result validation, the
@@ -792,6 +798,18 @@ async def _step_validate_tracks(
     state.discogs_titles = result.discogs_titles
     if result.found_on_compilation is not None:
         state.found_on_compilation = result.found_on_compilation
+        if not result.found_on_compilation:
+            # ``search_type`` must move with the verdict, not just alongside it.
+            # It is the signal downstream actually keys on: Backend-Service's
+            # ``isTrustedLmlTrackContextMatch`` gates purely on
+            # ``search_type in {direct, compilation}`` and reads neither
+            # ``found_on_compilation`` nor ``song_not_found``. Leaving it at
+            # "compilation" here would tell BS to trust — as a confirmed
+            # track-context match — a result list whose surviving rows are
+            # precisely the artist albums we just failed to confirm the track on.
+            # "fallback" is what this shape is: the artist was found, the song
+            # was not confirmed on any of it.
+            state.search_type = SEARCH_TYPE_FALLBACK
 
 
 async def _step_populate_streaming_status(
