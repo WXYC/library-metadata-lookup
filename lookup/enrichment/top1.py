@@ -14,6 +14,7 @@ non-top-1 items reuse the same per-result streaming-URL build in
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import ArtistDetails, DiscogsSearchResult, ReleaseMetadataResponse
 from discogs.service import DiscogsService
+from lookup.wikipedia_url import PickedWikiUrl, pick_artist_wikipedia_url
 
 
 async def fetch_top1_release_details(
@@ -22,7 +23,7 @@ async def fetch_top1_release_details(
 ) -> tuple[
     int | None,
     str | None,
-    str | None,
+    PickedWikiUrl | None,
     ReleaseMetadataResponse | None,
     ArtistDetails | None,
 ]:
@@ -74,10 +75,10 @@ async def fetch_top1_release_details(
             return year, None, None, release, None
 
         bio = details.profile if isinstance(details.profile, str) else None
-        wiki = next(
-            (url for url in details.urls if isinstance(url, str) and "wikipedia.org" in url),
-            None,
-        )
+        # LML#513 (Phase A): slug-scored pick over the legacy first-substring
+        # match — see lookup/wikipedia_url.py for the extractor and the
+        # LML_WIKIPEDIA_SLUG_MATCH flag it reads.
+        wiki = pick_artist_wikipedia_url(details.urls, details.name)
         return year, bio, wiki, release, details
     except Exception:
         return None, None, None, None, None

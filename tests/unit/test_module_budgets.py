@@ -192,6 +192,15 @@ MODULE_BUDGETS: dict[str, int] = {
     # promotion moved in from the spine, carrying this file from 243 to ~395
     # lines. Smallest multiple of 50 at or above 1.3x the post-change size.
     "lookup/validation.py": 550,
+    # LML#513 (Phase A of the Wikipedia-preferred-bio program, docs/plans/
+    # lml-1192-wikipedia-artist-bio.md): the slug-scored Wikipedia URL
+    # extractor -- parsing, the hard-reject denylist, disambig stripping,
+    # scoring/tie-break, PickedWikiUrl, and the shadow-telemetry
+    # projection/log pair. Measured 226 lines (well above the plan's ~110
+    # estimate -- the repo's documentation density, not padding; see the
+    # PR-A "Deviations from plan" note). Smallest multiple of 50 at or
+    # above 1.3x that -> 300.
+    "lookup/wikipedia_url.py": 300,
     # LML#751: strategy runner, SearchState, and budget/timeout machinery —
     # the pipeline's other regrowth attractor once every lookup/ file was
     # capped. 1033 measured lines (2026-07-29); smallest multiple of 50 at or

@@ -213,6 +213,24 @@ DISCOGS_TOKEN=... python scripts/discogs_ranking_jitter.py \
 
 Bypasses `DiscogsService` (no L1 LRU, no semaphore) to surface Discogs-side ranking behavior directly. Default delay is 30s (within Discogs's 60req/60s window); the `X-Discogs-Ratelimit-Remaining` header is logged after each call.
 
+## Wikipedia URL Extractor Validation (`scripts/wikipedia_url_validation.py`)
+
+LML#513's empirical gate for the `LML_WIKIPEDIA_SLUG_MATCH` flag (`docs/plans/lml-1192-wikipedia-artist-bio.md` Phase A): samples discogs-cache artists carrying a `wikipedia.org` `artist_url` row, runs both the legacy first-match heuristic and the slug-scored extractor (`lookup.wikipedia_url.compare_wikipedia_extractors`) over each, and writes a CSV for hand classification. Two phases, mirroring `scripts/resolver_calibration`'s sweep-then-hand-review split.
+
+**Usage:**
+```bash
+# 1. sample phase: query discogs-cache, write a CSV with blank
+#    heuristic_correct / slug_correct columns
+DATABASE_URL_DISCOGS=postgresql://... uv run python -m scripts.wikipedia_url_validation \
+  --sample-size 300 --seed 513 --out lml-513-sample.csv
+
+# 2. a human opens each URL in the CSV and fills in heuristic_correct /
+#    slug_correct with TRUE/FALSE, then:
+uv run python -m scripts.wikipedia_url_validation --report lml-513-sample.csv
+```
+
+`--report` mode makes no DB connection — it only reads the already-classified CSV back and computes the regression rate (heuristic right, slug wrong) and improvement rate (heuristic wrong, slug right); rows with either column left blank are excluded from the denominator (not yet classified). The gate: a regression rate under 2% before flipping `LML_WIKIPEDIA_SLUG_MATCH` on staging, then prod. `--sample-size` (default 300), `--seed` (default 513, for a reproducible sample), `--out` (default `wikipedia_url_validation_sample.csv`). Read-only; never writes to PG.
+
 ## Artist Name Variation Audit (`scripts/variation_audit/`)
 
 Cross-references WXYC library catalog artist name variations against local Discogs and MusicBrainz datasets. Classifies each relationship (ALIAS, MEMBER_OF_GROUP, SEPARATE_ARTIST, COLLABORATION, SPELLING_VARIANT, SPLIT_RELEASE) and identifies artists that should have their own library code. Output includes flowsheet play counts and own-release counts for prioritization.

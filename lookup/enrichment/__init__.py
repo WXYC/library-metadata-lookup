@@ -316,7 +316,7 @@ async def enrich_artwork_results(
                 is_top1=(idx == 0),
                 top1_year=top1_year,
                 top1_bio=top1_bio,
-                top1_wiki=top1_wiki,
+                top1_wiki=top1_wiki.url if top1_wiki else None,
                 top1_release=top1_release,
                 top1_details=top1_details,
                 top1_profile_tokens=top1_profile_tokens,
