@@ -236,7 +236,7 @@ class FlowsheetCreateSongFromCatalog(BaseModel):
     track_title: str
     track_position: str | None = Field(
         None,
-        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Written by the dj-site flowsheet picker (catalog-track-search plan §5.3 / Track 3) when the DJ selects a track from the resolved release. Omitted when the DJ enters a free-text track_title without a tracklist lookup or when the release has no resolvable identity. String-typed to match Discogs\'s `release_track.position` (vinyl side notation, multi-disc prefixes).\n',
+        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Written by the dj-site flowsheet picker (catalog-track-search plan §5.3 / Track 3) when the DJ selects a track from the resolved release. Omitted when the DJ enters a free-text track_title without a tracklist lookup. String-typed to match Discogs\'s `release_track.position` (vinyl side notation, multi-disc prefixes).\n',
     )
     rotation_id: int | None = None
     request_flag: bool
@@ -255,6 +255,10 @@ class FlowsheetCreateSongFreeform(BaseModel):
     rotation_id: int | None = Field(
         None,
         description="Rotation linkage for a track on a rotation album that isn't in the WXYC library catalog (BS#1308). The Backend snapshot/else branch persists `rotation_id` alongside `album_id IS NULL` so the V2 read path can JOIN back to `rotation` for `rotation_bin` and the iOS rotation-artwork resolver can find the entry. `rotation_bin` is derived on read and intentionally not declared here.\n",
+    )
+    track_position: str | None = Field(
+        None,
+        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"), for an LML-only row with no library linkage (routed onto this album_id-less branch). Carries the Discogs `release_track.position` straight through — BS\'s `buildSnapshotFieldsEntry` already persists `body.track_position ?? null` on the same allowlist that sets `album_id: null`. String-typed to match Discogs\'s `release_track.position` (vinyl side notation, multi-disc prefixes).\n',
     )
 
 
@@ -728,6 +732,10 @@ class AlbumInfoResponse(Album):
     code_letters: str
     format_name: str
     genre_name: Genre
+    legacy_release_id: int | None = Field(
+        None,
+        description="The library row's surrogate key (BS#1963), NOT NULL in the database since migration 0137. Optional here (never required) so the live openapi-compliance deploy gate stays green across the publish -> BS-deploy window, matching the CatalogExportRow and BulkResolveInput precedent.\n",
+    )
     rotation: Rotation | None = None
 
 
@@ -875,6 +883,10 @@ class Rotation1(BaseModel):
     play_freq: RotationBin | None = None
     kill_date: date_aliased | None = None
     plays: int | None = None
+    legacy_release_id: int | None = Field(
+        None,
+        description="The library row's surrogate key (BS#1963). Nullable here (unlike AlbumSearchResult/BinLibraryDetails/AlbumInfoResponse): a library-unlinked rotation row has no library row at all, hence no legacy id.\n",
+    )
 
 
 class DJ(BaseModel):
@@ -947,6 +959,10 @@ class BinLibraryDetails(BaseModel):
     code_number: int | None = None
     format_name: str | None = None
     genre_name: str | None = None
+    legacy_release_id: int | None = Field(
+        None,
+        description="The library row's surrogate key (BS#1963), NOT NULL in the database since migration 0137. Optional here (never required) so the live openapi-compliance deploy gate stays green across the publish -> BS-deploy window, matching the CatalogExportRow and BulkResolveInput precedent.\n",
+    )
 
 
 class ScheduleShift(BaseModel):
@@ -2611,11 +2627,11 @@ class AppConfig(BaseModel):
 class AppSecrets(BaseModel):
     discogsApiKey: str = Field(
         ...,
-        description="Discogs API consumer key, for clients that call Discogs directly.",
+        description="Discogs API consumer key, for clients that call Discogs directly. Backend-Service serves an empty string (`''`) — never `null`, never an omitted key — whenever its `DISCOGS_API_KEY` variable is unset (WXYC/wxyc-shared#348 records the provenance; the Backend-Service handler falls back `process.env.DISCOGS_API_KEY || ''`), the same fallback shape `AppConfig.donateUrl` documents. Unlike `donateUrl`, there is no client-side substitute for a missing credential: a client that reads `''` here cannot call Discogs directly and must fall back to a server-proxied path instead. Both fields stay `required` because the handler always emits both keys via that fallback, so a spec-conformant producer never omits either; should a future producer ever omit one anyway, a strict consumer's decode of the whole `AppSecrets` object fails, which is the intended trade — a torn set of credentials (one present, one silently missing) is worse than a whole-object decode failure at the decode site. In practice that surfaces as a logged decode error and a degraded (server-proxied) Discogs path, not a crash — but it is still a diagnosable deploy misconfiguration, where half a credential pair would fail only at Discogs's door with an opaque 401.\n",
     )
     discogsApiSecret: str = Field(
         ...,
-        description="Discogs API consumer secret, for clients that call Discogs directly.",
+        description="Discogs API consumer secret, for clients that call Discogs directly. Same empty string (`''`) wire value when unset as `discogsApiKey` (`process.env.DISCOGS_API_SECRET || ''`) and the same required-together rationale: this field only carries meaning paired with `discogsApiKey`, so both are `required` and a producer omitting either arms a decode failure by design rather than a client silently attempting a call with half a credential pair.\n",
     )
 
 
@@ -3144,7 +3160,7 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
     track_title: str | None = None
     track_position: str | None = Field(
         None,
-        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Set by the dj-site flowsheet picker (catalog-track-search plan §5.3 / Track 3) when the DJ selected a track from the resolved release; null when the track_title was entered free-form or the release had no resolvable identity. String-typed to match Discogs\'s `release_track.position`.\n',
+        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Set by the dj-site flowsheet picker (catalog-track-search plan §5.3 / Track 3) when the DJ selected a track from the resolved release, or supplied directly on a freeform (LML-only) entry; null when the DJ entered a free-text track_title without a tracklist lookup. String-typed to match Discogs\'s `release_track.position`.\n',
     )
     record_label: str | None = None
     request_flag: bool
@@ -3247,6 +3263,10 @@ class AlbumSearchResult(BaseModel):
     genre_name: str
     label: str
     label_id: int | None = None
+    legacy_release_id: int | None = Field(
+        None,
+        description="The library row's surrogate key (BS#1963), NOT NULL in the database since migration 0137. Optional here (never required) so the live openapi-compliance deploy gate stays green across the publish -> BS-deploy window, matching the CatalogExportRow and BulkResolveInput precedent.\n",
+    )
     album_dist: float | None = None
     artist_dist: float | None = None
     rotation_bin: RotationBin | None = None
