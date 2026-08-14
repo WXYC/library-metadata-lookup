@@ -72,6 +72,8 @@ from lookup.endpoint_family import (
     record_low_priority_tag,
 )
 from lookup.enrichment import SKIPPED_PREFETCH_STAT_KEY
+from lookup.enrichment import wikipedia_bio as _wikipedia_bio
+from lookup.enrichment import wikipedia_warm as _wikipedia_warm
 from lookup.location_union import (
     LOCATION_UNION_INDEX_DEGRADED_STAT_KEY,
     LOCATION_UNION_INDEX_HIT_STAT_KEY,
@@ -282,6 +284,17 @@ _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     # #683 surface (mirrors BREAKER_OPEN_STAT_KEY / ADMISSION_WOULD_SHED_STAT_KEY
     # above) rather than a numerator with no denominator.
     STREAMING_WARM_DEPTH_SHED_STAT_KEY,
+    # LML#513/#1192 Phase B: the Wikipedia-preferred-bio cache/serve/warm
+    # counters (docs/observability-rowless-flag.md). fetch_ok/fetch_reject
+    # are deliberately NOT here -- they fire from a background task
+    # detached from any request's cache_stats context; see
+    # lookup/enrichment/wikipedia_warm.py's module docstring.
+    _wikipedia_bio.CACHE_HIT_STAT_KEY,
+    _wikipedia_bio.CACHE_NEGATIVE_STAT_KEY,
+    _wikipedia_bio.CACHE_MISS_WARM_SCHEDULED_STAT_KEY,
+    _wikipedia_bio.SERVED_STAT_KEY,
+    _wikipedia_bio.FALLBACK_DISCOGS_STAT_KEY,
+    _wikipedia_warm.WARM_SHED_STAT_KEY,
 )
 """LML-specific keys seeded into every request's cache_stats dict so PostHog
 and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and

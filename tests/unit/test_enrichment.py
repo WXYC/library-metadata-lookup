@@ -7,6 +7,7 @@ import pytest
 
 from clients.streaming.apple_music import AppleMusicClient, AppleMusicTrackMatch
 from discogs.breaker import DiscogsBreakerOpenError
+from discogs.markup_parser import parse as discogs_markup_parse
 from discogs.models import (
     ArtistCredit,
     ArtistDetails,
@@ -14,6 +15,7 @@ from discogs.models import (
     ReleaseMetadataResponse,
     TrackItem,
 )
+from entity.cache_toolkit import CachedValue
 from lookup.enrichment import enrich_artwork_results
 from lookup.enrichment.item import _build_streaming_search_url
 from lookup.rowless import ROWLESS_LIBRARY_ID
@@ -863,7 +865,7 @@ class TestEnrichArtworkResultsExtended:
             scheduled.append(task)
             return task
 
-        with patch("lookup.enrichment.asyncio.create_task", side_effect=spy_create_task):
+        with patch("lookup.enrichment.background.asyncio.create_task", side_effect=spy_create_task):
             await enrich_artwork_results(
                 [(item, artwork)],
                 discogs_service,
@@ -904,7 +906,7 @@ class TestEnrichArtworkResultsExtended:
             scheduled.append(task)
             return task
 
-        with patch("lookup.enrichment.asyncio.create_task", side_effect=spy_create_task):
+        with patch("lookup.enrichment.background.asyncio.create_task", side_effect=spy_create_task):
             await enrich_artwork_results(
                 [(item, artwork)], discogs_service, extended=True, warm_cache=False
             )
@@ -948,7 +950,7 @@ class TestEnrichArtworkResultsExtended:
             scheduled.append(task)
             return task
 
-        with patch("lookup.enrichment.asyncio.create_task", side_effect=spy_create_task):
+        with patch("lookup.enrichment.background.asyncio.create_task", side_effect=spy_create_task):
             await enrich_artwork_results(
                 [(item, artwork)], discogs_service, extended=True, warm_cache=True
             )
@@ -3560,7 +3562,7 @@ class TestArtistIdentitySplitGate:
             urls=["https://en.wikipedia.org/wiki/Other"],
         )
 
-        with patch("lookup.enrichment.asyncio.create_task") as mock_create_task:
+        with patch("lookup.enrichment.background.asyncio.create_task") as mock_create_task:
             await enrich_artwork_results(
                 [(item, artwork)],
                 discogs_service,
@@ -4159,7 +4161,7 @@ class TestTop1PrefetchSynthesisSkip:
 
         discogs_service = AsyncMock()
 
-        with patch("lookup.enrichment.asyncio.create_task") as mock_create_task:
+        with patch("lookup.enrichment.background.asyncio.create_task") as mock_create_task:
             await enrich_artwork_results(
                 [(item, larry_gus_artwork)],
                 discogs_service,
@@ -4811,4 +4813,288 @@ class TestBandcampStreamingUrlPostprocessWiring:
 
         _, enriched = results[0]
         assert enriched.bandcamp_url is not None
+
+
+class TestWikipediaPreferredBioSwap:
+    """Coordinator wiring for the Wikipedia-preferred-artist-bio program
+    (LML#513/#1192 Phase B, ``docs/plans/lml-1192-wikipedia-artist-bio.md``).
+
+    ``LML_WIKIPEDIA_SLUG_MATCH`` gates whether the Phase-A extractor even
+    picks a candidate above the floor; ``LML_BIO_PREFER_WIKIPEDIA`` gates
+    whether the coordinator serves cached Wikipedia text over the Discogs
+    profile. Both default off, so every test here sets them explicitly.
+    """
+
+    def _discogs_service_for(self, *, artist_id=99, artist="Stereolab", profile="A Discogs bio."):
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist=artist,
+            year=1998,
+            artist_id=artist_id,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=artist_id,
+            name=artist,
+            profile=profile,
+            urls=["https://en.wikipedia.org/wiki/Stereolab"],
+        )
+        return discogs_service
+
+    @pytest.mark.asyncio
+    async def test_both_flags_off_is_byte_identical_to_discogs_only(self, monkeypatch):
+        monkeypatch.delenv("LML_WIKIPEDIA_SLUG_MATCH", raising=False)
+        monkeypatch.delenv("LML_BIO_PREFER_WIKIPEDIA", raising=False)
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+        discogs_service = self._discogs_service_for()
+
+        with patch(
+            "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+            new_callable=AsyncMock,
+        ) as mock_get_cached:
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                discogs_cache_pg=AsyncMock(),
+            )
+
+        _, enriched = results[0]
+        assert enriched.artist_bio == "A Discogs bio."
+        assert enriched.wikipedia_url == "https://en.wikipedia.org/wiki/Stereolab"
+        mock_get_cached.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slug_match_on_but_bio_prefer_off_still_serves_discogs_bio(self, monkeypatch):
+        # LML_BIO_PREFER_WIKIPEDIA is inert without being explicitly on,
+        # even once the extractor has an above-floor pick.
+        monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
+        monkeypatch.delenv("LML_BIO_PREFER_WIKIPEDIA", raising=False)
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+        discogs_service = self._discogs_service_for()
+
+        with patch(
+            "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+            new_callable=AsyncMock,
+        ) as mock_get_cached:
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                discogs_cache_pg=AsyncMock(),
+            )
+
+        _, enriched = results[0]
+        assert enriched.artist_bio == "A Discogs bio."
+        mock_get_cached.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_both_flags_on_positive_cache_hit_serves_wikipedia_text(self, monkeypatch):
+        monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
+        monkeypatch.setenv("LML_BIO_PREFER_WIKIPEDIA", "true")
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+        discogs_service = self._discogs_service_for()
+
+        with patch(
+            "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+            new_callable=AsyncMock,
+            return_value=CachedValue(value="Stereolab is a band from London.", was_present=True),
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                discogs_cache_pg=AsyncMock(),
+            )
+
+        _, enriched = results[0]
+        assert enriched.artist_bio == "Stereolab is a band from London."
+        # The served link never changes -- Phase B only swaps the text.
+        assert enriched.wikipedia_url == "https://en.wikipedia.org/wiki/Stereolab"
+
+    @pytest.mark.asyncio
+    async def test_profile_tokens_still_parse_the_discogs_text_when_wikipedia_is_served(
+        self, monkeypatch
+    ):
+        # LML#513/#1192 accepted semantic shift: artist_bio can be Wikipedia
+        # prose while profile_tokens still describes the Discogs profile.
+        monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
+        monkeypatch.setenv("LML_BIO_PREFER_WIKIPEDIA", "true")
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+        discogs_service = self._discogs_service_for(profile="Discogs bio with [a123] ref.")
+
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+                return_value=CachedValue(value="Wikipedia prose.", was_present=True),
+            ),
+            patch("lookup.enrichment.parse", wraps=discogs_markup_parse) as mock_parse,
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                discogs_cache_pg=AsyncMock(),
+                extended=True,
+            )
+
+        _, enriched = results[0]
+        assert enriched.artist_bio == "Wikipedia prose."
+        assert enriched.profile_tokens is not None
+        # profile_tokens is parsed from the DISCOGS text, never the served
+        # Wikipedia prose -- the two source texts stay independent.
+        mock_parse.assert_called_once_with("Discogs bio with [a123] ref.")
+
+    @pytest.mark.asyncio
+    async def test_miss_falls_back_to_discogs_and_schedules_warm(self, monkeypatch):
+        monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
+        monkeypatch.setenv("LML_BIO_PREFER_WIKIPEDIA", "true")
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+        discogs_service = self._discogs_service_for()
+
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+                return_value=CachedValue(value=None, was_present=False),
+            ),
+            patch(
+                "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
+                return_value=True,
+            ) as mock_schedule,
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                discogs_cache_pg=AsyncMock(),
+                warm_cache=True,
+            )
+
+        _, enriched = results[0]
+        assert enriched.artist_bio == "A Discogs bio."
+        mock_schedule.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_discogs_ref_warm_does_not_fire_when_wikipedia_text_is_served(self, monkeypatch):
+        # LML#513/#1192 re-spec of the LML#504 Discogs-ref-warm gate: the
+        # served bio is Wikipedia prose, so deep-parsing the un-rendered
+        # Discogs profile's refs would be pure quota burn.
+        monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
+        monkeypatch.setenv("LML_BIO_PREFER_WIKIPEDIA", "true")
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+        discogs_service = self._discogs_service_for()
+
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+                return_value=CachedValue(value="Wikipedia prose.", was_present=True),
+            ),
+            patch("lookup.enrichment.background.asyncio.create_task") as mock_create_task,
+        ):
+            await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                discogs_cache_pg=AsyncMock(),
+                warm_cache=True,
+            )
+
+        mock_create_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discogs_ref_warm_still_fires_when_discogs_bio_is_served(self, monkeypatch):
+        # Contrast case: flags on, but the cache missed (Discogs fallback
+        # served) -- the ref-warm must still fire exactly as before.
+        monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
+        monkeypatch.setenv("LML_BIO_PREFER_WIKIPEDIA", "true")
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+        discogs_service = self._discogs_service_for()
+
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+                return_value=CachedValue(value=None, was_present=True),
+            ),
+            patch("lookup.enrichment.background.asyncio.create_task") as mock_create_task,
+        ):
+            mock_create_task.return_value = AsyncMock()
+            await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                discogs_cache_pg=AsyncMock(),
+                warm_cache=True,
+            )
+
+        mock_create_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_artist_identity_split_gate_nulls_served_pair_together(self, monkeypatch):
+        # LML#504: an unverified artist identity nulls bio AND link
+        # together, regardless of which text source Phase B would have
+        # served -- the served pair can never disagree. Release-side
+        # artist drift (the proven TestArtistIdentitySplitGate /
+        # test_warm_cache_skipped_when_bio_suppressed recipe): the library
+        # row's artist matches the request (library_row_artist_verified),
+        # but the release Discogs returned does not
+        # (release_side_artist_verified=False) -- under extended=True this
+        # fails the split gate even though library_row_acceptable (the
+        # legacy, title-only gate) would have passed.
+        monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
+        monkeypatch.setenv("LML_BIO_PREFER_WIKIPEDIA", "true")
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist="Completely Different Artist",
+            year=1998,
+            artist_id=99,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Completely Different Artist",
+            profile="A Discogs bio.",
+            urls=["https://en.wikipedia.org/wiki/Stereolab"],
+        )
+
+        with patch(
+            "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+            new_callable=AsyncMock,
+            return_value=CachedValue(value="Wikipedia prose.", was_present=True),
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                discogs_cache_pg=AsyncMock(),
+                extended=True,
+            )
+
+        _, enriched = results[0]
+        assert enriched.artist_bio is None
+        assert enriched.wikipedia_url is None
         assert enriched.bandcamp_url.startswith("https://bandcamp.com/search?q=")
