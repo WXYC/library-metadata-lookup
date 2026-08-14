@@ -355,6 +355,7 @@ async def lifespan(app: FastAPI):
     if settings.database_url_discogs:
         from core.dependencies import get_discogs_pool
         from entity.api_keys import set_up_api_keys_schema
+        from entity.artist_wikipedia_bio import set_up_artist_wikipedia_bio_schema
         from entity.compilation_track_identity import (
             set_up_compilation_track_identity_schema,
         )
@@ -468,6 +469,16 @@ async def lifespan(app: FastAPI):
                 (
                     "Compilation track identity",
                     set_up_compilation_track_identity_schema,
+                ),
+                # Artist Wikipedia bio cache (LML#513/#1192, Phase B of the
+                # Wikipedia-preferred-artist-bio program), another LML-owned
+                # lml_cache.* table. Same pool, same best-effort posture. No
+                # runtime reader yet -- lookup/enrichment/wikipedia_bio.py
+                # (PR-B2) and scripts/warm_wikipedia_bios.py (PR-C) are the
+                # consumers.
+                (
+                    "Artist Wikipedia bio cache",
+                    set_up_artist_wikipedia_bio_schema,
                 ),
             )
             await _run_lml_cache_bootstraps(source, bootstraps)

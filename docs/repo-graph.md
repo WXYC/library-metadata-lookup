@@ -59,6 +59,7 @@ graph LR
         deezer["Deezer"]
         bandcamp["Bandcamp"]
         slack["Slack"]
+        wikipedia["Wikipedia REST API<br/><i>background warm + offline drain only</i>"]
     end
 
     %% ---- apps → Backend-Service / semantic-index ----
@@ -95,6 +96,7 @@ graph LR
     lml --> apple
     lml --> deezer
     lml --> bandcamp
+    lml -.->|"background warm + drain only, never request-path"| wikipedia
 
     %% ---- build / contract dependencies (depends on →) ----
     lml -.-> wxycshared
@@ -124,6 +126,6 @@ graph LR
     class rom,tf,orch,backend,si,wxycshared,wxycetl,wxycfastapi,discogsetl,xmlconv,wxyccatalog repo;
     class djsite,ios,android,djios app;
     class librarydb,discogscache store;
-    class discogsAPI,spotify,apple,deezer,bandcamp,slack extn;
+    class discogsAPI,spotify,apple,deezer,bandcamp,slack,wikipedia extn;
     class canary monitor;
 ```

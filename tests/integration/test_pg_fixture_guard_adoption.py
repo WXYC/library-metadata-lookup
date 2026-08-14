@@ -75,6 +75,9 @@ _LML_CACHE_FIXTURE_FILES = (
     # scratch lml_cache.compilation_track_identity rows (its `entity.*`
     # fixture above is separately covered by _MIGRATED_FILES).
     "test_bulk_resolve_libraries.py",
+    # LML#513/#1192 Phase B: the artist Wikipedia bio cache drops its own
+    # scratch lml_cache.artist_wikipedia_bio rows.
+    "test_artist_wikipedia_bio.py",
 )
 
 # Any DROP SCHEMA aimed at lml_cache, however spelled (with/without IF
