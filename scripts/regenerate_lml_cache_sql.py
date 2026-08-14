@@ -40,6 +40,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from entity import (  # noqa: E402
     api_keys,
+    artist_wikipedia_bio,
     compilation_track_identity,
     compilation_track_location,
     discogs_rate_bucket,
@@ -130,6 +131,35 @@ _MODULES: dict[str, SidecarSpec] = {
 --
 {_ownership_boilerplate("api_keys", "set_up_api_keys_schema")}""",
         statements=(api_keys._DDL_SCHEMA, api_keys._DDL_TABLE),
+    ),
+    "artist_wikipedia_bio": SidecarSpec(
+        header=f"""\
+-- Artist Wikipedia bio cache schema for the Wikipedia-preferred-artist-bio
+-- program (docs/plans/lml-1192-wikipedia-artist-bio.md; LML#513/#1192).
+--
+-- Canonical DDL reference for `lml_cache.artist_wikipedia_bio`: one row per
+-- Discogs artist id, carrying the lead-paragraph extract fetched from the
+-- Phase-A-picked Wikipedia page (or a NULL extract recording a negative --
+-- 404 / disambiguation / empty / a rejected `description`).
+--
+{_ownership_boilerplate("artist_wikipedia_bio", "set_up_artist_wikipedia_bio_schema")}""",
+        statements=(artist_wikipedia_bio._DDL_SCHEMA, artist_wikipedia_bio._DDL_TABLE),
+        comments={
+            "CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio (": """\
+-- `discogs_artist_id` -- the PRIMARY KEY; one row per artist, no composite
+-- key. `wikipedia_url` -- the Phase-A pick the extract came from; the read
+-- side additionally filters on this matching the CALLER's current pick, so
+-- a Phase-A recalibration (or an Discogs `artist_url` change) self-heals a
+-- stale row to a miss rather than serving prose against a URL LML no
+-- longer believes is right. `slug_score` -- the Phase-A extractor's
+-- confidence at fetch time (audit only, never compared). `lang` -- the
+-- Wikipedia edition the extract came from. `extract` -- NULL records a
+-- negative result (see `clients/wikipedia.py`); a positive result is never
+-- empty (the client itself rejects an empty extract before returning).
+-- `fetched_at` -- read-side TTL cutoff, on two DIFFERENT clocks depending
+-- on `extract IS NULL` (`entity/artist_wikipedia_bio.py`'s module
+-- docstring has the full freshness rationale).""",
+        },
     ),
     "compilation_track_identity": SidecarSpec(
         header=f"""\

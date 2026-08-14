@@ -131,6 +131,44 @@ class TestLifespan:
             assert mock_catalog.await_args.args[0] is locked_source
 
     @pytest.mark.asyncio
+    async def test_artist_wikipedia_bio_bootstrap_runs_under_the_lock(self, mock_settings):
+        """LML#513/#1192 Phase B: ``set_up_artist_wikipedia_bio_schema`` must
+        be a registered ``bootstraps`` entry, run under the same
+        session-scoped advisory lock every other ``lml_cache.*`` bootstrap
+        gets (the same ``locked_source`` every sibling call receives)."""
+        import main
+        from main import app, lifespan
+
+        pool = _FakePool()
+        with (
+            patch.object(main.settings, "database_url_discogs", "postgresql://unit/test"),
+            patch.object(main.settings, "lml_bucket_name", None),
+            patch.object(main.settings, "lml_bucket_endpoint", None),
+            patch(
+                "core.dependencies.get_discogs_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "entity.artist_wikipedia_bio.set_up_artist_wikipedia_bio_schema",
+                new_callable=AsyncMock,
+            ) as mock_wikipedia_bio,
+            patch(
+                "entity.streaming_url_cache.set_up_streaming_url_cache_schema",
+                new_callable=AsyncMock,
+            ) as mock_url_cache,
+            patch("main.shutdown_posthog"),
+            patch("main.close_library_db", new_callable=AsyncMock),
+            patch("main.close_discogs_service", new_callable=AsyncMock),
+        ):
+            async with lifespan(app):
+                pass
+
+            mock_wikipedia_bio.assert_awaited_once()
+            mock_url_cache.assert_awaited_once()
+            assert mock_wikipedia_bio.await_args.args[0] is mock_url_cache.await_args.args[0]
+
+    @pytest.mark.asyncio
     async def test_lml_cache_bootstrap_lock_failure_is_nonfatal(self):
         """A bootstrap advisory-lock timeout skips caches, not the whole boot."""
         import main
