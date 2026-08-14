@@ -23,6 +23,7 @@ from lookup.wikipedia_url import (
     _wikipedia_slug_match_enabled,
     compare_wikipedia_extractors,
     pick_artist_wikipedia_url,
+    wikipedia_title_from_url,
 )
 
 # ---------------------------------------------------------------------------
@@ -315,6 +316,39 @@ class TestCompareWikipediaExtractors:
         comparison = compare_wikipedia_extractors(urls, "Sessa")
         assert comparison.heuristic_pick == urls[0]
         assert comparison.slug_pick is None
+
+
+# ---------------------------------------------------------------------------
+# wikipedia_title_from_url — the URL -> title conversion the warm task and
+# the offline drain both need to call clients.wikipedia.WikipediaClient
+# ---------------------------------------------------------------------------
+
+
+class TestWikipediaTitleFromUrl:
+    def test_extracts_decoded_space_form_title(self):
+        assert (
+            wikipedia_title_from_url("https://en.wikipedia.org/wiki/Duke_Ellington")
+            == "Duke Ellington"
+        )
+
+    def test_url_encoded_characters_are_decoded(self):
+        assert (
+            wikipedia_title_from_url("https://en.wikipedia.org/wiki/Sessa_%282%29") == "Sessa (2)"
+        )
+
+    def test_strips_query_and_fragment(self):
+        assert (
+            wikipedia_title_from_url(
+                "https://en.wikipedia.org/wiki/Stereolab?action=history#History"
+            )
+            == "Stereolab"
+        )
+
+    def test_non_wikipedia_url_returns_none(self):
+        assert wikipedia_title_from_url("https://stereolab.example") is None
+
+    def test_empty_slug_returns_none(self):
+        assert wikipedia_title_from_url("https://en.wikipedia.org/wiki/") is None
 
 
 # ---------------------------------------------------------------------------

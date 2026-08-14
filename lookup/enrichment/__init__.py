@@ -41,7 +41,7 @@ from lookup.artist_resolution import (
 # imports, so each submodule stays the single patch/rebind seam for its own
 # names — a value import here would bind a second copy on the package namespace
 # that patches against the submodule silently miss.
-from lookup.enrichment import background, item, top1
+from lookup.enrichment import background, item, top1, wikipedia_bio
 from lookup.enrichment.context import EnrichmentContext
 from lookup.spine_deadline import SpineDeadline
 
@@ -307,6 +307,11 @@ async def enrich_artwork_results(
         else:
             top1_profile_tokens = parse(top1_bio)
 
+    # LML#513/#1192: served pair; ``top1_bio`` stays Discogs below (profile_tokens + ref-warm).
+    served_top1_bio, served_top1_wiki = await wikipedia_bio.resolve_served_bio(
+        top1_wiki, top1_bio, top1_details, discogs_cache_pg, warm_cache=warm_cache
+    )
+
     enriched = await asyncio.gather(
         *[
             item.enrich_one(
@@ -315,8 +320,8 @@ async def enrich_artwork_results(
                 artwork,
                 is_top1=(idx == 0),
                 top1_year=top1_year,
-                top1_bio=top1_bio,
-                top1_wiki=top1_wiki.url if top1_wiki else None,
+                top1_bio=served_top1_bio,
+                top1_wiki=served_top1_wiki,
                 top1_release=top1_release,
                 top1_details=top1_details,
                 top1_profile_tokens=top1_profile_tokens,
@@ -327,24 +332,19 @@ async def enrich_artwork_results(
         ]
     )
 
-    # Write-path warm: fire-and-forget deep async parse of the top-1 bio
-    # using the API-capable resolver, so the PG cache gets populated for
-    # `[a…]`/`[r…]`/`[m…]` references. The task is intentionally not
-    # awaited — read-path latency is unaffected. The task reference is
-    # parked in ``_background_tasks`` so the GC can't reap it mid-flight
-    # (asyncio holds only weak refs to tasks).
-    #
-    # LML#504: don't warm a bio the response itself suppressed. The deep
-    # parse fires per-ref Discogs API calls (DiscogsServiceResolver: cache
-    # → API → write-back) — wasting those on a bio iOS will never render
-    # is pure quota burn. Inspect the top-1 enriched result rather than
-    # re-deriving the gate so the warm check is locked in step with the
-    # actual surfaced output.
+    # Discogs ref-warm (relocated to background.maybe_schedule_discogs_bio_warm
+    # — full LML#504 + LML#513/#1192 re-spec rationale lives there).
     top1_enriched_result = enriched[0][1] if enriched else None
     top1_bio_surfaced = top1_enriched_result is not None and bool(top1_enriched_result.artist_bio)
-    if warm_cache and top1_bio and top1_bio_surfaced:
-        task = asyncio.create_task(background._warm_bio_cache(top1_bio, discogs_service))
-        background._background_tasks.add(task)
-        task.add_done_callback(background._background_tasks.discard)
+    top1_bio_is_discogs = (
+        top1_enriched_result is not None and top1_enriched_result.artist_bio == top1_bio
+    )
+    background.maybe_schedule_discogs_bio_warm(
+        warm_cache=warm_cache,
+        top1_bio=top1_bio,
+        top1_bio_surfaced=top1_bio_surfaced,
+        served_bio_is_discogs=top1_bio_is_discogs,
+        discogs_service=discogs_service,
+    )
 
     return list(enriched)

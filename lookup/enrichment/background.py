@@ -61,3 +61,35 @@ async def _warm_bio_cache(bio: str, discogs_service: DiscogsService) -> None:
             await parse_async(bio, DiscogsServiceResolver(discogs_service))
     except Exception:
         logger.exception("Background bio cache-warm failed")
+
+
+def maybe_schedule_discogs_bio_warm(
+    *,
+    warm_cache: bool,
+    top1_bio: str | None,
+    top1_bio_surfaced: bool,
+    served_bio_is_discogs: bool,
+    discogs_service: DiscogsService,
+) -> None:
+    """Schedule the fire-and-forget deep-parse Discogs-bio warm, when eligible.
+
+    Relocated from ``lookup/enrichment/__init__.py`` (LML#513/#1192 Phase B)
+    -- this module already owns ``_warm_bio_cache`` and the task-anchor set,
+    so it's the natural home.
+
+    LML#504: don't warm a bio the response itself suppressed -- the deep
+    parse fires per-ref Discogs API calls (cache -> API -> write-back), so
+    wasting those on a bio no client will ever read is pure quota burn.
+
+    LML#513/#1192 re-spec: ``top1_bio_surfaced`` alone no longer answers
+    "was the Discogs bio surfaced" once the coordinator can serve a
+    Wikipedia extract instead (Phase B) -- ``served_bio_is_discogs``
+    additionally requires the SERVED text to be the Discogs one. When
+    Wikipedia text is what iOS renders, deep-parsing the unrendered Discogs
+    profile's refs is exactly the same quota burn LML#504 prohibits.
+    """
+    if not (warm_cache and top1_bio and top1_bio_surfaced and served_bio_is_discogs):
+        return
+    task = asyncio.create_task(_warm_bio_cache(top1_bio, discogs_service))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)

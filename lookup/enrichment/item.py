@@ -597,13 +597,23 @@ async def enrich_one(
         # iOS adds an artist-image mount.
         update["artist_image_url"] = top1_details.image_url if top1_details is not None else None
 
-    # ``profile_tokens`` parses from ``top1_bio``; ``discogs_artist_id``
-    # IS ``release.artist_id``. Both are strictly artist-scoped, so they
-    # ride the artist-identity gate (not the album-derived gate). This
-    # keeps the API contract coherent: any response that carries
-    # ``artist_bio`` also carries the ``discogs_artist_id`` key that
-    # iOS/BS need to key an artist-metadata cache against (see
-    # ``generated/api_models.DiscogsMatchResult.discogs_artist_id``).
+    # ``discogs_artist_id`` IS ``release.artist_id``. Both ``profile_tokens``
+    # and ``discogs_artist_id`` are strictly artist-scoped, so they ride the
+    # artist-identity gate (not the album-derived gate) — same gate
+    # ``artist_bio`` rides just above, keeping the API contract coherent:
+    # any response carrying ``artist_bio`` also carries the
+    # ``discogs_artist_id`` key iOS/BS need to key an artist-metadata cache
+    # against (see ``generated/api_models.DiscogsMatchResult.discogs_artist_id``).
+    #
+    # LML#513/#1192 accepted semantic shift: ``top1_profile_tokens`` (the
+    # coordinator's parameter here) is ALWAYS parsed from the raw Discogs
+    # profile, never this function's own ``top1_bio`` parameter — which,
+    # since Phase B, may itself be served Wikipedia prose instead. A
+    # response can therefore legitimately carry Wikipedia text in
+    # ``artist_bio`` and Discogs-profile tokens in ``profile_tokens``
+    # simultaneously: two different source texts, not two renderings of
+    # one bio. See ``lookup/enrichment/wikipedia_bio.py`` and
+    # ``docs/architecture.md``'s step-4b note.
     if ctx.extended and is_artist_derived_eligible:
         update["profile_tokens"] = top1_profile_tokens
         if top1_release is not None:

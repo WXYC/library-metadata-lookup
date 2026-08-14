@@ -307,6 +307,24 @@ def compare_wikipedia_extractors(
     )
 
 
+def wikipedia_title_from_url(url: str) -> str | None:
+    """Extract the decoded, space-form page title from a ``wikipedia.org``
+    ``/wiki/`` URL — the form ``clients.wikipedia.WikipediaClient.get_summary``
+    expects (it re-encodes internally, so the round trip is safe). ``None``
+    when ``url`` isn't a recognizable wiki URL, or its slug is empty.
+
+    Shared by ``lookup/enrichment/wikipedia_warm.py`` and
+    ``scripts/warm_wikipedia_bios.py``, both of which need to turn a stored
+    ``wikipedia_url`` back into a fetchable title.
+    """
+    match = _WIKI_URL_RE.match(url.strip())
+    if not match:
+        return None
+    raw_slug = match.group(2).split("#", 1)[0].split("?", 1)[0]
+    decoded = unquote(raw_slug).replace("_", " ").strip()
+    return decoded or None
+
+
 def pick_artist_wikipedia_url(urls: Sequence[str] | None, artist_name: str) -> PickedWikiUrl | None:
     """Pick the Wikipedia URL to serve for ``artist_name`` from a Discogs
     artist's ``urls`` list.

@@ -82,6 +82,18 @@ MODULE_BUDGETS: dict[str, int] = {
     # maintenance headroom at all.
     "lookup/enrichment/streaming_status.py": 200,
     "lookup/enrichment/top1.py": 100,
+    # LML#513/#1192 Phase B (docs/plans/lml-1192-wikipedia-artist-bio.md):
+    # the read-path resolver -- CachedValue read, served-pair resolution,
+    # warm-scheduling decision. Measured 130 lines (plan estimated ~70 --
+    # the repo's documentation density, same story as wikipedia_url.py's
+    # own recalibration). Smallest multiple of 50 at or above 1.3x that.
+    "lookup/enrichment/wikipedia_bio.py": 200,
+    # LML#513/#1192 Phase B: the bounded miss-warm executor, modeled on
+    # lookup/streaming_warm_admission.py -- depth-bound admission, the
+    # fetch, and the unsampled fetch-outcome PostHog counters. Measured
+    # 171 lines (plan estimated ~75). Smallest multiple of 50 at or above
+    # 1.3x that.
+    "lookup/enrichment/wikipedia_warm.py": 250,
     "lookup/external_search.py": 350,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
     # transparent-fold calibration): the module gained the empty-vs-degraded
