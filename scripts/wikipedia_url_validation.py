@@ -200,7 +200,17 @@ def _is_true(value: str) -> bool:
 def compute_ground_truth_summary(rows: list[dict[str, Any]]) -> GroundTruthSummary:
     """LML#513's gate: regression = heuristic right, slug wrong; improvement
     = heuristic wrong, slug right. Rows with a blank ``heuristic_correct`` or
-    ``slug_correct`` are excluded from the denominator (not yet classified)."""
+    ``slug_correct`` are excluded from the denominator (not yet classified).
+
+    LML#1192 review, A6: a row whose ``clears_floor`` is False is ALSO
+    excluded, regardless of classification -- a below-floor slug pick is
+    never actually served once ``LML_WIKIPEDIA_SLUG_MATCH`` flips (the
+    heuristic wins the served ``url`` either way; see
+    ``lookup.wikipedia_url.pick_artist_wikipedia_url``), so marking it
+    "wrong" is not a real regression, and counting it dilutes the
+    denominator with a row the flip provably can't affect. A missing or
+    unparseable ``clears_floor`` value fails safe to excluded, not included.
+    """
     classified = 0
     regressions = 0
     improvements = 0
@@ -208,6 +218,8 @@ def compute_ground_truth_summary(rows: list[dict[str, Any]]) -> GroundTruthSumma
         heuristic_raw = row.get("heuristic_correct", "")
         slug_raw = row.get("slug_correct", "")
         if not heuristic_raw.strip() or not slug_raw.strip():
+            continue
+        if not _is_true(row.get("clears_floor", "")):
             continue
         classified += 1
         heuristic_correct = _is_true(heuristic_raw)
