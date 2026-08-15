@@ -5107,7 +5107,7 @@ class TestWikipediaPreferredBioSwap:
         assert enriched.bandcamp_url.startswith("https://bandcamp.com/search?q=")
         # LML#1192 review, B2-1: the gate suppressed the bio entirely --
         # neither adoption counter should fire, even though resolve_served_bio
-        # itself picked the Wikipedia source (wiki_is_source=True).
+        # itself picked the Wikipedia source (source=BioSource.WIKIPEDIA).
         stats = get_cache_stats()
         assert stats.get(SERVED_STAT_KEY) is None
         assert stats.get(FALLBACK_DISCOGS_STAT_KEY) is None

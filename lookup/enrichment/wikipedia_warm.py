@@ -92,6 +92,15 @@ def schedule_wikipedia_bio_warm(
     pending-plus-running depth bound was already at capacity) or deduped
     (this artist already has a warm pending or running). Never queues
     unboundedly.
+
+    LML#1192 review round 3, finding 7: the task is created BEFORE the
+    dedup key is registered, matching ``lookup/streaming_warm.py``'s
+    ``_enqueue_streaming_warm`` -- a ``create_task`` failure (e.g. no
+    running loop) then can't leak a key that would suppress this artist's
+    warm for the rest of the process's life, since nothing would ever
+    remove a key registered with no corresponding task/done-callback.
+    There is no ``await`` between the membership check and the
+    registration below, so two identical misses still dedup to one task.
     """
     if discogs_artist_id in _pending_artist_ids:
         return False
@@ -101,8 +110,8 @@ def schedule_wikipedia_bio_warm(
         except Exception as e:
             logger.warning("Failed to record %s: %s", WARM_SHED_STAT_KEY, e)
         return False
-    _pending_artist_ids.add(discogs_artist_id)
     task = asyncio.create_task(_run_warm(discogs_artist_id, pick, discogs_cache_pg))
+    _pending_artist_ids.add(discogs_artist_id)
     _background_tasks.add(task)
     task.add_done_callback(lambda t: _on_warm_done(t, discogs_artist_id))
     return True

@@ -13,11 +13,9 @@ resolution that used to be inline in the coordinator. It returns a
 warm-scheduling itself: it runs BEFORE ``item.enrich_one``, so it cannot
 know whether the LML#504 artist-identity split gate will null the bio back
 out before it reaches the wire (LML#1192 review, B2-1/B2-2). The
-COORDINATOR calls :func:`record_bio_adoption` and
-:func:`maybe_schedule_wikipedia_bio_warm` after ``item.enrich_one`` has run,
-passing in whether the decided bio actually survived the gate — the same
-post-hoc comparison pattern already used for the Discogs ref-warm's
-``top1_bio_is_discogs`` (``lookup/enrichment/__init__.py``).
+COORDINATOR calls :func:`finalize_bio` after ``item.enrich_one`` has run,
+passing in the ENRICHED top-1 result's ``artist_bio`` — the one signal that
+answers whether the decided bio actually survived the gate.
 
 **The variable split is the crux.** ``top1_bio`` (the raw Discogs profile
 text) has two other consumers in the coordinator that must keep seeing
@@ -30,6 +28,21 @@ NEW ``bio`` value on :class:`ServedBioResolution` for the response.
 in every branch below — Phase B only ever swaps which TEXT accompanies that
 link, never the link itself, so the served pair can never disagree (the
 LML#504 split gate downstream nulls both together, exactly as today).
+
+**LML#1192 review round 3, finding 10 — why ``bio_surfaced`` is a plain
+truthiness check.** ``item.enrich_one``'s LML#504 gate has exactly two
+outcomes for ``top1_bio``: pass it through UNCHANGED, or null it to
+``None``. So once the coordinator has the enriched top-1 result, "does its
+``artist_bio`` equal what ``resolve_served_bio`` decided" and "is its
+``artist_bio`` truthy" are the SAME fact — a resolution can never survive
+the gate as anything other than itself. :func:`finalize_bio` takes the
+enriched ``artist_bio`` directly and reduces it to one ``bool()``, rather
+than re-deriving that fact via an explicit equality comparison against
+``resolution.bio`` (the coordinator's pre-round-3 shape, and the same
+redundant shape the sibling Discogs ref-warm gate had for
+``top1_bio_is_discogs`` — see ``lookup/enrichment/background.py``, whose
+``served_bio_is_discogs`` param this module's :data:`BioSource` now also
+answers directly instead of via string comparison).
 """
 
 from __future__ import annotations
@@ -37,6 +50,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from enum import Enum, auto
 
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
@@ -63,6 +77,25 @@ SERVED_STAT_KEY = "wikipedia_bio_served"
 FALLBACK_DISCOGS_STAT_KEY = "wikipedia_bio_fallback_discogs"
 
 
+class BioSource(Enum):
+    """Which text ``ServedBioResolution.bio`` actually came from.
+
+    LML#1192 review round 3, finding 10: replaces a bare ``wiki_is_source:
+    bool`` so a future third source (were one ever added) is a new enum
+    member + one new :data:`SOURCE_STAT_KEYS` entry, not a find-every-``if``
+    edit across this module and the coordinator.
+    """
+
+    DISCOGS = auto()
+    WIKIPEDIA = auto()
+
+
+SOURCE_STAT_KEYS: dict[BioSource, str] = {
+    BioSource.WIKIPEDIA: SERVED_STAT_KEY,
+    BioSource.DISCOGS: FALLBACK_DISCOGS_STAT_KEY,
+}
+
+
 def _bio_prefer_wikipedia_enabled() -> bool:
     """Read the flag at call time (no Settings indirection) so it is a
     no-redeploy Railway lever, mirroring ``lookup.wikipedia_url._wikipedia_slug_match_enabled``."""
@@ -85,20 +118,20 @@ class ServedBioResolution:
     needs to finish the job once the LML#504 gate's outcome is known.
 
     ``bio``/``wiki_url`` are the pair to thread into ``item.enrich_one`` —
-    unconditionally, regardless of ``wiki_is_source``: this dataclass makes
-    no promise about whether the response ultimately surfaces them (that's
-    the gate's call, downstream). ``wiki_is_source`` is True only for a
-    fresh positive cache hit; every other outcome (flag off, no pick,
+    unconditionally, regardless of ``source``: this dataclass makes no
+    promise about whether the response ultimately surfaces them (that's the
+    gate's call, downstream). ``source`` is ``BioSource.WIKIPEDIA`` only for
+    a fresh positive cache hit; every other outcome (flag off, no pick,
     below-floor, negative hit, miss) carries the Discogs pair with
-    ``wiki_is_source=False``. ``miss_pick``/``discogs_artist_id`` are set
-    ONLY on a genuine cache miss (the one case with something worth warming)
-    — both ``None`` otherwise, which :func:`maybe_schedule_wikipedia_bio_warm`
-    treats as "nothing to schedule."
+    ``source=BioSource.DISCOGS``. ``miss_pick``/``discogs_artist_id`` are
+    set ONLY on a genuine cache miss (the one case with something worth
+    warming) — both ``None`` otherwise, which the internal miss-warm
+    scheduler treats as "nothing to schedule."
     """
 
     bio: str | None
     wiki_url: str | None
-    wiki_is_source: bool
+    source: BioSource
     miss_pick: PickedWikiUrl | None
     discogs_artist_id: int | None
 
@@ -123,16 +156,14 @@ async def resolve_served_bio(
 
     Cache-fact telemetry (``CACHE_HIT``/``CACHE_NEGATIVE``) is recorded
     immediately here — it's true regardless of what the response ends up
-    surfacing. Adoption telemetry (``SERVED``/``FALLBACK_DISCOGS``) and
-    warm-scheduling are deliberately NOT done here (LML#1192 review,
-    B2-1/B2-2) — see :func:`record_bio_adoption` and
-    :func:`maybe_schedule_wikipedia_bio_warm`.
+    surfacing. Adoption telemetry and warm-scheduling are deliberately NOT
+    done here (LML#1192 review, B2-1/B2-2) — see :func:`finalize_bio`.
     """
     wiki_url = pick.url if pick is not None else None
     discogs_resolution = ServedBioResolution(
         bio=top1_bio,
         wiki_url=wiki_url,
-        wiki_is_source=False,
+        source=BioSource.DISCOGS,
         miss_pick=None,
         discogs_artist_id=None,
     )
@@ -158,7 +189,7 @@ async def resolve_served_bio(
         return ServedBioResolution(
             bio=cached.value,
             wiki_url=wiki_url,
-            wiki_is_source=True,
+            source=BioSource.WIKIPEDIA,
             miss_pick=None,
             discogs_artist_id=None,
         )
@@ -173,27 +204,28 @@ async def resolve_served_bio(
     return ServedBioResolution(
         bio=top1_bio,
         wiki_url=wiki_url,
-        wiki_is_source=False,
+        source=BioSource.DISCOGS,
         miss_pick=pick,
         discogs_artist_id=discogs_artist_id,
     )
 
 
-def record_bio_adoption(resolution: ServedBioResolution, *, bio_surfaced: bool) -> None:
+def _record_bio_adoption(resolution: ServedBioResolution, *, bio_surfaced: bool) -> None:
     """Post-hoc adoption telemetry: SERVED or FALLBACK_DISCOGS, gated on
     whether the LML#504 split gate actually let the bio through.
 
     LML#1192 review, B2-1: the pre-fix code recorded these unconditionally
     inside ``resolve_served_bio``, before the gate ran, so the adoption rate
     counted resolutions the response never surfaced. Neither counter fires
-    when ``bio_surfaced`` is False.
+    when ``bio_surfaced`` is False. Private: called only by
+    :func:`finalize_bio` (LML#1192 review round 3, finding 10).
     """
     if not bio_surfaced:
         return
-    _record(SERVED_STAT_KEY if resolution.wiki_is_source else FALLBACK_DISCOGS_STAT_KEY)
+    _record(SOURCE_STAT_KEYS[resolution.source])
 
 
-def maybe_schedule_wikipedia_bio_warm(
+def _maybe_schedule_wikipedia_bio_warm(
     resolution: ServedBioResolution,
     *,
     warm_cache: bool,
@@ -208,7 +240,8 @@ def maybe_schedule_wikipedia_bio_warm(
     pre-fix Wikipedia miss-warm lacked that same gate. A warm is scheduled
     only when caching is requested, the response actually surfaced a bio,
     AND ``resolve_served_bio`` recorded a genuine miss (``miss_pick`` is
-    only ever non-None on that branch).
+    only ever non-None on that branch). Private: called only by
+    :func:`finalize_bio` (LML#1192 review round 3, finding 10).
     """
     if not warm_cache or not bio_surfaced:
         return
@@ -225,3 +258,35 @@ def maybe_schedule_wikipedia_bio_warm(
     )
     if scheduled:
         _record(CACHE_MISS_WARM_SCHEDULED_STAT_KEY)
+
+
+def finalize_bio(
+    resolution: ServedBioResolution,
+    *,
+    enriched_top1_bio: str | None,
+    warm_cache: bool,
+    discogs_cache_pg: PgSource | None,
+) -> bool:
+    """Post-``item.enrich_one`` finish: adoption telemetry + miss-warm
+    scheduling in one call, gated on whether the LML#504 split gate
+    actually let the resolved bio through.
+
+    LML#1192 review round 3, finding 10: replaces the coordinator's own
+    ``record_bio_adoption`` + ``maybe_schedule_wikipedia_bio_warm`` pair of
+    calls (and the ``resolution_bio_surfaced`` boolean it hand-computed via
+    an explicit ``== resolution.bio`` comparison — see the module
+    docstring for why that comparison was always redundant with a plain
+    truthiness check). Returns ``bio_surfaced`` so the coordinator can pass
+    the SAME fact into the sibling Discogs ref-warm gate
+    (``background.maybe_schedule_discogs_bio_warm``'s
+    ``top1_bio_surfaced``), which needs it too.
+    """
+    bio_surfaced = bool(enriched_top1_bio)
+    _record_bio_adoption(resolution, bio_surfaced=bio_surfaced)
+    _maybe_schedule_wikipedia_bio_warm(
+        resolution,
+        warm_cache=warm_cache,
+        bio_surfaced=bio_surfaced,
+        discogs_cache_pg=discogs_cache_pg,
+    )
+    return bio_surfaced
