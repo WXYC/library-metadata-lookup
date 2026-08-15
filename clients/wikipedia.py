@@ -83,10 +83,24 @@ _RELEASE_NOUNS = (
 _RELEASE_PREPOSITIONS = ("by", "de", "von", "di", "par", "do", "da")
 _RELEASE_NOUN_ALTERNATION = "|".join(re.escape(n) for n in _RELEASE_NOUNS)
 _RELEASE_PREPOSITION_ALTERNATION = "|".join(re.escape(p) for p in _RELEASE_PREPOSITIONS)
+# LML#1192 review round 4, finding 9: pattern 2 used to match
+# `\b(noun)\b\s+(prep)\s+` ANYWHERE in the description, not just at the
+# start -- so an ordinary genre-descriptor phrase for a PERSON that
+# happens to contain a release-noun followed by a preposition mid-sentence
+# ("cantante de canción de autor española" -- Spanish for "Spanish
+# singer-songwriter" -- "canción de autor" is the standard idiom for that
+# genre, not "song by") false-positive-rejected, writing an authoritative
+# extract=NULL for a real artist page. Verified live: every genuine
+# release-page description across en/es/fr starts DIRECTLY with the
+# release noun ("1997 studio album by Radiohead", "álbum de Radiohead",
+# "album de Radiohead, sorti en 1997") -- so anchoring to the START of the
+# description (narrowed, not reverted -- the broadened non-English
+# vocabulary itself stays) keeps every true positive and drops the false
+# ones. Anchored, not `\b`-prefixed: `^` already implies a word boundary.
 _DESCRIPTION_REJECT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(rf"^\d{{4}}\s+.*\b(?:{_RELEASE_NOUN_ALTERNATION})\b", re.IGNORECASE),
     re.compile(
-        rf"\b(?:{_RELEASE_NOUN_ALTERNATION})\b\s+(?:{_RELEASE_PREPOSITION_ALTERNATION})\s+",
+        rf"^(?:{_RELEASE_NOUN_ALTERNATION})\b\s+(?:{_RELEASE_PREPOSITION_ALTERNATION})\s+",
         re.IGNORECASE,
     ),
 )
