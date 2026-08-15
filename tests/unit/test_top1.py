@@ -14,7 +14,7 @@ only the widened ``wiki`` element.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -86,3 +86,62 @@ class TestFetchTop1WikipediaWidening:
         )
 
         assert wiki is None
+
+
+@pytest.mark.asyncio
+class TestWikipediaExtractorFailureIsolation:
+    """LML#1192 review round 4, P0-10: pick_artist_wikipedia_url sat inside
+    fetch_top1_release_details's OUTER catch-all, so a failure there
+    discarded year/release/details already fetched successfully this same
+    request -- exactly the "not a reason to discard the release-level
+    enrichment" shape the LML#1049 DiscogsBreakerOpenError comment (eight
+    lines above the extractor call) already argues for, but didn't cover.
+    """
+
+    async def test_extractor_failure_defaults_wiki_to_none_but_keeps_year_release_details(self):
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = _release()
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Stereolab",
+            profile="French-British band.",
+            urls=["https://en.wikipedia.org/wiki/Stereolab"],
+        )
+
+        with patch(
+            "lookup.enrichment.top1.pick_artist_wikipedia_url",
+            side_effect=RuntimeError("boom"),
+        ):
+            year, bio, wiki, release, details = await fetch_top1_release_details(
+                discogs_service, _artwork()
+            )
+
+        assert wiki is None
+        # The bug: the OLD code's outer except caught this and returned
+        # (None, None, None, None, None) -- discarding everything below,
+        # not just the extractor's own output.
+        assert year == 1998
+        assert bio == "French-British band."
+        assert release is not None
+        assert details is not None
+
+    async def test_extractor_failure_is_logged_not_silent(self):
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = _release()
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Stereolab",
+            profile="French-British band.",
+            urls=["https://en.wikipedia.org/wiki/Stereolab"],
+        )
+
+        with (
+            patch(
+                "lookup.enrichment.top1.pick_artist_wikipedia_url",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("lookup.enrichment.top1.logger") as mock_logger,
+        ):
+            await fetch_top1_release_details(discogs_service, _artwork())
+
+        mock_logger.exception.assert_called_once()

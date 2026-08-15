@@ -396,6 +396,7 @@ class TestFinalizeBio:
         surfaced = finalize_bio(
             resolution,
             enriched_top1_bio="Wikipedia prose.",
+            enriched_top1_wiki=_PICK.url,
             warm_cache=False,
             discogs_cache_pg=None,
         )
@@ -403,12 +404,17 @@ class TestFinalizeBio:
         assert get_cache_stats().get(SERVED_STAT_KEY) == 1
 
     def test_gate_nulled_bio_records_nothing_and_returns_false(self):
-        # The LML#504 split gate nulled the bio out -- enriched_top1_bio is
-        # None even though the resolution itself picked Wikipedia text.
+        # The LML#504 split gate nulled BOTH bio and wiki_url out together
+        # -- enriched_top1_bio/enriched_top1_wiki are both None even though
+        # the resolution itself picked Wikipedia text.
         init_cache_stats()
         resolution = self._wikipedia_resolution()
         surfaced = finalize_bio(
-            resolution, enriched_top1_bio=None, warm_cache=False, discogs_cache_pg=None
+            resolution,
+            enriched_top1_bio=None,
+            enriched_top1_wiki=None,
+            warm_cache=False,
+            discogs_cache_pg=None,
         )
         assert surfaced is False
         assert get_cache_stats().get(SERVED_STAT_KEY) is None
@@ -425,6 +431,7 @@ class TestFinalizeBio:
             surfaced = finalize_bio(
                 resolution,
                 enriched_top1_bio=_DISCOGS_BIO,
+                enriched_top1_wiki=_PICK.url,
                 warm_cache=True,
                 discogs_cache_pg=pg,
             )
@@ -434,7 +441,9 @@ class TestFinalizeBio:
         )
         assert get_cache_stats().get(CACHE_MISS_WARM_SCHEDULED_STAT_KEY) == 1
 
-    def test_unsurfaced_miss_does_not_schedule_a_warm(self):
+    def test_gate_nulled_miss_does_not_schedule_a_warm(self):
+        # The LML#504 gate blocked this artist entirely -- both bio and
+        # wiki_url come back None, so there's nothing worth warming.
         pg = AsyncMock(spec=PgSource)
         with patch(
             "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
@@ -442,8 +451,40 @@ class TestFinalizeBio:
             surfaced = finalize_bio(
                 self._miss_resolution(),
                 enriched_top1_bio=None,
+                enriched_top1_wiki=None,
                 warm_cache=True,
                 discogs_cache_pg=pg,
             )
         assert surfaced is False
         mock_schedule.assert_not_called()
+
+    def test_no_discogs_profile_still_schedules_the_warm(self):
+        # LML#1192 review round 4, P0-6: an artist with NO Discogs profile
+        # at all has top1_bio=None even on a genuine cache miss, so
+        # enriched_top1_bio is unconditionally None/falsy for this cohort
+        # -- exactly the artists this warm exists for (Discogs has nothing
+        # to offer; Wikipedia might). The warm must NOT gate on
+        # bio_surfaced: it gates on whether the LML#504 identity gate let
+        # the artist's IDENTITY through at all, which wikipedia_url
+        # (nulled by that same gate, independently of bio text) answers
+        # correctly. Here the gate passed (wiki_url survived) even though
+        # there was never any bio text to surface.
+        pg = AsyncMock(spec=PgSource)
+        init_cache_stats()
+        resolution = self._miss_resolution()
+        with patch(
+            "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
+            return_value=True,
+        ) as mock_schedule:
+            surfaced = finalize_bio(
+                resolution,
+                enriched_top1_bio=None,  # no Discogs profile -- nothing to surface
+                enriched_top1_wiki=_PICK.url,  # but the gate let the identity through
+                warm_cache=True,
+                discogs_cache_pg=pg,
+            )
+        assert surfaced is False  # correctly reports nothing was SHOWN
+        mock_schedule.assert_called_once_with(
+            discogs_artist_id=_DETAILS.artist_id, pick=_PICK, discogs_cache_pg=pg
+        )
+        assert get_cache_stats().get(CACHE_MISS_WARM_SCHEDULED_STAT_KEY) == 1

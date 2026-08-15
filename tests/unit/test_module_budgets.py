@@ -93,17 +93,25 @@ MODULE_BUDGETS: dict[str, int] = {
     # -> 200; at the old 100 the file sat exactly on its ceiling with no
     # maintenance headroom at all.
     "lookup/enrichment/streaming_status.py": 200,
-    "lookup/enrichment/top1.py": 100,
+    # Recalibrated (LML#1192 review round 4, P0-10): the Wikipedia-URL
+    # extractor call gained its own try/except (a failure there must not
+    # discard year/release/details already fetched successfully this same
+    # request -- the same LML#1049 rationale the DiscogsBreakerOpenError
+    # branch above it already followed). Measured 106 lines at this PR's
+    # tip. Smallest multiple of 50 at or above 1.3x that -> 150.
+    "lookup/enrichment/top1.py": 150,
     # LML#513/#1192 Phase B (docs/plans/lml-1192-wikipedia-artist-bio.md):
     # the read-path resolver -- CachedValue read, served-pair resolution --
-    # plus two post-hoc functions the coordinator calls after the LML#504
-    # gate has run (record_bio_adoption, maybe_schedule_wikipedia_bio_warm;
-    # LML#1192 review round 2, B2-1/B2-2: resolve_served_bio itself can't
-    # know the gate's outcome, so adoption telemetry and warm-scheduling
-    # moved out to these two functions and a ServedBioResolution dataclass).
-    # Measured 223 lines at this PR's tip. Smallest multiple of 50 at or
-    # above 1.3x that -> 300.
-    "lookup/enrichment/wikipedia_bio.py": 300,
+    # plus finalize_bio (LML#1192 review round 3, finding 10: collapses the
+    # coordinator's post-gate adoption-telemetry + miss-warm-scheduling
+    # calls into one) and its two private helpers. Recalibrated again
+    # (round 4, P0-6): the miss-warm's gate condition split from
+    # bio_surfaced to a separate enriched_top1_wiki-derived signal (an
+    # artist with no Discogs profile has bio_surfaced permanently False,
+    # which made the warm unreachable for exactly the cohort it exists
+    # for). Measured 308 lines at this PR's tip. Smallest multiple of 50
+    # at or above 1.3x that -> 400.
+    "lookup/enrichment/wikipedia_bio.py": 400,
     # LML#513/#1192 Phase B: the bounded miss-warm executor, modeled on
     # lookup/streaming_warm_admission.py -- depth-bound admission, the
     # fetch, and the unsampled fetch-outcome PostHog counters. Measured
