@@ -32,6 +32,7 @@ from entity.artist_wikipedia_bio import (
     get_cached_artist_wikipedia_bio,
     set_cached_artist_wikipedia_bio,
     set_up_artist_wikipedia_bio_schema,
+    touch_artist_wikipedia_bio_last_checked_at,
 )
 from tests.integration.conftest import skip_if_named_tables_populated
 
@@ -155,6 +156,108 @@ class TestRoundTrip:
             )
         assert row["wikipedia_url"] == _URL
         assert row["extract"] == "Correct text."
+
+
+@pytest.mark.pg
+class TestSqlLevelNullOverwriteGuard:
+    """LML#1192 review round 4, P0-5: real ``ON CONFLICT ... WHERE`` clause
+    behavior needs a live Postgres round-trip to prove -- the unit-level
+    mock only pins that the SQL text carries the guard.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_would_be_negative_write_leaves_an_existing_positive_row_untouched(
+        self, pg_source, pg_pool
+    ):
+        await set_cached_artist_wikipedia_bio(
+            pg_source,
+            discogs_artist_id=99,
+            wikipedia_url=_URL,
+            slug_score=97.0,
+            lang="en",
+            extract="The real, already-collected biography.",
+        )
+        # A later write attempts to null it out (e.g. a --repick whose
+        # fresh pick diverged into a rejected/404 page) -- must be a no-op
+        # at the database level, not just skipped by the Python caller.
+        await set_cached_artist_wikipedia_bio(
+            pg_source,
+            discogs_artist_id=99,
+            wikipedia_url="https://en.wikipedia.org/wiki/A_Different_Diverged_Pick",
+            slug_score=40.0,
+            lang="en",
+            extract=None,
+        )
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT wikipedia_url, extract FROM lml_cache.artist_wikipedia_bio "
+                "WHERE discogs_artist_id = 99"
+            )
+        assert row["extract"] == "The real, already-collected biography."
+        # The WHERE clause blocks the WHOLE update, not just extract --
+        # wikipedia_url must ALSO stay the original, not the diverged pick.
+        assert row["wikipedia_url"] == _URL
+
+    @pytest.mark.asyncio
+    async def test_a_positive_write_over_an_existing_negative_row_still_updates_normally(
+        self, pg_source, pg_pool
+    ):
+        # The guard is one-directional: it only blocks positive->negative.
+        # A negative row (or no row at all) accepting a fresh positive
+        # extract is the whole point of the cache and must be unaffected.
+        await set_cached_artist_wikipedia_bio(
+            pg_source,
+            discogs_artist_id=99,
+            wikipedia_url=_URL,
+            slug_score=40.0,
+            lang="en",
+            extract=None,
+        )
+        await set_cached_artist_wikipedia_bio(
+            pg_source,
+            discogs_artist_id=99,
+            wikipedia_url=_URL,
+            slug_score=97.0,
+            lang="en",
+            extract="Newly-found biography.",
+        )
+        result = await get_cached_artist_wikipedia_bio(
+            pg_source, discogs_artist_id=99, wikipedia_url=_URL
+        )
+        assert result.value == "Newly-found biography."
+
+    @pytest.mark.asyncio
+    async def test_touch_advances_last_checked_at_without_touching_fetched_at(
+        self, pg_source, pg_pool
+    ):
+        await set_cached_artist_wikipedia_bio(
+            pg_source,
+            discogs_artist_id=99,
+            wikipedia_url=_URL,
+            slug_score=97.0,
+            lang="en",
+            extract="Text.",
+        )
+        async with pg_pool.acquire() as conn:
+            before = await conn.fetchrow(
+                "SELECT fetched_at, last_checked_at FROM lml_cache.artist_wikipedia_bio "
+                "WHERE discogs_artist_id = 99"
+            )
+            # Move last_checked_at into the past so the touch's advance is
+            # observable regardless of same-millisecond now() collisions.
+            await conn.execute(
+                "UPDATE lml_cache.artist_wikipedia_bio "
+                "SET last_checked_at = last_checked_at - interval '1 day' "
+                "WHERE discogs_artist_id = 99"
+            )
+        await touch_artist_wikipedia_bio_last_checked_at(pg_source, discogs_artist_id=99)
+        async with pg_pool.acquire() as conn:
+            after = await conn.fetchrow(
+                "SELECT fetched_at, last_checked_at FROM lml_cache.artist_wikipedia_bio "
+                "WHERE discogs_artist_id = 99"
+            )
+        assert after["fetched_at"] == before["fetched_at"]
+        assert after["last_checked_at"] > before["last_checked_at"]
 
 
 @pytest.mark.pg

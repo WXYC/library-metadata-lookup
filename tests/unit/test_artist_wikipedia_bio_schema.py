@@ -4,8 +4,13 @@ Mirrors ``tests/unit/test_release_resolution_cache_schema.py``. Two surfaces:
 
 * ``entity/artist_wikipedia_bio.sql`` -- the canonical-DDL reference file.
 * ``set_up_artist_wikipedia_bio_schema`` -- the lifespan bootstrap helper. It
-  must issue ``CREATE SCHEMA`` then ``CREATE TABLE`` and nothing else (no
-  additive ALTER -- this table has no pre-#1192 shape to upgrade).
+  issues ``CREATE SCHEMA``/``CREATE TABLE`` as one ``bootstrap_lml_cache_table``
+  transaction, THEN the ``last_checked_at`` additive
+  ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` as its OWN, separate
+  ``bootstrap_lml_cache_table`` call (LML#1192 review round 4, P0-1 --
+  this table's CREATE TABLE alone shipped in #1194 before last_checked_at
+  existed at all; the ALTER upgrades a table #1194 already created without
+  it, mirroring ``entity/streaming_url_cache.py``'s ``is_error`` column).
 
 The parity assertion pins the module's runtime ``CREATE TABLE`` text to the
 ``.sql`` reference so the two cannot silently drift. PG is mocked; the
@@ -69,23 +74,36 @@ class TestSetUpArtistWikipediaBioSchema:
 
         await set_up_artist_wikipedia_bio_schema(mock_pg_tx)
 
-        # [0] is the lock_timeout preamble; [1]-[2] are schema then table.
-        assert conn.execute.await_count == 3
+        # [0] is the lock_timeout preamble; [1]-[2] are schema then table
+        # (the first bootstrap_lml_cache_table call).
+        assert conn.execute.await_count >= 3
         schema_sql = conn.execute.await_args_list[1].args[0]
         table_sql = conn.execute.await_args_list[2].args[0]
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in schema_sql
         assert "CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio" in table_sql
         assert "discogs_artist_id BIGINT PRIMARY KEY" in table_sql
+        assert "last_checked_at" in table_sql
 
-    async def test_runs_as_one_transaction_on_one_connection(self, mock_pg_tx):
+    async def test_last_checked_at_column_is_added_via_its_own_bootstrap_call(self, mock_pg_tx):
+        # LML#1192 review round 4, P0-1: a SECOND, SEPARATE
+        # bootstrap_lml_cache_table call -- its own connection acquire and
+        # its own transaction -- carries the additive ALTER TABLE, so a
+        # lock_timeout there can't roll back the (already-succeeded)
+        # schema/table step (mirrors entity/streaming_url_cache.py's
+        # LML#1121 FIX 5 lock-isolation rationale).
         conn = mock_pg_tx._mock_conn
 
         await set_up_artist_wikipedia_bio_schema(mock_pg_tx)
 
-        mock_pg_tx.acquire.assert_called_once()
-        conn.transaction.assert_called_once()
-        conn._mock_tx_ctx.__aenter__.assert_awaited_once()
-        conn._mock_tx_ctx.__aexit__.assert_awaited_once()
+        executed = [call.args[0] for call in conn.execute.await_args_list]
+        assert any(
+            "ALTER TABLE" in sql and "ADD COLUMN IF NOT EXISTS" in sql and "last_checked_at" in sql
+            for sql in executed
+        )
+        assert mock_pg_tx.acquire.call_count == 2, (
+            "the CREATE TABLE step and the additive ALTER must run as TWO "
+            "separate bootstrap_lml_cache_table calls, not one shared transaction"
+        )
 
     async def test_does_not_read_or_backfill(self, mock_pg_tx):
         conn = mock_pg_tx._mock_conn

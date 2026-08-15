@@ -74,9 +74,29 @@ CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio (
     slug_score SMALLINT NOT NULL,
     lang TEXT NOT NULL,
     extract TEXT,
-    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now()
 )\
 """
+
+# LML#1192 review round 4, P0-1: this table is created ONLY here (#1194) --
+# the drain PR (#1196) reads/writes last_checked_at but its OWN
+# CREATE TABLE IF NOT EXISTS is a no-op once this one has already run once.
+# Without this ALTER, the deploy sequence "#1194 merges and deploys (table
+# created without the column) -> #1196 merges" leaves the column
+# permanently absent: every read/write touching it then fails (silently
+# swallowed by swallowing_fetch/swallowing_execute) against a live cache.
+# Mirrors entity/streaming_url_cache.py's `is_error` ALTER (LML#1121) --
+# metadata-only/fast on modern Postgres, safe to re-issue on every boot,
+# a no-op once the column exists. Runs as its OWN bootstrap_lml_cache_table
+# call (see set_up_artist_wikipedia_bio_schema) since PG16 still takes an
+# AccessExclusiveLock on ADD COLUMN IF NOT EXISTS even on that no-op path,
+# so it must not share a transaction with (and risk rolling back) the
+# CREATE TABLE/SCHEMA step above.
+_DDL_ADD_LAST_CHECKED_AT_COLUMN = (
+    "ALTER TABLE lml_cache.artist_wikipedia_bio "
+    "ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+)
 
 # Staleness AND the self-healing URL-match both live in the WHERE clause.
 # $1 = discogs_artist_id, $2 = the caller's CURRENT Phase-A wikipedia_url
@@ -98,17 +118,50 @@ WHERE discogs_artist_id = $1 AND wikipedia_url = $2
 # UPSERT: one row per artist, keyed on discogs_artist_id alone. A later
 # write (a fresh fetch, a --repick correction) always replaces the prior
 # row wholesale -- including wikipedia_url -- which is exactly the
-# self-healing the read side relies on.
+# self-healing the read side relies on. Sets BOTH fetched_at and
+# last_checked_at: a real fetch is by definition a fresh check too, so the
+# drain's progress cursor advances on every real write.
+#
+# LML#1192 review round 4, P0-5: the WHERE clause is the SQL-level
+# enforcement of this repo's standing data-safety rule (never overwrite
+# successfully collected data without explicit approval) -- the Python-level
+# guard in scripts/warm_wikipedia_bios.py's `_write_bio` is necessary but
+# not sufficient, since it only protects callers that go through it. When
+# the WHERE condition is false, Postgres skips the DO UPDATE entirely --
+# EVERY column, not just extract, is left exactly as it was -- so a caller
+# that (by bug or by a future code path this file's author didn't imagine)
+# tries to write a negative over an existing positive extract silently
+# no-ops at the database itself, rather than destroying the row.
 _UPSERT_SQL = """\
 INSERT INTO lml_cache.artist_wikipedia_bio
-    (discogs_artist_id, wikipedia_url, slug_score, lang, extract, fetched_at)
-VALUES ($1, $2, $3, $4, $5, now())
+    (discogs_artist_id, wikipedia_url, slug_score, lang, extract, fetched_at, last_checked_at)
+VALUES ($1, $2, $3, $4, $5, now(), now())
 ON CONFLICT (discogs_artist_id) DO UPDATE
 SET wikipedia_url = EXCLUDED.wikipedia_url,
     slug_score = EXCLUDED.slug_score,
     lang = EXCLUDED.lang,
     extract = EXCLUDED.extract,
-    fetched_at = EXCLUDED.fetched_at\
+    fetched_at = EXCLUDED.fetched_at,
+    last_checked_at = EXCLUDED.last_checked_at
+WHERE NOT (
+    lml_cache.artist_wikipedia_bio.extract IS NOT NULL AND EXCLUDED.extract IS NULL
+)\
+"""
+
+# Content-free progress-cursor bump: advances ONLY last_checked_at, NEVER
+# fetched_at (fetched_at is content age; conflating the two would grant an
+# unchanged repick's prose another full DEFAULT_SUCCESS_TTL of freshness
+# authority it didn't earn). Used by scripts/warm_wikipedia_bios.py's
+# --repick mode when a re-run of the extractor confirms the stored pick is
+# still correct -- the UPSERT above deliberately doesn't run for an
+# already-correct row (the "only divergent rows are written" data-safety
+# rule), but that means an unchanged row's cursor never advances without
+# this, so a cursor-ordered seed query would keep re-selecting the SAME
+# already-verified rows forever instead of progressing through the table.
+_TOUCH_LAST_CHECKED_AT_SQL = """\
+UPDATE lml_cache.artist_wikipedia_bio
+SET last_checked_at = now()
+WHERE discogs_artist_id = $1\
 """
 
 
@@ -117,11 +170,17 @@ async def set_up_artist_wikipedia_bio_schema(pg: PgSource) -> None:
 
     Registered as a ``(label, fn)`` entry in ``main.py``'s ``bootstraps``
     tuple, so it runs under the lifespan's session-scoped advisory lock like
-    every other ``lml_cache.*`` bootstrap. Runs as one transaction on one
-    acquired connection, behind a ``lock_timeout`` preamble
-    (``entity.ddl.bootstrap_lml_cache_table``).
+    every other ``lml_cache.*`` bootstrap. Schema + table creation run as
+    one transaction on one acquired connection, behind a ``lock_timeout``
+    preamble (``entity.ddl.bootstrap_lml_cache_table``).
+
+    The ``last_checked_at`` column ALTER (LML#1192 review round 4, P0-1)
+    runs as its OWN, SEPARATE ``bootstrap_lml_cache_table`` call — see
+    :data:`_DDL_ADD_LAST_CHECKED_AT_COLUMN`'s docstring for why it can't
+    share a transaction with the step above.
     """
     await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE)
+    await bootstrap_lml_cache_table(pg, _DDL_ADD_LAST_CHECKED_AT_COLUMN)
 
 
 async def get_cached_artist_wikipedia_bio(
@@ -193,5 +252,28 @@ async def set_cached_artist_wikipedia_bio(
         extract,
         logger=logger,
         log_label="artist_wikipedia_bio set failed for discogs_artist_id=%s",
+        log_args=(discogs_artist_id,),
+    )
+
+
+async def touch_artist_wikipedia_bio_last_checked_at(
+    pg: PgSource, *, discogs_artist_id: int
+) -> None:
+    """Bump ``last_checked_at`` to now without touching ``fetched_at`` or
+    any other column.
+
+    Used by ``scripts/warm_wikipedia_bios.py``'s ``--repick`` mode when a
+    re-run of the extractor confirms the stored pick is still correct (see
+    :data:`_TOUCH_LAST_CHECKED_AT_SQL` for why this needs to exist
+    separately from the UPSERT above, and why it must never touch
+    ``fetched_at``). A no-op if the row doesn't exist. Best-effort, same
+    posture as every other write in this module.
+    """
+    await swallowing_execute(
+        pg,
+        _TOUCH_LAST_CHECKED_AT_SQL,
+        discogs_artist_id,
+        logger=logger,
+        log_label="artist_wikipedia_bio touch failed for discogs_artist_id=%s",
         log_args=(discogs_artist_id,),
     )

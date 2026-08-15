@@ -187,6 +187,43 @@ class TestNegativeResults:
         client = WikipediaClient()
         assert await client.get_summary("Stereolab", "en") is not None
 
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "cantante de canción de autor española",  # Spanish: singer-songwriter
+            "chanteur de chanson de variété française",  # French: variety/pop singer
+            "grupo de música disco de Estados Unidos",  # Spanish: US disco-music group
+        ],
+    )
+    async def test_release_noun_embedded_mid_sentence_is_not_rejected(
+        self, httpx_mock, description
+    ):
+        # LML#1192 review round 4, finding 9: B1-1's broadened net matched
+        # `\b(noun)\b\s+(prep)\s+` ANYWHERE in the description, not just at
+        # its start -- so an ordinary genre-descriptor phrase for a PERSON
+        # that happens to contain a release-noun followed by a preposition
+        # mid-sentence ("canción de autor" = the standard Spanish term for
+        # "singer-songwriter"; "chanson de variété" = French for "pop
+        # song"/variety singer; "música disco de Estados Unidos" = "disco
+        # music FROM the United States") was wrongly rejected, writing an
+        # authoritative extract=NULL for a real artist page. Verified live:
+        # every genuine release-page description across en/es/fr starts
+        # DIRECTLY with the release noun (e.g. "1997 studio album by
+        # Radiohead", "álbum de Radiohead", "album de Radiohead, sorti en
+        # 1997") -- so anchoring pattern 2 to the START of the description
+        # (narrowed, not reverted) keeps every true positive and drops
+        # these three false positives.
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            json={
+                "type": "standard",
+                "extract": "An artist.",
+                "description": description,
+            },
+        )
+        client = WikipediaClient()
+        assert await client.get_summary("Stereolab", "en") is not None
+
     async def test_ordinary_person_description_is_not_rejected(self, httpx_mock):
         httpx_mock.add_response(
             url=_SUMMARY_URL,

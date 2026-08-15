@@ -158,8 +158,23 @@ _MODULES: dict[str, SidecarSpec] = {
 -- empty (the client itself rejects an empty extract before returning).
 -- `fetched_at` -- read-side TTL cutoff, on two DIFFERENT clocks depending
 -- on `extract IS NULL` (`entity/artist_wikipedia_bio.py`'s module
--- docstring has the full freshness rationale).""",
+-- docstring has the full freshness rationale). `last_checked_at` -- the
+-- offline drain's own progress cursor (LML#1192 review round 4, finding
+-- 13), distinct from `fetched_at`'s content-age meaning -- see the footer
+-- below for tables that predate the column.""",
         },
+        footer=f"""\
+-- LML#1192 review round 4, P0-1: this table is created ONLY here
+-- (#1194) -- the drain PR (#1196) reads/writes `last_checked_at` but its
+-- own `CREATE TABLE IF NOT EXISTS` is a no-op once this one has already
+-- run. A fresh install already has the column from the CREATE TABLE
+-- above; the runtime bootstrap additionally issues this idempotent ALTER
+-- (not shown as a top-level statement -- it is a follow-up upgrade for a
+-- table that predates the column, a no-op once the column exists) so an
+-- existing prod table gains it in place. Mirrors
+-- `entity/streaming_url_cache.py`'s `is_error` upgrade (LML#1121):
+--
+--   {artist_wikipedia_bio._DDL_ADD_LAST_CHECKED_AT_COLUMN};""",
     ),
     "compilation_track_identity": SidecarSpec(
         header=f"""\
