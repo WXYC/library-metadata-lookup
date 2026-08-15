@@ -11,10 +11,14 @@ non-top-1 items reuse the same per-result streaming-URL build in
 ``lookup.enrichment.item``.
 """
 
+import logging
+
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import ArtistDetails, DiscogsSearchResult, ReleaseMetadataResponse
 from discogs.service import DiscogsService
 from lookup.wikipedia_url import PickedWikiUrl, pick_artist_wikipedia_url
+
+logger = logging.getLogger(__name__)
 
 
 async def fetch_top1_release_details(
@@ -78,7 +82,25 @@ async def fetch_top1_release_details(
         # LML#513 (Phase A): slug-scored pick over the legacy first-substring
         # match — see lookup/wikipedia_url.py for the extractor and the
         # LML_WIKIPEDIA_SLUG_MATCH flag it reads.
-        wiki = pick_artist_wikipedia_url(details.urls, details.name)
+        #
+        # LML#1192 review round 4, P0-10: its OWN try/except -- this call
+        # runs regex parsing, wxyc_etl's PyO3 bindings
+        # (strip_discogs_disambig), and Sentry SDK calls
+        # (_project_wikipedia_slug_pick), any of which failing must not
+        # discard year/release/details already fetched successfully this
+        # same request. Same LML#1049 rationale as the DiscogsBreakerOpenError
+        # branch above (a bio-step failure isn't a reason to discard the
+        # release-level enrichment) -- the OUTER except below is a
+        # catch-all for the Discogs I/O calls, not a place a pure-function
+        # bug in the extractor should also be able to reach.
+        try:
+            wiki = pick_artist_wikipedia_url(details.urls, details.name)
+        except Exception:
+            logger.exception("Wikipedia URL extraction failed for artist_id=%s", artist_id)
+            wiki = None
         return year, bio, wiki, release, details
     except Exception:
+        logger.exception(
+            "Top-1 release/artist detail fetch failed for release_id=%s", top_artwork.release_id
+        )
         return None, None, None, None, None

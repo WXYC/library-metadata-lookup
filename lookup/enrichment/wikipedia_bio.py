@@ -264,12 +264,12 @@ def finalize_bio(
     resolution: ServedBioResolution,
     *,
     enriched_top1_bio: str | None,
+    enriched_top1_wiki: str | None,
     warm_cache: bool,
     discogs_cache_pg: PgSource | None,
 ) -> bool:
     """Post-``item.enrich_one`` finish: adoption telemetry + miss-warm
-    scheduling in one call, gated on whether the LML#504 split gate
-    actually let the resolved bio through.
+    scheduling in one call.
 
     LML#1192 review round 3, finding 10: replaces the coordinator's own
     ``record_bio_adoption`` + ``maybe_schedule_wikipedia_bio_warm`` pair of
@@ -280,13 +280,29 @@ def finalize_bio(
     the SAME fact into the sibling Discogs ref-warm gate
     (``background.maybe_schedule_discogs_bio_warm``'s
     ``top1_bio_surfaced``), which needs it too.
+
+    LML#1192 review round 4, P0-6: adoption telemetry gates on
+    ``bio_surfaced`` (bio TEXT reached the wire — the right question for
+    "which source got served"), but the miss-warm must NOT: an artist
+    with no Discogs profile at all has ``top1_bio=None`` even on a genuine
+    cache miss, so ``bio_surfaced`` is unconditionally ``False`` for
+    exactly the cohort this warm exists for (Discogs has nothing; Wikipedia
+    might) — gating the warm on it made the feature unreachable for that
+    cohort, and ``CACHE_MISS_WARM_SCHEDULED_STAT_KEY`` invisible for them
+    too. The warm instead gates on ``enriched_top1_wiki`` — nulled by the
+    SAME LML#504 split gate, independently of bio text (``item.enrich_one``
+    applies ``is_artist_derived_eligible`` to ``top1_wiki`` on its own line,
+    not as a side effect of the bio one) — so "did the identity gate let
+    this artist through at all" is answered correctly regardless of
+    whether there was ever bio text to show.
     """
     bio_surfaced = bool(enriched_top1_bio)
+    gate_passed = enriched_top1_wiki is not None
     _record_bio_adoption(resolution, bio_surfaced=bio_surfaced)
     _maybe_schedule_wikipedia_bio_warm(
         resolution,
         warm_cache=warm_cache,
-        bio_surfaced=bio_surfaced,
+        bio_surfaced=gate_passed,
         discogs_cache_pg=discogs_cache_pg,
     )
     return bio_surfaced

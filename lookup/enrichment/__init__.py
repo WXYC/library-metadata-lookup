@@ -340,9 +340,18 @@ async def enrich_artwork_results(
     enriched_top1_bio = (
         top1_enriched_result.artist_bio if top1_enriched_result is not None else None
     )
+    # LML#1192 review round 4, P0-6: wikipedia_url is nulled by the SAME
+    # LML#504 gate, independently of bio text -- passed through so the
+    # miss-warm can gate on "the artist's identity survived the gate" even
+    # when there was never any bio text to surface (see
+    # wikipedia_bio.finalize_bio's docstring).
+    enriched_top1_wiki = (
+        top1_enriched_result.wikipedia_url if top1_enriched_result is not None else None
+    )
     bio_surfaced = wikipedia_bio.finalize_bio(
         bio_resolution,
         enriched_top1_bio=enriched_top1_bio,
+        enriched_top1_wiki=enriched_top1_wiki,
         warm_cache=warm_cache,
         discogs_cache_pg=discogs_cache_pg,
     )
