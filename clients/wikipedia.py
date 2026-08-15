@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -45,11 +46,49 @@ _SUMMARY_URL_TEMPLATE = "https://{lang}.wikipedia.org/api/rest_v1/page/summary/{
 
 # The description-pattern reject (see module docstring): a non-artist page
 # whose slug survived the Phase-A denylist. Matches Wikipedia's own
-# machine-generated descriptions for album/EP/song/single pages, e.g.
-# "1975 studio album by Some Artist" or "song by Some Artist".
+# machine-generated descriptions for album/EP/song/single/mixtape pages,
+# e.g. "1975 studio album by Some Artist" or "song by Some Artist".
+#
+# LML#1192 review (round 2), finding B1-1: the original two patterns were
+# English-only (a non-English Wikipedia edition's description sailed
+# straight through) and "mixtape by" fell through both -- pattern 1
+# required a leading year, and "mixtape" was absent from pattern 2's
+# alternation entirely. Broadened to a language-agnostic release-noun
+# vocabulary (the handful of European languages WXYC's Discogs-linked
+# Wikipedia pages most commonly surface in) matched against a release
+# PREPOSITION set, rather than one hand-built phrase shape per language --
+# this is deliberately a wider net, not an exhaustive per-language grammar:
+# it is a backstop behind the Phase-A slug denylist, not the primary
+# signal, so trading a little precision for materially broader recall is
+# the correct trade here. Python's ``re.IGNORECASE`` case-folds non-ASCII
+# letters correctly (``Álbum`` matches ``álbum``), so no separate
+# diacritic-stripping step is needed.
+_RELEASE_NOUNS = (
+    "album",
+    "ep",
+    "single",
+    "song",
+    "mixtape",
+    "compilation",  # English
+    "álbum",
+    "sencillo",
+    "canción",  # Spanish / Portuguese
+    "disque",
+    "chanson",  # French
+    "studioalbum",
+    "lied",  # German
+    "disco",
+    "canzone",  # Italian
+)
+_RELEASE_PREPOSITIONS = ("by", "de", "von", "di", "par", "do", "da")
+_RELEASE_NOUN_ALTERNATION = "|".join(re.escape(n) for n in _RELEASE_NOUNS)
+_RELEASE_PREPOSITION_ALTERNATION = "|".join(re.escape(p) for p in _RELEASE_PREPOSITIONS)
 _DESCRIPTION_REJECT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\d{4}\s+.*\b(album|ep|single|mixtape)\b", re.IGNORECASE),
-    re.compile(r"\b(album|song|single|ep)\b\s+by\s+", re.IGNORECASE),
+    re.compile(rf"^\d{{4}}\s+.*\b(?:{_RELEASE_NOUN_ALTERNATION})\b", re.IGNORECASE),
+    re.compile(
+        rf"\b(?:{_RELEASE_NOUN_ALTERNATION})\b\s+(?:{_RELEASE_PREPOSITION_ALTERNATION})\s+",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -70,17 +109,34 @@ def _is_rejected_description(description: str | None) -> bool:
     return any(pattern.search(description) for pattern in _DESCRIPTION_REJECT_PATTERNS)
 
 
+_MAX_RETRY_DELAY_SECONDS = 30.0
+"""Hard ceiling on any single retry sleep, however parsed. LML#1192 review
+(B1-2): ``float()`` happily accepts ``"inf"``/``"nan"`` and ``max(x, 0.0)``
+clamps neither (``max(nan, 0.0)`` is itself undefined-by-comparison) --
+``asyncio.sleep(inf)`` never wakes, permanently stranding one of the two
+background-warm permits (or stalling the offline drain outright) on a
+malicious or malformed upstream header. Every parsed value, finite or not,
+is clamped into ``[0, _MAX_RETRY_DELAY_SECONDS]``."""
+
+
 def _parse_retry_after(response: httpx.Response) -> float:
     raw = response.headers.get("Retry-After")
     if raw is None:
         return _DEFAULT_RETRY_DELAY_SECONDS
     try:
-        return max(float(raw), 0.0)
+        parsed = float(raw)
     except ValueError:
         # Retry-After may also be an HTTP-date; this client doesn't parse
         # that form (Wikipedia's REST API sends the delta-seconds form in
         # practice) — fall back to the default delay rather than raise.
         return _DEFAULT_RETRY_DELAY_SECONDS
+    if not math.isfinite(parsed):
+        # inf/-inf/nan: never trust an upstream header enough to sleep on
+        # it directly. Falls back to the same default a malformed value
+        # gets, rather than clamping to the ceiling — an upstream sending
+        # "inf" is a malformed signal, not a "wait as long as possible" one.
+        return _DEFAULT_RETRY_DELAY_SECONDS
+    return min(max(parsed, 0.0), _MAX_RETRY_DELAY_SECONDS)
 
 
 class WikipediaClient:
@@ -143,7 +199,27 @@ class WikipediaClient:
                         f"Wikipedia summary fetch returned HTTP {response.status_code}"
                     )
 
-                return _parse_summary(response.json())
+                # LML#1192 review (B1-3): a malformed/non-JSON 200 body
+                # (an upstream error page misrouted through a proxy, a
+                # truncated response, ...) previously raised a raw
+                # json.JSONDecodeError -- or, for well-formed-but-wrong-
+                # shaped JSON (a bare list instead of an object), a raw
+                # AttributeError out of _parse_summary's dict access --
+                # neither of which is WikipediaFetchError, so both escaped
+                # every caller's `except WikipediaFetchError` handling.
+                # ``json.JSONDecodeError`` is a ``ValueError`` subclass.
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    raise WikipediaFetchError(
+                        f"Wikipedia summary fetch returned a non-JSON body: {exc}"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise WikipediaFetchError(
+                        "Wikipedia summary fetch returned a non-object JSON body "
+                        f"({type(payload).__name__})"
+                    )
+                return _parse_summary(payload)
 
 
 def _parse_summary(payload: dict) -> WikipediaSummary | None:
