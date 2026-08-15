@@ -48,10 +48,19 @@ that triggered it, so this rides the standard contextvar-scoped recorder
 FETCH_OK_STAT_KEY = "wikipedia_bio_fetch_ok"
 FETCH_REJECT_STAT_KEY = "wikipedia_bio_fetch_reject"
 """Unsampled PostHog counters (see :func:`_capture_fetch_outcome`) — the
-warm TASK runs detached from any request's cache_stats context (the request
-that scheduled it has typically already returned by the time the fetch
-completes), so these do NOT use the per-request recorder; a write there
-would land in an already-reported, orphaned copy of the stats dict."""
+warm TASK runs detached from any request's cache_stats context, so these do
+NOT use the per-request recorder.
+
+LML#1192 review, B2-4 correction: the ``cache_stats`` dict itself is NOT
+copied per task. ``asyncio.create_task`` binds the new task to a shallow
+copy of the parent's ContextVar *bindings*, but the dict object a
+``cache_stats`` binding points to is the SAME shared mutable object in both
+contexts -- a write from this detached task would mutate the very dict the
+request handler already read. The reason a write here still wouldn't count
+is ordering, not isolation: by the time this task's first ``await``
+resolves, the request that scheduled it has already read and reported its
+``cache_stats`` snapshot and returned, so a late write lands in a dict
+nobody will read again -- silently dropped, not orphaned into a copy."""
 
 _POSTHOG_EVENT_PREFIX = "wikipedia_bio_warm"
 _POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"

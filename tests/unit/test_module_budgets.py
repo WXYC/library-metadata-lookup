@@ -50,7 +50,14 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/candidate_memo.py": 150,
     "lookup/concurrency.py": 200,
     "lookup/endpoint_family.py": 100,
-    "lookup/enrichment/__init__.py": 350,
+    # Recalibrated (LML#1192 review round 2, B2-1/B2-2): the coordinator now
+    # also calls record_bio_adoption + maybe_schedule_wikipedia_bio_warm
+    # after the LML#504 gate runs, since resolve_served_bio itself can no
+    # longer commit to adoption telemetry or warm-scheduling before the
+    # gate's outcome is known (see lookup/enrichment/wikipedia_bio.py's
+    # module docstring). Measured 366 lines at this PR's tip. Smallest
+    # multiple of 50 at or above 1.3x that -> 500.
+    "lookup/enrichment/__init__.py": 500,
     "lookup/enrichment/background.py": 100,
     # LML#1098: the inline Bandcamp live probe, extracted out of item.py to keep
     # that file under its ceiling (same posture streaming_status.py took for
@@ -83,11 +90,15 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/enrichment/streaming_status.py": 200,
     "lookup/enrichment/top1.py": 100,
     # LML#513/#1192 Phase B (docs/plans/lml-1192-wikipedia-artist-bio.md):
-    # the read-path resolver -- CachedValue read, served-pair resolution,
-    # warm-scheduling decision. Measured 130 lines (plan estimated ~70 --
-    # the repo's documentation density, same story as wikipedia_url.py's
-    # own recalibration). Smallest multiple of 50 at or above 1.3x that.
-    "lookup/enrichment/wikipedia_bio.py": 200,
+    # the read-path resolver -- CachedValue read, served-pair resolution --
+    # plus two post-hoc functions the coordinator calls after the LML#504
+    # gate has run (record_bio_adoption, maybe_schedule_wikipedia_bio_warm;
+    # LML#1192 review round 2, B2-1/B2-2: resolve_served_bio itself can't
+    # know the gate's outcome, so adoption telemetry and warm-scheduling
+    # moved out to these two functions and a ServedBioResolution dataclass).
+    # Measured 223 lines at this PR's tip. Smallest multiple of 50 at or
+    # above 1.3x that -> 300.
+    "lookup/enrichment/wikipedia_bio.py": 300,
     # LML#513/#1192 Phase B: the bounded miss-warm executor, modeled on
     # lookup/streaming_warm_admission.py -- depth-bound admission, the
     # fetch, and the unsampled fetch-outcome PostHog counters. Measured

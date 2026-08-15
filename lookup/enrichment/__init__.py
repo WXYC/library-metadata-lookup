@@ -308,8 +308,8 @@ async def enrich_artwork_results(
             top1_profile_tokens = parse(top1_bio)
 
     # LML#513/#1192: served pair; ``top1_bio`` stays Discogs below (profile_tokens + ref-warm).
-    served_top1_bio, served_top1_wiki = await wikipedia_bio.resolve_served_bio(
-        top1_wiki, top1_bio, top1_details, discogs_cache_pg, warm_cache=warm_cache
+    bio_resolution = await wikipedia_bio.resolve_served_bio(
+        top1_wiki, top1_bio, top1_details, discogs_cache_pg
     )
 
     enriched = await asyncio.gather(
@@ -320,8 +320,8 @@ async def enrich_artwork_results(
                 artwork,
                 is_top1=(idx == 0),
                 top1_year=top1_year,
-                top1_bio=served_top1_bio,
-                top1_wiki=served_top1_wiki,
+                top1_bio=bio_resolution.bio,
+                top1_wiki=bio_resolution.wiki_url,
                 top1_release=top1_release,
                 top1_details=top1_details,
                 top1_profile_tokens=top1_profile_tokens,
@@ -345,6 +345,23 @@ async def enrich_artwork_results(
         top1_bio_surfaced=top1_bio_surfaced,
         served_bio_is_discogs=top1_bio_is_discogs,
         discogs_service=discogs_service,
+    )
+
+    # LML#1192 review, B2-1/B2-2: the Wikipedia counterparts of the pair
+    # above -- both gated on whether THIS resolution's bio is what actually
+    # reached the wire (``bio_resolution.bio`` short-circuits the compare so
+    # a None-vs-None top1_enriched_result never misreports "surfaced").
+    resolution_bio_surfaced = (
+        top1_bio_surfaced
+        and top1_enriched_result is not None
+        and top1_enriched_result.artist_bio == bio_resolution.bio
+    )
+    wikipedia_bio.record_bio_adoption(bio_resolution, bio_surfaced=resolution_bio_surfaced)
+    wikipedia_bio.maybe_schedule_wikipedia_bio_warm(
+        bio_resolution,
+        warm_cache=warm_cache,
+        bio_surfaced=resolution_bio_surfaced,
+        discogs_cache_pg=discogs_cache_pg,
     )
 
     return list(enriched)

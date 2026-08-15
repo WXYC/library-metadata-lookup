@@ -4,6 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
 
 from clients.streaming.apple_music import AppleMusicClient, AppleMusicTrackMatch
 from discogs.breaker import DiscogsBreakerOpenError
@@ -18,6 +19,11 @@ from discogs.models import (
 from entity.cache_toolkit import CachedValue
 from lookup.enrichment import enrich_artwork_results
 from lookup.enrichment.item import _build_streaming_search_url
+from lookup.enrichment.wikipedia_bio import (
+    CACHE_MISS_WARM_SCHEDULED_STAT_KEY,
+    FALLBACK_DISCOGS_STAT_KEY,
+    SERVED_STAT_KEY,
+)
 from lookup.rowless import ROWLESS_LIBRARY_ID
 from tests.factories import make_discogs_result, make_library_item
 
@@ -5080,6 +5086,7 @@ class TestWikipediaPreferredBioSwap:
             urls=["https://en.wikipedia.org/wiki/Stereolab"],
         )
 
+        init_cache_stats()
         with patch(
             "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
             new_callable=AsyncMock,
@@ -5098,3 +5105,76 @@ class TestWikipediaPreferredBioSwap:
         assert enriched.artist_bio is None
         assert enriched.wikipedia_url is None
         assert enriched.bandcamp_url.startswith("https://bandcamp.com/search?q=")
+        # LML#1192 review, B2-1: the gate suppressed the bio entirely --
+        # neither adoption counter should fire, even though resolve_served_bio
+        # itself picked the Wikipedia source (wiki_is_source=True).
+        stats = get_cache_stats()
+        assert stats.get(SERVED_STAT_KEY) is None
+        assert stats.get(FALLBACK_DISCOGS_STAT_KEY) is None
+
+    @pytest.mark.asyncio
+    async def test_warm_not_scheduled_when_split_gate_nulls_the_bio(self, monkeypatch):
+        # LML#1192 review, B2-2: symmetric with the Discogs ref-warm's own
+        # LML#504 gate -- a genuine cache miss must not schedule a Wikipedia
+        # warm when the split gate suppressed the bio the response would
+        # have served, mirroring test_artist_identity_split_gate_nulls_served_pair_together's
+        # release-side-artist-drift recipe but with a cache MISS instead of a hit.
+        #
+        # Deliberately decoupled from that sibling test's fixture: the
+        # split gate reads ``release.artist`` (via release_side_artist_verified)
+        # while the Phase-A Wikipedia pick scores against
+        # ``artist_details.name`` (top1.py: pick_artist_wikipedia_url(details.urls,
+        # details.name)) -- two independent knobs. ``details.name`` stays
+        # "Stereolab" here (matching the URL slug) so the pick clears the
+        # floor and resolve_served_bio actually reaches the cache-miss
+        # branch; ``release.artist`` diverges to trip the split gate. Using
+        # the sibling test's single "Completely Different Artist" name for
+        # both would make the pick itself fall below_floor for an unrelated
+        # reason (name mismatch), short-circuiting resolve_served_bio before
+        # the miss branch and making this test pass for the wrong reason.
+        monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
+        monkeypatch.setenv("LML_BIO_PREFER_WIKIPEDIA", "true")
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist="Completely Different Artist",
+            year=1998,
+            artist_id=99,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Stereolab",
+            profile="A Discogs bio.",
+            urls=["https://en.wikipedia.org/wiki/Stereolab"],
+        )
+
+        init_cache_stats()
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+                return_value=CachedValue(value=None, was_present=False),
+            ),
+            patch(
+                "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
+            ) as mock_schedule,
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                discogs_cache_pg=AsyncMock(),
+                extended=True,
+                warm_cache=True,
+            )
+
+        _, enriched = results[0]
+        assert enriched.artist_bio is None
+        assert enriched.wikipedia_url is None
+        mock_schedule.assert_not_called()
+        assert get_cache_stats().get(CACHE_MISS_WARM_SCHEDULED_STAT_KEY) is None
