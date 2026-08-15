@@ -47,13 +47,15 @@ Markers route CI by infrastructure, not taxonomy. See the WXYC test-patterns gui
 | Marker | Meaning | CI provisions |
 |---|---|---|
 | `pg` | needs a PostgreSQL service | `postgres:16-alpine` service container, `DATABASE_URL_TEST` |
-| `external_api` | needs a real third-party API key (Discogs) | `DISCOGS_TOKEN` secret |
+| `external_api` | needs network access to a real third-party API (Discogs — credential-gated; Wikipedia — keyless, runtime-skip-on-unanswerable instead) | `DISCOGS_TOKEN` secret for the Discogs suites; no secret for the Wikipedia suite |
 
 Default `pytest` (no `-m`) runs every unmarked test across `tests/unit/`, `tests/integration/`, and `tests/e2e/`. Tier directories are documentation; CI routes by markers.
 
 **Default Tests** runs `pytest -v --cov=...` -- pyproject's `addopts = "-m 'not pg and not external_api'"` excludes the infra-tagged tests.
 
 **External API Tests** runs `pytest -v -m external_api`. The `tests/e2e/discogs/*` suite, the `TestDiscogsApiSearch` / `TestEntityResolution` classes in `tests/integration/test_api_discogs.py`, and the `type=artist` payload-shape smoke in `tests/integration/test_search_artists_live.py` hit the real Discogs API. Skip behavior differs by tier (PR runs from forks may have no secret access): the e2e suite self-skips at collection (module-level `pytest.skip`) when no Discogs credentials are configured — `DISCOGS_TOKEN` or the `DISCOGS_API_KEY`/`DISCOGS_API_SECRET` pair; the integration classes and the live smoke check `DISCOGS_TOKEN` alone and skip at runtime inside the test body. The smoke also runtime-skips when the probe is unanswerable (rate-limited, network, LML#755 breaker shed) and goes red when Discogs answers but the contract moved: `id`/`title` payload-shape drift, or the pinned Popsicle overload family disappearing from page 1 (data drift — the assert message says to pick a new stable family).
+
+`tests/integration/test_wikipedia_client_live.py` (LML#513/#1192) is the same `external_api` marker, a different skip shape: Wikipedia's REST `/page/summary` endpoint is **keyless**, so there is no credential to check — the CI External API lane runs `-m external_api` unconditionally in one serial job regardless, so this suite runtime-skips on an unanswerable probe (a caught `WikipediaFetchError` — timeout, network error, transient non-200) rather than gating on an env var no environment would ever set. Goes red only on contract drift: Wikipedia's REST API no longer returning `type: "standard"` + a non-empty `extract` for a known-stable artist page (Stereolab), no longer marking a known-ambiguous term `type: "disambiguation"`, or no longer 404ing a nonexistent page.
 
 **PG Tests** runs `pytest -v -m pg` against a `postgres:16-alpine` service container on port 5433. The `EntityStore` CRUD tests in `tests/integration/test_entity_resolution.py` run end-to-end against a fresh `entity` schema. The Discogs reconciliation tests skip themselves when the `release_artist` table is missing -- that table is part of the discogs-cache fixture and is too large to load in CI. `tests/integration/test_va_discogs_lookup.py` self-skips without `DATABASE_URL_DISCOGS`, which is intentional in CI.
 

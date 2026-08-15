@@ -117,6 +117,11 @@ class TestNegativeResults:
             "2001 EP by Some Artist",
             "song by Some Artist",
             "single by Some Artist",
+            # LML#1192 review (B1-1): "mixtape by" fell through the original
+            # pattern set entirely -- pattern 1 required a leading year,
+            # pattern 2's alternation had no "mixtape" entry.
+            "mixtape by Some Artist",
+            "2019 mixtape by Some Artist",
         ],
     )
     async def test_album_or_song_description_pattern_returns_none(self, httpx_mock, description):
@@ -134,6 +139,54 @@ class TestNegativeResults:
         client = WikipediaClient()
         assert await client.get_summary("Stereolab", "en") is None
 
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "album de Sessa",  # French/Spanish
+            "Album von Stereolab",  # German
+            "álbum de estudio de Sessa",  # Spanish, accented + "estudio" infix
+            "album di Sessa",  # Italian
+        ],
+    )
+    async def test_non_english_description_pattern_returns_none(self, httpx_mock, description):
+        # LML#1192 review (B1-1): the original patterns were English-only,
+        # so a non-English Wikipedia edition's machine-generated
+        # description sailed straight past the backstop.
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            json={
+                "type": "standard",
+                "extract": "Some Album is a release by Some Artist.",
+                "description": description,
+            },
+        )
+        client = WikipediaClient()
+        assert await client.get_summary("Stereolab", "en") is None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Peruvian musical duo",
+            "German record producer",
+            "compositeur français",
+            "cantante italiana",
+        ],
+    )
+    async def test_non_english_person_description_is_not_rejected(self, httpx_mock, description):
+        # The broadened release-noun/preposition net (B1-1) must not start
+        # rejecting ordinary person descriptions just because they share a
+        # short substring with a preposition/noun in some language.
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            json={
+                "type": "standard",
+                "extract": "An artist.",
+                "description": description,
+            },
+        )
+        client = WikipediaClient()
+        assert await client.get_summary("Stereolab", "en") is not None
+
     async def test_ordinary_person_description_is_not_rejected(self, httpx_mock):
         httpx_mock.add_response(
             url=_SUMMARY_URL,
@@ -149,6 +202,26 @@ class TestNegativeResults:
 
 @pytest.mark.asyncio
 class TestTransientFailuresRaise:
+    async def test_non_json_200_body_raises_wikipedia_fetch_error(self, httpx_mock):
+        # LML#1192 review (B1-3): response.json() previously sat OUTSIDE
+        # the try/except, so a malformed body raised a raw
+        # json.JSONDecodeError that escaped WikipediaFetchError callers.
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            status_code=200,
+            text="<html>upstream error</html>",
+            headers={"Content-Type": "text/html"},
+        )
+        with pytest.raises(WikipediaFetchError):
+            await WikipediaClient().get_summary("Stereolab", "en")
+
+    async def test_json_list_payload_raises_wikipedia_fetch_error(self, httpx_mock):
+        # A non-dict JSON body (e.g. a bare list) crashed _parse_summary's
+        # .get() calls with an unguarded AttributeError instead.
+        httpx_mock.add_response(url=_SUMMARY_URL, json=["not", "a", "dict"])
+        with pytest.raises(WikipediaFetchError):
+            await WikipediaClient().get_summary("Stereolab", "en")
+
     async def test_timeout_raises_wikipedia_fetch_error(self, httpx_mock):
         httpx_mock.add_exception(httpx.TimeoutException("timed out"))
         client = WikipediaClient()
@@ -212,3 +285,48 @@ class TestRateLimitRetry:
             summary = await client.get_summary("Stereolab", "en", max_retries=1)
         assert summary is not None
         mock_sleep.assert_awaited_once()
+
+    @pytest.mark.parametrize("retry_after", ["inf", "Infinity", "nan", "NaN"])
+    async def test_non_finite_retry_after_never_hangs_forever(self, httpx_mock, retry_after):
+        # LML#1192 review (B1-2): float() accepts "inf"/"nan" and
+        # max(x, 0.0) does not clamp either -- asyncio.sleep(inf) would
+        # never wake, hanging a warm permit (or the drain) forever.
+        httpx_mock.add_response(
+            url=_SUMMARY_URL, status_code=429, headers={"Retry-After": retry_after}
+        )
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            json={"type": "standard", "extract": "An artist.", "description": "musician"},
+        )
+        client = WikipediaClient()
+        with patch("clients.wikipedia.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await client.get_summary("Stereolab", "en", max_retries=1)
+        delay = mock_sleep.await_args.args[0]
+        assert delay == pytest.approx(delay)  # not NaN (NaN != NaN)
+        assert delay != float("inf")
+        assert 0.0 <= delay <= 30.0
+
+    async def test_negative_retry_after_clamps_to_zero(self, httpx_mock):
+        httpx_mock.add_response(url=_SUMMARY_URL, status_code=429, headers={"Retry-After": "-5"})
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            json={"type": "standard", "extract": "An artist.", "description": "musician"},
+        )
+        client = WikipediaClient()
+        with patch("clients.wikipedia.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await client.get_summary("Stereolab", "en", max_retries=1)
+        mock_sleep.assert_awaited_once_with(0.0)
+
+    async def test_absurdly_large_retry_after_is_clamped_to_a_ceiling(self, httpx_mock):
+        httpx_mock.add_response(
+            url=_SUMMARY_URL, status_code=429, headers={"Retry-After": "99999999999999"}
+        )
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            json={"type": "standard", "extract": "An artist.", "description": "musician"},
+        )
+        client = WikipediaClient()
+        with patch("clients.wikipedia.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await client.get_summary("Stereolab", "en", max_retries=1)
+        delay = mock_sleep.await_args.args[0]
+        assert delay <= 30.0
