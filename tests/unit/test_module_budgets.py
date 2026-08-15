@@ -50,14 +50,19 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/candidate_memo.py": 150,
     "lookup/concurrency.py": 200,
     "lookup/endpoint_family.py": 100,
-    # Recalibrated (LML#1192 review round 2, B2-1/B2-2): the coordinator now
-    # also calls record_bio_adoption + maybe_schedule_wikipedia_bio_warm
-    # after the LML#504 gate runs, since resolve_served_bio itself can no
-    # longer commit to adoption telemetry or warm-scheduling before the
-    # gate's outcome is known (see lookup/enrichment/wikipedia_bio.py's
-    # module docstring). Measured 366 lines at this PR's tip. Smallest
-    # multiple of 50 at or above 1.3x that -> 500.
-    "lookup/enrichment/__init__.py": 500,
+    # Recalibrated again (LML#1192 review round 3, finding 10): the round-2
+    # B2-1/B2-2 fix (record_bio_adoption + maybe_schedule_wikipedia_bio_warm,
+    # 366 lines, budget bumped to 500) carried a provably-redundant
+    # resolution_bio_surfaced boolean and a top1_bio_is_discogs string
+    # comparison -- both collapsed into wikipedia_bio.finalize_bio's single
+    # bool()/enum check (see that module's docstring). Measured 358 lines at
+    # this PR's tip -- close to, but not quite, the pre-round-2 350 the
+    # reviewer asked to restore "if the line count allows." Rather than
+    # reapply the standard 1.3x-headroom rule (which would re-inflate this
+    # back toward 500, defeating the point of the collapse), this is a
+    # minimal-headroom restoration: smallest multiple of 50 AT OR ABOVE the
+    # measured size, no multiplier.
+    "lookup/enrichment/__init__.py": 400,
     "lookup/enrichment/background.py": 100,
     # LML#1098: the inline Bandcamp live probe, extracted out of item.py to keep
     # that file under its ceiling (same posture streaming_status.py took for

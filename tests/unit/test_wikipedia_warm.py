@@ -81,6 +81,26 @@ class TestScheduleWikipediaBioWarm:
         stats = get_cache_stats()
         assert stats.get(wikipedia_warm.WARM_SHED_STAT_KEY) == 1
 
+    async def test_create_task_failure_does_not_leak_the_dedup_key(self):
+        # LML#1192 review round 3, finding 7: the key was added to
+        # _pending_artist_ids BEFORE asyncio.create_task -- if create_task
+        # itself raised (e.g. no running loop), the key was already
+        # registered and nothing would ever remove it (no task, no
+        # done-callback), permanently suppressing this artist's warm for
+        # the rest of the process's life. lookup/streaming_warm.py's
+        # _enqueue_streaming_warm (:186-189) creates the task FIRST for
+        # exactly this reason; match that ordering.
+        pg = AsyncMock(spec=PgSource)
+        with patch(
+            "lookup.enrichment.wikipedia_warm.asyncio.create_task",
+            side_effect=RuntimeError("no running event loop"),
+        ):
+            with pytest.raises(RuntimeError):
+                wikipedia_warm.schedule_wikipedia_bio_warm(
+                    discogs_artist_id=99, pick=_PICK, discogs_cache_pg=pg
+                )
+        assert 99 not in wikipedia_warm._pending_artist_ids
+
     async def test_task_removes_itself_from_pending_when_done(self):
         pg = AsyncMock(spec=PgSource)
         with patch.object(wikipedia_warm, "_run_warm", new_callable=AsyncMock):

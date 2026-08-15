@@ -332,36 +332,29 @@ async def enrich_artwork_results(
         ]
     )
 
+    # enrich_one's LML#504 gate only ever passes bio_resolution.bio through
+    # UNCHANGED or nulls it, so finalize_bio's truthiness check on the
+    # enriched artist_bio IS "did this resolution survive the gate" (LML#1192
+    # review round 3, finding 10 — see wikipedia_bio.py's module docstring).
+    top1_enriched_result = enriched[0][1] if enriched else None
+    enriched_top1_bio = (
+        top1_enriched_result.artist_bio if top1_enriched_result is not None else None
+    )
+    bio_surfaced = wikipedia_bio.finalize_bio(
+        bio_resolution,
+        enriched_top1_bio=enriched_top1_bio,
+        warm_cache=warm_cache,
+        discogs_cache_pg=discogs_cache_pg,
+    )
+
     # Discogs ref-warm (relocated to background.maybe_schedule_discogs_bio_warm
     # — full LML#504 + LML#513/#1192 re-spec rationale lives there).
-    top1_enriched_result = enriched[0][1] if enriched else None
-    top1_bio_surfaced = top1_enriched_result is not None and bool(top1_enriched_result.artist_bio)
-    top1_bio_is_discogs = (
-        top1_enriched_result is not None and top1_enriched_result.artist_bio == top1_bio
-    )
     background.maybe_schedule_discogs_bio_warm(
         warm_cache=warm_cache,
         top1_bio=top1_bio,
-        top1_bio_surfaced=top1_bio_surfaced,
-        served_bio_is_discogs=top1_bio_is_discogs,
+        top1_bio_surfaced=bio_surfaced,
+        served_bio_is_discogs=bio_resolution.source is wikipedia_bio.BioSource.DISCOGS,
         discogs_service=discogs_service,
-    )
-
-    # LML#1192 review, B2-1/B2-2: the Wikipedia counterparts of the pair
-    # above -- both gated on whether THIS resolution's bio is what actually
-    # reached the wire (``bio_resolution.bio`` short-circuits the compare so
-    # a None-vs-None top1_enriched_result never misreports "surfaced").
-    resolution_bio_surfaced = (
-        top1_bio_surfaced
-        and top1_enriched_result is not None
-        and top1_enriched_result.artist_bio == bio_resolution.bio
-    )
-    wikipedia_bio.record_bio_adoption(bio_resolution, bio_surfaced=resolution_bio_surfaced)
-    wikipedia_bio.maybe_schedule_wikipedia_bio_warm(
-        bio_resolution,
-        warm_cache=warm_cache,
-        bio_surfaced=resolution_bio_surfaced,
-        discogs_cache_pg=discogs_cache_pg,
     )
 
     return list(enriched)

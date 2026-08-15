@@ -4,18 +4,22 @@ LML#513/#1192).
 
 ``resolve_served_bio`` returns a :class:`ServedBioResolution` carrying the
 ``(bio, wiki_url)`` pair to thread into ``item.enrich_one``, plus enough
-bookkeeping (``wiki_is_source``, ``miss_pick``, ``discogs_artist_id``) for
-the COORDINATOR to finish the job after the LML#504 split gate has run.
+bookkeeping (``source``, ``miss_pick``, ``discogs_artist_id``) for the
+COORDINATOR to finish the job after the LML#504 split gate has run.
 ``wiki_url`` is ALWAYS ``pick.url`` (or ``None`` when there's no pick)
 regardless of the flag/floor/cache outcome — Phase B only ever swaps which
 TEXT accompanies that link, never the link itself.
 
 LML#1192 review (round 2), B2-1/B2-2: ``resolve_served_bio`` runs BEFORE
 ``item.enrich_one``, so it cannot know whether the LML#504 split gate will
-null the bio out — the adoption telemetry (``record_bio_adoption``) and the
-miss-warm scheduling (``maybe_schedule_wikipedia_bio_warm``) are therefore
-SEPARATE, POST-HOC calls the coordinator makes after ``item.enrich_one`` has
-run, passing in whether the bio it decided on actually reached the wire.
+null the bio out — adoption telemetry and miss-warm scheduling are
+therefore a SEPARATE, POST-HOC call (:func:`finalize_bio`, LML#1192 review
+round 3, finding 10 — collapses the pair of coordinator calls this module
+used to expose publicly, ``record_bio_adoption``/``maybe_schedule_wikipedia_bio_warm``,
+now private helpers) the coordinator makes after ``item.enrich_one`` has
+run, passing in the ENRICHED top-1 ``artist_bio`` (whether the bio it
+decided on actually reached the wire is then a plain truthiness check, not
+a separately-computed boolean — see that module's docstring).
 """
 
 from __future__ import annotations
@@ -35,10 +39,12 @@ from lookup.enrichment.wikipedia_bio import (
     CACHE_NEGATIVE_STAT_KEY,
     FALLBACK_DISCOGS_STAT_KEY,
     SERVED_STAT_KEY,
+    BioSource,
     ServedBioResolution,
     _bio_prefer_wikipedia_enabled,
-    maybe_schedule_wikipedia_bio_warm,
-    record_bio_adoption,
+    _maybe_schedule_wikipedia_bio_warm,
+    _record_bio_adoption,
+    finalize_bio,
     resolve_served_bio,
 )
 from lookup.wikipedia_url import PickedWikiUrl
@@ -73,7 +79,7 @@ class TestFlagOffOrNoPick:
         resolution = await resolve_served_bio(_PICK, _DISCOGS_BIO, _DETAILS, pg)
         assert resolution.bio == _DISCOGS_BIO
         assert resolution.wiki_url == _PICK.url
-        assert resolution.wiki_is_source is False
+        assert resolution.source is BioSource.DISCOGS
         assert resolution.miss_pick is None
         pg.fetchone.assert_not_awaited()
 
@@ -131,7 +137,7 @@ class TestFlagOnAbovefloorCacheOutcomes:
             resolution = await resolve_served_bio(_PICK, _DISCOGS_BIO, _DETAILS, pg)
         assert resolution.bio == "Stereolab are a French band."
         assert resolution.wiki_url == _PICK.url
-        assert resolution.wiki_is_source is True
+        assert resolution.source is BioSource.WIKIPEDIA
         mock_get.assert_awaited_once_with(
             pg, discogs_artist_id=_DETAILS.artist_id, wikipedia_url=_PICK.url
         )
@@ -152,7 +158,7 @@ class TestFlagOnAbovefloorCacheOutcomes:
             resolution = await resolve_served_bio(_PICK, _DISCOGS_BIO, _DETAILS, pg)
         assert resolution.bio == _DISCOGS_BIO
         assert resolution.wiki_url == _PICK.url
-        assert resolution.wiki_is_source is False
+        assert resolution.source is BioSource.DISCOGS
         stats = get_cache_stats()
         assert stats.get(CACHE_NEGATIVE_STAT_KEY) == 1
 
@@ -167,7 +173,7 @@ class TestFlagOnAbovefloorCacheOutcomes:
             resolution = await resolve_served_bio(_PICK, _DISCOGS_BIO, _DETAILS, pg)
         assert resolution.bio == _DISCOGS_BIO
         assert resolution.wiki_url == _PICK.url
-        assert resolution.wiki_is_source is False
+        assert resolution.source is BioSource.DISCOGS
         # A miss does NOT schedule anything itself (B2-2) -- it hands back
         # what a later, post-gate scheduling call needs.
         assert resolution.miss_pick == _PICK
@@ -220,12 +226,12 @@ class TestRecordBioAdoption:
         resolution = ServedBioResolution(
             bio="Wikipedia prose.",
             wiki_url=_PICK.url,
-            wiki_is_source=True,
+            source=BioSource.WIKIPEDIA,
             miss_pick=None,
             discogs_artist_id=None,
         )
         init_cache_stats()
-        record_bio_adoption(resolution, bio_surfaced=True)
+        _record_bio_adoption(resolution, bio_surfaced=True)
         stats = get_cache_stats()
         assert stats.get(SERVED_STAT_KEY) == 1
         assert stats.get(FALLBACK_DISCOGS_STAT_KEY) is None
@@ -234,12 +240,12 @@ class TestRecordBioAdoption:
         resolution = ServedBioResolution(
             bio=_DISCOGS_BIO,
             wiki_url=_PICK.url,
-            wiki_is_source=False,
+            source=BioSource.DISCOGS,
             miss_pick=None,
             discogs_artist_id=None,
         )
         init_cache_stats()
-        record_bio_adoption(resolution, bio_surfaced=True)
+        _record_bio_adoption(resolution, bio_surfaced=True)
         stats = get_cache_stats()
         assert stats.get(FALLBACK_DISCOGS_STAT_KEY) == 1
         assert stats.get(SERVED_STAT_KEY) is None
@@ -250,12 +256,12 @@ class TestRecordBioAdoption:
         resolution = ServedBioResolution(
             bio="Wikipedia prose.",
             wiki_url=_PICK.url,
-            wiki_is_source=True,
+            source=BioSource.WIKIPEDIA,
             miss_pick=None,
             discogs_artist_id=None,
         )
         init_cache_stats()
-        record_bio_adoption(resolution, bio_surfaced=False)
+        _record_bio_adoption(resolution, bio_surfaced=False)
         stats = get_cache_stats()
         assert stats.get(SERVED_STAT_KEY) is None
         assert stats.get(FALLBACK_DISCOGS_STAT_KEY) is None
@@ -273,7 +279,7 @@ class TestMaybeScheduleWikipediaBioWarm:
         return ServedBioResolution(
             bio=_DISCOGS_BIO,
             wiki_url=_PICK.url,
-            wiki_is_source=False,
+            source=BioSource.DISCOGS,
             miss_pick=_PICK,
             discogs_artist_id=_DETAILS.artist_id,
         )
@@ -285,7 +291,7 @@ class TestMaybeScheduleWikipediaBioWarm:
             "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
             return_value=True,
         ) as mock_schedule:
-            maybe_schedule_wikipedia_bio_warm(
+            _maybe_schedule_wikipedia_bio_warm(
                 self._miss_resolution(), warm_cache=True, bio_surfaced=True, discogs_cache_pg=pg
             )
         mock_schedule.assert_called_once_with(
@@ -298,7 +304,7 @@ class TestMaybeScheduleWikipediaBioWarm:
         with patch(
             "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
         ) as mock_schedule:
-            maybe_schedule_wikipedia_bio_warm(
+            _maybe_schedule_wikipedia_bio_warm(
                 self._miss_resolution(), warm_cache=False, bio_surfaced=True, discogs_cache_pg=pg
             )
         mock_schedule.assert_not_called()
@@ -310,7 +316,7 @@ class TestMaybeScheduleWikipediaBioWarm:
         with patch(
             "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
         ) as mock_schedule:
-            maybe_schedule_wikipedia_bio_warm(
+            _maybe_schedule_wikipedia_bio_warm(
                 self._miss_resolution(), warm_cache=True, bio_surfaced=False, discogs_cache_pg=pg
             )
         mock_schedule.assert_not_called()
@@ -321,14 +327,14 @@ class TestMaybeScheduleWikipediaBioWarm:
         resolution = ServedBioResolution(
             bio=_DISCOGS_BIO,
             wiki_url=_PICK.url,
-            wiki_is_source=False,
+            source=BioSource.DISCOGS,
             miss_pick=None,
             discogs_artist_id=None,
         )
         with patch(
             "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
         ) as mock_schedule:
-            maybe_schedule_wikipedia_bio_warm(
+            _maybe_schedule_wikipedia_bio_warm(
                 resolution, warm_cache=True, bio_surfaced=True, discogs_cache_pg=pg
             )
         mock_schedule.assert_not_called()
@@ -337,7 +343,7 @@ class TestMaybeScheduleWikipediaBioWarm:
         with patch(
             "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
         ) as mock_schedule:
-            maybe_schedule_wikipedia_bio_warm(
+            _maybe_schedule_wikipedia_bio_warm(
                 self._miss_resolution(), warm_cache=True, bio_surfaced=True, discogs_cache_pg=None
             )
         mock_schedule.assert_not_called()
@@ -349,7 +355,95 @@ class TestMaybeScheduleWikipediaBioWarm:
             "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
             return_value=False,
         ):
-            maybe_schedule_wikipedia_bio_warm(
+            _maybe_schedule_wikipedia_bio_warm(
                 self._miss_resolution(), warm_cache=True, bio_surfaced=True, discogs_cache_pg=pg
             )
         assert get_cache_stats().get(CACHE_MISS_WARM_SCHEDULED_STAT_KEY) is None
+
+
+# ---------------------------------------------------------------------------
+# finalize_bio -- the single public post-item.enrich_one entry point
+# (LML#1192 review round 3, finding 10). Replaces the coordinator's own
+# top1_bio_surfaced/resolution_bio_surfaced pair and the top1_bio_is_discogs
+# string comparison -- bio_surfaced is now a plain bool() on the ENRICHED
+# artist_bio the coordinator passes in, and "was it Discogs" is answered by
+# ServedBioResolution.source directly.
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeBio:
+    def _wikipedia_resolution(self):
+        return ServedBioResolution(
+            bio="Wikipedia prose.",
+            wiki_url=_PICK.url,
+            source=BioSource.WIKIPEDIA,
+            miss_pick=None,
+            discogs_artist_id=None,
+        )
+
+    def _miss_resolution(self):
+        return ServedBioResolution(
+            bio=_DISCOGS_BIO,
+            wiki_url=_PICK.url,
+            source=BioSource.DISCOGS,
+            miss_pick=_PICK,
+            discogs_artist_id=_DETAILS.artist_id,
+        )
+
+    def test_surfaced_wikipedia_bio_records_served_and_returns_true(self):
+        init_cache_stats()
+        resolution = self._wikipedia_resolution()
+        surfaced = finalize_bio(
+            resolution,
+            enriched_top1_bio="Wikipedia prose.",
+            warm_cache=False,
+            discogs_cache_pg=None,
+        )
+        assert surfaced is True
+        assert get_cache_stats().get(SERVED_STAT_KEY) == 1
+
+    def test_gate_nulled_bio_records_nothing_and_returns_false(self):
+        # The LML#504 split gate nulled the bio out -- enriched_top1_bio is
+        # None even though the resolution itself picked Wikipedia text.
+        init_cache_stats()
+        resolution = self._wikipedia_resolution()
+        surfaced = finalize_bio(
+            resolution, enriched_top1_bio=None, warm_cache=False, discogs_cache_pg=None
+        )
+        assert surfaced is False
+        assert get_cache_stats().get(SERVED_STAT_KEY) is None
+        assert get_cache_stats().get(FALLBACK_DISCOGS_STAT_KEY) is None
+
+    def test_surfaced_bio_schedules_a_pending_miss_warm(self):
+        pg = AsyncMock(spec=PgSource)
+        init_cache_stats()
+        resolution = self._miss_resolution()
+        with patch(
+            "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
+            return_value=True,
+        ) as mock_schedule:
+            surfaced = finalize_bio(
+                resolution,
+                enriched_top1_bio=_DISCOGS_BIO,
+                warm_cache=True,
+                discogs_cache_pg=pg,
+            )
+        assert surfaced is True
+        mock_schedule.assert_called_once_with(
+            discogs_artist_id=_DETAILS.artist_id, pick=_PICK, discogs_cache_pg=pg
+        )
+        assert get_cache_stats().get(CACHE_MISS_WARM_SCHEDULED_STAT_KEY) == 1
+
+    def test_unsurfaced_miss_does_not_schedule_a_warm(self):
+        pg = AsyncMock(spec=PgSource)
+        with patch(
+            "lookup.enrichment.wikipedia_bio.wikipedia_warm.schedule_wikipedia_bio_warm",
+        ) as mock_schedule:
+            surfaced = finalize_bio(
+                self._miss_resolution(),
+                enriched_top1_bio=None,
+                warm_cache=True,
+                discogs_cache_pg=pg,
+            )
+        assert surfaced is False
+        mock_schedule.assert_not_called()
