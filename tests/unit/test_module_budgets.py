@@ -196,11 +196,14 @@ MODULE_BUDGETS: dict[str, int] = {
     # lml-1192-wikipedia-artist-bio.md): the slug-scored Wikipedia URL
     # extractor -- parsing, the hard-reject denylist, disambig stripping,
     # scoring/tie-break, PickedWikiUrl, and the shadow-telemetry
-    # projection/log pair. Measured 226 lines (well above the plan's ~110
-    # estimate -- the repo's documentation density, not padding; see the
-    # PR-A "Deviations from plan" note). Smallest multiple of 50 at or
-    # above 1.3x that -> 300.
-    "lookup/wikipedia_url.py": 300,
+    # projection/log pair. Well above the plan's ~110 estimate -- the
+    # repo's documentation density, not padding; see the PR-A "Deviations
+    # from plan" note. Recalibrated post-review (LML#1192 round 2, A1/A2/A4/
+    # A5 fixes: the widened hard-reject denylist + regex, the symmetric
+    # artist-name disambig strip, and the telemetry fixes all added lines)
+    # -- measured 342 at this PR's tip. Smallest multiple of 50 at or above
+    # 1.3x that -> 450.
+    "lookup/wikipedia_url.py": 450,
     # LML#751: strategy runner, SearchState, and budget/timeout machinery —
     # the pipeline's other regrowth attractor once every lookup/ file was
     # capped. 1033 measured lines (2026-07-29); smallest multiple of 50 at or

@@ -162,15 +162,15 @@ class TestEmitCsvRoundTrips:
 
 class TestComputeGroundTruthSummary:
     def test_regression_and_improvement_rates(self):
-        # Row 1: heuristic correct, slug wrong -> regression.
-        # Row 2: heuristic wrong, slug correct -> improvement.
-        # Row 3: both correct -> neither.
+        # Row 1: heuristic correct, slug wrong, clears the floor -> regression.
+        # Row 2: heuristic wrong, slug correct, clears the floor -> improvement.
+        # Row 3: both correct, clears the floor -> neither.
         # Row 4: blank ground truth -> excluded from the denominator.
         rows = [
-            {"heuristic_correct": "TRUE", "slug_correct": "FALSE"},
-            {"heuristic_correct": "FALSE", "slug_correct": "TRUE"},
-            {"heuristic_correct": "TRUE", "slug_correct": "TRUE"},
-            {"heuristic_correct": "", "slug_correct": ""},
+            {"heuristic_correct": "TRUE", "slug_correct": "FALSE", "clears_floor": "True"},
+            {"heuristic_correct": "FALSE", "slug_correct": "TRUE", "clears_floor": "True"},
+            {"heuristic_correct": "TRUE", "slug_correct": "TRUE", "clears_floor": "True"},
+            {"heuristic_correct": "", "slug_correct": "", "clears_floor": "True"},
         ]
         summary = compute_ground_truth_summary(rows)
         assert summary.classified == 3
@@ -182,3 +182,37 @@ class TestComputeGroundTruthSummary:
         summary = compute_ground_truth_summary([{"heuristic_correct": "", "slug_correct": ""}])
         assert summary.classified == 0
         assert summary.regression_rate == 0.0
+
+    def test_below_floor_row_is_excluded_even_when_fully_classified(self):
+        # LML#1192 review (A6): a below-floor slug pick is NEVER actually
+        # served once the flag flips -- the heuristic wins regardless -- so
+        # marking it "wrong" is not a real regression. Ignoring
+        # clears_floor here over-counts regressions and dilutes the
+        # denominator with no-op rows the flip can't affect either way.
+        rows = [
+            {"heuristic_correct": "TRUE", "slug_correct": "FALSE", "clears_floor": "False"},
+            {"heuristic_correct": "FALSE", "slug_correct": "TRUE", "clears_floor": "False"},
+        ]
+        summary = compute_ground_truth_summary(rows)
+        assert summary.classified == 0
+        assert summary.regressions == 0
+        assert summary.improvements == 0
+
+    def test_mixed_floor_status_counts_only_the_above_floor_rows(self):
+        rows = [
+            # Above floor, genuine regression.
+            {"heuristic_correct": "TRUE", "slug_correct": "FALSE", "clears_floor": "True"},
+            # Below floor: heuristic wins regardless -- must not count.
+            {"heuristic_correct": "TRUE", "slug_correct": "FALSE", "clears_floor": "False"},
+        ]
+        summary = compute_ground_truth_summary(rows)
+        assert summary.classified == 1
+        assert summary.regressions == 1
+        assert summary.regression_rate == 1.0
+
+    def test_missing_clears_floor_column_defaults_to_excluded(self):
+        # A row lacking the column at all (e.g. a hand-edited CSV) must
+        # fail safe -- excluded, not counted as a regression.
+        rows = [{"heuristic_correct": "TRUE", "slug_correct": "FALSE"}]
+        summary = compute_ground_truth_summary(rows)
+        assert summary.classified == 0

@@ -127,6 +127,29 @@ class TestFlagOnScoring:
         assert picked is not None
         assert picked.below_floor is False
 
+    def test_disambiguated_artist_name_is_stripped_before_scoring(self, monkeypatch):
+        # LML#1192 review (A2): a Discogs artist name like "Sessa (2)" must
+        # be stripped symmetrically with the candidate slug, mirroring
+        # lookup/artist_resolution.py's _artist_pair_verified (lines
+        # 119/124) -- without the strip, "Sessa" vs "Sessa (2)" scores
+        # 71.43 and fails the 80 floor, making every disambiguated Discogs
+        # artist name unable to ever match its own correct Wikipedia page.
+        monkeypatch.setenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, "true")
+        urls = ["https://en.wikipedia.org/wiki/Sessa"]
+        picked = pick_artist_wikipedia_url(urls, "Sessa (2)")
+        assert picked is not None
+        assert picked.url == "https://en.wikipedia.org/wiki/Sessa"
+        assert picked.below_floor is False
+        assert picked.slug_score == pytest.approx(100.0)
+
+    def test_disambiguated_artist_name_matches_a_country_suffixed_page(self, monkeypatch):
+        monkeypatch.setenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, "true")
+        urls = ["https://en.wikipedia.org/wiki/Stereolab"]
+        picked = pick_artist_wikipedia_url(urls, "Stereolab (UK)")
+        assert picked is not None
+        assert picked.below_floor is False
+        assert picked.slug_score == pytest.approx(100.0)
+
 
 # ---------------------------------------------------------------------------
 # Hard-reject denylist — fires BEFORE disambig stripping
@@ -165,6 +188,45 @@ class TestHardRejectDenylist:
         monkeypatch.setenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, "true")
         urls = [
             "https://en.wikipedia.org/wiki/Sessa_(album)",
+            "https://en.wikipedia.org/wiki/Sessa_(musician)",
+        ]
+        picked = pick_artist_wikipedia_url(urls, "Sessa")
+        assert picked is not None
+        assert picked.url == "https://en.wikipedia.org/wiki/Sessa_(musician)"
+        assert picked.below_floor is False
+
+    @pytest.mark.parametrize(
+        "slug,artist",
+        [
+            # Compound qualifiers: a year/name/adjective PRECEDES the
+            # denylist word inside the parenthetical, so the whole
+            # parenthetical never equals a bare denylist entry -- these
+            # must still hard-reject on the trailing qualifier TOKEN.
+            ("Sessa_(2015_album)", "Sessa"),
+            ("Grace_(Jeff_Buckley_album)", "Grace"),
+            ("Edits_(mixtape)", "Edits"),
+            ("DOGA_(compilation_album)", "DOGA"),
+            ("Aluminum_Tunes_(Stereolab_album)", "Aluminum Tunes"),
+        ],
+    )
+    def test_compound_qualifier_still_hard_rejects(self, monkeypatch, slug, artist):
+        # Confirmed pre-fix leak (LML#1192 review): the slug's own prefix
+        # equals the query artist, and without the fix the compound
+        # parenthetical sails past the exact-match-only denylist check,
+        # strips down to the bare prefix via strip_discogs_disambig, and
+        # scores 100 -- an album/mixtape/compilation page masquerading as
+        # the artist page.
+        monkeypatch.setenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, "true")
+        urls = [f"https://en.wikipedia.org/wiki/{slug}"]
+        picked = pick_artist_wikipedia_url(urls, artist)
+        assert picked is not None
+        assert picked.below_floor is True
+        assert picked.url == urls[0]  # falls back to the (only) heuristic pick
+
+    def test_compound_qualifier_leak_does_not_win_against_the_real_artist_page(self, monkeypatch):
+        monkeypatch.setenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, "true")
+        urls = [
+            "https://en.wikipedia.org/wiki/Sessa_(2015_album)",
             "https://en.wikipedia.org/wiki/Sessa_(musician)",
         ]
         picked = pick_artist_wikipedia_url(urls, "Sessa")
@@ -326,3 +388,84 @@ class TestShadowTelemetry:
             mock_sentry.get_current_scope.side_effect = RuntimeError("boom")
             # Must not raise — telemetry is best-effort.
             pick_artist_wikipedia_url(urls, "Stereolab")
+
+    def test_no_wikipedia_url_at_all_does_not_fire_telemetry(self, monkeypatch):
+        # LML#1192 review (A4): a non-event (nothing to compare -- no
+        # wikipedia.org URL present) must not be recorded as a
+        # disagreement; it would flood the divergence counter with
+        # meaningless entries.
+        monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
+        mock_transaction = MagicMock()
+        with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
+            mock_sentry.get_current_scope.return_value.transaction = mock_transaction
+            result = pick_artist_wikipedia_url(["https://example.com/not-wikipedia"], "Stereolab")
+        assert result is None
+        mock_transaction.set_data.assert_not_called()
+        mock_sentry.add_breadcrumb.assert_not_called()
+
+    def test_payload_carries_slug_score_and_clears_floor(self, monkeypatch):
+        monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
+        urls = ["https://en.wikipedia.org/wiki/Stereolab"]
+        mock_transaction = MagicMock()
+        with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
+            mock_sentry.get_current_scope.return_value.transaction = mock_transaction
+            pick_artist_wikipedia_url(urls, "Stereolab")
+        _key, payload = mock_transaction.set_data.call_args.args
+        assert payload["slug_score"] == pytest.approx(100.0)
+        assert payload["clears_floor"] is True
+
+    def test_below_floor_payload_reports_clears_floor_false(self, monkeypatch):
+        monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
+        urls = ["https://en.wikipedia.org/wiki/Completely_Unrelated_Page"]
+        mock_transaction = MagicMock()
+        with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
+            mock_sentry.get_current_scope.return_value.transaction = mock_transaction
+            pick_artist_wikipedia_url(urls, "Stereolab")
+        _key, payload = mock_transaction.set_data.call_args.args
+        assert payload["clears_floor"] is False
+
+    def test_fires_a_breadcrumb_so_bulk_items_do_not_clobber_each_other(self, monkeypatch):
+        # LML#1192 review (A4): set_data with a fixed key is last-writer-wins
+        # across multiple items sharing one /lookup/bulk transaction --
+        # add_breadcrumb accumulates instead, mirroring
+        # lookup.artist_resolution._log_artist_identity_split_gate.
+        monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
+        urls = ["https://en.wikipedia.org/wiki/Stereolab"]
+        with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
+            mock_sentry.get_current_scope.return_value.transaction = MagicMock()
+            pick_artist_wikipedia_url(urls, "Stereolab")
+        mock_sentry.add_breadcrumb.assert_called_once()
+        assert mock_sentry.add_breadcrumb.call_args.kwargs["category"] == "wikipedia_slug_pick"
+
+    def test_breadcrumb_error_is_independently_swallowed(self, monkeypatch):
+        monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
+        urls = ["https://en.wikipedia.org/wiki/Stereolab"]
+        with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
+            mock_sentry.get_current_scope.return_value.transaction = MagicMock()
+            mock_sentry.add_breadcrumb.side_effect = RuntimeError("boom")
+            # Must not raise, and must not prevent set_data from still firing.
+            pick_artist_wikipedia_url(urls, "Stereolab")
+        mock_sentry.get_current_scope.return_value.transaction.set_data.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Fallback URL/lang consistency (LML#1192 review, A5)
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackUrlLangConsistency:
+    def test_fallback_lang_matches_the_served_url_not_a_different_candidate(self, monkeypatch):
+        # The heuristic pick (served in the below-floor fallback) is the
+        # FIRST wikipedia.org URL, in German; the highest-scoring (but
+        # below-floor) slug candidate is a DIFFERENT, English URL. The
+        # served pair must describe the SAME page -- lang must come from
+        # the served url, never from an unrelated candidate.
+        monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
+        urls = [
+            "https://de.wikipedia.org/wiki/Erste_Seite",
+            "https://en.wikipedia.org/wiki/Stereolab",
+        ]
+        picked = pick_artist_wikipedia_url(urls, "A Totally Different Band")
+        assert picked is not None
+        assert picked.url == "https://de.wikipedia.org/wiki/Erste_Seite"
+        assert picked.lang == "de"

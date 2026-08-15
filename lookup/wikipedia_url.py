@@ -90,26 +90,66 @@ _WIKI_URL_RE = re.compile(r"^https?://([a-z0-9.-]+)\.wikipedia\.org/wiki/(.+)$",
 _LANG_ONLY_RE = re.compile(r"^https?://([a-z0-9.-]+)\.wikipedia\.org", re.IGNORECASE)
 
 # Hard-reject qualifiers (LML#513): a slug whose trailing parenthetical (or
-# bare trailing token/phrase) names one of these is a non-artist page —
-# rejected BEFORE any disambig stripping, since stripping first would
-# destroy the only signal separating an eponymous album/song page from the
-# artist page itself (``Sessa_(album)`` strips and scores 100 against
-# artist ``Sessa`` exactly like the real ``Sessa_(2)`` disambiguator would).
+# bare trailing token/phrase) NAMES one of these as its last word is a
+# non-artist page — rejected BEFORE any disambig stripping, since stripping
+# first would destroy the only signal separating an eponymous album/song
+# page from the artist page itself (``Sessa_(album)`` strips and scores 100
+# against artist ``Sessa`` exactly like the real ``Sessa_(2)`` disambiguator
+# would). ``mixtape``/``compilation`` were added after the LML#1192 review
+# (round 2) found real WXYC catalog collisions (Chuquimamani-Condori's
+# "Edits" is a mixtape; compilation-album qualifiers are common on VA-style
+# releases).
+#
+# LML#1192 review (round 2), finding A1: matching REQUIRES the qualifier to
+# be the trailing WORD inside the parenthetical (or at the bare end of the
+# slug), not the WHOLE parenthetical/slug — a compound qualifier like
+# ``(2015 album)``, ``(Jeff Buckley album)``, or ``(compilation album)``
+# must reject on its trailing ``album`` token exactly as readily as a bare
+# ``(album)`` does. The original implementation required exact equality
+# against the whole bracketed content, so any qualifier with a preceding
+# year/name/adjective sailed straight through to scoring and stripped down
+# to a leak that could score 100 against an unrelated artist sharing the
+# slug's prefix.
 _HARD_REJECT_QUALIFIERS: frozenset[str] = frozenset(
-    {"album", "song", "single", "ep", "soundtrack", "film", "tv series", "discography"}
+    {
+        "album",
+        "song",
+        "single",
+        "ep",
+        "soundtrack",
+        "film",
+        "tv series",
+        "discography",
+        "mixtape",
+        "compilation",
+    }
 )
-_TRAILING_PAREN_RE = re.compile(r"\(([^()]+)\)\s*$")
+# Longest-first so "tv series" (which itself contains no shorter alternative
+# as a strict prefix) and any future multi-word entry can't be pre-empted by
+# a shorter alternative matching first within the same alternation.
+_QUALIFIER_ALTERNATION = "|".join(
+    re.escape(q) for q in sorted(_HARD_REJECT_QUALIFIERS, key=len, reverse=True)
+)
+# A trailing parenthetical whose LAST word (immediately before the closing
+# paren) is a denylist qualifier -- content before that word, if any, is
+# unconstrained, so "(2015 album)" / "(Jeff Buckley album)" match on their
+# trailing "album" exactly as "(album)" alone does.
+_TRAILING_PAREN_QUALIFIER_RE = re.compile(
+    rf"\([^()]*\b(?:{_QUALIFIER_ALTERNATION})\)\s*$", re.IGNORECASE
+)
+# The no-parens form: the qualifier is the trailing word of the whole slug
+# (preceded by whitespace, or the entire slug), e.g. "An Artist Discography".
+_TRAILING_BARE_QUALIFIER_RE = re.compile(
+    rf"(?:^|\s)(?:{_QUALIFIER_ALTERNATION})\s*$", re.IGNORECASE
+)
 
 
 def _is_hard_rejected_slug(decoded_slug: str) -> bool:
     """True when ``decoded_slug`` names a non-artist qualifier (see above)."""
-    match = _TRAILING_PAREN_RE.search(decoded_slug)
-    if match and match.group(1).strip().lower() in _HARD_REJECT_QUALIFIERS:
-        return True
-    lowered = decoded_slug.strip().lower()
-    return any(
-        lowered == qualifier or lowered.endswith(" " + qualifier)
-        for qualifier in _HARD_REJECT_QUALIFIERS
+    stripped = decoded_slug.strip()
+    return bool(
+        _TRAILING_PAREN_QUALIFIER_RE.search(stripped)
+        or _TRAILING_BARE_QUALIFIER_RE.search(stripped)
     )
 
 
@@ -134,6 +174,17 @@ class _ScoredCandidate:
 
 
 def _score_candidates(urls: Sequence[str] | None, artist_name: str) -> list[_ScoredCandidate]:
+    # LML#1192 review (round 2), finding A2: strip the QUERY artist name's
+    # own Discogs disambiguation suffix too, symmetrically with the
+    # candidate slug -- mirrors lookup/artist_resolution.py's
+    # _artist_pair_verified (which strips both sides for exactly this
+    # reason). A resolved Discogs artist name routinely carries its own
+    # "(N)"/"(UK)"/"(band)" disambiguator (e.g. "Sessa (2)"), and without
+    # stripping it here, "Sessa" vs "Sessa (2)" scores 71.43 -- below the 80
+    # floor -- so a disambiguated artist could never match its own correct
+    # Wikipedia page. Falls back to the original string if stripping would
+    # leave it empty (an artist name that was entirely a disambiguator).
+    artist_stripped = strip_discogs_disambig(artist_name).strip() or artist_name
     scored: list[_ScoredCandidate] = []
     for url in urls or ():
         if not isinstance(url, str):
@@ -149,7 +200,7 @@ def _score_candidates(urls: Sequence[str] | None, artist_name: str) -> list[_Sco
         stripped = strip_discogs_disambig(decoded_slug).strip()
         if not stripped:
             continue
-        score = score_match(stripped, artist_name)
+        score = score_match(stripped, artist_stripped)
         scored.append(_ScoredCandidate(url=url, lang=lang, score=score))
     return scored
 
@@ -167,18 +218,35 @@ def _select_best(scored: list[_ScoredCandidate]) -> _ScoredCandidate | None:
 
 
 def _project_wikipedia_slug_pick(
-    *, heuristic_pick: str | None, slug_pick: str | None, agreement: bool
+    *,
+    heuristic_pick: str | None,
+    slug_pick: str | None,
+    slug_score: float,
+    clears_floor: bool,
+    agreement: bool,
 ) -> None:
     """Shadow telemetry, fires regardless of the enable flag (LML#513).
 
     Mirrors ``lookup.artist_resolution._log_artist_identity_split_gate``:
-    ``set_data`` on the active Sentry transaction at production rate, plus a
-    1% sampled INFO log line. Best-effort — any SDK error is swallowed so
-    telemetry can never break enrichment.
+    ``set_data`` on the active Sentry transaction (single-item view) AND
+    ``add_breadcrumb`` (accumulating view — LML#1192 review, A4: a fixed
+    ``set_data`` key is last-writer-wins across the multiple items sharing
+    one ``/lookup/bulk`` transaction, which would silently drop every item's
+    projection but the last; the breadcrumb list accumulates instead), plus
+    a 1% sampled INFO log line. Best-effort — each SDK call is independently
+    swallowed so telemetry can never break enrichment, and one surface's
+    failure can't suppress another's.
+
+    Callers must skip this entirely for the no-URL-at-all case (there is
+    nothing to compare — see the call site) rather than pass ``None``/``None``
+    through: recording that as a "disagreement" would flood the divergence
+    signal with non-events.
     """
     payload = {
         "heuristic_pick": heuristic_pick,
         "slug_pick": slug_pick,
+        "slug_score": slug_score,
+        "clears_floor": clears_floor,
         "agreement": agreement,
     }
     try:
@@ -187,6 +255,10 @@ def _project_wikipedia_slug_pick(
             transaction.set_data("wikipedia_slug_pick", payload)
     except Exception as e:
         logger.warning("Failed to project wikipedia_slug_pick onto Sentry transaction: %s", e)
+    try:
+        sentry_sdk.add_breadcrumb(category="wikipedia_slug_pick", level="info", data=payload)
+    except Exception as e:
+        logger.warning("Failed to add wikipedia_slug_pick breadcrumb: %s", e)
     if random.random() < 0.01:
         logger.info("wikipedia_slug_pick %s", payload)
 
@@ -231,16 +303,24 @@ def pick_artist_wikipedia_url(urls: Sequence[str] | None, artist_name: str) -> P
     """
     comparison = compare_wikipedia_extractors(urls, artist_name)
 
-    _project_wikipedia_slug_pick(
-        heuristic_pick=comparison.heuristic_pick,
-        slug_pick=comparison.slug_pick,
-        agreement=comparison.slug_pick is not None
-        and comparison.slug_pick == comparison.heuristic_pick,
-    )
+    # LML#1192 review, A4: the no-URL-at-all case is a non-event, not a
+    # disagreement — check it BEFORE emitting telemetry, not after, so it
+    # never floods the divergence signal.
+    if comparison.heuristic_pick is None and comparison.slug_pick is None:
+        return None
 
     score_clears_floor = (
         comparison.slug_pick is not None and comparison.slug_score >= SCORE_MATCH_ACCEPTANCE_FLOOR
     )
+    _project_wikipedia_slug_pick(
+        heuristic_pick=comparison.heuristic_pick,
+        slug_pick=comparison.slug_pick,
+        slug_score=comparison.slug_score,
+        clears_floor=score_clears_floor,
+        agreement=comparison.slug_pick is not None
+        and comparison.slug_pick == comparison.heuristic_pick,
+    )
+
     if _wikipedia_slug_match_enabled() and score_clears_floor:
         return PickedWikiUrl(
             url=comparison.slug_pick,
@@ -249,10 +329,11 @@ def pick_artist_wikipedia_url(urls: Sequence[str] | None, artist_name: str) -> P
             below_floor=False,
         )
 
-    if comparison.heuristic_pick is None and comparison.slug_pick is None:
-        return None
-
-    fallback_lang = comparison.slug_lang or _extract_lang(comparison.heuristic_pick or "")
+    # LML#1192 review, A5: derive lang from the URL actually being SERVED
+    # (the heuristic pick) — never from ``comparison.slug_lang``, which
+    # describes whichever candidate scored highest and may be a completely
+    # different page than the one being returned here.
+    fallback_lang = _extract_lang(comparison.heuristic_pick or "")
     return PickedWikiUrl(
         url=comparison.heuristic_pick,
         lang=fallback_lang,
