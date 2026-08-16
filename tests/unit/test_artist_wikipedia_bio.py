@@ -2,11 +2,16 @@
 
 PG interaction is mocked with ``AsyncMock(spec=PgSource)``, mirroring
 ``tests/unit/test_streaming_url_cache.py``. Covers the three-valued
-``CachedValue`` read contract (positive hit / negative hit / miss), the
-self-healing URL-match predicate (a stored row for a DIFFERENT
-``wikipedia_url`` than the caller's current pick reads as a miss), the two
+``CachedValue`` read contract (positive hit / negative hit / miss), the two
 TTL cutoffs bound as separate SQL params, and the UPSERT write shape. The
 ``pg``-marked integration layer drives the real DDL/TTL math.
+
+LML#1192 review round 5: the read predicate is no longer keyed on the
+caller's current pick (``wikipedia_url`` dropped as a parameter entirely) --
+see ``TestReadBackAfterAWarmWrittenUnderADifferentUrl`` for why. A hit now
+carries the row's OWN stored ``wikipedia_url`` alongside ``extract`` (see
+:class:`~entity.artist_wikipedia_bio.WikipediaBioHit`), since there is no
+longer a caller-supplied URL to assume the hit describes.
 """
 
 from __future__ import annotations
@@ -38,80 +43,99 @@ class TestGetCachedArtistWikipediaBio:
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
 
-        result = await get_cached_artist_wikipedia_bio(
-            pg, discogs_artist_id=_ARTIST_ID, wikipedia_url=_URL, now=_NOW
-        )
+        result = await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
 
         assert result.was_present is False
         assert result.value is None
 
-    async def test_returns_positive_hit(self):
+    async def test_returns_positive_hit_carrying_the_rows_own_url(self):
         pg = AsyncMock(spec=PgSource)
-        pg.fetchone = AsyncMock(return_value={"extract": "Stereolab are a band."})
-
-        result = await get_cached_artist_wikipedia_bio(
-            pg, discogs_artist_id=_ARTIST_ID, wikipedia_url=_URL, now=_NOW
+        pg.fetchone = AsyncMock(
+            return_value={"extract": "Stereolab are a band.", "wikipedia_url": _URL}
         )
 
+        result = await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
+
         assert result.was_present is True
-        assert result.value == "Stereolab are a band."
+        assert result.value.extract == "Stereolab are a band."
+        assert result.value.wikipedia_url == _URL
 
     async def test_returns_negative_hit_distinct_from_absent(self):
         pg = AsyncMock(spec=PgSource)
-        pg.fetchone = AsyncMock(return_value={"extract": None})
+        pg.fetchone = AsyncMock(return_value={"extract": None, "wikipedia_url": _URL})
 
-        result = await get_cached_artist_wikipedia_bio(
-            pg, discogs_artist_id=_ARTIST_ID, wikipedia_url=_URL, now=_NOW
-        )
+        result = await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
 
         assert result.was_present is True
-        assert result.value is None
+        assert result.value.extract is None
+        assert result.value.wikipedia_url == _URL
 
-    async def test_binds_artist_id_url_and_both_cutoffs(self):
+    async def test_binds_artist_id_and_both_cutoffs_no_url_param(self):
+        # LML#1192 review round 5: no wikipedia_url parameter exists at all
+        # anymore -- the row is authoritative, read by discogs_artist_id
+        # alone.
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
 
-        await get_cached_artist_wikipedia_bio(
-            pg, discogs_artist_id=_ARTIST_ID, wikipedia_url=_URL, now=_NOW
-        )
+        await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
 
         args = pg.fetchone.await_args.args
-        sql, artist_id, url, positive_cutoff, negative_cutoff = args
+        sql, artist_id, positive_cutoff, negative_cutoff = args
         assert artist_id == _ARTIST_ID
-        assert url == _URL
         assert positive_cutoff == _NOW - DEFAULT_SUCCESS_TTL
         assert negative_cutoff == _NOW - DEFAULT_MISS_TTL
-
-    async def test_url_mismatch_is_a_miss_not_a_hit(self):
-        # The SQL WHERE clause filters on the caller's wikipedia_url, so a
-        # row stored under a DIFFERENT (now-stale-pick) URL is invisible to
-        # this call -- the fake PG here just proves the caller's URL is what
-        # gets bound; the real self-healing lives in the SQL predicate,
-        # pinned by the pg-marked integration test.
-        pg = AsyncMock(spec=PgSource)
-        pg.fetchone = AsyncMock(return_value=None)
-
-        result = await get_cached_artist_wikipedia_bio(
-            pg,
-            discogs_artist_id=_ARTIST_ID,
-            wikipedia_url="https://en.wikipedia.org/wiki/A_Different_Pick",
-            now=_NOW,
-        )
-
-        assert result.was_present is False
-        bound_url = pg.fetchone.await_args.args[2]
-        assert bound_url == "https://en.wikipedia.org/wiki/A_Different_Pick"
+        assert "wikipedia_url = $" not in sql
 
     async def test_pg_error_degrades_to_absent(self):
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(side_effect=RuntimeError("PG unreachable"))
 
-        result = await get_cached_artist_wikipedia_bio(
-            pg, discogs_artist_id=_ARTIST_ID, wikipedia_url=_URL, now=_NOW
-        )
+        result = await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
 
         assert result.was_present is False
         assert result.value is None
+
+
+@pytest.mark.asyncio
+class TestReadBackAfterAWarmWrittenUnderADifferentUrl:
+    """LML#1192 review round 5: pins the fix for the infinite-miss-warm
+    loop directly. Before this round, the read predicate additionally
+    required ``wikipedia_url = $2`` (the CALLER's current sync pick) -- but
+    a fetch-validated warm (LML#1192 review round 4, P0-2) can legitimately
+    write under a DIFFERENT, BETTER url than the sync pick's unvalidated
+    best guess. The canonical case: the sync picker's ``pick_artist_wikipedia_url``
+    has no fetch to validate against, so for an artist like Low or Sade it
+    returns the bare, disambiguation-page URL; the validated warm determines
+    the REAL article lives at the qualified ``_(band)`` URL and writes the
+    row there instead. Reproduced live against real Postgres before this
+    fix: writing under the qualified URL and then re-reading with the
+    caller's (unchanged) bare sync pick returned ``was_present=False`` --
+    every single request re-triggers a warm forever, reintroducing exactly
+    the live Wikipedia dependency on the request path the plan's Non-goals
+    rule out.
+
+    The row is now authoritative: read by ``discogs_artist_id`` alone,
+    serving whichever ``wikipedia_url`` the row itself carries -- so this
+    read-back is a HIT, not a miss.
+    """
+
+    async def test_a_row_written_under_a_different_url_than_the_sync_pick_still_hits(self):
+        pg = AsyncMock(spec=PgSource)
+        # Simulates: the sync pick for "Low" is the bare, disambiguation
+        # URL, but the validated warm determined "Low_(band)" is the real
+        # page and wrote the row under THAT url instead.
+        pg.fetchone = AsyncMock(
+            return_value={
+                "extract": "Low are a band.",
+                "wikipedia_url": "https://en.wikipedia.org/wiki/Low_(band)",
+            }
+        )
+
+        result = await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
+
+        assert result.was_present is True
+        assert result.value.extract == "Low are a band."
+        assert result.value.wikipedia_url == "https://en.wikipedia.org/wiki/Low_(band)"
 
 
 @pytest.mark.asyncio
