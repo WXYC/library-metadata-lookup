@@ -83,6 +83,9 @@ _LML_CACHE_FIXTURE_FILES = (
     # drain and the background miss-warm task): the write-nothing attempt
     # record drops its own scratch lml_cache.artist_wikipedia_bio_attempt rows.
     "test_artist_wikipedia_bio_attempt.py",
+    # LML#1192 review round 5: the full validated-warm round-trip test also
+    # drops its own scratch lml_cache.artist_wikipedia_bio rows.
+    "test_wikipedia_bio_warm_round_trip.py",
 )
 
 # Any DROP SCHEMA aimed at lml_cache, however spelled (with/without IF

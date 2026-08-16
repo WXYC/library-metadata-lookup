@@ -118,6 +118,14 @@ MODULE_BUDGETS: dict[str, int] = {
     # 171 lines (plan estimated ~75). Smallest multiple of 50 at or above
     # 1.3x that.
     "lookup/enrichment/wikipedia_warm.py": 250,
+    # LML#1192 review round 4, P0-2 / round 5: fetch-validated Wikipedia
+    # page selection. Moved down from #1196 (the drain PR) to #1195 (round
+    # 5) -- this is the earliest branch that can host it, since it needs
+    # clients.wikipedia.WikipediaSummary from #1194, and round 5 makes the
+    # background miss-warm (this branch's own wikipedia_warm.py) a second
+    # consumer alongside the offline drain. Measured 137 lines when first
+    # added; budget set to 200 (smallest multiple of 50 at or above 1.3x).
+    "lookup/wikipedia_pick_validation.py": 200,
     "lookup/external_search.py": 350,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
     # transparent-fold calibration): the module gained the empty-vs-degraded

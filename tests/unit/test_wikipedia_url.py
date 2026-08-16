@@ -262,6 +262,87 @@ class TestLanguageTieBreak:
         assert picked.lang == "fr"
         assert picked.below_floor is False
 
+    def test_www_subdomain_normalizes_to_en_not_a_literal_www_lang(self, monkeypatch):
+        # LML#1192 review round 4, P0-7: "www.wikipedia.org/wiki/..." is a
+        # realistic input (artist_url is unvalidated free text, and a
+        # browser 301s a bare wikipedia.org root to the www host) -- but
+        # "www" is a hostname prefix, not a language code. Verified live:
+        # the REST API 500s on https://www.wikipedia.org/api/rest_v1/...
+        # (https://en.wikipedia.org/... 200s for the same title), so an
+        # un-normalized "www" lang persists into the NOT NULL lang column
+        # and generates permanent fetch_error residue on every retry.
+        monkeypatch.setenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, "true")
+        urls = ["https://www.wikipedia.org/wiki/Stereolab"]
+        picked = pick_artist_wikipedia_url(urls, "Stereolab")
+        assert picked is not None
+        assert picked.lang == "en"
+        assert picked.below_floor is False
+
+    def test_mixed_case_wikipedia_domain_still_falls_back_to_the_heuristic_pick(self, monkeypatch):
+        # LML#1192 review round 2, C3: scripts/warm_wikipedia_bios.py's seed
+        # SQL selects candidates via a case-INSENSITIVE `au.url ILIKE
+        # '%wikipedia.org%'`, and _score_candidates's _WIKI_URL_RE matches
+        # case-insensitively too (re.IGNORECASE) -- but the legacy heuristic
+        # fallback used a case-SENSITIVE `"wikipedia.org" in url` substring
+        # check. A mixed-case domain ("en.Wikipedia.org") that scores below
+        # the floor would make compare_wikipedia_extractors return a real
+        # slug_pick/slug_score but a None heuristic_pick, so
+        # pick_artist_wikipedia_url's below-floor fallback branch (which
+        # serves heuristic_pick) silently returned a URL-less pick even
+        # though the artist DOES have a wikipedia.org URL -- and the SAME
+        # gap crashed the offline drain's below-floor write path outright
+        # (a since-removed `assert url is not None`; see
+        # test_warm_wikipedia_bios.py).
+        monkeypatch.setenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, "true")
+        urls = ["https://en.Wikipedia.org/wiki/Totally_Unrelated_Page"]
+        picked = pick_artist_wikipedia_url(urls, "Some Artist Whose Name Does Not Match At All")
+        assert picked is not None
+        assert picked.below_floor is True
+        assert picked.url == urls[0]
+
+    @pytest.mark.parametrize(
+        "artist_name,bare_slug,qualified_slug",
+        [
+            ("Sun Ra", "Sun_Ra", "Sun_Ra_(disambiguation)"),
+            ("Stereolab", "Stereolab", "Stereolab_(band)"),
+            ("Cat Power", "Cat_Power", "Cat_Power_(musician)"),
+            ("Sade", "Sade", "Sade_(band)"),
+            ("Low", "Low", "Low_(band)"),
+            ("Sessa", "Sessa", "Sessa_(2)"),
+        ],
+    )
+    def test_genuine_tie_picks_the_shorter_unqualified_page_regardless_of_input_order(
+        self, monkeypatch, artist_name, bare_slug, qualified_slug
+    ):
+        # LML#1192 review round 3: round 2's C1 fix made the tiebreak TOTAL
+        # (good -- that property must survive) but broke WHICH url wins --
+        # it sorted on the url string descending, and a bare slug is always
+        # a strict string prefix of its qualified sibling, so the qualified
+        # (wrong) page won 5/5 on real examples, deterministically, every
+        # time. Once LML_WIKIPEDIA_SLUG_MATCH is on this is a live /lookup
+        # regression: a disambiguation page fails `type != "standard"` and a
+        # `(band)`/`(musician)` page 404s, so both negative-cache for 7 days
+        # (BS#1747 can then freeze that permanently). The correct tiebreak
+        # prefers the SHORTER (unqualified) URL -- still a total order
+        # (independent of input list order), but now pointed at the
+        # canonical page instead of away from it.
+        monkeypatch.setenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, "true")
+        bare_url = f"https://en.wikipedia.org/wiki/{bare_slug}"
+        qualified_url = f"https://en.wikipedia.org/wiki/{qualified_slug}"
+
+        picked_bare_first = pick_artist_wikipedia_url([bare_url, qualified_url], artist_name)
+        picked_qualified_first = pick_artist_wikipedia_url([qualified_url, bare_url], artist_name)
+
+        assert picked_bare_first is not None
+        assert picked_qualified_first is not None
+        assert picked_bare_first.url == bare_url, (
+            f"expected the bare page to win, got {picked_bare_first.url!r}"
+        )
+        assert picked_qualified_first.url == bare_url, (
+            "a genuine tie must resolve identically regardless of input order -- "
+            f"got {picked_qualified_first.url!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Below-floor fallback — never regress populated -> None
@@ -316,6 +397,102 @@ class TestCompareWikipediaExtractors:
         comparison = compare_wikipedia_extractors(urls, "Sessa")
         assert comparison.heuristic_pick == urls[0]
         assert comparison.slug_pick is None
+
+
+class TestExtractorComparisonClearsFloorAndAgreement:
+    """LML#1192 review round 3, finding 9: ``clears_floor``/``agreement`` were
+    hand-written identically in three modules; now owned here."""
+
+    def test_clears_floor_true_above_the_acceptance_floor(self):
+        comparison = compare_wikipedia_extractors(
+            ["https://en.wikipedia.org/wiki/Stereolab"], "Stereolab"
+        )
+        assert comparison.clears_floor is True
+
+    def test_clears_floor_false_when_no_slug_pick(self):
+        comparison = compare_wikipedia_extractors([], "Stereolab")
+        assert comparison.clears_floor is False
+
+    def test_clears_floor_false_below_the_acceptance_floor(self):
+        comparison = compare_wikipedia_extractors(
+            ["https://en.wikipedia.org/wiki/Completely_Unrelated_Page"], "Stereolab"
+        )
+        assert comparison.clears_floor is False
+
+    def test_agreement_true_when_picks_match(self):
+        comparison = compare_wikipedia_extractors(
+            ["https://en.wikipedia.org/wiki/Jessica_Pratt"], "Jessica Pratt"
+        )
+        assert comparison.agreement is True
+
+    def test_agreement_false_when_picks_diverge(self):
+        urls = [
+            "https://en.wikipedia.org/wiki/Tim_Gane",
+            "https://en.wikipedia.org/wiki/Stereolab",
+        ]
+        comparison = compare_wikipedia_extractors(urls, "Stereolab")
+        assert comparison.agreement is False
+
+    def test_agreement_false_when_no_slug_pick_even_if_heuristic_exists(self):
+        comparison = compare_wikipedia_extractors(
+            ["https://en.wikipedia.org/wiki/Sessa_(album)"], "Sessa"
+        )
+        assert comparison.slug_pick is None
+        assert comparison.heuristic_pick is not None
+        assert comparison.agreement is False
+
+
+class TestExtractorComparisonResolve:
+    """LML#1192 review round 3, finding 9: the decision body for
+    ``pick_artist_wikipedia_url`` (``slug_enabled=_wikipedia_slug_match_enabled()``),
+    the live read path's unvalidated best-guess pick. LML#1192 review round
+    4, P0-2: the offline drain and background miss-warm no longer call this
+    -- they go through ``lookup.wikipedia_pick_validation.resolve_and_validate_pick``
+    instead, which validates each ranked candidate against a live fetch."""
+
+    def test_no_url_at_all_returns_none(self):
+        comparison = compare_wikipedia_extractors([], "Stereolab")
+        assert comparison.resolve(slug_enabled=True) is None
+        assert comparison.resolve(slug_enabled=False) is None
+
+    def test_slug_enabled_and_clears_floor_serves_the_slug_pick(self):
+        comparison = compare_wikipedia_extractors(
+            ["https://en.wikipedia.org/wiki/Stereolab"], "Stereolab"
+        )
+        picked = comparison.resolve(slug_enabled=True)
+        assert picked == PickedWikiUrl(
+            url="https://en.wikipedia.org/wiki/Stereolab",
+            lang="en",
+            slug_score=pytest.approx(100.0),
+            below_floor=False,
+        )
+
+    def test_slug_disabled_falls_back_to_heuristic_even_above_floor(self):
+        comparison = compare_wikipedia_extractors(
+            ["https://en.wikipedia.org/wiki/Stereolab"], "Stereolab"
+        )
+        picked = comparison.resolve(slug_enabled=False)
+        assert picked is not None
+        assert picked.below_floor is True
+        assert picked.url == "https://en.wikipedia.org/wiki/Stereolab"
+
+    def test_below_floor_fallback_derives_lang_from_the_served_heuristic_url_not_slug_lang(self):
+        # LML#1192 review round 3, finding 8: the drain's own hand-rolled
+        # copy of this decision returned slug_lang (the winning SLUG
+        # candidate's language) on the below-floor branch, which can name a
+        # completely different page's language than the URL actually being
+        # served. resolve() must always derive lang from heuristic_pick.
+        urls = [
+            "https://de.wikipedia.org/wiki/Voellig_Unrelated_Seite",  # heuristic (first)
+            "https://fr.wikipedia.org/wiki/Le_Meilleur_Match_Possible",  # scores highest
+        ]
+        comparison = compare_wikipedia_extractors(urls, "Le Meilleur Match Possible")
+        assert comparison.slug_lang == "fr"
+        assert comparison.heuristic_pick != comparison.slug_pick
+        picked = comparison.resolve(slug_enabled=False)
+        assert picked is not None
+        assert picked.url == urls[0]
+        assert picked.lang == "de"
 
 
 # ---------------------------------------------------------------------------
