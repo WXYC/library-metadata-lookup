@@ -24,15 +24,37 @@ release-resolution cache's 90-day positive TTL — a Wikipedia lead paragraph
 churns (deaths, new releases, editorial rewrites) far faster than a resolved
 ``release_id`` does.
 
-**Self-healing on a stale pick (LML#513's Phase-A recalibration case):** the
-read predicate additionally requires the row's stored ``wikipedia_url`` to
-equal the CALLER'S current Phase-A pick. When the stored URL and the current
-pick diverge — because the slug-scoring extractor was recalibrated, or the
-underlying Discogs ``artist_url`` data changed, after this row was written —
-the row reads as a miss (regardless of ``extract`` or freshness) rather than
-serving stale prose against a URL LML no longer believes is right. This is
-what lets a served ``(artist_bio, wikipedia_url)`` pair always describe the
-same page: the served link is always the exact source of the served text.
+**The row is authoritative (LML#1192 review round 5), not the caller's pick.**
+Through round 4, the read predicate additionally required the row's stored
+``wikipedia_url`` to equal the CALLER's current Phase-A pick — described as
+"self-healing on a stale pick" (a scorer recalibration or an ``artist_url``
+change would then read as a miss rather than serve stale prose against a
+link LML no longer trusted). That URL-match requirement is REMOVED: a
+fetch-validated background warm (round 4, P0-2) can legitimately write a
+row under a DIFFERENT, BETTER url than the caller's own unvalidated sync
+pick — the sync path has no live fetch to validate against, so for an
+artist like Low or Sade it names the bare, disambiguation-page URL, while
+the validated warm determines the real article lives at the qualified
+``_(band)`` url and writes there instead. Keying the read on URL equality
+made that row permanently unreadable by a caller whose sync pick never
+changes — every request re-triggered a warm forever, reintroducing exactly
+the live Wikipedia dependency on the request path the plan's Non-goals rule
+out. A hit now returns whichever ``wikipedia_url`` the row itself carries
+(:class:`WikipediaBioHit`), and the caller serves THAT link alongside the
+extract — link and text always describe the same page, just no longer
+because they were compared against each other.
+
+The freshness property the URL-match predicate used to provide (a stale
+pick self-heals promptly) is re-homed onto the two TTLs above plus
+``scripts/warm_wikipedia_bios.py --repick`` (which already re-derives and
+re-validates a pick, and — since round 4's P0-2/P0-3 — writes a fresh
+extract even when the pick is unchanged): a Phase-A recalibration or an
+``artist_url`` change now surfaces the next time ``--repick`` runs or the
+row ages past its TTL, not instantly on the next read. Slower, but the
+instant version was never actually correct once the read and write paths
+could validate a pick differently — it was self-healing to whichever pick
+happened to be RIGHT more often by construction, not a real correctness
+signal.
 
 Reads/writes wrapped in ``swallowing_fetch``/``swallowing_execute`` so a PG
 hiccup degrades to a cache miss (or a silently-dropped write) instead of
@@ -45,6 +67,7 @@ other ``lml_cache.*`` module has.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute, swallowing_fetch
@@ -98,20 +121,23 @@ _DDL_ADD_LAST_CHECKED_AT_COLUMN = (
     "ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now()"
 )
 
-# Staleness AND the self-healing URL-match both live in the WHERE clause.
-# $1 = discogs_artist_id, $2 = the caller's CURRENT Phase-A wikipedia_url
-# pick, $3 = the positive-hit cutoff (now - success_ttl), $4 = the
-# negative-hit cutoff (now - miss_ttl). A row whose stored wikipedia_url
-# doesn't match $2 never satisfies any branch -- read as absent, same as a
-# genuinely missing row -- so a Phase-A recalibration self-heals the next
-# time this is read, with no explicit migration.
+# LML#1192 review round 5: the URL-match requirement this comment used to
+# describe ("staleness AND the self-healing URL-match both live in the
+# WHERE clause") is GONE -- see the module docstring's "The row is
+# authoritative" section for why keying the read on the caller's current
+# pick made a validated warm's own write permanently unreadable by that
+# same caller. $1 = discogs_artist_id, $2 = the positive-hit cutoff
+# (now - success_ttl), $3 = the negative-hit cutoff (now - miss_ttl).
+# wikipedia_url is SELECTed (not filtered on) so a hit can report whichever
+# url the row itself carries -- the caller no longer supplies one to
+# compare against.
 _SELECT_SQL = """\
-SELECT extract
+SELECT extract, wikipedia_url
 FROM lml_cache.artist_wikipedia_bio
-WHERE discogs_artist_id = $1 AND wikipedia_url = $2
+WHERE discogs_artist_id = $1
   AND (
-    (extract IS NOT NULL AND fetched_at > $3)
-    OR (extract IS NULL AND fetched_at > $4)
+    (extract IS NOT NULL AND fetched_at > $2)
+    OR (extract IS NULL AND fetched_at > $3)
   )\
 """
 
@@ -183,26 +209,43 @@ async def set_up_artist_wikipedia_bio_schema(pg: PgSource) -> None:
     await bootstrap_lml_cache_table(pg, _DDL_ADD_LAST_CHECKED_AT_COLUMN)
 
 
+@dataclass(frozen=True)
+class WikipediaBioHit:
+    """A cache row's content, as returned by a hit (positive or negative).
+
+    LML#1192 review round 5: the row is authoritative, so a hit reports
+    whichever ``wikipedia_url`` it was actually written under — the caller
+    no longer supplies one to compare against (see the module docstring's
+    "The row is authoritative" section). ``extract`` is ``None`` for a
+    negative hit, matching the pre-round-5 contract.
+    """
+
+    wikipedia_url: str
+    extract: str | None
+
+
 async def get_cached_artist_wikipedia_bio(
     pg: PgSource,
     *,
     discogs_artist_id: int,
-    wikipedia_url: str,
     success_ttl: timedelta = DEFAULT_SUCCESS_TTL,
     miss_ttl: timedelta = DEFAULT_MISS_TTL,
     now: datetime | None = None,
-) -> CachedValue[str]:
-    """Look up the cached bio for ``discogs_artist_id`` served from ``wikipedia_url``.
+) -> CachedValue[WikipediaBioHit]:
+    """Look up the cached bio for ``discogs_artist_id``.
 
     Returns a three-valued :class:`~entity.cache_toolkit.CachedValue`: a
-    fresh positive hit carries the extract text; a fresh negative hit
-    carries ``value=None`` with ``was_present=True`` (skip the fetch, serve
-    the Discogs fallback); an absent, stale, or URL-mismatched row carries
-    ``was_present=False`` (fetch and warm).
+    fresh positive hit carries a :class:`WikipediaBioHit` with the row's own
+    ``wikipedia_url`` and a non-``None`` ``extract``; a fresh negative hit
+    carries a :class:`WikipediaBioHit` with ``extract=None`` and
+    ``was_present=True`` (skip the fetch, serve the Discogs fallback); an
+    absent or stale row carries ``was_present=False`` (fetch and warm).
 
-    PG failures degrade to ``was_present=False`` (best-effort, same posture
-    as every sibling ``lml_cache.*`` read). ``now`` is exposed for
-    testability; production callers leave it at the default.
+    LML#1192 review round 5: no longer takes a ``wikipedia_url`` parameter
+    — the read is keyed on ``discogs_artist_id`` alone (see the module
+    docstring). PG failures degrade to ``was_present=False`` (best-effort,
+    same posture as every sibling ``lml_cache.*`` read). ``now`` is exposed
+    for testability; production callers leave it at the default.
     """
     reference_now = now or datetime.now(UTC)
     positive_cutoff = reference_now - success_ttl
@@ -211,7 +254,6 @@ async def get_cached_artist_wikipedia_bio(
         pg,
         _SELECT_SQL,
         discogs_artist_id,
-        wikipedia_url,
         positive_cutoff,
         negative_cutoff,
         miss=None,
@@ -221,7 +263,8 @@ async def get_cached_artist_wikipedia_bio(
     )
     if row is None:
         return CachedValue(value=None, was_present=False)
-    return CachedValue(value=row["extract"], was_present=True)
+    hit = WikipediaBioHit(wikipedia_url=row["wikipedia_url"], extract=row["extract"])
+    return CachedValue(value=hit, was_present=True)
 
 
 async def set_cached_artist_wikipedia_bio(

@@ -3,18 +3,22 @@
 Mirrors ``tests/integration/test_release_resolution_cache.py``. All unit
 coverage mocks ``PgSource``; this file is the matching ``@pytest.mark.pg``
 layer driving the real schema, the real UPSERT, the real dual-TTL math, and
-the self-healing URL-mismatch predicate against an actual PostgreSQL
-connection.
+(LML#1192 review round 5) the row-is-authoritative read against an actual
+PostgreSQL connection.
 
 Concrete production risks the unit tests cannot catch:
 
 * TIMESTAMPTZ codec drift -- asyncpg returns aware ``datetime``; a naive
   value would break the ``fetched_at`` cutoff comparison.
 * UPSERT semantics -- the single-column-PK ``ON CONFLICT`` updates in place,
-  including ``wikipedia_url`` itself (the self-healing write path).
-* The self-healing read predicate: a row stored under a DIFFERENT
-  ``wikipedia_url`` than the caller's current pick is invisible to
-  ``get_cached_artist_wikipedia_bio``, regardless of freshness.
+  including ``wikipedia_url`` itself.
+* The round-5 read predicate: a row is now readable by ``discogs_artist_id``
+  alone, regardless of which ``wikipedia_url`` it was written under --
+  through round 4 a row stored under a DIFFERENT url than the caller's
+  current pick was invisible, which made a fetch-validated warm's own write
+  permanently unreadable by a caller whose sync pick never changes (see
+  ``TestRowIsAuthoritative``, and ``entity/artist_wikipedia_bio.py``'s
+  module docstring for the full history).
 * The dual TTL: a positive hit reads stale after 30 days; a negative hit
   reads stale after 7 days, on its own shorter cutoff.
 
@@ -73,7 +77,7 @@ class TestSchemaBootstrap:
 @pytest.mark.pg
 class TestRoundTrip:
     @pytest.mark.asyncio
-    async def test_set_then_get_returns_extract(self, pg_source):
+    async def test_set_then_get_returns_extract_and_url(self, pg_source):
         await set_cached_artist_wikipedia_bio(
             pg_source,
             discogs_artist_id=99,
@@ -82,14 +86,13 @@ class TestRoundTrip:
             lang="en",
             extract="Stereolab are a band.",
         )
-        result = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=99, wikipedia_url=_URL
-        )
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99)
         assert result.was_present is True
-        assert result.value == "Stereolab are a band."
+        assert result.value.extract == "Stereolab are a band."
+        assert result.value.wikipedia_url == _URL
 
     @pytest.mark.asyncio
-    async def test_negative_result_round_trips_as_present_with_none_value(self, pg_source):
+    async def test_negative_result_round_trips_as_present_with_none_extract(self, pg_source):
         await set_cached_artist_wikipedia_bio(
             pg_source,
             discogs_artist_id=99,
@@ -98,11 +101,10 @@ class TestRoundTrip:
             lang="en",
             extract=None,
         )
-        result = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=99, wikipedia_url=_URL
-        )
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99)
         assert result.was_present is True
-        assert result.value is None
+        assert result.value.extract is None
+        assert result.value.wikipedia_url == _URL
 
     @pytest.mark.asyncio
     async def test_upsert_updates_in_place(self, pg_source, pg_pool):
@@ -221,10 +223,8 @@ class TestSqlLevelNullOverwriteGuard:
             lang="en",
             extract="Newly-found biography.",
         )
-        result = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=99, wikipedia_url=_URL
-        )
-        assert result.value == "Newly-found biography."
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99)
+        assert result.value.extract == "Newly-found biography."
 
     @pytest.mark.asyncio
     async def test_touch_advances_last_checked_at_without_touching_fetched_at(
@@ -261,27 +261,45 @@ class TestSqlLevelNullOverwriteGuard:
 
 
 @pytest.mark.pg
-class TestSelfHealingUrlMismatch:
+class TestRowIsAuthoritative:
+    """LML#1192 review round 5: through round 4, a row stored under a
+    DIFFERENT ``wikipedia_url`` than the caller's current pick was
+    invisible to ``get_cached_artist_wikipedia_bio`` -- framed at the time
+    as "self-healing" a stale Phase-A pick. That predicate made a
+    fetch-validated warm's own write (round 4, P0-2 -- which can
+    legitimately choose a DIFFERENT, better URL than the request path's
+    unvalidated sync pick, the canonical case being Low/Sade's bare
+    disambiguation-page URL vs. their real qualified ``_(band)`` article)
+    permanently unreadable by a caller whose sync pick never changes.
+    Reproduced live against real Postgres before this fix (see the round-5
+    coordinator report): writing under a qualified URL and reading back
+    with the original bare URL returned ``was_present=False`` forever. The
+    row is now read by ``discogs_artist_id`` alone and reports its own
+    ``wikipedia_url`` on a hit -- these tests pin that against a real
+    round-trip, not just the mocked unit layer.
+    """
+
     @pytest.mark.asyncio
-    async def test_stored_row_under_a_different_url_is_invisible(self, pg_source):
+    async def test_a_row_written_under_one_url_is_still_a_hit_regardless_of_which_url_written(
+        self, pg_source
+    ):
+        # No "caller's current pick" is compared against at all anymore --
+        # any wikipedia_url the row was written under round-trips as a hit.
         await set_cached_artist_wikipedia_bio(
             pg_source,
             discogs_artist_id=99,
-            wikipedia_url="https://en.wikipedia.org/wiki/Stale_Pick",
-            slug_score=82.0,
+            wikipedia_url="https://en.wikipedia.org/wiki/Low_(band)",
+            slug_score=100.0,
             lang="en",
-            extract="Stale text.",
+            extract="Low are a band.",
         )
-        # A read for the CURRENT pick (a different URL) sees no fresh row —
-        # a scorer recalibration self-heals to a miss, not stale served text.
-        result = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=99, wikipedia_url=_URL
-        )
-        assert result.was_present is False
-        assert result.value is None
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99)
+        assert result.was_present is True
+        assert result.value.extract == "Low are a band."
+        assert result.value.wikipedia_url == "https://en.wikipedia.org/wiki/Low_(band)"
 
     @pytest.mark.asyncio
-    async def test_negative_row_under_a_different_url_is_also_a_miss(self, pg_source):
+    async def test_a_negative_row_still_reports_its_own_url_on_a_negative_hit(self, pg_source):
         await set_cached_artist_wikipedia_bio(
             pg_source,
             discogs_artist_id=99,
@@ -290,19 +308,46 @@ class TestSelfHealingUrlMismatch:
             lang="en",
             extract=None,
         )
-        result = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=99, wikipedia_url=_URL
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99)
+        assert result.was_present is True
+        assert result.value.extract is None
+        assert result.value.wikipedia_url == "https://en.wikipedia.org/wiki/A_404_Page"
+
+    @pytest.mark.asyncio
+    async def test_replacing_the_stored_url_via_upsert_is_visible_on_the_very_next_read(
+        self, pg_source
+    ):
+        # Direct simulation of the warm-rewiring scenario: a first write
+        # under the bare url, then a later write (the validated warm)
+        # replaces it with the qualified url -- the read must see the NEW
+        # url immediately, keyed on discogs_artist_id alone.
+        await set_cached_artist_wikipedia_bio(
+            pg_source,
+            discogs_artist_id=99,
+            wikipedia_url="https://en.wikipedia.org/wiki/Low",
+            slug_score=75.0,
+            lang="en",
+            extract=None,
         )
-        assert result.was_present is False
+        await set_cached_artist_wikipedia_bio(
+            pg_source,
+            discogs_artist_id=99,
+            wikipedia_url="https://en.wikipedia.org/wiki/Low_(band)",
+            slug_score=100.0,
+            lang="en",
+            extract="Low are a band.",
+        )
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99)
+        assert result.was_present is True
+        assert result.value.extract == "Low are a band."
+        assert result.value.wikipedia_url == "https://en.wikipedia.org/wiki/Low_(band)"
 
 
 @pytest.mark.pg
 class TestDualTTL:
     @pytest.mark.asyncio
     async def test_absent_entry_reads_not_present(self, pg_source):
-        result = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=99, wikipedia_url=_URL
-        )
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99)
         assert result.was_present is False
         assert result.value is None
 
@@ -324,11 +369,9 @@ class TestDualTTL:
                 "WHERE discogs_artist_id = 99",
                 recent,
             )
-        result = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=99, wikipedia_url=_URL, now=now
-        )
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99, now=now)
         assert result.was_present is True
-        assert result.value == "Fresh text."
+        assert result.value.extract == "Fresh text."
 
     @pytest.mark.asyncio
     async def test_positive_hit_past_30_days_reads_stale(self, pg_source, pg_pool):
@@ -348,9 +391,7 @@ class TestDualTTL:
                 "WHERE discogs_artist_id = 99",
                 ancient,
             )
-        result = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=99, wikipedia_url=_URL, now=now
-        )
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99, now=now)
         assert result.was_present is False
         assert result.value is None
 
@@ -372,11 +413,9 @@ class TestDualTTL:
                 "WHERE discogs_artist_id = 99",
                 recent,
             )
-        result = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=99, wikipedia_url=_URL, now=now
-        )
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99, now=now)
         assert result.was_present is True
-        assert result.value is None
+        assert result.value.extract is None
 
     @pytest.mark.asyncio
     async def test_negative_hit_past_7_days_reads_stale(self, pg_source, pg_pool):
@@ -396,9 +435,7 @@ class TestDualTTL:
                 "WHERE discogs_artist_id = 99",
                 ancient,
             )
-        result = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=99, wikipedia_url=_URL, now=now
-        )
+        result = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99, now=now)
         assert result.was_present is False
         assert result.value is None
 
@@ -429,12 +466,8 @@ class TestDualTTL:
         aged = now - timedelta(days=29)
         async with pg_pool.acquire() as conn:
             await conn.execute("UPDATE lml_cache.artist_wikipedia_bio SET fetched_at = $1", aged)
-        negative = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=1, wikipedia_url=_URL, now=now
-        )
-        positive = await get_cached_artist_wikipedia_bio(
-            pg_source, discogs_artist_id=2, wikipedia_url=_URL, now=now
-        )
+        negative = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=1, now=now)
+        positive = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=2, now=now)
         assert negative.was_present is False
         assert positive.was_present is True
-        assert positive.value == "Still fresh."
+        assert positive.value.extract == "Still fresh."
