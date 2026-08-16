@@ -62,6 +62,23 @@ MODULE_BUDGETS: dict[str, int] = {
     # back toward 500, defeating the point of the collapse), this is a
     # minimal-headroom restoration: smallest multiple of 50 AT OR ABOVE the
     # measured size, no multiplier.
+    #
+    # Round 5: grew to 369 measured lines (the enriched_top1_wiki call-site
+    # plumbing the P0-6 miss-warm-reachability fix needed). The standard
+    # 1.3x rule at 369 would license 500 (1.3 x 369 = 479.7, smallest
+    # multiple of 50 at or above that) -- 400 stays a deliberate
+    # under-grant, approved by Jake as-is. This SPENDS the plan's
+    # (docs/plans/lml-1192-wikipedia-artist-bio.md) original coordinator
+    # line-neutrality commitment (net delta <= 0 from 350, funded by
+    # relocating the Discogs ref-warm to background.py) -- consciously
+    # released, not silently missed; see the plan doc's amended commitment
+    # note for the full reasoning. In short: the round-3 collapse above
+    # already did the substantive work of keeping this file honest, and
+    # extracting the ~19 lines of round-5 growth now would be motivated by
+    # a line count rather than a concern boundary -- the same failure mode
+    # this guardrail exists to prevent, pointed the other way. The growth
+    # is call-site plumbing for the bio resolution, which is what a
+    # coordinator is for.
     "lookup/enrichment/__init__.py": 400,
     "lookup/enrichment/background.py": 100,
     # LML#1098: the inline Bandcamp live probe, extracted out of item.py to keep
@@ -104,13 +121,19 @@ MODULE_BUDGETS: dict[str, int] = {
     # the read-path resolver -- CachedValue read, served-pair resolution --
     # plus finalize_bio (LML#1192 review round 3, finding 10: collapses the
     # coordinator's post-gate adoption-telemetry + miss-warm-scheduling
-    # calls into one) and its two private helpers. Recalibrated again
-    # (round 4, P0-6): the miss-warm's gate condition split from
-    # bio_surfaced to a separate enriched_top1_wiki-derived signal (an
-    # artist with no Discogs profile has bio_surfaced permanently False,
-    # which made the warm unreachable for exactly the cohort it exists
-    # for). Measured 308 lines at this PR's tip. Smallest multiple of 50
-    # at or above 1.3x that -> 400.
+    # calls into one) and its two private helpers. Recalibrated (round 4,
+    # P0-6): the miss-warm's gate condition split from bio_surfaced to a
+    # separate enriched_top1_wiki-derived signal (an artist with no Discogs
+    # profile has bio_surfaced permanently False, which made the warm
+    # unreachable for exactly the cohort it exists for).
+    #
+    # Round 5 (the row-is-authoritative read + WikipediaBioHit consumption)
+    # grew this to 337 measured lines, not the 308 an earlier version of
+    # this comment stated. The standard 1.3x-headroom rule at 337 would
+    # license 450 (1.3 x 337 = 438.1, smallest multiple of 50 at or above
+    # that) -- NOT 400. 400 is a deliberate under-grant (~19% headroom,
+    # not the rule's ~30%), approved by Jake as-is rather than raised to
+    # 450: the tighter number is the point.
     "lookup/enrichment/wikipedia_bio.py": 400,
     # LML#513/#1192 Phase B: the bounded miss-warm executor, modeled on
     # lookup/streaming_warm_admission.py -- depth-bound admission, the
