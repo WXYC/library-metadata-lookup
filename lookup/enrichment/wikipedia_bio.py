@@ -24,10 +24,25 @@ parse, and the Discogs ref-warm (``background.maybe_schedule_discogs_bio_warm``)
 This module never mutates its caller's ``top1_bio`` — it only returns a
 NEW ``bio`` value on :class:`ServedBioResolution` for the response.
 
-``wiki_url`` is **always** ``pick.url`` (or ``None`` when there's no pick),
-in every branch below — Phase B only ever swaps which TEXT accompanies that
-link, never the link itself, so the served pair can never disagree (the
-LML#504 split gate downstream nulls both together, exactly as today).
+``wiki_url`` is ``pick.url`` (or ``None`` when there's no pick) on every
+branch EXCEPT a positive cache hit (LML#1192 review round 5). There, it is
+the CACHE ROW's own stored ``wikipedia_url``, which can legitimately differ
+from the caller's sync ``pick``: a fetch-validated background warm
+(``lookup/enrichment/wikipedia_warm.py``, round 4's P0-2 fix) can determine
+a DIFFERENT, better page than the request path's unvalidated sync pick
+names — the canonical case is Low or Sade, where the sync pick is the bare
+disambiguation-page url (the sync path has no live fetch to validate
+against) while the validated warm writes the row under the qualified, real
+article's url instead. Through round 4, the cache read was additionally
+keyed on ``wikipedia_url = pick.url``, so a row written under a different
+url was permanently invisible to a caller whose sync pick never changes —
+see ``entity/artist_wikipedia_bio.py``'s module docstring for the full
+history and why the row is authoritative now. Every OTHER branch
+(below-floor, negative hit, miss, flag off) still serves ``pick.url``,
+since there is no cached content to override it with — the served pair
+still can never disagree (the LML#504 split gate downstream nulls both
+together, exactly as today), it just isn't always sourced from the same
+place.
 
 **LML#1192 review round 3, finding 10 — why ``bio_surfaced`` is a plain
 truthiness check.** ``item.enrich_one``'s LML#504 gate has exactly two
@@ -123,16 +138,23 @@ class ServedBioResolution:
     gate's call, downstream). ``source`` is ``BioSource.WIKIPEDIA`` only for
     a fresh positive cache hit; every other outcome (flag off, no pick,
     below-floor, negative hit, miss) carries the Discogs pair with
-    ``source=BioSource.DISCOGS``. ``miss_pick``/``discogs_artist_id`` are
+    ``source=BioSource.DISCOGS``. ``miss_details``/``discogs_artist_id`` are
     set ONLY on a genuine cache miss (the one case with something worth
     warming) — both ``None`` otherwise, which the internal miss-warm
     scheduler treats as "nothing to schedule."
+
+    LML#1192 review round 5: ``miss_details`` carries ``top1_details``
+    itself (name + urls), not a pre-computed ``PickedWikiUrl`` — the warm
+    now runs its own fetch-validated candidate selection
+    (``lookup.wikipedia_pick_validation.resolve_and_validate_pick``) rather
+    than reusing the request path's unvalidated sync pick, so the sync
+    pick's score/lang/below-floor fields are no longer useful to it.
     """
 
     bio: str | None
     wiki_url: str | None
     source: BioSource
-    miss_pick: PickedWikiUrl | None
+    miss_details: ArtistDetails | None
     discogs_artist_id: int | None
 
 
@@ -148,11 +170,15 @@ async def resolve_served_bio(
     (``top1_bio``, ``pick.url`` or ``None``) — byte-identical to the
     pre-Phase-B response. Above-floor pick, flag on: one ``CachedValue``
     read of ``lml_cache.artist_wikipedia_bio`` keyed on
-    ``(discogs_artist_id, pick.url)`` — the self-healing URL-match predicate
-    lives in ``entity/artist_wikipedia_bio.py``'s SQL, not here. A fresh
-    positive hit serves the cached extract; a fresh negative hit falls back
-    to the Discogs pair; an absent/stale row (miss) also falls back but
-    carries the pick forward on ``miss_pick`` for a possible warm.
+    ``discogs_artist_id`` alone (LML#1192 review round 5 — the row is
+    authoritative, not the caller's pick; see
+    ``entity/artist_wikipedia_bio.py``'s module docstring). A fresh
+    positive hit serves the cached extract AND the cached row's own
+    ``wikipedia_url`` (which may differ from ``pick.url`` — a validated
+    warm can have chosen a different, better page); a fresh negative hit
+    falls back to the Discogs pair; an absent/stale row (miss) also falls
+    back but carries ``top1_details`` forward on ``miss_details`` for a
+    possible warm.
 
     Cache-fact telemetry (``CACHE_HIT``/``CACHE_NEGATIVE``) is recorded
     immediately here — it's true regardless of what the response ends up
@@ -164,7 +190,7 @@ async def resolve_served_bio(
         bio=top1_bio,
         wiki_url=wiki_url,
         source=BioSource.DISCOGS,
-        miss_pick=None,
+        miss_details=None,
         discogs_artist_id=None,
     )
 
@@ -175,22 +201,17 @@ async def resolve_served_bio(
     if discogs_cache_pg is None or not isinstance(discogs_artist_id, int) or discogs_artist_id <= 0:
         return discogs_resolution
 
-    # A PickedWikiUrl only ever omits ``url`` when pick_artist_wikipedia_url
-    # returns None for the whole object (no wikipedia.org candidate at all)
-    # — this branch already required ``pick is not None`` above, so ``url``
-    # is guaranteed real here. Asserted for mypy narrowing.
-    assert pick.url is not None
     cached = await get_cached_artist_wikipedia_bio(
-        discogs_cache_pg, discogs_artist_id=discogs_artist_id, wikipedia_url=pick.url
+        discogs_cache_pg, discogs_artist_id=discogs_artist_id
     )
 
-    if cached.was_present and cached.value is not None:
+    if cached.was_present and cached.value is not None and cached.value.extract is not None:
         _record(CACHE_HIT_STAT_KEY)
         return ServedBioResolution(
-            bio=cached.value,
-            wiki_url=wiki_url,
+            bio=cached.value.extract,
+            wiki_url=cached.value.wikipedia_url,
             source=BioSource.WIKIPEDIA,
-            miss_pick=None,
+            miss_details=None,
             discogs_artist_id=None,
         )
 
@@ -198,14 +219,16 @@ async def resolve_served_bio(
         _record(CACHE_NEGATIVE_STAT_KEY)
         return discogs_resolution
 
-    # Genuine miss: no row at all (absent or aged past its TTL). Carry the
-    # pick + artist id forward -- the coordinator decides, post-gate,
+    # Genuine miss: no row at all (absent or aged past its TTL). Carry
+    # top1_details (guaranteed non-None here -- the artist_id check above
+    # already required it) forward -- the coordinator decides, post-gate,
     # whether a warm is worth scheduling.
+    assert top1_details is not None
     return ServedBioResolution(
         bio=top1_bio,
         wiki_url=wiki_url,
         source=BioSource.DISCOGS,
-        miss_pick=pick,
+        miss_details=top1_details,
         discogs_artist_id=discogs_artist_id,
     )
 
@@ -239,21 +262,27 @@ def _maybe_schedule_wikipedia_bio_warm(
     response actually surfaced the bio it would warm (LML#504) — the
     pre-fix Wikipedia miss-warm lacked that same gate. A warm is scheduled
     only when caching is requested, the response actually surfaced a bio,
-    AND ``resolve_served_bio`` recorded a genuine miss (``miss_pick`` is
+    AND ``resolve_served_bio`` recorded a genuine miss (``miss_details`` is
     only ever non-None on that branch). Private: called only by
     :func:`finalize_bio` (LML#1192 review round 3, finding 10).
+
+    LML#1192 review round 5: passes ``artist_name``/``urls`` (from
+    ``miss_details``) rather than a pre-computed ``PickedWikiUrl`` — the
+    warm now runs its own fetch-validated candidate selection instead of
+    reusing the sync pick.
     """
     if not warm_cache or not bio_surfaced:
         return
     if (
-        resolution.miss_pick is None
+        resolution.miss_details is None
         or discogs_cache_pg is None
         or resolution.discogs_artist_id is None
     ):
         return
     scheduled = wikipedia_warm.schedule_wikipedia_bio_warm(
         discogs_artist_id=resolution.discogs_artist_id,
-        pick=resolution.miss_pick,
+        artist_name=resolution.miss_details.name,
+        urls=resolution.miss_details.urls,
         discogs_cache_pg=discogs_cache_pg,
     )
     if scheduled:

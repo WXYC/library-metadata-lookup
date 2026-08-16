@@ -4,11 +4,13 @@ LML#513/#1192).
 
 ``resolve_served_bio`` returns a :class:`ServedBioResolution` carrying the
 ``(bio, wiki_url)`` pair to thread into ``item.enrich_one``, plus enough
-bookkeeping (``source``, ``miss_pick``, ``discogs_artist_id``) for the
+bookkeeping (``source``, ``miss_details``, ``discogs_artist_id``) for the
 COORDINATOR to finish the job after the LML#504 split gate has run.
-``wiki_url`` is ALWAYS ``pick.url`` (or ``None`` when there's no pick)
-regardless of the flag/floor/cache outcome — Phase B only ever swaps which
-TEXT accompanies that link, never the link itself.
+``wiki_url`` is ``pick.url`` (or ``None`` when there's no pick) on every
+branch EXCEPT a positive cache hit (LML#1192 review round 5) — see
+``TestValidatedWarmRoundTrip`` below and ``entity/artist_wikipedia_bio.py``'s
+module docstring for why the row, not the caller's sync pick, is now
+authoritative there.
 
 LML#1192 review (round 2), B2-1/B2-2: ``resolve_served_bio`` runs BEFORE
 ``item.enrich_one``, so it cannot know whether the LML#504 split gate will
@@ -30,6 +32,7 @@ import pytest
 from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
 
 from discogs.models import ArtistDetails
+from entity.artist_wikipedia_bio import WikipediaBioHit
 from entity.cache_toolkit import CachedValue
 from entity.sources import PgSource
 from lookup.enrichment.wikipedia_bio import (
@@ -58,7 +61,9 @@ _BELOW_FLOOR_PICK = PickedWikiUrl(
     slug_score=40.0,
     below_floor=True,
 )
-_DETAILS = ArtistDetails(artist_id=99, name="Stereolab")
+_DETAILS = ArtistDetails(
+    artist_id=99, name="Stereolab", urls=["https://en.wikipedia.org/wiki/Stereolab"]
+)
 _DISCOGS_BIO = "Stereolab are an Anglo-French band."
 
 
@@ -80,7 +85,7 @@ class TestFlagOffOrNoPick:
         assert resolution.bio == _DISCOGS_BIO
         assert resolution.wiki_url == _PICK.url
         assert resolution.source is BioSource.DISCOGS
-        assert resolution.miss_pick is None
+        assert resolution.miss_details is None
         pg.fetchone.assert_not_awaited()
 
     async def test_no_pick_returns_discogs_pair_with_none_wiki(self, monkeypatch):
@@ -126,21 +131,22 @@ class TestFlagOffOrNoPick:
 
 @pytest.mark.asyncio
 class TestFlagOnAbovefloorCacheOutcomes:
-    async def test_positive_cache_hit_serves_wikipedia_text(self, monkeypatch):
+    async def test_positive_cache_hit_serves_wikipedia_text_and_url(self, monkeypatch):
         monkeypatch.setenv(BIO_PREFER_WIKIPEDIA_ENV_VAR, "true")
         pg = AsyncMock(spec=PgSource)
+        hit = WikipediaBioHit(wikipedia_url=_PICK.url, extract="Stereolab are a French band.")
         with patch(
             "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
             new_callable=AsyncMock,
-            return_value=CachedValue(value="Stereolab are a French band.", was_present=True),
+            return_value=CachedValue(value=hit, was_present=True),
         ) as mock_get:
             resolution = await resolve_served_bio(_PICK, _DISCOGS_BIO, _DETAILS, pg)
         assert resolution.bio == "Stereolab are a French band."
         assert resolution.wiki_url == _PICK.url
         assert resolution.source is BioSource.WIKIPEDIA
-        mock_get.assert_awaited_once_with(
-            pg, discogs_artist_id=_DETAILS.artist_id, wikipedia_url=_PICK.url
-        )
+        # LML#1192 review round 5: no wikipedia_url kwarg -- the read is
+        # keyed on discogs_artist_id alone.
+        mock_get.assert_awaited_once_with(pg, discogs_artist_id=_DETAILS.artist_id)
         # CACHE_HIT is a fact about the cache lookup itself, true regardless
         # of what the LML#504 gate later does -- recorded immediately.
         stats = get_cache_stats()
@@ -150,10 +156,11 @@ class TestFlagOnAbovefloorCacheOutcomes:
     async def test_negative_cache_hit_falls_back_to_discogs(self, monkeypatch):
         monkeypatch.setenv(BIO_PREFER_WIKIPEDIA_ENV_VAR, "true")
         pg = AsyncMock(spec=PgSource)
+        hit = WikipediaBioHit(wikipedia_url=_PICK.url, extract=None)
         with patch(
             "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
             new_callable=AsyncMock,
-            return_value=CachedValue(value=None, was_present=True),
+            return_value=CachedValue(value=hit, was_present=True),
         ):
             resolution = await resolve_served_bio(_PICK, _DISCOGS_BIO, _DETAILS, pg)
         assert resolution.bio == _DISCOGS_BIO
@@ -162,7 +169,7 @@ class TestFlagOnAbovefloorCacheOutcomes:
         stats = get_cache_stats()
         assert stats.get(CACHE_NEGATIVE_STAT_KEY) == 1
 
-    async def test_miss_falls_back_to_discogs_and_carries_the_miss_pick(self, monkeypatch):
+    async def test_miss_falls_back_to_discogs_and_carries_the_artist_details(self, monkeypatch):
         monkeypatch.setenv(BIO_PREFER_WIKIPEDIA_ENV_VAR, "true")
         pg = AsyncMock(spec=PgSource)
         with patch(
@@ -175,28 +182,63 @@ class TestFlagOnAbovefloorCacheOutcomes:
         assert resolution.wiki_url == _PICK.url
         assert resolution.source is BioSource.DISCOGS
         # A miss does NOT schedule anything itself (B2-2) -- it hands back
-        # what a later, post-gate scheduling call needs.
-        assert resolution.miss_pick == _PICK
+        # what a later, post-gate scheduling call needs. LML#1192 review
+        # round 5: top1_details itself (name + urls), not the sync pick --
+        # the warm now runs its OWN fetch-validated selection rather than
+        # reusing the sync pick's unvalidated one.
+        assert resolution.miss_details is _DETAILS
         assert resolution.discogs_artist_id == _DETAILS.artist_id
         stats = get_cache_stats()
         assert stats.get(CACHE_MISS_WARM_SCHEDULED_STAT_KEY) is None
 
 
 @pytest.mark.asyncio
-class TestUrlMismatchSelfHealing:
-    async def test_cache_read_is_keyed_on_the_current_pick_url(self, monkeypatch):
-        # entity/artist_wikipedia_bio.py's own SQL predicate does the
-        # self-healing; this pins that resolve_served_bio always passes the
-        # CURRENT pick's url through, never a stale/cached one.
+class TestValidatedWarmRoundTrip:
+    """LML#1192 review round 5: the coordinator's own red test. Through
+    round 4, the cache read was keyed on ``wikipedia_url = pick.url`` (the
+    caller's current SYNC pick) -- but a fetch-validated warm (round 4,
+    P0-2) can legitimately write a row under a DIFFERENT, better url. The
+    canonical case: the sync picker (``pick_artist_wikipedia_url``, no live
+    fetch) names Low's bare disambiguation-page url; the validated warm
+    determines the real article lives at the qualified ``_(band)`` url and
+    writes there. Reproduced live against a real Postgres round-trip before
+    the entity-layer fix (LML#1192 review round 5's #1194 commit): writing
+    under the qualified url and reading back with the unchanged sync pick
+    returned ``was_present=False`` forever -- every request would
+    re-trigger a warm indefinitely, reintroducing exactly the live
+    Wikipedia dependency on the request path the plan's Non-goals rule out.
+
+    The row is now authoritative: a hit serves ITS OWN stored
+    ``wikipedia_url``, regardless of what the caller's sync pick names.
+    """
+
+    async def test_a_row_the_warm_wrote_under_a_different_url_than_the_sync_pick_is_a_hit(
+        self, monkeypatch
+    ):
         monkeypatch.setenv(BIO_PREFER_WIKIPEDIA_ENV_VAR, "true")
         pg = AsyncMock(spec=PgSource)
+        # The sync pick (unvalidated, no live fetch) names the bare,
+        # disambiguation-page url -- exactly what pick_artist_wikipedia_url
+        # would return for "Low" with no way to know it's the wrong page.
+        sync_pick = PickedWikiUrl(
+            url="https://en.wikipedia.org/wiki/Low", lang="en", slug_score=75.0, below_floor=False
+        )
+        # The validated warm determined the REAL article is the qualified
+        # url and wrote the row there instead.
+        validated_hit = WikipediaBioHit(
+            wikipedia_url="https://en.wikipedia.org/wiki/Low_(band)", extract="Low are a band."
+        )
         with patch(
             "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
             new_callable=AsyncMock,
-            return_value=CachedValue(value=None, was_present=False),
-        ) as mock_get:
-            await resolve_served_bio(_PICK, _DISCOGS_BIO, _DETAILS, pg)
-        assert mock_get.await_args.kwargs["wikipedia_url"] == _PICK.url
+            return_value=CachedValue(value=validated_hit, was_present=True),
+        ):
+            resolution = await resolve_served_bio(sync_pick, _DISCOGS_BIO, _DETAILS, pg)
+        # A HIT, not a miss -- serving the ROW's url/content, not the sync
+        # pick's.
+        assert resolution.source is BioSource.WIKIPEDIA
+        assert resolution.bio == "Low are a band."
+        assert resolution.wiki_url == "https://en.wikipedia.org/wiki/Low_(band)"
 
 
 class TestBioPreferWikipediaEnabled:
@@ -227,7 +269,7 @@ class TestRecordBioAdoption:
             bio="Wikipedia prose.",
             wiki_url=_PICK.url,
             source=BioSource.WIKIPEDIA,
-            miss_pick=None,
+            miss_details=None,
             discogs_artist_id=None,
         )
         init_cache_stats()
@@ -241,7 +283,7 @@ class TestRecordBioAdoption:
             bio=_DISCOGS_BIO,
             wiki_url=_PICK.url,
             source=BioSource.DISCOGS,
-            miss_pick=None,
+            miss_details=None,
             discogs_artist_id=None,
         )
         init_cache_stats()
@@ -257,7 +299,7 @@ class TestRecordBioAdoption:
             bio="Wikipedia prose.",
             wiki_url=_PICK.url,
             source=BioSource.WIKIPEDIA,
-            miss_pick=None,
+            miss_details=None,
             discogs_artist_id=None,
         )
         init_cache_stats()
@@ -280,7 +322,7 @@ class TestMaybeScheduleWikipediaBioWarm:
             bio=_DISCOGS_BIO,
             wiki_url=_PICK.url,
             source=BioSource.DISCOGS,
-            miss_pick=_PICK,
+            miss_details=_DETAILS,
             discogs_artist_id=_DETAILS.artist_id,
         )
 
@@ -295,7 +337,10 @@ class TestMaybeScheduleWikipediaBioWarm:
                 self._miss_resolution(), warm_cache=True, bio_surfaced=True, discogs_cache_pg=pg
             )
         mock_schedule.assert_called_once_with(
-            discogs_artist_id=_DETAILS.artist_id, pick=_PICK, discogs_cache_pg=pg
+            discogs_artist_id=_DETAILS.artist_id,
+            artist_name=_DETAILS.name,
+            urls=_DETAILS.urls,
+            discogs_cache_pg=pg,
         )
         assert get_cache_stats().get(CACHE_MISS_WARM_SCHEDULED_STAT_KEY) == 1
 
@@ -321,14 +366,14 @@ class TestMaybeScheduleWikipediaBioWarm:
             )
         mock_schedule.assert_not_called()
 
-    async def test_skips_when_no_miss_pick(self, monkeypatch):
-        # A hit or negative resolution carries miss_pick=None -- nothing to warm.
+    async def test_skips_when_no_miss_details(self, monkeypatch):
+        # A hit or negative resolution carries miss_details=None -- nothing to warm.
         pg = AsyncMock(spec=PgSource)
         resolution = ServedBioResolution(
             bio=_DISCOGS_BIO,
             wiki_url=_PICK.url,
             source=BioSource.DISCOGS,
-            miss_pick=None,
+            miss_details=None,
             discogs_artist_id=None,
         )
         with patch(
@@ -377,7 +422,7 @@ class TestFinalizeBio:
             bio="Wikipedia prose.",
             wiki_url=_PICK.url,
             source=BioSource.WIKIPEDIA,
-            miss_pick=None,
+            miss_details=None,
             discogs_artist_id=None,
         )
 
@@ -386,7 +431,7 @@ class TestFinalizeBio:
             bio=_DISCOGS_BIO,
             wiki_url=_PICK.url,
             source=BioSource.DISCOGS,
-            miss_pick=_PICK,
+            miss_details=_DETAILS,
             discogs_artist_id=_DETAILS.artist_id,
         )
 
@@ -437,7 +482,10 @@ class TestFinalizeBio:
             )
         assert surfaced is True
         mock_schedule.assert_called_once_with(
-            discogs_artist_id=_DETAILS.artist_id, pick=_PICK, discogs_cache_pg=pg
+            discogs_artist_id=_DETAILS.artist_id,
+            artist_name=_DETAILS.name,
+            urls=_DETAILS.urls,
+            discogs_cache_pg=pg,
         )
         assert get_cache_stats().get(CACHE_MISS_WARM_SCHEDULED_STAT_KEY) == 1
 
@@ -485,6 +533,9 @@ class TestFinalizeBio:
             )
         assert surfaced is False  # correctly reports nothing was SHOWN
         mock_schedule.assert_called_once_with(
-            discogs_artist_id=_DETAILS.artist_id, pick=_PICK, discogs_cache_pg=pg
+            discogs_artist_id=_DETAILS.artist_id,
+            artist_name=_DETAILS.name,
+            urls=_DETAILS.urls,
+            discogs_cache_pg=pg,
         )
         assert get_cache_stats().get(CACHE_MISS_WARM_SCHEDULED_STAT_KEY) == 1

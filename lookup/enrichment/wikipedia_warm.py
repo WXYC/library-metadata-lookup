@@ -3,8 +3,8 @@ Wikipedia-preferred-artist-bio program, ``docs/plans/lml-1192-wikipedia-artist-b
 LML#513/#1192).
 
 Fire-and-forget: on a genuine cache miss, ``lookup/enrichment/wikipedia_bio.py``
-calls :func:`schedule_wikipedia_bio_warm`, which fetches the Phase-A pick's
-Wikipedia summary and writes the result (positive or negative) to
+calls :func:`schedule_wikipedia_bio_warm`, which validates a Wikipedia page
+against a live fetch and writes the result (positive or negative) to
 ``lml_cache.artist_wikipedia_bio``. Modeled on ``lookup/streaming_warm_admission.py``
 (LML#1108): bounded queue depth (never an unbounded task set behind a bare
 semaphore) plus a dedicated shed stat key, rather than a fixed concurrency
@@ -12,6 +12,14 @@ cap alone. Strong-reference task set + done-callback per
 ``lookup/enrichment/background.py``. Errors are logged and swallowed; no
 Sentry scope tagging (mirrors ``background._warm_bio_cache`` — the request
 scope has long since closed by the time this runs).
+
+LML#1192 review round 5: takes ``artist_name``/``urls``, not a pre-computed
+``PickedWikiUrl`` — the sync pick (``lookup.wikipedia_url.pick_artist_wikipedia_url``)
+can't validate against a live fetch, so for an artist like Low or Sade it
+names the bare, disambiguation-page url. Runs the SAME fetch-validated
+picker the offline drain got in round 4's P0-2 fix
+(``lookup.wikipedia_pick_validation.resolve_and_validate_pick``) — the
+other live-fetch site sharing that exact tiebreak exposure.
 """
 
 from __future__ import annotations
@@ -21,11 +29,12 @@ import logging
 
 from wxyc_fastapi.observability import get_cache_stats_recorder, get_posthog_client
 
-from clients.wikipedia import WikipediaClient, WikipediaFetchError
+from clients.wikipedia import WikipediaClient, WikipediaFetchError, WikipediaSummary
 from config.settings import get_settings
 from entity.artist_wikipedia_bio import set_cached_artist_wikipedia_bio
 from entity.sources import PgSource
-from lookup.wikipedia_url import PickedWikiUrl, wikipedia_title_from_url
+from lookup.wikipedia_pick_validation import resolve_and_validate_pick
+from lookup.wikipedia_url import wikipedia_title_from_url
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +42,18 @@ WARM_CONCURRENCY = 2
 """Process-wide cap on concurrent Wikipedia bio warm fetches — deliberately
 small (this is a background courtesy warm, not a bulk drain; the offline
 drain, Phase C, is the actual population mechanism)."""
+
+MAX_CANDIDATES_PER_WARM = 3
+"""Bounds how many candidates :data:`_warm_semaphore` can be held for.
+``resolve_and_validate_pick`` runs entirely inside the semaphore and can
+issue one fetch per candidate; uncapped, one artist could hold a permit for
+an unbounded run of sequential fetches. A real Discogs record rarely lists
+more than a couple genuine ``wikipedia.org`` urls, so this is a latency
+ceiling, not a real-traffic tuning knob. Worst case under one permit:
+``MAX_CANDIDATES_PER_WARM * (1 + max_retries)`` = 6 sequential HTTP
+attempts, at this value and :func:`_run_warm`'s ``max_retries=1``. The
+offline drain passes no cap — an explicit batch job, no request-latency
+budget."""
 
 _QUEUE_DEPTH_MULTIPLIER = 8
 """Pending-plus-running depth bound = ``WARM_CONCURRENCY * this``. Fixed
@@ -84,9 +105,11 @@ def _queue_depth_bound() -> int:
 
 
 def schedule_wikipedia_bio_warm(
-    *, discogs_artist_id: int, pick: PickedWikiUrl, discogs_cache_pg: PgSource
+    *, discogs_artist_id: int, artist_name: str, urls: list[str], discogs_cache_pg: PgSource
 ) -> bool:
-    """Fire-and-forget: fetch ``pick``'s Wikipedia summary and cache-write it.
+    """Fire-and-forget: validate a Wikipedia page for ``artist_name`` against
+    ``urls`` (a live fetch, trying each ranked candidate in turn) and
+    cache-write the result.
 
     Returns ``True`` when a task was scheduled, ``False`` when shed (the
     pending-plus-running depth bound was already at capacity) or deduped
@@ -110,7 +133,7 @@ def schedule_wikipedia_bio_warm(
         except Exception as e:
             logger.warning("Failed to record %s: %s", WARM_SHED_STAT_KEY, e)
         return False
-    task = asyncio.create_task(_run_warm(discogs_artist_id, pick, discogs_cache_pg))
+    task = asyncio.create_task(_run_warm(discogs_artist_id, artist_name, urls, discogs_cache_pg))
     _pending_artist_ids.add(discogs_artist_id)
     _background_tasks.add(task)
     task.add_done_callback(lambda t: _on_warm_done(t, discogs_artist_id))
@@ -123,46 +146,66 @@ def _on_warm_done(task: asyncio.Task, discogs_artist_id: int) -> None:
 
 
 async def _run_warm(
-    discogs_artist_id: int, pick: PickedWikiUrl, discogs_cache_pg: PgSource
+    discogs_artist_id: int, artist_name: str, urls: list[str], discogs_cache_pg: PgSource
 ) -> None:
-    """Background task body: one bounded Wikipedia fetch, then a cache write.
+    """Background task body: a fetch-validated candidate selection
+    (``lookup.wikipedia_pick_validation.resolve_and_validate_pick`` — the
+    same picker the offline drain uses, review round 4's P0-2), then a
+    cache write. No longer trusts a single pre-computed pick, so this warm
+    can't write the WRONG page the way a single-candidate pick could (the
+    Low/Sade case: the sync pick names a disambiguation page). The fetch
+    closure reuses ``WikipediaClient``/``wikipedia_title_from_url`` exactly
+    as before; a :class:`~clients.wikipedia.WikipediaFetchError` still
+    writes NOTHING (propagates out of the picker by design — a couldn't-ask
+    on one candidate says nothing about a different one). Any other
+    exception is logged and swallowed — the task must never propagate to
+    the event loop.
 
-    A :class:`~clients.wikipedia.WikipediaFetchError` (transient — timeout,
-    network error, exhausted 429 retries) writes NOTHING: a couldn't-ask is
-    never a reason to negative-cache. Any other exception is logged and
-    swallowed — the task must never propagate to the event loop.
+    Candidates are capped at :data:`MAX_CANDIDATES_PER_WARM`; the whole
+    selection runs inside :data:`_warm_semaphore` (see that constant's
+    docstring for the worst-case bound this implies).
     """
     global _warm_semaphore
     if _warm_semaphore is None:
         _warm_semaphore = asyncio.Semaphore(WARM_CONCURRENCY)
-    # Only an above-floor pick reaches here (resolve_served_bio's gate), and
-    # a PickedWikiUrl only ever omits url/lang when pick_artist_wikipedia_url
-    # returns None for the whole object -- both are guaranteed real.
-    # Asserted for mypy narrowing.
-    assert pick.url is not None
-    assert pick.lang is not None
-    title = wikipedia_title_from_url(pick.url)
-    if title is None:
-        logger.warning("Wikipedia bio warm: could not parse a title from %s", pick.url)
-        return
+
+    async def fetch(url: str, lang: str) -> WikipediaSummary | None:
+        title = wikipedia_title_from_url(url)
+        if title is None:
+            return None
+        return await client.get_summary(title, lang, max_retries=1)
+
     try:
         async with _warm_semaphore:
             client = WikipediaClient()
             try:
-                summary = await client.get_summary(title, pick.lang, max_retries=1)
+                result = await resolve_and_validate_pick(
+                    urls, artist_name, fetch=fetch, max_candidates=MAX_CANDIDATES_PER_WARM
+                )
             except WikipediaFetchError as e:
                 logger.info("Wikipedia bio warm shed for artist_id=%s: %s", discogs_artist_id, e)
                 return
-            extract = summary.extract if summary is not None else None
+
+            picked = result.picked
+            if picked is None or picked.url is None:
+                logger.warning(
+                    "Wikipedia bio warm: no resolvable pick for artist_id=%s (%r) despite "
+                    "a genuine cache miss having been scheduled -- skipping",
+                    discogs_artist_id,
+                    artist_name,
+                )
+                return
+
+            extract = result.summary.extract if result.summary is not None else None
             _capture_fetch_outcome(
                 FETCH_OK_STAT_KEY if extract is not None else FETCH_REJECT_STAT_KEY
             )
             await set_cached_artist_wikipedia_bio(
                 discogs_cache_pg,
                 discogs_artist_id=discogs_artist_id,
-                wikipedia_url=pick.url,
-                slug_score=pick.slug_score,
-                lang=pick.lang,
+                wikipedia_url=picked.url,
+                slug_score=picked.slug_score,
+                lang=picked.lang or "en",
                 extract=extract,
             )
     except Exception:

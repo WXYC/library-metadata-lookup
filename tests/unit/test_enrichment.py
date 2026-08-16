@@ -16,6 +16,7 @@ from discogs.models import (
     ReleaseMetadataResponse,
     TrackItem,
 )
+from entity.artist_wikipedia_bio import WikipediaBioHit
 from entity.cache_toolkit import CachedValue
 from lookup.enrichment import enrich_artwork_results
 from lookup.enrichment.item import _build_streaming_search_url
@@ -4911,7 +4912,13 @@ class TestWikipediaPreferredBioSwap:
         with patch(
             "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
             new_callable=AsyncMock,
-            return_value=CachedValue(value="Stereolab is a band from London.", was_present=True),
+            return_value=CachedValue(
+                value=WikipediaBioHit(
+                    wikipedia_url="https://en.wikipedia.org/wiki/Stereolab",
+                    extract="Stereolab is a band from London.",
+                ),
+                was_present=True,
+            ),
         ):
             results = await enrich_artwork_results(
                 [(item, artwork)],
@@ -4942,7 +4949,13 @@ class TestWikipediaPreferredBioSwap:
             patch(
                 "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
                 new_callable=AsyncMock,
-                return_value=CachedValue(value="Wikipedia prose.", was_present=True),
+                return_value=CachedValue(
+                    value=WikipediaBioHit(
+                        wikipedia_url="https://en.wikipedia.org/wiki/Stereolab",
+                        extract="Wikipedia prose.",
+                    ),
+                    was_present=True,
+                ),
             ),
             patch("lookup.enrichment.parse", wraps=discogs_markup_parse) as mock_parse,
         ):
@@ -5009,7 +5022,13 @@ class TestWikipediaPreferredBioSwap:
             patch(
                 "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
                 new_callable=AsyncMock,
-                return_value=CachedValue(value="Wikipedia prose.", was_present=True),
+                return_value=CachedValue(
+                    value=WikipediaBioHit(
+                        wikipedia_url="https://en.wikipedia.org/wiki/Stereolab",
+                        extract="Wikipedia prose.",
+                    ),
+                    was_present=True,
+                ),
             ),
             patch("lookup.enrichment.background.asyncio.create_task") as mock_create_task,
         ):
@@ -5090,7 +5109,13 @@ class TestWikipediaPreferredBioSwap:
         with patch(
             "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
             new_callable=AsyncMock,
-            return_value=CachedValue(value="Wikipedia prose.", was_present=True),
+            return_value=CachedValue(
+                value=WikipediaBioHit(
+                    wikipedia_url="https://en.wikipedia.org/wiki/Stereolab",
+                    extract="Wikipedia prose.",
+                ),
+                was_present=True,
+            ),
         ):
             results = await enrich_artwork_results(
                 [(item, artwork)],

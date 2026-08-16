@@ -154,16 +154,46 @@ def _is_hard_rejected_slug(decoded_slug: str) -> bool:
 
 
 def _first_wikipedia_match(urls: Sequence[str] | None) -> str | None:
-    """The legacy heuristic: first URL substring-containing ``wikipedia.org``."""
+    """The legacy heuristic: first URL substring-containing ``wikipedia.org``
+    (case-insensitively).
+
+    LML#1192 review round 2, C3: this must stay case-insensitive to agree
+    with the two other places a "does this URL point at wikipedia.org"
+    judgment gets made -- ``_WIKI_URL_RE``'s ``re.IGNORECASE`` in
+    ``_score_candidates`` above, and ``scripts/warm_wikipedia_bios.py``'s
+    seed SQL (``au.url ILIKE '%wikipedia.org%'``). A case-sensitive check
+    here let a mixed-case domain (e.g. ``en.Wikipedia.org``) score a real
+    ``slug_pick`` via the regex while this function returned ``None`` for
+    the same URL -- silently dropping the URL entirely from a below-floor
+    ``PickedWikiUrl`` on the live read path (``compare_wikipedia_extractors``);
+    also used directly by ``lookup.wikipedia_pick_validation.resolve_and_validate_pick``
+    (LML#1192 review round 4, P0-2) for the offline drain and background
+    miss-warm's fetch-validated heuristic fallback.
+    """
     for url in urls or ():
-        if isinstance(url, str) and "wikipedia.org" in url:
+        if isinstance(url, str) and "wikipedia.org" in url.lower():
             return url
     return None
 
 
+def _normalize_lang_subdomain(raw: str) -> str:
+    """LML#1192 review round 4, P0-7: ``www.wikipedia.org/wiki/...`` is a
+    realistic input (``artist_url`` is unvalidated free text, and a
+    browser 301s a bare ``wikipedia.org`` root to the ``www`` host) — but
+    ``www`` is a hostname prefix, not a language code. Verified live: the
+    REST API 500s on ``https://www.wikipedia.org/api/rest_v1/...`` (``en.``
+    200s for the same title), so an un-normalized ``www`` persists into
+    the ``NOT NULL lang`` column and generates permanent ``fetch_error``
+    residue on every retry (feeds LML#1192 review round 4, P0-8). No
+    exhaustive language-code validation here — just the one confirmed,
+    realistic non-language subdomain.
+    """
+    return "en" if raw == "www" else raw
+
+
 def _extract_lang(url: str) -> str | None:
     match = _LANG_ONLY_RE.match(url.strip())
-    return match.group(1).lower() if match else None
+    return _normalize_lang_subdomain(match.group(1).lower()) if match else None
 
 
 @dataclass(frozen=True)
@@ -192,7 +222,7 @@ def _score_candidates(urls: Sequence[str] | None, artist_name: str) -> list[_Sco
         match = _WIKI_URL_RE.match(url.strip())
         if not match:
             continue
-        lang = match.group(1).lower()
+        lang = _normalize_lang_subdomain(match.group(1).lower())
         raw_slug = match.group(2).split("#", 1)[0].split("?", 1)[0]
         decoded_slug = unquote(raw_slug).replace("_", " ").strip()
         if not decoded_slug or _is_hard_rejected_slug(decoded_slug):
@@ -205,16 +235,39 @@ def _score_candidates(urls: Sequence[str] | None, artist_name: str) -> list[_Sco
     return scored
 
 
+def _candidate_sort_key(candidate: _ScoredCandidate) -> tuple[float, bool, int, str]:
+    """TRY-ORDER ranking key: score desc, ``en`` breaks a tie, shorter URL
+    breaks a remaining tie, the URL string is the final deterministic
+    tiebreak (total order — LML#1192 round 2, C1: two callers can see the
+    same candidate set in different input orders). Shared by
+    :func:`_select_best` (picks rank 0) and
+    ``lookup.wikipedia_pick_validation`` (round 4, P0-2 — needs the full
+    ranked list to try candidates against a live fetch in order).
+
+    Round 3 found sorting the bare URL alone picks the qualified
+    (frequently WRONG — a disambiguation/type page) URL 100% of a tie,
+    since a bare slug always string-prefixes its qualified sibling. Round
+    4 found "prefer shorter" is ALSO wrong standalone — verified live:
+    ``Low``/``Sade``'s BARE titles are real disambiguation pages (the
+    qualified url is correct); ``Sun Ra``/``Stereolab``/``Cat Power``'s
+    qualified slugs don't exist as pages at all (the bare url is correct).
+    No string rule can tell these apart — the deciding signal isn't in
+    either URL. This key therefore only orders TRY order now; the final
+    answer comes from validating each candidate against its fetched
+    payload (``lookup.wikipedia_pick_validation.resolve_and_validate_pick``),
+    falling through to the next-ranked candidate on rejection.
+    """
+    return (candidate.score, candidate.lang == "en", -len(candidate.url), candidate.url)
+
+
 def _select_best(scored: list[_ScoredCandidate]) -> _ScoredCandidate | None:
-    """Highest score wins; ``en`` wins a tie; otherwise first-encountered wins."""
-    best: _ScoredCandidate | None = None
-    for candidate in scored:
-        if best is None or (candidate.score, candidate.lang == "en") > (
-            best.score,
-            best.lang == "en",
-        ):
-            best = candidate
-    return best
+    """The top-ranked candidate under :func:`_candidate_sort_key` — a
+    best-guess for the synchronous, no-fetch live path
+    (``pick_artist_wikipedia_url``, which cannot afford a live Wikipedia
+    call on ``/lookup``). Fetch-capable callers use
+    ``lookup.wikipedia_pick_validation`` instead for the full ranked list.
+    """
+    return max(scored, key=_candidate_sort_key, default=None)
 
 
 def _project_wikipedia_slug_pick(
@@ -292,6 +345,46 @@ class ExtractorComparison:
         at all — this repo's convention for "no agreement to report"."""
         return self.slug_pick is not None and self.slug_pick == self.heuristic_pick
 
+    def resolve(self, *, slug_enabled: bool) -> PickedWikiUrl | None:
+        """Own the flag/floor SERVING decision — the one place that turns a
+        comparison into what actually gets used.
+
+        ``None`` only when neither extractor found a wikipedia.org URL at
+        all (matching :func:`pick_artist_wikipedia_url`'s pre-existing
+        contract). Otherwise: ``slug_enabled`` and :attr:`clears_floor` both
+        true serves the slug pick; every other case falls back to the
+        legacy heuristic pick, with ``lang`` derived from THAT url (LML#1192
+        review, A5 — never from ``slug_lang``, which describes whichever
+        candidate scored highest and may be a completely different page
+        than the one actually being served here). This is the decision
+        body for the live read path
+        (``pick_artist_wikipedia_url``, ``slug_enabled=_wikipedia_slug_match_enabled()``).
+
+        LML#1192 review round 4, P0-2: the offline drain
+        (``scripts/warm_wikipedia_bios.py``) and background miss-warm no
+        longer call this method — an unvalidated score-only pick can't
+        distinguish a canonical page from its disambiguation/type-page
+        sibling (three straight review rounds of a wrong string-only
+        tiebreak proved that), so both now go through
+        ``lookup.wikipedia_pick_validation.resolve_and_validate_pick``
+        instead, which fetches and validates each ranked candidate in turn.
+        """
+        if self.heuristic_pick is None and self.slug_pick is None:
+            return None
+        if slug_enabled and self.clears_floor:
+            return PickedWikiUrl(
+                url=self.slug_pick,
+                lang=self.slug_lang,
+                slug_score=self.slug_score,
+                below_floor=False,
+            )
+        fallback_lang = _extract_lang(self.heuristic_pick or "")
+        return PickedWikiUrl(
+            url=self.heuristic_pick,
+            lang=fallback_lang,
+            slug_score=self.slug_score,
+            below_floor=True,
+        )
 
 def compare_wikipedia_extractors(
     urls: Sequence[str] | None, artist_name: str
@@ -341,34 +434,12 @@ def pick_artist_wikipedia_url(urls: Sequence[str] | None, artist_name: str) -> P
     if comparison.heuristic_pick is None and comparison.slug_pick is None:
         return None
 
-    score_clears_floor = (
-        comparison.slug_pick is not None and comparison.slug_score >= SCORE_MATCH_ACCEPTANCE_FLOOR
-    )
     _project_wikipedia_slug_pick(
         heuristic_pick=comparison.heuristic_pick,
         slug_pick=comparison.slug_pick,
         slug_score=comparison.slug_score,
-        clears_floor=score_clears_floor,
-        agreement=comparison.slug_pick is not None
-        and comparison.slug_pick == comparison.heuristic_pick,
+        clears_floor=comparison.clears_floor,
+        agreement=comparison.agreement,
     )
 
-    if _wikipedia_slug_match_enabled() and score_clears_floor:
-        return PickedWikiUrl(
-            url=comparison.slug_pick,
-            lang=comparison.slug_lang,
-            slug_score=comparison.slug_score,
-            below_floor=False,
-        )
-
-    # LML#1192 review, A5: derive lang from the URL actually being SERVED
-    # (the heuristic pick) — never from ``comparison.slug_lang``, which
-    # describes whichever candidate scored highest and may be a completely
-    # different page than the one being returned here.
-    fallback_lang = _extract_lang(comparison.heuristic_pick or "")
-    return PickedWikiUrl(
-        url=comparison.heuristic_pick,
-        lang=fallback_lang,
-        slug_score=comparison.slug_score,
-        below_floor=True,
-    )
+    return comparison.resolve(slug_enabled=_wikipedia_slug_match_enabled())
