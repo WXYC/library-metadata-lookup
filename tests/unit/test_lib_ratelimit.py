@@ -1,16 +1,6 @@
 """Unit tests for ``scripts/_lib/ratelimit.py`` — the shared operator-rate
-limiter construction (LML#1204 item 6).
-
-The fractional-rate fix (LML#1192 review round 3, P0-2) was trapped as a
-private function of ``scripts/warm_wikipedia_bios.py``: ``AsyncLimiter(rate, 1)``
-sets ``max_rate`` (bucket capacity) to the rate itself, but ``aiolimiter``
-requires ``acquire(1) <= max_rate`` — so any operator rate below 1.0 (a
-deliberate throttle-down under 429 pressure, e.g. ``--rate 0.5``) raised
-``ValueError`` on the very first acquisition, before any HTTP attempt.
-Capacity 1 refilled over ``1 / rate`` seconds is correct for every positive
-rate; this is now the one shared home both drain scripts route their
-operator ``--rate`` flags through.
-"""
+limiter construction (LML#1204 item 6; the full fractional-rate trap story
+lives in that module's docstring)."""
 
 from __future__ import annotations
 

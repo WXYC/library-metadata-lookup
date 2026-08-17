@@ -734,10 +734,8 @@ async def run_drain(
     dry_run: bool = False,
 ) -> DrainReport:
     report = DrainReport()
-    # LML#1192 review round 3, P0-2 / LML#1204 item 6: the shared
-    # construction is correct for ANY positive rate (a fractional operator
-    # throttle-down must slow the run, never ValueError it) -- see
-    # scripts/_lib/ratelimit.py for the full trap.
+    # Shared construction, correct for any positive rate -- the full
+    # fractional-rate trap story lives in scripts/_lib/ratelimit.py.
     limiter = build_rate_limiter(rate_per_second)
     client = WikipediaClient()
     consecutive_failures = 0
