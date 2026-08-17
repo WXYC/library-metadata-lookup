@@ -278,6 +278,20 @@ class ExtractorComparison:
     slug_score: float
     slug_lang: str | None
 
+    @property
+    def clears_floor(self) -> bool:
+        """LML#1192 review round 3, finding 9: this exact predicate was
+        hand-written three times (here, ``scripts/warm_wikipedia_bios.py``,
+        ``scripts/wikipedia_url_validation.py``) — now the single owner."""
+        return self.slug_pick is not None and self.slug_score >= SCORE_MATCH_ACCEPTANCE_FLOOR
+
+    @property
+    def agreement(self) -> bool:
+        """Whether the slug-scored and legacy heuristic picks are the same
+        URL. ``False`` (not ``None``-comparable) when there is no slug pick
+        at all — this repo's convention for "no agreement to report"."""
+        return self.slug_pick is not None and self.slug_pick == self.heuristic_pick
+
 
 def compare_wikipedia_extractors(
     urls: Sequence[str] | None, artist_name: str

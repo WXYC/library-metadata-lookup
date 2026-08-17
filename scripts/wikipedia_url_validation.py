@@ -40,7 +40,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
 from lookup.wikipedia_url import compare_wikipedia_extractors
 
 if TYPE_CHECKING:
@@ -131,10 +130,6 @@ def build_comparison_rows(samples: list[ArtistSample]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for sample in samples:
         comparison = compare_wikipedia_extractors(sample.urls, sample.artist_name)
-        clears_floor = (
-            comparison.slug_pick is not None
-            and comparison.slug_score >= SCORE_MATCH_ACCEPTANCE_FLOOR
-        )
         rows.append(
             {
                 "artist_id": sample.artist_id,
@@ -143,9 +138,16 @@ def build_comparison_rows(samples: list[ArtistSample]) -> list[dict[str, Any]]:
                 "slug_pick": comparison.slug_pick,
                 "slug_score": round(comparison.slug_score, 2),
                 "slug_lang": comparison.slug_lang,
-                "agreement": comparison.slug_pick is not None
-                and comparison.slug_pick == comparison.heuristic_pick,
-                "clears_floor": clears_floor,
+                # LML#1192 review round 6, pass 3, A4: read the single-owner
+                # properties (round 3, finding 9) rather than hand-rewriting
+                # the same predicates here -- this script computes the
+                # <2%-divergence gate that authorizes the prod
+                # LML_WIKIPEDIA_SLUG_MATCH flip, so it must measure exactly
+                # what the shipped code means by "clears the floor" /
+                # "agrees," not a separately-maintained copy that could
+                # silently drift from it.
+                "agreement": comparison.agreement,
+                "clears_floor": comparison.clears_floor,
                 # Blank: filled in by hand during ground-truth classification.
                 "heuristic_correct": "",
                 "slug_correct": "",

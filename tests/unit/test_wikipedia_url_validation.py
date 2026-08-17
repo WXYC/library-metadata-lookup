@@ -14,8 +14,9 @@ CSV-in/CSV-out).
 from __future__ import annotations
 
 import io
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock, patch
 
+from lookup.wikipedia_url import ExtractorComparison
 from scripts.wikipedia_url_validation import (
     ArtistSample,
     build_comparison_rows,
@@ -138,6 +139,43 @@ class TestBuildComparisonRows:
         assert row["slug_pick"] == "https://en.wikipedia.org/wiki/Stereolab"
         assert row["agreement"] is False
         assert row["clears_floor"] is True
+
+    def test_clears_floor_reads_the_single_owner_property_not_a_hand_rolled_copy(self):
+        # LML#1192 review round 6, pass 3, A4: ExtractorComparison.clears_floor
+        # already declares itself "the single owner" (round 3, finding 9) --
+        # this script must call it, not hand-rewrite the same predicate
+        # locally. Proven by patching the PROPERTY and confirming the row
+        # reflects the patched value: if the script still hand-derived
+        # clears_floor from slug_pick/slug_score itself, patching the
+        # property here would have no effect on the row at all.
+        samples = [
+            ArtistSample(
+                artist_id=1,
+                artist_name="Jessica Pratt",
+                urls=["https://en.wikipedia.org/wiki/Jessica_Pratt"],
+            )
+        ]
+        with patch.object(
+            ExtractorComparison, "clears_floor", new_callable=PropertyMock
+        ) as mock_clears_floor:
+            mock_clears_floor.return_value = "PATCHED_SENTINEL"
+            rows = build_comparison_rows(samples)
+        assert rows[0]["clears_floor"] == "PATCHED_SENTINEL"
+
+    def test_agreement_reads_the_single_owner_property_not_a_hand_rolled_copy(self):
+        samples = [
+            ArtistSample(
+                artist_id=1,
+                artist_name="Jessica Pratt",
+                urls=["https://en.wikipedia.org/wiki/Jessica_Pratt"],
+            )
+        ]
+        with patch.object(
+            ExtractorComparison, "agreement", new_callable=PropertyMock
+        ) as mock_agreement:
+            mock_agreement.return_value = "PATCHED_SENTINEL"
+            rows = build_comparison_rows(samples)
+        assert rows[0]["agreement"] == "PATCHED_SENTINEL"
 
 
 class TestEmitCsvRoundTrips:
