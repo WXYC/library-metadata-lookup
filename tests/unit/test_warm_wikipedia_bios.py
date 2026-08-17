@@ -754,7 +754,9 @@ class TestRunDrain:
         candidates = self._candidates(3)
         pg = AsyncMock(spec=PgSource)
 
-        async def fake_process(pg, client, candidate, *, max_retries, rate_limiter=None):
+        async def fake_process(
+            pg, client, candidate, *, max_retries, rate_limiter=None, dry_run=False
+        ):
             if candidate.artist_id == 2:
                 raise RuntimeError("boom")
             return "positive"
@@ -831,7 +833,9 @@ class TestRunDrain:
         monkeypatch.setattr("scripts.warm_wikipedia_bios._MAX_CONSECUTIVE_FAILURES", 3)
         candidates = self._candidates(10)
 
-        async def always_fails(pg, client, candidate, *, max_retries, rate_limiter=None):
+        async def always_fails(
+            pg, client, candidate, *, max_retries, rate_limiter=None, dry_run=False
+        ):
             return "fetch_error"
 
         with patch("scripts.warm_wikipedia_bios.process_candidate", side_effect=always_fails):
@@ -853,7 +857,7 @@ class TestRunDrain:
         candidates = self._candidates(9)
 
         async def fails_then_succeeds_every_other(
-            pg, client, candidate, *, max_retries, rate_limiter=None
+            pg, client, candidate, *, max_retries, rate_limiter=None, dry_run=False
         ):
             # Two failures, one success, repeating -- consecutive-failure
             # count never reaches 3, so the whole batch should complete.
@@ -889,7 +893,9 @@ class TestRunDrain:
         monkeypatch.setattr("scripts.warm_wikipedia_bios._MAX_CONSECUTIVE_FAILURES", 3)
         candidates = self._candidates(10)
 
-        async def always_this_outcome(pg, client, candidate, *, max_retries, rate_limiter=None):
+        async def always_this_outcome(
+            pg, client, candidate, *, max_retries, rate_limiter=None, dry_run=False
+        ):
             return failure_outcome
 
         with patch(
@@ -918,7 +924,9 @@ class TestRunDrain:
         monkeypatch.setattr("scripts.warm_wikipedia_bios._MAX_CONSECUTIVE_FAILURES", 3)
         candidates = self._candidates(10)
 
-        async def always_negative(pg, client, candidate, *, max_retries, rate_limiter=None):
+        async def always_negative(
+            pg, client, candidate, *, max_retries, rate_limiter=None, dry_run=False
+        ):
             return "negative"
 
         with patch("scripts.warm_wikipedia_bios.process_candidate", side_effect=always_negative):
@@ -941,7 +949,9 @@ class TestRunDrain:
         monkeypatch.setattr("scripts.warm_wikipedia_bios._MAX_CONSECUTIVE_FAILURES", 3)
         candidates = self._candidates(10)
 
-        async def alternating(pg, client, candidate, *, max_retries, rate_limiter=None):
+        async def alternating(
+            pg, client, candidate, *, max_retries, rate_limiter=None, dry_run=False
+        ):
             return "declined" if candidate.artist_id % 2 else "refreshed"
 
         with patch("scripts.warm_wikipedia_bios.process_candidate", side_effect=alternating):
@@ -1050,3 +1060,159 @@ def _report(*, aborted: bool, counts: dict[str, int]):
     report.counts.update(counts)
     report.aborted = aborted
     return report
+
+
+class _ScriptedShutdownFlag:
+    """ShutdownFlagProtocol stub: answers ``requested`` from a script, then
+    holds True forever -- models an operator's first Ctrl-C landing between
+    two candidates."""
+
+    def __init__(self, answers: list[bool]) -> None:
+        self._answers = iter(answers)
+
+    @property
+    def requested(self) -> bool:
+        return next(self._answers, True)
+
+
+@pytest.mark.asyncio
+class TestShutdownFlag:
+    """LML#1192 cross-PR review, round 7: the drain was the family's only
+    long-running script WITHOUT the scripts/_lib two-stage graceful Ctrl-C
+    -- SIGINT landed as a raw KeyboardInterrupt inside asyncio.run, killing
+    a multi-hour session with no summary and an exit indistinguishable from
+    a crash, while every sibling drain has trained the operator that Ctrl-C
+    is safe. run_drain now takes the same optional ShutdownFlagProtocol the
+    LML#1020 backfill threads through, checked at the candidate boundary."""
+
+    def _candidates(self, n: int) -> list[ArtistCandidate]:
+        return [
+            ArtistCandidate(
+                artist_id=i, artist_name=f"Artist {i}", urls=[f"https://en.wikipedia.org/wiki/A{i}"]
+            )
+            for i in range(1, n + 1)
+        ]
+
+    async def test_shutdown_stops_at_the_candidate_boundary(self, monkeypatch):
+        candidates = self._candidates(3)
+        pg = AsyncMock(spec=PgSource)
+
+        async def fake_process(
+            pg, client, candidate, *, max_retries, rate_limiter=None, dry_run=False
+        ):
+            return "positive"
+
+        monkeypatch.setattr("scripts.warm_wikipedia_bios.process_candidate", fake_process)
+        report = await run_drain(
+            pg,
+            candidates,
+            rate_per_second=100,
+            max_retries=1,
+            shutdown=_ScriptedShutdownFlag([False, True]),
+        )
+        # Candidate 1 processed, then the flag stops the loop BEFORE
+        # candidate 2 -- a clean, resumable stop, not an abort.
+        assert report.counts == {"positive": 1}
+        assert report.aborted is False
+
+    async def test_no_flag_processes_everything(self, monkeypatch):
+        candidates = self._candidates(2)
+        pg = AsyncMock(spec=PgSource)
+
+        async def fake_process(
+            pg, client, candidate, *, max_retries, rate_limiter=None, dry_run=False
+        ):
+            return "positive"
+
+        monkeypatch.setattr("scripts.warm_wikipedia_bios.process_candidate", fake_process)
+        report = await run_drain(pg, candidates, rate_per_second=100, max_retries=1)
+        assert report.counts == {"positive": 2}
+
+
+@pytest.mark.asyncio
+class TestDryRun:
+    """LML#1192 cross-PR review, round 7: every sibling drain takes a
+    no-write preview mode; this one's --repick/--refresh-stale rewrite every
+    positive row they visit, which is exactly the pass an operator most
+    wants to preview. Dry-run runs the full picker + live fetches and
+    tallies outcomes but writes NOTHING -- neither content rows nor durable
+    attempt records."""
+
+    async def test_positive_outcome_writes_nothing(self, monkeypatch):
+        from lookup.wikipedia_pick_validation import ValidatedPick
+        from lookup.wikipedia_url import PickedWikiUrl
+
+        pg = AsyncMock(spec=PgSource)
+        write_content = AsyncMock()
+        write_refusal = AsyncMock()
+        write_attempt = AsyncMock()
+        monkeypatch.setattr(
+            "scripts.warm_wikipedia_bios.set_cached_artist_wikipedia_bio", write_content
+        )
+        monkeypatch.setattr(
+            "scripts.warm_wikipedia_bios.mark_artist_wikipedia_bio_refused", write_refusal
+        )
+        monkeypatch.setattr(
+            "scripts.warm_wikipedia_bios.record_artist_wikipedia_bio_attempt", write_attempt
+        )
+
+        async def fake_resolve(urls, artist_name, *, fetch, max_candidates=None):
+            return ValidatedPick(
+                picked=PickedWikiUrl(
+                    url="https://en.wikipedia.org/wiki/Stereolab",
+                    lang="en",
+                    slug_score=100.0,
+                    below_floor=False,
+                ),
+                summary=WikipediaSummary(extract="Stereolab are an Anglo-French band."),
+            )
+
+        monkeypatch.setattr("scripts.warm_wikipedia_bios.resolve_and_validate_pick", fake_resolve)
+        outcome = await process_candidate(
+            pg, AsyncMock(), _ABOVE_FLOOR_CANDIDATE, max_retries=1, dry_run=True
+        )
+        assert outcome == "positive"
+        write_content.assert_not_awaited()
+        write_refusal.assert_not_awaited()
+        write_attempt.assert_not_awaited()
+
+    async def test_fetch_error_records_no_attempt(self, monkeypatch):
+        pg = AsyncMock(spec=PgSource)
+        write_attempt = AsyncMock()
+        monkeypatch.setattr(
+            "scripts.warm_wikipedia_bios.record_artist_wikipedia_bio_attempt", write_attempt
+        )
+
+        async def fake_resolve(urls, artist_name, *, fetch, max_candidates=None):
+            raise WikipediaFetchError("timeout")
+
+        monkeypatch.setattr("scripts.warm_wikipedia_bios.resolve_and_validate_pick", fake_resolve)
+        outcome = await process_candidate(
+            pg, AsyncMock(), _ABOVE_FLOOR_CANDIDATE, max_retries=1, dry_run=True
+        )
+        assert outcome == "fetch_error"
+        write_attempt.assert_not_awaited()
+
+
+class TestRateFlagAlias:
+    """LML#1192 cross-PR review, round 7: the drain family's flag for the
+    identical concept is --rate (ytm_coverage_drain); --rate-per-second
+    stays as an alias so neither spelling breaks."""
+
+    def test_rate_is_the_canonical_spelling(self):
+        from scripts.warm_wikipedia_bios import _build_arg_parser
+
+        args = _build_arg_parser().parse_args(["--rate", "2.5"])
+        assert args.rate == 2.5
+
+    def test_rate_per_second_still_works_as_an_alias(self):
+        from scripts.warm_wikipedia_bios import _build_arg_parser
+
+        args = _build_arg_parser().parse_args(["--rate-per-second", "1.5"])
+        assert args.rate == 1.5
+
+    def test_dry_run_flag_exists_and_defaults_off(self):
+        from scripts.warm_wikipedia_bios import _build_arg_parser
+
+        assert _build_arg_parser().parse_args([]).dry_run is False
+        assert _build_arg_parser().parse_args(["--dry-run"]).dry_run is True
