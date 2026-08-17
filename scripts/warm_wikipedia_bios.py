@@ -50,8 +50,13 @@ that already pays for a live fetch, so it's where this validation has to
 live; the live ``/lookup`` request path stays on the unvalidated
 best-guess ``lookup.wikipedia_url.pick_artist_wikipedia_url``, unchanged
 — see ``wikipedia_pick_validation``'s own module docstring for the full
-history and the two pick strategies' divergence being covered by the
-existing self-healing URL-match predicate in ``entity/artist_wikipedia_bio.py``.
+history. The two pick strategies can disagree on which URL the response
+cites vs. which the cache serves text for; since LML#1192 review round 5
+that divergence is a non-issue by construction rather than something a read
+predicate reconciles — ``entity/artist_wikipedia_bio.py``'s cache read is
+keyed on ``discogs_artist_id`` alone and always serves whichever
+``wikipedia_url`` the row itself carries, never the live request's own sync
+pick, so this drain's better, fetch-validated URL simply wins at read time.
 
 A below-floor pick (no candidate ever cleared the score floor) is
 **declined without any live fetch** — same "never fetch bio text for an
@@ -105,10 +110,17 @@ in a row predicate, an ORDER BY, and one selected column):
   (LML#1192 review round 2, C2; round 3, finding 13; round 4, P0-8
   partial) — so successive ``--limit``-bounded ``--repick`` sessions
   progress through the table instead of re-verifying the same rows
-  forever. The read-side URL-match predicate in
-  ``entity/artist_wikipedia_bio.py`` self-heals a stale pick lazily either
-  way; this mode is for deliberately forcing that correction ahead of the
-  next natural read.
+  forever. Since LML#1192 review round 5, the cache read no longer
+  self-heals a stale pick lazily on its own — ``entity/artist_wikipedia_bio.py``
+  is keyed on ``discogs_artist_id`` alone and serves whichever
+  ``wikipedia_url`` the row already carries, regardless of what the
+  extractor would pick today (see that module's docstring for why: a
+  URL-match read predicate used to provide this, but it made a validated
+  warm's own write permanently unreadable by a caller whose own pick never
+  changes). A stale pick now only corrects via this table's 30-day positive
+  TTL expiring, or via an explicit ``--repick``/``--refresh-stale`` run —
+  this mode is that explicit, immediate correction, not a sooner version of
+  something that would happen anyway.
 * ``--refresh-stale`` (LML#1192 review round 4, P0-3) — the SAME
   fetch-validate-and-write machinery as ``--repick`` (candidates carry
   ``stored_wikipedia_url`` too), but scoped to already-successful rows
