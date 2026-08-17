@@ -119,3 +119,19 @@ async def test_tasquier_comp_resolves_via_tracklist_credit(service):
     assert result is not None, "expected release 27518829; got no candidate past floor or rescue"
     _, best = result
     assert best.release_id == 27518829, f"resolved wrong release {best.release_id}"
+
+
+@pytest.mark.asyncio
+async def test_mavi_disambiguation_suffix_resolves(service):
+    """LML#1206: the bare name ``"MAVI"`` must resolve *The Pilot* (release
+    37193856), cached under Discogs' disambiguation-suffixed credit
+    ``"Mavi (12)"`` — the live-API companion to the mocked reproduction in
+    ``tests/unit/test_library_miss_discogs.py::TestDisambiguationSuffixRecall``.
+    """
+    result = await _library_miss_discogs_search(
+        _parsed("MAVI", "The Pilot"),
+        discogs_service=service,
+    )
+    assert result is not None, "expected release 37193856; got no floor-clearing candidate"
+    _, best = result
+    assert best.release_id == 37193856, f"resolved wrong release {best.release_id}"
