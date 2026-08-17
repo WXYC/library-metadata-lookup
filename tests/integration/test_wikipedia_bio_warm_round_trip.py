@@ -78,7 +78,7 @@ class TestValidatedWarmClosesTheInfiniteMissLoop:
 
         # -- The scheduled warm runs: the live fetch rejects the bare
         # (disambiguation) page and validates the qualified (real) one.
-        async def fake_get_summary(title, lang, *, max_retries=1):
+        async def fake_get_summary(title, lang, *, max_retries=1, rate_limiter=None):
             if title == "Low":
                 return None  # disambiguation page -- rejected
             return WikipediaSummary(extract="Low are a band.")
