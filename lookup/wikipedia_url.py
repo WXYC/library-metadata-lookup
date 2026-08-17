@@ -42,7 +42,6 @@ will (the plan's Non-goals rule out a live Wikipedia dependency on
 from __future__ import annotations
 
 import logging
-import os
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -50,6 +49,7 @@ from dataclasses import dataclass
 import sentry_sdk
 
 from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
+from core.search import resolve_bool_env
 from lookup.wikipedia_candidates import (
     extract_lang,
     first_wikipedia_match,
@@ -60,22 +60,17 @@ from lookup.wikipedia_candidates import (
 logger = logging.getLogger(__name__)
 
 WIKIPEDIA_SLUG_MATCH_ENV_VAR = "LML_WIKIPEDIA_SLUG_MATCH"
-"""When set to a ``_TRUE_FLAG_VALUES`` spelling, the slug-scored pick is
-served (when it clears the floor) instead of the legacy first-match pick.
-Default OFF — see ``docs/env-vars.md``."""
-
-_TRUE_FLAG_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
-"""Spellings that enable a default-OFF boolean flag. Mirrors
-``lookup.admission``'s flag of the same name/polarity."""
+"""When set to a true spelling (``core.search.resolve_bool_env``'s
+vocabulary), the slug-scored pick is served (when it clears the floor)
+instead of the legacy first-match pick. Default OFF — see
+``docs/env-vars.md``."""
 
 
 def _wikipedia_slug_match_enabled() -> bool:
-    """Read the flag at call time (no Settings indirection) so it is a
-    no-redeploy Railway lever, mirroring ``lookup.admission.is_shed_enforced``."""
-    raw = os.getenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR)
-    if raw is None:
-        return False
-    return raw.strip().lower() in _TRUE_FLAG_VALUES
+    """Read the flag at call time via the shared ``resolve_bool_env``
+    (LML#1204 item 3) so it is a no-redeploy Railway lever, mirroring
+    ``lookup.admission.is_shed_enforced``."""
+    return resolve_bool_env(WIKIPEDIA_SLUG_MATCH_ENV_VAR, default=False)
 
 
 @dataclass(frozen=True)

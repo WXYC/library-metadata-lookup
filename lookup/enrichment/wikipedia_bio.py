@@ -66,12 +66,12 @@ Discogs" was the wrong question for that gate to ask).
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
 
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
+from core.search import resolve_bool_env
 from discogs.models import ArtistDetails
 from entity.artist_wikipedia_bio import WikipediaBioReadError, get_cached_artist_wikipedia_bio
 from entity.sources import PgSource
@@ -81,12 +81,11 @@ from lookup.wikipedia_url import PickedWikiUrl
 logger = logging.getLogger(__name__)
 
 BIO_PREFER_WIKIPEDIA_ENV_VAR = "LML_BIO_PREFER_WIKIPEDIA"
-"""Default OFF. Inert unless ``LML_WIKIPEDIA_SLUG_MATCH`` (Phase A,
-``lookup/wikipedia_url.py``) is also ON: with slug-match off, every pick's
-``below_floor`` is unconditionally True, so this flag never gets past the
-first gate below. See ``docs/env-vars.md``."""
-
-_TRUE_FLAG_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+"""Default OFF (``core.search.resolve_bool_env``'s accept vocabulary). Inert
+unless ``LML_WIKIPEDIA_SLUG_MATCH`` (Phase A, ``lookup/wikipedia_url.py``)
+is also ON: with slug-match off, every pick's ``below_floor`` is
+unconditionally True, so this flag never gets past the first gate below.
+See ``docs/env-vars.md``."""
 
 CACHE_HIT_STAT_KEY = "wikipedia_bio_cache_hit"
 CACHE_NEGATIVE_STAT_KEY = "wikipedia_bio_cache_negative"
@@ -115,12 +114,10 @@ SOURCE_STAT_KEYS: dict[BioSource, str] = {
 
 
 def _bio_prefer_wikipedia_enabled() -> bool:
-    """Read the flag at call time (no Settings indirection) so it is a
-    no-redeploy Railway lever, mirroring ``lookup.wikipedia_url._wikipedia_slug_match_enabled``."""
-    raw = os.getenv(BIO_PREFER_WIKIPEDIA_ENV_VAR)
-    if raw is None:
-        return False
-    return raw.strip().lower() in _TRUE_FLAG_VALUES
+    """Read the flag at call time via the shared ``core.search.resolve_bool_env``
+    (LML#1204 item 3) so it is a no-redeploy Railway lever, mirroring
+    ``lookup.wikipedia_url._wikipedia_slug_match_enabled``."""
+    return resolve_bool_env(BIO_PREFER_WIKIPEDIA_ENV_VAR, default=False)
 
 
 def _record(key: str) -> None:

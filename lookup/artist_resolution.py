@@ -9,7 +9,6 @@ Extracted verbatim from ``lookup/orchestrator.py`` (LML#724).
 """
 
 import logging
-import os
 import random
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +23,7 @@ from clients.streaming.matching import (
     score_match,
     strip_discogs_disambig,
 )
+from core.search import resolve_bool_env
 from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import create_ttl_cache, should_skip_cache
@@ -38,20 +38,13 @@ _ARTIST_IDENTITY_SPLIT_GATE_ENV_VAR = "LML_ARTIST_IDENTITY_SPLIT_GATE"
 ``is_album_derived_eligible`` predicate. Emergency rollback only — default
 is ``true`` (on)."""
 
-_FALSE_FLAG_VALUES: frozenset[str] = frozenset({"false", "0", "no", "off", "disabled"})
-"""Strings (case-insensitive, whitespace-trimmed) that disable a default-on
-boolean env flag. Mirrors the wider Pydantic ``BoolField`` accept-set so an
-operator typing the same value across knobs gets the same result."""
-
 
 def _artist_identity_split_gate_enabled() -> bool:
-    """Read the rollback flag at request time (no Settings indirection) so the
-    knob can be flipped via Railway env vars without a redeploy. See
+    """Read the rollback flag at request time via the shared
+    ``core.search.resolve_bool_env`` (LML#1204 item 3) so the knob can be
+    flipped via Railway env vars without a redeploy. See
     ``LML_ARTIST_IDENTITY_SPLIT_GATE`` in ``docs/env-vars.md``."""
-    raw = os.getenv(_ARTIST_IDENTITY_SPLIT_GATE_ENV_VAR)
-    if raw is None:
-        return True
-    return raw.strip().lower() not in _FALSE_FLAG_VALUES
+    return resolve_bool_env(_ARTIST_IDENTITY_SPLIT_GATE_ENV_VAR, default=True)
 
 
 _MB_RESCUE_REQUIRE_SONG_MATCH_ENV_VAR = "LML_MB_RESCUE_REQUIRE_SONG_MATCH"
@@ -65,10 +58,7 @@ MB tracklist is surfaced unconditionally — reverting to the pre-LML#506
 def _mb_rescue_song_match_required() -> bool:
     """Read the LML#506 rollback flag at request time. See
     ``LML_MB_RESCUE_REQUIRE_SONG_MATCH`` in ``docs/env-vars.md``."""
-    raw = os.getenv(_MB_RESCUE_REQUIRE_SONG_MATCH_ENV_VAR)
-    if raw is None:
-        return True
-    return raw.strip().lower() not in _FALSE_FLAG_VALUES
+    return resolve_bool_env(_MB_RESCUE_REQUIRE_SONG_MATCH_ENV_VAR, default=True)
 
 
 _SKIP_PREFETCH_ON_SYNTHESIS_ENV_VAR = "LML_ENRICH_SKIP_PREFETCH_ON_SYNTHESIS"
@@ -81,14 +71,11 @@ only — default is ``true`` (on)."""
 
 
 def _skip_prefetch_on_synthesis_enabled() -> bool:
-    """Read the LML#507 rollback flag at request time (no Settings
-    indirection) so the knob can be flipped via Railway env vars without a
-    redeploy. See ``LML_ENRICH_SKIP_PREFETCH_ON_SYNTHESIS`` in
-    ``docs/env-vars.md``."""
-    raw = os.getenv(_SKIP_PREFETCH_ON_SYNTHESIS_ENV_VAR)
-    if raw is None:
-        return True
-    return raw.strip().lower() not in _FALSE_FLAG_VALUES
+    """Read the LML#507 rollback flag at request time via the shared
+    ``core.search.resolve_bool_env`` (LML#1204 item 3) so the knob can be
+    flipped via Railway env vars without a redeploy. See
+    ``LML_ENRICH_SKIP_PREFETCH_ON_SYNTHESIS`` in ``docs/env-vars.md``."""
+    return resolve_bool_env(_SKIP_PREFETCH_ON_SYNTHESIS_ENV_VAR, default=True)
 
 
 def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:

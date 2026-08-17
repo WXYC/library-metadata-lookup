@@ -12,6 +12,7 @@ strategies with mock Outcome-returning callables.
 """
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, Mock, patch
@@ -1917,3 +1918,81 @@ class TestRetryBudgetDeadlineWiring:
         assert captured[0] == pytest.approx(
             observed_monotonic[0] + expected_budget_seconds, abs=0.5
         )
+
+
+class TestResolveBoolEnv:
+    """LML#1204 item 3: one shared boolean env reader beside
+    ``resolve_positive_int_env``, replacing the three ``_TRUE_FLAG_VALUES``
+    copies (``lookup/admission.py``, ``lookup/wikipedia_url.py``,
+    ``lookup/enrichment/wikipedia_bio.py``) and ``lookup/artist_resolution.py``'s
+    inverse-polarity ``_FALSE_FLAG_VALUES`` — whose accept-set was asymmetric
+    (``disabled`` disabled a default-ON flag but ``enabled`` did NOT enable a
+    default-OFF one). One vocabulary, symmetric spellings."""
+
+    _ENV_VAR = "LML_TEST_BOOL_FLAG"
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv(self._ENV_VAR, raising=False)
+
+    @pytest.mark.parametrize("default", [True, False])
+    def test_unset_returns_the_default(self, default):
+        from core.search import resolve_bool_env
+
+        assert resolve_bool_env(self._ENV_VAR, default=default) is default
+
+    @pytest.mark.parametrize("default", [True, False])
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_empty_behaves_like_unset(self, monkeypatch, value, default):
+        """Env vars outrank the .env source, and empty behaves like unset
+        throughout this codebase — matching every replaced copy, where an
+        empty string fell through to the site's default."""
+        from core.search import resolve_bool_env
+
+        monkeypatch.setenv(self._ENV_VAR, value)
+        assert resolve_bool_env(self._ENV_VAR, default=default) is default
+
+    @pytest.mark.parametrize("default", [True, False])
+    @pytest.mark.parametrize("value", ["1", "true", "True", "yes", "YES", "on", " on ", "enabled"])
+    def test_true_spellings_enable_regardless_of_default(self, monkeypatch, value, default):
+        from core.search import resolve_bool_env
+
+        monkeypatch.setenv(self._ENV_VAR, value)
+        assert resolve_bool_env(self._ENV_VAR, default=default) is True
+
+    @pytest.mark.parametrize("default", [True, False])
+    @pytest.mark.parametrize(
+        "value", ["0", "false", "False", "no", "NO", "off", " off ", "disabled"]
+    )
+    def test_false_spellings_disable_regardless_of_default(self, monkeypatch, value, default):
+        from core.search import resolve_bool_env
+
+        monkeypatch.setenv(self._ENV_VAR, value)
+        assert resolve_bool_env(self._ENV_VAR, default=default) is False
+
+    @pytest.mark.parametrize("default", [True, False])
+    def test_junk_falls_back_to_the_default_with_a_warn(self, monkeypatch, caplog, default):
+        """Same operator-typo contract as ``resolve_positive_int_env``: junk
+        must not 500 anything, and must not silently flip a flag either way."""
+        from core.search import resolve_bool_env
+
+        monkeypatch.setenv(self._ENV_VAR, "garbage")
+        with caplog.at_level(logging.WARNING, logger="core.search"):
+            assert resolve_bool_env(self._ENV_VAR, default=default) is default
+        assert any(self._ENV_VAR in record.getMessage() for record in caplog.records)
+
+    def test_the_accept_vocabulary_is_symmetric(self):
+        """Every true spelling has a false counterpart (1/0, true/false,
+        yes/no, on/off, enabled/disabled) — the asymmetry this consolidation
+        retires from ``lookup/artist_resolution.py``."""
+        from core.search import _FALSE_BOOL_ENV_VALUES, _TRUE_BOOL_ENV_VALUES
+
+        pairs = [
+            ("1", "0"),
+            ("true", "false"),
+            ("yes", "no"),
+            ("on", "off"),
+            ("enabled", "disabled"),
+        ]
+        assert _TRUE_BOOL_ENV_VALUES == frozenset(t for t, _ in pairs)
+        assert _FALSE_BOOL_ENV_VALUES == frozenset(f for _, f in pairs)
