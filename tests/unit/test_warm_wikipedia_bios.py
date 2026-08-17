@@ -28,7 +28,6 @@ from clients.wikipedia import WikipediaFetchError, WikipediaSummary
 from entity.sources import PgSource
 from scripts.warm_wikipedia_bios import (
     ArtistCandidate,
-    _build_rate_limiter,
     fetch_candidates,
     main,
     process_candidate,
@@ -689,30 +688,10 @@ class TestFetchCandidates:
         assert "ORDER BY COALESCE(b.last_refused_at, b.fetched_at) ASC" in sql
 
 
-@pytest.mark.asyncio
-class TestBuildRateLimiter:
-    """LML#1192 review round 3, P0-2: ``AsyncLimiter(max(rate, 0.01), 1)``
-    requires ``acquire(1) <= max_rate`` -- any rate below 1.0 (an operator
-    deliberately throttling down under 429 pressure, e.g. ``--rate-per-second
-    0.5``) raised ``ValueError`` on the very first acquisition, before any
-    HTTP attempt, and that ``ValueError`` isn't a ``WikipediaFetchError`` so
-    it fell into the bare ``except Exception`` as ``unexpected_error`` --
-    exactly the operator action most likely to be needed during an outage
-    would have killed the run instead of slowing it down. This went
-    untested because every prior ``TestRunDrain`` case used rate 100.0 *and*
-    patched out ``process_candidate``, so the limiter was constructed but
-    never actually acquired.
-    """
-
-    @pytest.mark.parametrize("rate", [3.0, 1.0, 0.9, 0.5, 0.1, 0.01])
-    async def test_any_positive_rate_can_actually_be_acquired(self, rate):
-        limiter = _build_rate_limiter(rate)
-        await limiter.acquire()  # must not raise, for any positive rate
-
-    async def test_zero_or_negative_rate_falls_back_to_a_floor_not_a_crash(self):
-        for rate in (0.0, -5.0):
-            limiter = _build_rate_limiter(rate)
-            await limiter.acquire()
+# The acquirability-at-any-positive-rate cases (LML#1192 review round 3,
+# P0-2) moved to tests/unit/test_lib_ratelimit.py with the construction
+# itself (LML#1204 item 6) -- run_drain routes through the shared
+# scripts._lib.ratelimit.build_rate_limiter.
 
 
 @pytest.mark.asyncio

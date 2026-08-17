@@ -479,3 +479,27 @@ class TestRerunResumability:
         finally:
             await rerun_db.close()
         assert rerun_candidates == []
+
+
+@pytest.mark.asyncio
+class TestOperatorRateRouting:
+    """LML#1204 item 6: the drain's ``--rate`` flag routes through the shared
+    ``scripts._lib.ratelimit`` construction. The old direct tuple form
+    (``rate_limit=(args.rate, 1)``) crashes for any fractional rate — an
+    operator throttling to ``--rate 0.5`` under 429 pressure killed the run
+    on the very first acquisition."""
+
+    async def test_a_fractional_operator_rate_builds_an_acquirable_client(self):
+        from scripts.ytm_coverage_drain import _build_client
+
+        client = _build_client(rate=0.5, search_limit=5)
+        await client._rate_limiter.acquire()  # must not raise
+
+    async def test_the_old_tuple_form_is_the_crash_this_guards_against(self):
+        # Characterizes the bug the routing exists to avoid: the direct
+        # tuple form still raises for a fractional rate at acquire time.
+        from clients.streaming.youtube_music import YouTubeMusicClient
+
+        client = YouTubeMusicClient(rate_limit=(0.5, 1), limit=5)
+        with pytest.raises(ValueError):
+            await client._rate_limiter.acquire()

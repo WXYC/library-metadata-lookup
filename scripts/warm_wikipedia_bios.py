@@ -206,6 +206,7 @@ from entity.artist_wikipedia_bio_attempt import (
 )
 from entity.sources import PgSource
 from lookup.wikipedia_pick_validation import make_summary_fetcher, resolve_and_validate_pick
+from scripts._lib.ratelimit import build_rate_limiter
 from scripts.build_filtered_discogs import extract_library_artists
 
 logger = logging.getLogger(__name__)
@@ -466,11 +467,12 @@ async def fetch_candidates(
 
 class ShutdownFlagProtocol(Protocol):
     """Structural match for ``scripts._lib.signals.ShutdownFlag`` -- kept as
-    a Protocol (not an import) so this module's only runtime dependency on
-    ``scripts._lib`` is at the CLI wiring layer, mirroring
-    ``scripts/backfill_compilation_track_identity.py`` (LML#1192 cross-PR
-    review, round 7: this drain was the family's one long-running script
-    without the shared two-stage graceful Ctrl-C)."""
+    a Protocol (not an import) so the signal-handling wiring stays at the
+    CLI layer, mirroring ``scripts/backfill_compilation_track_identity.py``
+    (LML#1192 cross-PR review, round 7: this drain was the family's one
+    long-running script without the shared two-stage graceful Ctrl-C).
+    ``scripts._lib.ratelimit`` (LML#1204 item 6) is a plain shared helper,
+    not process wiring, so it IS imported directly."""
 
     @property
     def requested(self) -> bool: ...
@@ -682,28 +684,6 @@ class DrainReport:
             print("ABORTED: too many consecutive failures -- see the log above; resume later")
 
 
-def _build_rate_limiter(rate_per_second: float) -> AsyncLimiter:
-    """Construct the drain's rate limiter, correct for ANY positive rate.
-
-    LML#1192 review round 3, P0-2: the original ``AsyncLimiter(max(rate, 0.01), 1)``
-    sets ``max_rate`` (the bucket's total capacity) to the rate itself, but
-    ``aiolimiter`` requires ``acquire(1) <= max_rate`` -- so any rate below
-    1.0 (an operator deliberately throttling DOWN under 429 pressure, e.g.
-    ``--rate-per-second 0.5``) raised ``ValueError`` on the very first
-    acquisition, before any HTTP attempt. That's not a
-    ``WikipediaFetchError``, so it fell into ``run_drain``'s bare
-    ``except Exception`` as ``unexpected_error`` -- the operator's own
-    throttle-down action would have killed the run instead of slowing it
-    down. Bucket capacity 1, refilled over ``1 / rate`` seconds is correct
-    for every positive rate, fractional or not: 3.0 rps -> refill every
-    ~0.33s; 0.5 rps -> refill every 2s. ``rate_per_second <= 0`` (an
-    operator typo) falls back to the same ``0.01`` floor as before, rather
-    than dividing by zero or going negative.
-    """
-    effective_rate = rate_per_second if rate_per_second > 0 else 0.01
-    return AsyncLimiter(1, 1 / effective_rate)
-
-
 # LML#1192 review round 3, finding 4: covers every outcome that indicates
 # something isn't working, not just "fetch_error" -- a storm of
 # "repick_kept_existing" conflicts (the picker's choices regressed) is just
@@ -754,7 +734,11 @@ async def run_drain(
     dry_run: bool = False,
 ) -> DrainReport:
     report = DrainReport()
-    limiter = _build_rate_limiter(rate_per_second)
+    # LML#1192 review round 3, P0-2 / LML#1204 item 6: the shared
+    # construction is correct for ANY positive rate (a fractional operator
+    # throttle-down must slow the run, never ValueError it) -- see
+    # scripts/_lib/ratelimit.py for the full trap.
+    limiter = build_rate_limiter(rate_per_second)
     client = WikipediaClient()
     consecutive_failures = 0
     for i, candidate in enumerate(candidates, start=1):
