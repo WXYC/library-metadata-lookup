@@ -12,16 +12,17 @@
 -- becomes the candidate list, 100% failure-ish, aborting every session
 -- immediately and masking real progress elsewhere in the catalog.
 --
+-- Lifespan-bootstrapped since LML#1192 review round 6 (C2-3) -- NOT just
+-- the offline drain's private bookkeeping; see
+-- `entity/artist_wikipedia_bio_attempt.py`'s module docstring for why
+-- (this generated comment intentionally does not restate it, to avoid a
+-- second copy that can drift).
+--
 -- It lives in the LML-owned `lml_cache.*` schema (per WXYC/discogs-etl#288,
 -- Option 3) -- not the discogs-cache-owned `entity.*` identity contract,
 -- which is created and migrated only via discogs-cache alembic migrations --
--- and discogs-cache tooling never touches `lml_cache.*`.
---
--- Bootstrapped from LML's own FastAPI lifespan (LML#1192 review round 6,
--- C2-3), same as every other `lml_cache.*` table -- NOT just the offline
--- drain; see `entity/artist_wikipedia_bio_attempt.py`'s module docstring
--- for why (this generated comment intentionally does not restate it, to
--- avoid a second copy that can drift).
+-- and is bootstrapped from LML's own FastAPI lifespan; discogs-cache tooling
+-- never touches `lml_cache.*`.
 --
 -- This file exists so:
 --
@@ -31,12 +32,11 @@
 --
 -- GENERATED FILE -- regenerate via:
 --   uv run python -m scripts.regenerate_lml_cache_sql
--- Statements come verbatim from `entity/artist_wikipedia_bio_attempt.py`;
--- do not hand-edit this file -- `tests/unit/test_artist_wikipedia_bio_attempt_schema.py`
+-- Statements come verbatim from `entity/artist_wikipedia_bio_attempt.py`; do not hand-edit
+-- this file -- a per-module unit test (`tests/unit/test_artist_wikipedia_bio_attempt_schema.py`)
 -- pins the statement text. The runtime source of truth is
--- `entity/artist_wikipedia_bio_attempt.py`'s
--- `set_up_artist_wikipedia_bio_attempt_schema`, which issues these
--- statements (`IF NOT EXISTS` forms) on every boot.
+-- `entity/artist_wikipedia_bio_attempt.py`'s `set_up_artist_wikipedia_bio_attempt_schema`, which issues these statements
+-- (`IF NOT EXISTS` forms) on every boot.
 
 CREATE SCHEMA IF NOT EXISTS lml_cache;
 
