@@ -51,7 +51,23 @@ async def fetch_top1_release_details(
         # This stage reads only year / artist_id / artist bio + Wikipedia URL,
         # so the lean shape is byte-identical for what it consumes while cutting
         # the top-1 hydration from 14 PG round-trips to 10.
-        release = await discogs_service.get_release(top_artwork.release_id, lean=True)
+        try:
+            release = await discogs_service.get_release(top_artwork.release_id, lean=True)
+        except DiscogsBreakerOpenError:
+            # LML#1192 review round 6, pass 3, A2: a saturation-breaker
+            # shed here used to fall into the OUTER except below, which
+            # calls logger.exception -- promoted to a discrete Sentry
+            # event by the LoggingIntegration on EVERY shed, reproducing
+            # the LML#755 flood (cache/dispatch.py's own P0-era fix
+            # documents this exact hazard). A shed is an expected degrade,
+            # not a bug: nothing has been fetched yet at this point, so
+            # there is nothing to preserve, unlike the get_artist_details
+            # shed below.
+            logger.warning(
+                "Top-1 release fetch shed by saturation breaker for release_id=%s",
+                top_artwork.release_id,
+            )
+            return None, None, None, None, None
         if not release:
             return None, None, None, None, None
 

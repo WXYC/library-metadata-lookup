@@ -465,6 +465,57 @@ class TestTop1ArtistBreakerShed:
         assert result == (None, None, None, None, None)
 
 
+class TestTop1ReleaseBreakerShed:
+    """LML#1192 review round 6, pass 3, A2: ``DiscogsBreakerOpenError`` is
+    raised at ``discogs/service.py:1591`` inside ``get_release`` -- but the
+    P0-10 narrow handler (``TestTop1ArtistBreakerShed`` above) only wraps
+    ``get_artist_details``, so a shed on ``get_release`` falls into the
+    OUTER catch-all and gets ``logger.exception``'d. Sentry's
+    LoggingIntegration promotes every ERROR record to a discrete event
+    (``cache/dispatch.py:154`` documents this exact hazard verbatim,
+    "reproducing the #755 flood, 32.5K events"), and during a
+    saturation-breaker OPEN episode -- i.e. peak traffic -- every
+    ``/lookup`` request mints one. Reproduced here exactly as the reviewer
+    described: a shed from the ``get_release`` call landing in the same
+    ``except Exception`` as a genuine, unexpected failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_release_step_shed_is_not_logged_at_exception_level(self):
+        from lookup.enrichment.top1 import fetch_top1_release_details
+
+        artwork = make_discogs_result(release_id=555, artist="Chuquimamani-Condori", album="Edits")
+        discogs_service = AsyncMock()
+        discogs_service.get_release.side_effect = DiscogsBreakerOpenError("shed")
+
+        with patch("lookup.enrichment.top1.logger") as mock_logger:
+            result = await fetch_top1_release_details(discogs_service, artwork)
+
+        # The bug: pre-fix, this landed in the generic `except Exception`,
+        # which calls `logger.exception` -- promoted to a discrete Sentry
+        # event by the LoggingIntegration on every single shed.
+        mock_logger.exception.assert_not_called()
+        assert result == (None, None, None, None, None)
+
+    @pytest.mark.asyncio
+    async def test_non_breaker_error_on_release_step_still_logs_at_exception_level(self):
+        """Contrast: a genuine, unexpected failure on the release step must
+        keep reaching Sentry -- only the EXPECTED saturation-shed degrades
+        quietly. Mirrors TestTop1ArtistBreakerShed's own non-breaker contrast
+        test for the artist step."""
+        from lookup.enrichment.top1 import fetch_top1_release_details
+
+        artwork = make_discogs_result(release_id=555, artist="Chuquimamani-Condori", album="Edits")
+        discogs_service = AsyncMock()
+        discogs_service.get_release.side_effect = RuntimeError("Discogs 500")
+
+        with patch("lookup.enrichment.top1.logger") as mock_logger:
+            result = await fetch_top1_release_details(discogs_service, artwork)
+
+        mock_logger.exception.assert_called_once()
+        assert result == (None, None, None, None, None)
+
+
 class TestEnrichArtworkResultsExtended:
     """Coverage for the ``extended=True`` path: populates the additional
     DiscogsMatchResult fields LML already loads but normally discards.
@@ -4976,6 +5027,55 @@ class TestWikipediaPreferredBioSwap:
         mock_parse.assert_called_once_with("Discogs bio with [a123] ref.")
 
     @pytest.mark.asyncio
+    async def test_discogs_ref_warm_fires_even_when_wikipedia_is_served(self, monkeypatch):
+        # LML#1192 review round 6, pass 3, A3: the reviewer's own
+        # reproduction, end to end through the coordinator. Same scenario
+        # as test_profile_tokens_still_parse_the_discogs_text_when_wikipedia_is_served
+        # above (Wikipedia wins artist_bio, profile_tokens still ships) --
+        # plus warm_cache=True. Before this fix, the ref-warm's own
+        # served_bio_is_discogs check suppressed this unconditionally, so
+        # profile_tokens's unresolved refs could never populate no matter
+        # how many warm_cache=true calls followed -- contradicting the
+        # api.yaml contract text verbatim ("Pair with warm_cache=true...
+        # to progressively populate the cache so subsequent reads render
+        # richer").
+        monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
+        monkeypatch.setenv("LML_BIO_PREFER_WIKIPEDIA", "true")
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+        discogs_service = self._discogs_service_for(profile="Discogs bio with [a123] ref.")
+
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+                return_value=CachedValue(
+                    value=WikipediaBioHit(
+                        wikipedia_url="https://en.wikipedia.org/wiki/Stereolab",
+                        extract="Wikipedia prose.",
+                    ),
+                    was_present=True,
+                ),
+            ),
+            patch("lookup.enrichment.background.asyncio.create_task") as mock_create_task,
+        ):
+            mock_create_task.return_value = AsyncMock()
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                discogs_cache_pg=AsyncMock(),
+                extended=True,
+                warm_cache=True,
+            )
+
+        _, enriched = results[0]
+        assert enriched.artist_bio == "Wikipedia prose."
+        assert enriched.profile_tokens is not None
+        mock_create_task.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_miss_falls_back_to_discogs_and_schedules_warm(self, monkeypatch):
         monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
         monkeypatch.setenv("LML_BIO_PREFER_WIKIPEDIA", "true")
@@ -5047,6 +5147,13 @@ class TestWikipediaPreferredBioSwap:
     async def test_discogs_ref_warm_still_fires_when_discogs_bio_is_served(self, monkeypatch):
         # Contrast case: flags on, but the cache missed (Discogs fallback
         # served) -- the ref-warm must still fire exactly as before.
+        #
+        # LML#1192 review round 6, pass 3, A3: extended=True is now
+        # required for this scenario to be meaningful at all --
+        # profile_tokens (what the ref-warm actually populates refs for)
+        # never ships without it, so a call omitting it can't tell "the
+        # warm correctly fired" apart from "the warm fired for the wrong
+        # reason" the way the pre-fix, source-based gate could.
         monkeypatch.setenv("LML_WIKIPEDIA_SLUG_MATCH", "true")
         monkeypatch.setenv("LML_BIO_PREFER_WIKIPEDIA", "true")
         item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
@@ -5067,6 +5174,7 @@ class TestWikipediaPreferredBioSwap:
                 discogs_service,
                 album="Aluminum Tunes",
                 artist="Stereolab",
+                extended=True,
                 discogs_cache_pg=AsyncMock(),
                 warm_cache=True,
             )

@@ -26,13 +26,19 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from wxyc_fastapi.observability import get_cache_stats_recorder, get_posthog_client
+from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from clients.wikipedia import WikipediaClient, WikipediaFetchError, WikipediaSummary
-from config.settings import get_settings
 from entity.artist_wikipedia_bio import set_cached_artist_wikipedia_bio
 from entity.artist_wikipedia_bio_attempt import record_artist_wikipedia_bio_attempt
 from entity.sources import PgSource
+from lookup.enrichment.wikipedia_warm_telemetry import (
+    FETCH_OK_STAT_KEY,
+    FETCH_REJECT_STAT_KEY,
+)
+from lookup.enrichment.wikipedia_warm_telemetry import (
+    capture_fetch_outcome as _capture_fetch_outcome,
+)
 from lookup.wikipedia_candidates import wikipedia_title_from_url
 from lookup.wikipedia_pick_validation import resolve_and_validate_pick
 
@@ -62,21 +68,11 @@ WARM_SHED_STAT_KEY = "wikipedia_bio_warm_shed"
 that triggered it, so this rides the standard contextvar-scoped recorder
 (mirrors ``lookup.streaming_warm_admission.record_depth_shed``)."""
 
-FETCH_OK_STAT_KEY = "wikipedia_bio_fetch_ok"
-FETCH_REJECT_STAT_KEY = "wikipedia_bio_fetch_reject"
-"""Unsampled PostHog counters (see :func:`_capture_fetch_outcome`) — the
-warm TASK runs detached from any request's cache_stats context, so these do
-NOT use the per-request recorder.
-
-LML#1192 review, B2-4 correction: the ``cache_stats`` dict object a
-detached task's copied ContextVar binding points to is the SAME shared
-mutable object the request handler read -- but by the time this task's
-first ``await`` resolves, that handler has already read and returned its
-snapshot, so a write here lands in a dict nobody will read again (ordering,
-not isolation, is why a per-request recorder still wouldn't count)."""
-
-_POSTHOG_EVENT_PREFIX = "wikipedia_bio_warm"
-_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
+# FETCH_OK_STAT_KEY / FETCH_REJECT_STAT_KEY / the fetch-outcome capture
+# itself moved to lookup/enrichment/wikipedia_warm_telemetry.py (LML#1192
+# review round 6, pass 3, A1 -- this module's own budget-driven extraction)
+# -- imported above, re-exported under their original names so no other
+# call site or test patch target needs to change.
 
 _warm_semaphore: asyncio.Semaphore | None = None
 """Lazily-constructed (needs a running event loop). Re-bind on the first call."""
@@ -202,10 +198,22 @@ async def _run_warm(
             # tried at all (below_floor with zero live fetches) -- a
             # negative must mean "asked about the right page, no page,"
             # never "ran out of budget" or "didn't ask."
-            if result.truncated or (picked.below_floor and not attempted_a_live_fetch):
-                logger.info(
-                    "Wikipedia bio warm skip (no negative write): artist_id=%s", discogs_artist_id
-                )
+            if result.truncated:
+                # Pass 3, A1: unlike the zero-fetch branch below, real
+                # fetches DID happen here -- record that durably (a
+                # distinct outcome from "fetch_error", since nothing
+                # transient failed) so --retry-misses can pick this artist
+                # back up, the same shape C2-3 already gives WikipediaFetchError.
+                if attempted_a_live_fetch:
+                    logger.info(
+                        "Wikipedia bio warm truncated for artist_id=%s -- recording attempt",
+                        discogs_artist_id,
+                    )
+                    await record_artist_wikipedia_bio_attempt(
+                        discogs_cache_pg, discogs_artist_id=discogs_artist_id, outcome="truncated"
+                    )
+                return
+            if picked.below_floor and not attempted_a_live_fetch:
                 return
 
             extract = result.summary.extract if result.summary is not None else None
@@ -222,29 +230,3 @@ async def _run_warm(
             )
     except Exception:
         logger.exception("Background Wikipedia bio warm failed")
-
-
-def _capture_fetch_outcome(event: str) -> None:
-    """Unsampled PostHog counter for a background warm-task fetch outcome.
-
-    Mirrors ``discogs.service._capture_artist_breaker_shed`` /
-    ``discogs.ratelimit._capture_fail_open`` (LML#879): best-effort, gated by
-    ``Settings.enable_telemetry``, wired through the shared
-    ``wxyc_fastapi.observability.get_posthog_client`` accessor rather than
-    the per-request cache-stats recorder — see :data:`FETCH_OK_STAT_KEY` for
-    why the latter would be a silent no-op here.
-    """
-    try:
-        settings = get_settings()
-        if not settings.enable_telemetry:
-            return
-        client = get_posthog_client(event_prefix=_POSTHOG_EVENT_PREFIX)
-        if client is None:
-            return
-        client.capture(
-            distinct_id=_POSTHOG_DISTINCT_ID,
-            event=event,
-            properties={"environment": settings.environment},
-        )
-    except Exception:
-        logger.warning("Failed to emit %s counter", event, exc_info=True)
