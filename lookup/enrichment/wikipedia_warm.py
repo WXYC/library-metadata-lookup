@@ -30,7 +30,11 @@ from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from clients.wikipedia import WikipediaClient, WikipediaFetchError, WikipediaSummary
 from entity.artist_wikipedia_bio import set_cached_artist_wikipedia_bio
-from entity.artist_wikipedia_bio_attempt import record_artist_wikipedia_bio_attempt
+from entity.artist_wikipedia_bio_attempt import (
+    OUTCOME_FETCH_ERROR,
+    OUTCOME_TRUNCATED,
+    record_artist_wikipedia_bio_attempt,
+)
 from entity.sources import PgSource
 from lookup.enrichment.wikipedia_warm_telemetry import (
     FETCH_OK_STAT_KEY,
@@ -179,7 +183,9 @@ async def _run_warm(
             except WikipediaFetchError as e:
                 logger.info("Wikipedia bio warm shed for artist_id=%s: %s", discogs_artist_id, e)
                 await record_artist_wikipedia_bio_attempt(
-                    discogs_cache_pg, discogs_artist_id=discogs_artist_id, outcome="fetch_error"
+                    discogs_cache_pg,
+                    discogs_artist_id=discogs_artist_id,
+                    outcome=OUTCOME_FETCH_ERROR,
                 )
                 return
 
@@ -210,7 +216,9 @@ async def _run_warm(
                         discogs_artist_id,
                     )
                     await record_artist_wikipedia_bio_attempt(
-                        discogs_cache_pg, discogs_artist_id=discogs_artist_id, outcome="truncated"
+                        discogs_cache_pg,
+                        discogs_artist_id=discogs_artist_id,
+                        outcome=OUTCOME_TRUNCATED,
                     )
                 return
             if picked.below_floor and not attempted_a_live_fetch:
