@@ -314,6 +314,12 @@ class TestRepickNeverDestroysAPositiveExtract:
     This repo's standing data-safety rule (never overwrite/reset
     successfully collected data without explicit approval) applies here
     just as much as to any other cache.
+
+    LML#1192 review round 6, C1-1/C1-2: the refusal now marks
+    ``mark_artist_wikipedia_bio_refused`` (advances BOTH ``last_refused_at``
+    and ``last_checked_at``) rather than the narrower
+    ``touch_artist_wikipedia_bio_last_checked_at`` -- see
+    ``entity/artist_wikipedia_bio.py`` for why a third clock exists at all.
     """
 
     async def test_diverged_below_floor_pick_keeps_the_existing_positive_extract(self):
@@ -331,9 +337,9 @@ class TestRepickNeverDestroysAPositiveExtract:
                 new_callable=AsyncMock,
             ) as mock_set,
             patch(
-                "scripts.warm_wikipedia_bios.touch_artist_wikipedia_bio_last_checked_at",
+                "scripts.warm_wikipedia_bios.mark_artist_wikipedia_bio_refused",
                 new_callable=AsyncMock,
-            ) as mock_touch,
+            ) as mock_mark_refused,
         ):
             outcome = await process_candidate(pg, client, candidate, max_retries=5)
         assert outcome == "repick_kept_existing"
@@ -343,8 +349,10 @@ class TestRepickNeverDestroysAPositiveExtract:
         # still advance the drain's own progress cursor, or a
         # last_checked_at-ordered repick/refresh session would re-select
         # this same divergent-but-protected row forever instead of moving
-        # on to the next stalest candidate.
-        mock_touch.assert_awaited_once_with(pg, discogs_artist_id=1)
+        # on to the next stalest candidate. Round 6, C1-1/C1-2: it must ALSO
+        # advance last_refused_at, so --refresh-stale's own ordering (which
+        # reads that clock, not last_checked_at) doesn't starve behind it.
+        mock_mark_refused.assert_awaited_once_with(pg, discogs_artist_id=1)
 
     async def test_diverged_pick_that_fetches_negative_keeps_the_existing_positive_extract(self):
         pg = AsyncMock(spec=PgSource)
@@ -362,14 +370,14 @@ class TestRepickNeverDestroysAPositiveExtract:
                 new_callable=AsyncMock,
             ) as mock_set,
             patch(
-                "scripts.warm_wikipedia_bios.touch_artist_wikipedia_bio_last_checked_at",
+                "scripts.warm_wikipedia_bios.mark_artist_wikipedia_bio_refused",
                 new_callable=AsyncMock,
-            ) as mock_touch,
+            ) as mock_mark_refused,
         ):
             outcome = await process_candidate(pg, client, candidate, max_retries=5)
         assert outcome == "repick_kept_existing"
         mock_set.assert_not_awaited()
-        mock_touch.assert_awaited_once_with(pg, discogs_artist_id=99)
+        mock_mark_refused.assert_awaited_once_with(pg, discogs_artist_id=99)
 
     async def test_non_repick_candidate_negative_writes_normally(self):
         # The guard is keyed on stored_wikipedia_url, which is None outside
@@ -526,11 +534,18 @@ class TestFetchCandidates:
         pg.fetchall = AsyncMock(return_value=[])
         await fetch_candidates(pg, mode="retry_misses", library_artist_names=["X"], limit=None)
         sql = pg.fetchall.await_args.args[0]
-        # LML#1192 review round 4, P0-8: COALESCE(b.last_checked_at,
-        # ba.attempted_at) -- an attempt-only row has no b.last_checked_at
-        # at all (LEFT JOIN, no content-table row), so ordering must fall
-        # back to the attempt table's own timestamp for those rows.
-        assert "ORDER BY COALESCE(b.last_checked_at, ba.attempted_at) ASC" in sql
+        # LML#1192 review round 6, C1-3: GREATEST, not COALESCE. A
+        # write-nothing outcome (fetch_error) only ever advances
+        # ba.attempted_at; a content-table outcome (negative/refused
+        # refresh) only ever advances b.last_checked_at. For an artist with
+        # BOTH rows, COALESCE always preferred b.last_checked_at even when
+        # ba.attempted_at was the more recent re-check -- sorting the
+        # failing artist ahead of successfully re-checked ones and, under a
+        # sustained outage, re-pinning the same rows at the head of every
+        # --limit-bounded session. GREATEST is NULL-ignoring in Postgres
+        # (verified live), so it correctly picks whichever clock is
+        # actually more recent.
+        assert "ORDER BY GREATEST(b.last_checked_at, ba.attempted_at) ASC" in sql
         assert "ORDER BY au.artist_id" not in sql
 
     async def test_repick_candidates_carry_the_stored_url(self):
@@ -655,11 +670,23 @@ class TestFetchCandidates:
         # The whole point of --refresh-stale is content freshness, not
         # attempt-cursor progression -- it should refresh the OLDEST content
         # first, not the least-recently-touched row.
+        #
+        # LML#1192 review round 6, C1-2: COALESCE(b.last_refused_at,
+        # b.fetched_at), not fetched_at alone. A refused refresh (the P0-5
+        # guard fired) advances ONLY last_refused_at, never fetched_at --
+        # ordering on fetched_at alone left a refused row's content-age
+        # clock frozen forever, so it kept re-sorting to the head of every
+        # --refresh-stale session: once ten of these accumulate, the
+        # consecutive-failure guard trips and starves every stale row
+        # behind them. COALESCE prefers the more-recent refusal when one
+        # exists, falling back to content age when it doesn't -- WHERE
+        # eligibility (which rows are stale enough to be a candidate at
+        # all) is unchanged, only the ORDER moves.
         pg = AsyncMock(spec=PgSource)
         pg.fetchall = AsyncMock(return_value=[])
         await fetch_candidates(pg, mode="refresh", library_artist_names=["X"], limit=None)
         sql = pg.fetchall.await_args.args[0]
-        assert "ORDER BY b.fetched_at ASC" in sql
+        assert "ORDER BY COALESCE(b.last_refused_at, b.fetched_at) ASC" in sql
 
 
 @pytest.mark.asyncio
@@ -848,16 +875,17 @@ class TestRunDrain:
         assert report.counts["fetch_error"] == 6
         assert report.aborted is False
 
-    @pytest.mark.parametrize("failure_outcome", ["negative", "repick_kept_existing"])
+    @pytest.mark.parametrize("failure_outcome", ["repick_kept_existing"])
     async def test_abort_guard_covers_every_failure_ish_outcome_not_just_fetch_error(
         self, monkeypatch, failure_outcome
     ):
         # LML#1192 review round 3, finding 4: the ORIGINAL guard only
-        # counted fetch_error/unexpected_error -- a 100%-negative run (or a
-        # storm of repick_kept_existing conflicts) completed "normally"
-        # despite being just as clear a signal that something systemic is
-        # wrong (wrong API version, IP blocked returning empty bodies, a
-        # pick-quality regression) as a fetch_error storm.
+        # counted fetch_error/unexpected_error -- a storm of
+        # repick_kept_existing conflicts completed "normally" despite being
+        # just as clear a signal that something systemic is wrong (a
+        # pick-quality regression) as a fetch_error storm. "negative" was
+        # REMOVED from this list in review round 6, C2-2 -- see
+        # test_negative_never_counts_toward_the_abort below.
         monkeypatch.setattr("scripts.warm_wikipedia_bios._MAX_CONSECUTIVE_FAILURES", 3)
         candidates = self._candidates(10)
 
@@ -876,6 +904,33 @@ class TestRunDrain:
 
         assert report.total == 3
         assert report.aborted is True
+
+    async def test_negative_never_counts_toward_the_abort(self, monkeypatch):
+        # LML#1192 review round 6, C2-2: "negative" is not a failure -- it's
+        # a healthy, correctly-cached outcome, and blocked the flip. Ten
+        # consecutive negatives used to abort with a non-zero exit even
+        # though every one was a genuine, correctly-recorded "asked, no
+        # page" result. Structurally worst for --retry-misses, whose
+        # candidate set is BY CONSTRUCTION previously-negative rows that
+        # deterministically re-return the same outcome -- a guard firing on
+        # that expected steady state is a hard blocker on running the drain
+        # to completion before the prod flag flip.
+        monkeypatch.setattr("scripts.warm_wikipedia_bios._MAX_CONSECUTIVE_FAILURES", 3)
+        candidates = self._candidates(10)
+
+        async def always_negative(pg, client, candidate, *, max_retries, rate_limiter=None):
+            return "negative"
+
+        with patch("scripts.warm_wikipedia_bios.process_candidate", side_effect=always_negative):
+            report = await run_drain(
+                AsyncMock(spec=PgSource),
+                candidates,
+                rate_per_second=100.0,
+                max_retries=1,
+            )
+
+        assert report.total == 10
+        assert report.aborted is False
 
     async def test_declined_and_refreshed_never_count_toward_the_abort(self, monkeypatch):
         # "declined" (no candidate ever cleared the floor -- never touches

@@ -141,11 +141,17 @@ processed inside a try/except (LML#1192 review round 2, C3) so one
 unexpected failure can't kill a multi-hour session before its summary
 prints; a consecutive-failure abort (:data:`_MAX_CONSECUTIVE_FAILURES`)
 covers every failure-ish outcome — not just ``fetch_error`` — since a
-100%-``negative`` (or ``repick_kept_existing``) run is just as strong a
+storm of ``repick_kept_existing`` conflicts is just as strong a
 systemic-problem signal as a fetch-error storm. ``DrainReport.aborted``
 lets :func:`main` return a non-zero exit code when a session stopped early,
 distinguishable from a clean completion by any caller checking the process
-exit code.
+exit code. LML#1192 review round 6, C2-2: ``"negative"`` is deliberately
+NOT in :data:`_FAILURE_ISH_OUTCOMES` — a healthy, correctly-cached "asked,
+no page" result, not a failure; a run of these (the expected steady state
+once a library's catalog is mostly drained, and the entire point of
+``--retry-misses``, whose candidate set is previously-negative rows by
+construction) must not abort the session the drain needs to reach
+completion on before the prod flag flip.
 
 Rough scale: bounded by LIBRARY artists with a Discogs-known Wikipedia URL
 — expect low-tens-of-thousands; at 3 rps that is a few hours across 1-2
@@ -175,9 +181,9 @@ from aiolimiter import AsyncLimiter
 from clients.wikipedia import WikipediaClient, WikipediaFetchError, WikipediaSummary
 from entity.artist_wikipedia_bio import (
     DEFAULT_SUCCESS_TTL,
+    mark_artist_wikipedia_bio_refused,
     set_cached_artist_wikipedia_bio,
     set_up_artist_wikipedia_bio_schema,
-    touch_artist_wikipedia_bio_last_checked_at,
 )
 from entity.artist_wikipedia_bio_attempt import (
     record_artist_wikipedia_bio_attempt,
@@ -304,14 +310,27 @@ _MODE_SQL: dict[DrainMode, str] = {
       AND b.extract IS NULL
       AND (b.discogs_artist_id IS NOT NULL OR ba.discogs_artist_id IS NOT NULL)
     GROUP BY au.artist_id, a.name, b.last_checked_at, ba.attempted_at
-    ORDER BY COALESCE(b.last_checked_at, ba.attempted_at) ASC
+    ORDER BY GREATEST(b.last_checked_at, ba.attempted_at) ASC
 """,
+    # LML#1192 review round 6, C1-3: GREATEST, not COALESCE (Postgres's
+    # GREATEST is NULL-ignoring, verified live). A write-nothing outcome
+    # (fetch_error) only ever advances ba.attempted_at; a content-table
+    # outcome (negative, or a refused refresh -- see mark_artist_wikipedia_bio_refused
+    # below) only ever advances b.last_checked_at. For an artist with BOTH
+    # rows, COALESCE always preferred b.last_checked_at even when
+    # ba.attempted_at was the more recently re-checked clock -- sorting a
+    # repeatedly-failing artist ahead of successfully re-checked ones, and
+    # under a sustained outage, re-pinning the same residue at the head of
+    # every --limit-bounded session (the exact "residue becomes the
+    # candidate list" failure P0-8 was added to fix, relocated one clock
+    # over).
+    #
     # Same C2/finding-13 fix, and load-bearing here in a way --retry-misses
-    # isn't: an "unchanged" repick (the common case -- most rows won't
-    # have diverged) writes nothing via the UPSERT, so last_checked_at
-    # alone wouldn't advance without process_candidate's paired
-    # touch_artist_wikipedia_bio_last_checked_at call on that outcome (see
-    # below) -- the two changes are a matched pair.
+    # isn't: a repick candidate whose pick has since diverged into a
+    # negative gets its write refused (see mark_artist_wikipedia_bio_refused
+    # below) rather than written via the normal UPSERT, so last_checked_at
+    # alone wouldn't advance without process_candidate's paired call on that
+    # outcome -- the two changes are a matched pair.
     "repick": f"""
     SELECT au.artist_id, a.name, array_agg(DISTINCT au.url) AS urls, b.wikipedia_url AS stored_url
     FROM artist_url au
@@ -333,8 +352,21 @@ _MODE_SQL: dict[DrainMode, str] = {
     # have to pay for re-fetching rows that are still well within their TTL.
     # $2 is the TTL cutoff (an asyncpg-native timedelta bind, see
     # fetch_candidates); LIMIT, if given, binds at $3 instead of the usual
-    # $2. Orders by fetched_at ASC (content-age), not last_checked_at
-    # (attempt-cursor) -- refresh the OLDEST content first.
+    # $2. Eligibility (WHERE) is scoped on fetched_at ASC (content-age)
+    # alone, unchanged -- refresh the OLDEST content first among rows
+    # genuinely stale enough to be a candidate at all.
+    #
+    # LML#1192 review round 6, C1-2: ORDERing was ALSO fetched_at ASC, but
+    # the refusal path (mark_artist_wikipedia_bio_refused) advances only
+    # last_refused_at, never fetched_at -- so a refused row's content-age
+    # clock stayed frozen forever and it kept re-sorting to the head of
+    # every --refresh-stale session. Once _MAX_CONSECUTIVE_FAILURES of
+    # these accumulate, every run processes exactly those refused rows,
+    # aborts, and starves everything genuinely stale behind them --
+    # `_write_bio`'s docstring claim (that the mark-refused call prevents
+    # this) only holds for a last_checked_at-ordered query, and refresh is
+    # not one. COALESCE(b.last_refused_at, b.fetched_at) deprioritizes a
+    # recently-refused row without touching WHERE eligibility.
     "refresh": f"""
     SELECT au.artist_id, a.name, array_agg(DISTINCT au.url) AS urls, b.wikipedia_url AS stored_url
     FROM artist_url au
@@ -344,8 +376,8 @@ _MODE_SQL: dict[DrainMode, str] = {
       AND {_LIBRARY_ARTIST_INTERSECTION_PREDICATE}
       AND b.extract IS NOT NULL
       AND b.fetched_at < now() - $2::interval
-    GROUP BY au.artist_id, a.name, b.wikipedia_url, b.fetched_at
-    ORDER BY b.fetched_at ASC
+    GROUP BY au.artist_id, a.name, b.wikipedia_url, b.fetched_at, b.last_refused_at
+    ORDER BY COALESCE(b.last_refused_at, b.fetched_at) ASC
 """,
 }
 
@@ -436,19 +468,24 @@ async def _write_bio(
     **Data safety (P0-3):** refuses to write ``extract=None`` over a row
     that already has a positive extract -- ``candidate.stored_wikipedia_url
     is not None`` is a reliable proxy for that, since it is populated ONLY
-    by ``fetch_candidates(mode="repick")``, whose own WHERE clause
-    guarantees ``extract IS NOT NULL`` for every such candidate. This is
-    structural, not a per-branch reminder: a future new outcome branch
-    can't reintroduce the "--repick can destroy already-collected extracts"
+    by ``fetch_candidates(mode="repick")`` **or** ``mode="refresh"`` (LML#1192
+    review round 5 added the latter), both of whose WHERE clauses guarantee
+    ``extract IS NOT NULL`` for every such candidate. This is structural,
+    not a per-branch reminder: a future new outcome branch can't reintroduce
+    the "a repick/refresh candidate can destroy already-collected extracts"
     hole by forgetting to check, because every write -- present and future
     -- goes through here.
 
-    LML#1192 review round 4, P0-8 (partial): a refusal still advances
-    ``last_checked_at`` (never ``fetched_at``/``extract``/etc.) via
-    :func:`~entity.artist_wikipedia_bio.touch_artist_wikipedia_bio_last_checked_at`
-    -- otherwise a last_checked_at-ordered repick/refresh seed query would
-    re-select this same divergent-but-protected row forever instead of
-    moving on to the next stalest candidate.
+    LML#1192 review round 4, P0-8 / round 6, C1-1: a refusal marks
+    :func:`~entity.artist_wikipedia_bio.mark_artist_wikipedia_bio_refused`
+    -- advances ``last_checked_at`` (never ``fetched_at``/``extract``/etc.,
+    same as before) AND the new ``last_refused_at`` clock. The former keeps
+    a ``last_checked_at``-ordered repick seed progressing past this row
+    instead of re-selecting it forever; the latter is what lets
+    ``--refresh-stale``'s ORDER BY (which reads ``fetched_at``, not
+    ``last_checked_at``) also deprioritize it -- see ``_MODE_SQL["refresh"]``'s
+    C1-2 comment for why the narrower ``touch_artist_wikipedia_bio_last_checked_at``
+    this used to call wasn't enough.
     """
     if extract is None and candidate.stored_wikipedia_url is not None:
         logger.warning(
@@ -460,7 +497,7 @@ async def _write_bio(
             candidate.artist_name,
             wikipedia_url,
         )
-        await touch_artist_wikipedia_bio_last_checked_at(pg, discogs_artist_id=candidate.artist_id)
+        await mark_artist_wikipedia_bio_refused(pg, discogs_artist_id=candidate.artist_id)
         return "repick_kept_existing"
     await set_cached_artist_wikipedia_bio(
         pg,
@@ -645,8 +682,7 @@ def _build_rate_limiter(rate_per_second: float) -> AsyncLimiter:
 
 
 # LML#1192 review round 3, finding 4: covers every outcome that indicates
-# something isn't working, not just "fetch_error" -- a 100%-"negative" run
-# (live fetches happen but every summary comes back unusable) or a storm of
+# something isn't working, not just "fetch_error" -- a storm of
 # "repick_kept_existing" conflicts (the picker's choices regressed) is just
 # as strong a systemic-problem signal as a run of transient fetch errors,
 # and deserves the same protective abort. "declined" is deliberately
@@ -655,11 +691,21 @@ def _build_rate_limiter(rate_per_second: float) -> AsyncLimiter:
 # "refreshed" is also excluded -- LML#1192 review round 4, P0-2/P0-3: it's
 # a SUCCESS outcome (a repick/refresh candidate's validated pick matched
 # its stored URL and a fresh extract was written), not a failure.
+#
+# LML#1192 review round 6, C2-2: "negative" REMOVED (excluded the way
+# "declined" already was). A negative is a healthy, correctly-cached
+# result -- Wikipedia was asked and there's genuinely no page -- not a
+# failure, and treating it as one blocked the drain from ever running to
+# completion: ten consecutive negatives aborted with a non-zero exit even
+# though every one was recorded correctly. Structurally worst for
+# --retry-misses, whose candidate set is BY CONSTRUCTION previously-
+# negative rows that deterministically re-return "negative" -- a guard
+# firing on that expected steady state, not an outage, is a hard blocker
+# on the drain reaching completion before the prod flag flip.
 _FAILURE_ISH_OUTCOMES = frozenset(
     {
         "fetch_error",
         "unexpected_error",
-        "negative",
         "repick_kept_existing",
         "unresolvable",
     }
