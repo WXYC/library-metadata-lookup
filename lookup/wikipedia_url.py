@@ -214,6 +214,7 @@ class ExtractorComparison:
             below_floor=True,
         )
 
+
 def compare_wikipedia_extractors(
     urls: Sequence[str] | None, artist_name: str
 ) -> ExtractorComparison:
