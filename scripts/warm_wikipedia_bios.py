@@ -185,7 +185,7 @@ import asyncio
 import logging
 import sys
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Protocol
 
 import asyncpg
 from aiolimiter import AsyncLimiter
@@ -465,6 +465,18 @@ async def fetch_candidates(
     ]
 
 
+class ShutdownFlagProtocol(Protocol):
+    """Structural match for ``scripts._lib.signals.ShutdownFlag`` -- kept as
+    a Protocol (not an import) so this module's only runtime dependency on
+    ``scripts._lib`` is at the CLI wiring layer, mirroring
+    ``scripts/backfill_compilation_track_identity.py`` (LML#1192 cross-PR
+    review, round 7: this drain was the family's one long-running script
+    without the shared two-stage graceful Ctrl-C)."""
+
+    @property
+    def requested(self) -> bool: ...
+
+
 async def _write_bio(
     pg: PgSource,
     candidate: ArtistCandidate,
@@ -474,6 +486,7 @@ async def _write_bio(
     lang: str,
     extract: str | None,
     outcome_if_written: str,
+    dry_run: bool = False,
 ) -> str:
     """The single write path every ``process_candidate`` branch funnels
     through (LML#1192 review round 3, finding 17: the five
@@ -512,16 +525,18 @@ async def _write_bio(
             candidate.artist_name,
             wikipedia_url,
         )
-        await mark_artist_wikipedia_bio_refused(pg, discogs_artist_id=candidate.artist_id)
+        if not dry_run:
+            await mark_artist_wikipedia_bio_refused(pg, discogs_artist_id=candidate.artist_id)
         return "repick_kept_existing"
-    await set_cached_artist_wikipedia_bio(
-        pg,
-        discogs_artist_id=candidate.artist_id,
-        wikipedia_url=wikipedia_url,
-        slug_score=slug_score,
-        lang=lang,
-        extract=extract,
-    )
+    if not dry_run:
+        await set_cached_artist_wikipedia_bio(
+            pg,
+            discogs_artist_id=candidate.artist_id,
+            wikipedia_url=wikipedia_url,
+            slug_score=slug_score,
+            lang=lang,
+            extract=extract,
+        )
     return outcome_if_written
 
 
@@ -532,6 +547,7 @@ async def process_candidate(
     *,
     max_retries: int,
     rate_limiter: AsyncLimiter | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Run one candidate through the fetch-validated picker and (maybe) a write.
 
@@ -601,9 +617,10 @@ async def process_candidate(
         # reason to negative-cache) -- without a durable attempt record,
         # this candidate resurfaces at the front of every future
         # incremental run forever, since there's no row and no cursor.
-        await record_artist_wikipedia_bio_attempt(
-            pg, discogs_artist_id=candidate.artist_id, outcome=OUTCOME_FETCH_ERROR
-        )
+        if not dry_run:
+            await record_artist_wikipedia_bio_attempt(
+                pg, discogs_artist_id=candidate.artist_id, outcome=OUTCOME_FETCH_ERROR
+            )
         return OUTCOME_FETCH_ERROR
 
     picked = result.picked
@@ -614,9 +631,10 @@ async def process_candidate(
             candidate.artist_id,
             candidate.artist_name,
         )
-        await record_artist_wikipedia_bio_attempt(
-            pg, discogs_artist_id=candidate.artist_id, outcome=OUTCOME_UNRESOLVABLE
-        )
+        if not dry_run:
+            await record_artist_wikipedia_bio_attempt(
+                pg, discogs_artist_id=candidate.artist_id, outcome=OUTCOME_UNRESOLVABLE
+            )
         return OUTCOME_UNRESOLVABLE
 
     lang = picked.lang or "en"
@@ -631,6 +649,7 @@ async def process_candidate(
             lang=lang,
             extract=None,
             outcome_if_written=outcome,
+            dry_run=dry_run,
         )
 
     # resolve_and_validate_pick's contract: below_floor=False is returned
@@ -647,6 +666,7 @@ async def process_candidate(
         lang=lang,
         extract=result.summary.extract,
         outcome_if_written="refreshed" if is_refresh else "positive",
+        dry_run=dry_run,
     )
 
 
@@ -742,12 +762,26 @@ async def run_drain(
     *,
     rate_per_second: float,
     max_retries: int,
+    shutdown: ShutdownFlagProtocol | None = None,
+    dry_run: bool = False,
 ) -> DrainReport:
     report = DrainReport()
     limiter = _build_rate_limiter(rate_per_second)
     client = WikipediaClient()
     consecutive_failures = 0
     for i, candidate in enumerate(candidates, start=1):
+        # LML#1192 cross-PR review, round 7: the scripts/_lib two-stage
+        # Ctrl-C (first signal = stop at this boundary, print the summary,
+        # exit resumable) -- checked here so a multi-hour session never
+        # dies mid-candidate with no report.
+        if shutdown is not None and shutdown.requested:
+            logger.info(
+                "shutdown requested; stopping after %d/%d candidates -- "
+                "resume with the same mode later",
+                i - 1,
+                len(candidates),
+            )
+            break
         # LML#1192 review round 2, C3: a per-candidate exception must never
         # take down the whole session -- report.print_summary() (called by
         # _run, after this function returns) would otherwise never run for
@@ -763,6 +797,7 @@ async def run_drain(
                 candidate,
                 max_retries=max_retries,
                 rate_limiter=limiter,
+                dry_run=dry_run,
             )
         except Exception:
             logger.exception(
@@ -775,9 +810,10 @@ async def run_drain(
             # exception writes nothing to the content table either.
             # record_artist_wikipedia_bio_attempt already swallows its own
             # errors, so this can't turn one exception into two.
-            await record_artist_wikipedia_bio_attempt(
-                pg, discogs_artist_id=candidate.artist_id, outcome=OUTCOME_UNEXPECTED_ERROR
-            )
+            if not dry_run:
+                await record_artist_wikipedia_bio_attempt(
+                    pg, discogs_artist_id=candidate.artist_id, outcome=OUTCOME_UNEXPECTED_ERROR
+                )
             outcome = OUTCOME_UNEXPECTED_ERROR
 
         report.record(outcome)
@@ -838,10 +874,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=None, help="Per-session cap on candidates selected."
     )
     parser.add_argument(
+        "--rate",
         "--rate-per-second",
+        dest="rate",
         type=float,
         default=DEFAULT_RATE_PER_SECOND,
-        help=f"Live Wikipedia fetch rate ceiling (default {DEFAULT_RATE_PER_SECOND}).",
+        help=(
+            f"Live Wikipedia fetch rate ceiling (default {DEFAULT_RATE_PER_SECOND}). "
+            "--rate is the drain family's spelling (ytm_coverage_drain); "
+            "--rate-per-second is kept as an alias."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run the full picker + live fetches and tally outcomes, but write NOTHING "
+            "(neither content rows nor attempt records). Preview a mode's outcome mix -- "
+            "especially --repick/--refresh-stale, which rewrite every positive row they "
+            "visit -- before committing to a live pass."
+        ),
     )
     parser.add_argument(
         "--max-retries",
@@ -859,7 +911,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _run(args: argparse.Namespace) -> int:
+async def _run(args: argparse.Namespace, shutdown: ShutdownFlagProtocol | None = None) -> int:
     from config.settings import get_settings
 
     settings = get_settings()
@@ -896,11 +948,15 @@ async def _run(args: argparse.Namespace) -> int:
             print("nothing to do")
             return 0
 
+        if args.dry_run:
+            logger.info("DRY RUN: fetching and tallying, writing nothing")
         report = await run_drain(
             pg,
             candidates,
-            rate_per_second=args.rate_per_second,
+            rate_per_second=args.rate,
             max_retries=args.max_retries,
+            shutdown=shutdown,
+            dry_run=args.dry_run,
         )
         report.print_summary()
         return 1 if report.aborted else 0
@@ -909,9 +965,11 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from scripts._lib.runtime import set_up_script_runtime
+
     args = _build_arg_parser().parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
-    return asyncio.run(_run(args))
+    shutdown = set_up_script_runtime(logger=logger, verbose=args.verbose, shutdown_unit="candidate")
+    return asyncio.run(_run(args, shutdown))
 
 
 if __name__ == "__main__":
