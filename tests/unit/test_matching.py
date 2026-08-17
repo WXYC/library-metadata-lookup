@@ -11,7 +11,13 @@ from discogs.matching import (
     strip_discogs_suffix,
 )
 from discogs.service import calculate_confidence
-from lookup.matching import is_self_titled, map_library_format_to_discogs
+from lookup.matching import (
+    artist_variant_tie_break_key,
+    artist_variants_with_stripped_suffix,
+    is_self_titled,
+    map_library_format_to_discogs,
+)
+from tests.factories import make_discogs_result
 
 # ---------------------------------------------------------------------------
 # strip_discogs_suffix
@@ -408,3 +414,60 @@ class TestDetectAmbiguousFormat:
     )
     def test_non_matches_return_none(self, message):
         assert detect_ambiguous_format(message) is None
+
+
+# ---------------------------------------------------------------------------
+# LML#1206 — candidate-side artist variant widening (moved from
+# lookup/strategies/library_miss.py so the pure helper lives alongside the
+# rest of lookup/matching.py's leaf predicates) + its ranking tie-break.
+# ---------------------------------------------------------------------------
+
+
+class TestArtistVariantsWithStrippedSuffix:
+    """Review finding 5 — dedup: the common case (no suffix on the raw
+    credit) previously doubled every variant for no gain, since the
+    suffix-stripped form is byte-identical to the raw one."""
+
+    def test_dedups_when_raw_equals_stripped(self):
+        result = make_discogs_result(artist="Mavi", artist_credits=None)
+        assert artist_variants_with_stripped_suffix(result) == ["Mavi"]
+
+    def test_widens_with_stripped_form_when_suffixed(self):
+        result = make_discogs_result(artist="Mavi (12)", artist_credits=None)
+        assert artist_variants_with_stripped_suffix(result) == ["Mavi (12)", "Mavi"]
+
+    def test_qualifier_suffix_is_not_stripped(self):
+        """broad=False (numeric-only) semantics: "(UK)" is never widened."""
+        result = make_discogs_result(artist="Mavi (UK)", artist_credits=None)
+        assert artist_variants_with_stripped_suffix(result) == ["Mavi (UK)"]
+
+    def test_dedups_across_multiple_credits(self):
+        result = make_discogs_result(
+            artist="Fust, Merce Lemon", artist_credits=["Fust", "Merce Lemon"]
+        )
+        variants = artist_variants_with_stripped_suffix(result)
+        assert variants == ["Fust, Merce Lemon", "Fust", "Merce Lemon"]
+        assert len(variants) == len(set(variants))
+
+
+class TestArtistVariantTieBreakKey:
+    """Review finding 2 — the ranking flip: a bare-name credit and a
+    suffix-widened credit sharing an album now both score 100/100, so
+    LML#1097's ascending-release_id tie-break decided instead of artist
+    correctness. This key sorts an exact raw-credit match ahead of a
+    candidate that only ties via the suffix-stripped widening, before
+    release_id breaks any remaining tie."""
+
+    def test_exact_raw_match_sorts_before_stripped_only_match(self):
+        exact = make_discogs_result(release_id=900, artist="Mavi")
+        stripped_only = make_discogs_result(release_id=100, artist="Mavi (12)")
+        assert artist_variant_tie_break_key("Mavi", exact) < artist_variant_tie_break_key(
+            "Mavi", stripped_only
+        )
+
+    def test_release_id_still_breaks_ties_between_two_exact_matches(self):
+        later = make_discogs_result(release_id=200, artist="Mavi")
+        earlier = make_discogs_result(release_id=100, artist="Mavi")
+        assert artist_variant_tie_break_key("Mavi", earlier) < artist_variant_tie_break_key(
+            "Mavi", later
+        )
