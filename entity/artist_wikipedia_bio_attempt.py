@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import logging
 
+from entity.cache_toolkit import swallowing_execute
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.ddl import bootstrap_lml_cache_table
 from entity.sources import PgSource
@@ -124,14 +125,18 @@ async def record_artist_wikipedia_bio_attempt(
     Best-effort, like every other write in this module and its
     ``entity/artist_wikipedia_bio.py`` sibling -- a failure here must never
     take down a multi-hour drain session, so any PG error is logged and
-    swallowed rather than raised.
+    swallowed via ``entity.cache_toolkit.swallowing_execute`` (LML#1204
+    item 4) rather than raised. WARNING (not the toolkit's default ERROR)
+    because a lost attempt record costs only a redundant future re-attempt,
+    never collected data.
     """
-    try:
-        await pg.execute(_UPSERT_SQL, discogs_artist_id, outcome)
-    except Exception:
-        logger.warning(
-            "failed to record a wikipedia bio drain attempt for artist_id=%s (outcome=%s)",
-            discogs_artist_id,
-            outcome,
-            exc_info=True,
-        )
+    await swallowing_execute(
+        pg,
+        _UPSERT_SQL,
+        discogs_artist_id,
+        outcome,
+        logger=logger,
+        log_label="failed to record a wikipedia bio drain attempt for artist_id=%s (outcome=%s)",
+        log_args=(discogs_artist_id, outcome),
+        level=logging.WARNING,
+    )

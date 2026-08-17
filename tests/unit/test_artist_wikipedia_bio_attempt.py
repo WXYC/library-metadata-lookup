@@ -92,3 +92,50 @@ class TestSetUpArtistWikipediaBioAttemptSchema:
 
         assert any("CREATE SCHEMA" in s for s in pg.executed)
         assert any("CREATE TABLE" in s and "artist_wikipedia_bio_attempt" in s for s in pg.executed)
+
+
+@pytest.mark.asyncio
+class TestAdoptsCacheToolkit:
+    """LML#1204 item 4: the swallow-and-log write funnels through
+    ``entity.cache_toolkit.swallowing_execute`` (WARNING severity via its
+    ``level`` param) instead of a hand-rolled try/except — the exact idiom
+    that toolkit exists to own."""
+
+    async def test_write_routes_through_swallowing_execute_at_warning(self):
+        import logging
+        from unittest.mock import patch
+
+        from entity import artist_wikipedia_bio_attempt as module
+
+        pg = AsyncMock(spec=PgSource)
+        with patch.object(module, "swallowing_execute", new_callable=AsyncMock) as mock_execute:
+            await record_artist_wikipedia_bio_attempt(
+                pg, discogs_artist_id=_ARTIST_ID, outcome="fetch_error"
+            )
+
+        mock_execute.assert_awaited_once()
+        args = mock_execute.await_args.args
+        kwargs = mock_execute.await_args.kwargs
+        assert args[0] is pg
+        assert args[2] == _ARTIST_ID
+        assert args[3] == "fetch_error"
+        assert kwargs["logger"] is module.logger
+        assert kwargs["level"] == logging.WARNING
+
+    async def test_swallowed_failure_still_logs_the_original_warning_shape(self, caplog):
+        import logging
+
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(side_effect=RuntimeError("PG unreachable"))
+
+        with caplog.at_level(logging.WARNING, logger="entity.artist_wikipedia_bio_attempt"):
+            await record_artist_wikipedia_bio_attempt(
+                pg, discogs_artist_id=_ARTIST_ID, outcome="fetch_error"
+            )
+
+        record = next(r for r in caplog.records if r.name == "entity.artist_wikipedia_bio_attempt")
+        assert record.levelno == logging.WARNING
+        assert "failed to record a wikipedia bio drain attempt" in record.getMessage()
+        assert f"artist_id={_ARTIST_ID}" in record.getMessage()
+        assert "outcome=fetch_error" in record.getMessage()
+        assert record.exc_info

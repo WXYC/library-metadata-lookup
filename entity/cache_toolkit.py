@@ -134,6 +134,7 @@ async def swallowing_execute(
     logger: logging.Logger,
     log_label: str,
     log_args: Sequence[Any] = (),
+    level: int = logging.ERROR,
 ) -> str | None:
     """Run ``pg.execute(sql, *args)``, swallowing (and logging) any exception.
 
@@ -141,6 +142,13 @@ async def swallowing_execute(
     produced a real value still returns it even if the write-back fails.
     Same ``logger``/``log_label``/``log_args`` contract as
     :func:`swallowing_fetch`.
+
+    ``level`` (LML#1204 item 4) selects the severity of the swallowed-
+    exception log record; the default ``ERROR`` (+ traceback) is exactly the
+    ``logger.exception`` shape every pre-existing call site got, and a
+    caller whose failure is routine bookkeeping rather than lost cache value
+    (``entity/artist_wikipedia_bio_attempt.py``) can pass
+    ``logging.WARNING`` instead of hand-rolling the try/except.
 
     Returns the asyncpg command tag (e.g. ``"INSERT 0 1"``) on success, or
     ``None`` on a swallowed exception (LML#1192 review round 6, C1-1) --
@@ -154,5 +162,5 @@ async def swallowing_execute(
     try:
         return await pg.execute(sql, *args)
     except Exception:
-        logger.exception(log_label, *log_args)
+        logger.log(level, log_label, *log_args, exc_info=True)
         return None
