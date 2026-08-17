@@ -23,7 +23,6 @@ from lookup.wikipedia_url import (
     _wikipedia_slug_match_enabled,
     compare_wikipedia_extractors,
     pick_artist_wikipedia_url,
-    wikipedia_title_from_url,
 )
 
 # ---------------------------------------------------------------------------
@@ -235,6 +234,23 @@ class TestHardRejectDenylist:
         assert picked.url == "https://en.wikipedia.org/wiki/Sessa_(musician)"
         assert picked.below_floor is False
 
+    def test_synchronous_path_still_hard_rejects_a_bare_denylisted_slug(self, monkeypatch):
+        # LML#1192 review round 6, P2-2: the synchronous request path
+        # (pick_artist_wikipedia_url) has no live fetch to validate a
+        # denylisted guess against and never will (the plan's Non-goals) --
+        # unlike lookup.wikipedia_pick_validation.resolve_and_validate_pick
+        # (a fetch-capable caller, which now admits a denylisted candidate
+        # like this one -- see tests/unit/test_wikipedia_pick_validation.py),
+        # this path must keep the denylist fully decisive. The Polish/
+        # Croatian band Film's real article lives at exactly this URL, but
+        # this path has no way to know that without a fetch it can't afford.
+        monkeypatch.setenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, "true")
+        urls = ["https://en.wikipedia.org/wiki/Film"]
+        picked = pick_artist_wikipedia_url(urls, "Film")
+        assert picked is not None
+        assert picked.below_floor is True
+        assert picked.url == urls[0]  # legacy heuristic fallback, never the slug pick
+
 
 # ---------------------------------------------------------------------------
 # Language tie-break — en wins ties, foreign wikis are never rejected outright
@@ -281,8 +297,8 @@ class TestLanguageTieBreak:
     def test_mixed_case_wikipedia_domain_still_falls_back_to_the_heuristic_pick(self, monkeypatch):
         # LML#1192 review round 2, C3: scripts/warm_wikipedia_bios.py's seed
         # SQL selects candidates via a case-INSENSITIVE `au.url ILIKE
-        # '%wikipedia.org%'`, and _score_candidates's _WIKI_URL_RE matches
-        # case-insensitively too (re.IGNORECASE) -- but the legacy heuristic
+        # '%wikipedia.org%'`, and lookup.wikipedia_candidates.score_candidates's
+        # regex matches case-insensitively too (re.IGNORECASE) -- but the legacy heuristic
         # fallback used a case-SENSITIVE `"wikipedia.org" in url` substring
         # check. A mixed-case domain ("en.Wikipedia.org") that scores below
         # the floor would make compare_wikipedia_extractors return a real
@@ -493,39 +509,6 @@ class TestExtractorComparisonResolve:
         assert picked is not None
         assert picked.url == urls[0]
         assert picked.lang == "de"
-
-
-# ---------------------------------------------------------------------------
-# wikipedia_title_from_url — the URL -> title conversion the warm task and
-# the offline drain both need to call clients.wikipedia.WikipediaClient
-# ---------------------------------------------------------------------------
-
-
-class TestWikipediaTitleFromUrl:
-    def test_extracts_decoded_space_form_title(self):
-        assert (
-            wikipedia_title_from_url("https://en.wikipedia.org/wiki/Duke_Ellington")
-            == "Duke Ellington"
-        )
-
-    def test_url_encoded_characters_are_decoded(self):
-        assert (
-            wikipedia_title_from_url("https://en.wikipedia.org/wiki/Sessa_%282%29") == "Sessa (2)"
-        )
-
-    def test_strips_query_and_fragment(self):
-        assert (
-            wikipedia_title_from_url(
-                "https://en.wikipedia.org/wiki/Stereolab?action=history#History"
-            )
-            == "Stereolab"
-        )
-
-    def test_non_wikipedia_url_returns_none(self):
-        assert wikipedia_title_from_url("https://stereolab.example") is None
-
-    def test_empty_slug_returns_none(self):
-        assert wikipedia_title_from_url("https://en.wikipedia.org/wiki/") is None
 
 
 # ---------------------------------------------------------------------------

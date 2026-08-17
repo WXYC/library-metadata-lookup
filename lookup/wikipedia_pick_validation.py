@@ -14,7 +14,7 @@ distinguish these — the deciding signal (what the page actually IS) lives
 in the fetched payload, not the URL.
 
 :func:`resolve_and_validate_pick` is the fix: rank candidates by
-``lookup.wikipedia_url._candidate_sort_key`` (kept as a deterministic,
+``lookup.wikipedia_candidates.candidate_sort_key`` (kept as a deterministic,
 order-independent TRY order — not the final answer), then fetch and
 validate each in turn against the caller-supplied ``fetch`` callable,
 using the FIRST one whose fetch succeeds (``clients.wikipedia
@@ -23,6 +23,15 @@ right reasons here — a disambiguation page's ``type`` fails its
 ``"standard"`` check, and a 404'd qualified slug returns ``None`` outright
 — so no new validation logic is needed at the client layer, only a caller
 that tries more than one candidate).
+
+LML#1192 review round 6, P2-2: this is a fetch-CAPABLE caller (this
+function pays for the live fetch below), so it scores with
+``include_denylisted=True`` — a slug the hard-reject denylist would flag
+(``Film``, ``Single``, ``Ep``, ...) is still admitted and ranked (after
+every non-denylisted candidate — see ``lookup.wikipedia_candidates
+.candidate_sort_key``), rather than deleted before the payload this
+function already fetches gets a say. See that module's docstring for the
+full fetch-capable/synchronous asymmetry this function is one half of.
 
 This can only live where a live fetch is already happening. The offline
 drain (``scripts/warm_wikipedia_bios.py``) uses it — that is its primary
@@ -68,13 +77,13 @@ from dataclasses import dataclass
 
 from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
 from clients.wikipedia import WikipediaSummary
-from lookup.wikipedia_url import (
-    PickedWikiUrl,
-    _candidate_sort_key,
-    _extract_lang,
-    _first_wikipedia_match,
-    _score_candidates,
+from lookup.wikipedia_candidates import (
+    candidate_sort_key,
+    extract_lang,
+    first_wikipedia_match,
+    score_candidates,
 )
+from lookup.wikipedia_url import PickedWikiUrl
 
 FetchSummary = Callable[[str, str], Awaitable[WikipediaSummary | None]]
 """``(url, lang) -> WikipediaSummary | None`` — a thin wrapper around
@@ -149,14 +158,19 @@ async def resolve_and_validate_pick(
     treating the fallback as an authoritative negative (see that field's
     docstring).
     """
-    heuristic_pick = _first_wikipedia_match(urls)
+    heuristic_pick = first_wikipedia_match(urls)
     if heuristic_pick is None:
         return ValidatedPick(picked=None, summary=None)
 
-    scored = _score_candidates(urls, artist_name or "")
+    # LML#1192 review round 6, P2-2: include_denylisted=True -- this
+    # function is fetch-capable, so a hard-reject-denylisted candidate is
+    # still admitted (ranked after every non-denylisted one) rather than
+    # deleted before the live fetch below gets a chance to confirm or
+    # reject it. See lookup.wikipedia_candidates's module docstring.
+    scored = score_candidates(urls, artist_name or "", include_denylisted=True)
     ranked = sorted(
         (c for c in scored if c.score >= SCORE_MATCH_ACCEPTANCE_FLOOR),
-        key=_candidate_sort_key,
+        key=candidate_sort_key,
         reverse=True,
     )
     # LML#1192 review round 6, C2-1: computed BEFORE slicing -- True only
@@ -183,7 +197,7 @@ async def resolve_and_validate_pick(
     heuristic_score = next((c.score for c in scored if c.url == heuristic_pick), 0.0)
     picked = PickedWikiUrl(
         url=heuristic_pick,
-        lang=_extract_lang(heuristic_pick),
+        lang=extract_lang(heuristic_pick),
         slug_score=heuristic_score,
         below_floor=True,
     )

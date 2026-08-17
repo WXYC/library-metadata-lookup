@@ -25,6 +25,18 @@ bio-fetch gate checks ``below_floor`` before ever touching the network, so
 that gate closed. Shadow telemetry (the ``wikipedia_slug_pick`` projection)
 fires unconditionally so production divergence between the two picks is
 quantified before the flag ever flips.
+
+LML#1192 review round 6: candidate URL parsing, slug scoring, the
+hard-reject denylist, and language normalization moved to
+``lookup/wikipedia_candidates.py`` — this module owns the SERVING decision
+(flag + floor gate) and shadow telemetry, and calls into that one for the
+scoring mechanics. This module's own decision layer
+(:func:`pick_artist_wikipedia_url`) always scores with the denylist fully
+decisive (``include_denylisted=False``, the default) — see the extracted
+module's docstring for why: this is the synchronous, no-fetch request path,
+which has no live payload to validate a denylisted guess against and never
+will (the plan's Non-goals rule out a live Wikipedia dependency on
+``/lookup``), so the denylist must stay this path's only defense.
 """
 
 from __future__ import annotations
@@ -32,17 +44,17 @@ from __future__ import annotations
 import logging
 import os
 import random
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from urllib.parse import unquote
 
 import sentry_sdk
 
-from clients.streaming.matching import (
-    SCORE_MATCH_ACCEPTANCE_FLOOR,
-    score_match,
-    strip_discogs_disambig,
+from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
+from lookup.wikipedia_candidates import (
+    extract_lang,
+    first_wikipedia_match,
+    score_candidates,
+    select_best,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,190 +96,6 @@ class PickedWikiUrl:
     lang: str | None
     slug_score: float
     below_floor: bool
-
-
-_WIKI_URL_RE = re.compile(r"^https?://([a-z0-9.-]+)\.wikipedia\.org/wiki/(.+)$", re.IGNORECASE)
-_LANG_ONLY_RE = re.compile(r"^https?://([a-z0-9.-]+)\.wikipedia\.org", re.IGNORECASE)
-
-# Hard-reject qualifiers (LML#513): a slug whose trailing parenthetical (or
-# bare trailing token/phrase) NAMES one of these as its last word is a
-# non-artist page — rejected BEFORE any disambig stripping, since stripping
-# first would destroy the only signal separating an eponymous album/song
-# page from the artist page itself (``Sessa_(album)`` strips and scores 100
-# against artist ``Sessa`` exactly like the real ``Sessa_(2)`` disambiguator
-# would). ``mixtape``/``compilation`` were added after the LML#1192 review
-# (round 2) found real WXYC catalog collisions (Chuquimamani-Condori's
-# "Edits" is a mixtape; compilation-album qualifiers are common on VA-style
-# releases).
-#
-# LML#1192 review (round 2), finding A1: matching REQUIRES the qualifier to
-# be the trailing WORD inside the parenthetical (or at the bare end of the
-# slug), not the WHOLE parenthetical/slug — a compound qualifier like
-# ``(2015 album)``, ``(Jeff Buckley album)``, or ``(compilation album)``
-# must reject on its trailing ``album`` token exactly as readily as a bare
-# ``(album)`` does. The original implementation required exact equality
-# against the whole bracketed content, so any qualifier with a preceding
-# year/name/adjective sailed straight through to scoring and stripped down
-# to a leak that could score 100 against an unrelated artist sharing the
-# slug's prefix.
-_HARD_REJECT_QUALIFIERS: frozenset[str] = frozenset(
-    {
-        "album",
-        "song",
-        "single",
-        "ep",
-        "soundtrack",
-        "film",
-        "tv series",
-        "discography",
-        "mixtape",
-        "compilation",
-    }
-)
-# Longest-first so "tv series" (which itself contains no shorter alternative
-# as a strict prefix) and any future multi-word entry can't be pre-empted by
-# a shorter alternative matching first within the same alternation.
-_QUALIFIER_ALTERNATION = "|".join(
-    re.escape(q) for q in sorted(_HARD_REJECT_QUALIFIERS, key=len, reverse=True)
-)
-# A trailing parenthetical whose LAST word (immediately before the closing
-# paren) is a denylist qualifier -- content before that word, if any, is
-# unconstrained, so "(2015 album)" / "(Jeff Buckley album)" match on their
-# trailing "album" exactly as "(album)" alone does.
-_TRAILING_PAREN_QUALIFIER_RE = re.compile(
-    rf"\([^()]*\b(?:{_QUALIFIER_ALTERNATION})\)\s*$", re.IGNORECASE
-)
-# The no-parens form: the qualifier is the trailing word of the whole slug
-# (preceded by whitespace, or the entire slug), e.g. "An Artist Discography".
-_TRAILING_BARE_QUALIFIER_RE = re.compile(
-    rf"(?:^|\s)(?:{_QUALIFIER_ALTERNATION})\s*$", re.IGNORECASE
-)
-
-
-def _is_hard_rejected_slug(decoded_slug: str) -> bool:
-    """True when ``decoded_slug`` names a non-artist qualifier (see above)."""
-    stripped = decoded_slug.strip()
-    return bool(
-        _TRAILING_PAREN_QUALIFIER_RE.search(stripped)
-        or _TRAILING_BARE_QUALIFIER_RE.search(stripped)
-    )
-
-
-def _first_wikipedia_match(urls: Sequence[str] | None) -> str | None:
-    """The legacy heuristic: first URL substring-containing ``wikipedia.org``
-    (case-insensitively).
-
-    LML#1192 review round 2, C3: this must stay case-insensitive to agree
-    with the two other places a "does this URL point at wikipedia.org"
-    judgment gets made -- ``_WIKI_URL_RE``'s ``re.IGNORECASE`` in
-    ``_score_candidates`` above, and ``scripts/warm_wikipedia_bios.py``'s
-    seed SQL (``au.url ILIKE '%wikipedia.org%'``). A case-sensitive check
-    here let a mixed-case domain (e.g. ``en.Wikipedia.org``) score a real
-    ``slug_pick`` via the regex while this function returned ``None`` for
-    the same URL -- silently dropping the URL entirely from a below-floor
-    ``PickedWikiUrl`` on the live read path (``compare_wikipedia_extractors``);
-    also used directly by ``lookup.wikipedia_pick_validation.resolve_and_validate_pick``
-    (LML#1192 review round 4, P0-2) for the offline drain and background
-    miss-warm's fetch-validated heuristic fallback.
-    """
-    for url in urls or ():
-        if isinstance(url, str) and "wikipedia.org" in url.lower():
-            return url
-    return None
-
-
-def _normalize_lang_subdomain(raw: str) -> str:
-    """LML#1192 review round 4, P0-7: ``www.wikipedia.org/wiki/...`` is a
-    realistic input (``artist_url`` is unvalidated free text, and a
-    browser 301s a bare ``wikipedia.org`` root to the ``www`` host) — but
-    ``www`` is a hostname prefix, not a language code. Verified live: the
-    REST API 500s on ``https://www.wikipedia.org/api/rest_v1/...`` (``en.``
-    200s for the same title), so an un-normalized ``www`` persists into
-    the ``NOT NULL lang`` column and generates permanent ``fetch_error``
-    residue on every retry (feeds LML#1192 review round 4, P0-8). No
-    exhaustive language-code validation here — just the one confirmed,
-    realistic non-language subdomain.
-    """
-    return "en" if raw == "www" else raw
-
-
-def _extract_lang(url: str) -> str | None:
-    match = _LANG_ONLY_RE.match(url.strip())
-    return _normalize_lang_subdomain(match.group(1).lower()) if match else None
-
-
-@dataclass(frozen=True)
-class _ScoredCandidate:
-    url: str
-    lang: str
-    score: float
-
-
-def _score_candidates(urls: Sequence[str] | None, artist_name: str) -> list[_ScoredCandidate]:
-    # LML#1192 review (round 2), finding A2: strip the QUERY artist name's
-    # own Discogs disambiguation suffix too, symmetrically with the
-    # candidate slug -- mirrors lookup/artist_resolution.py's
-    # _artist_pair_verified (which strips both sides for exactly this
-    # reason). A resolved Discogs artist name routinely carries its own
-    # "(N)"/"(UK)"/"(band)" disambiguator (e.g. "Sessa (2)"), and without
-    # stripping it here, "Sessa" vs "Sessa (2)" scores 71.43 -- below the 80
-    # floor -- so a disambiguated artist could never match its own correct
-    # Wikipedia page. Falls back to the original string if stripping would
-    # leave it empty (an artist name that was entirely a disambiguator).
-    artist_stripped = strip_discogs_disambig(artist_name).strip() or artist_name
-    scored: list[_ScoredCandidate] = []
-    for url in urls or ():
-        if not isinstance(url, str):
-            continue
-        match = _WIKI_URL_RE.match(url.strip())
-        if not match:
-            continue
-        lang = _normalize_lang_subdomain(match.group(1).lower())
-        raw_slug = match.group(2).split("#", 1)[0].split("?", 1)[0]
-        decoded_slug = unquote(raw_slug).replace("_", " ").strip()
-        if not decoded_slug or _is_hard_rejected_slug(decoded_slug):
-            continue
-        stripped = strip_discogs_disambig(decoded_slug).strip()
-        if not stripped:
-            continue
-        score = score_match(stripped, artist_stripped)
-        scored.append(_ScoredCandidate(url=url, lang=lang, score=score))
-    return scored
-
-
-def _candidate_sort_key(candidate: _ScoredCandidate) -> tuple[float, bool, int, str]:
-    """TRY-ORDER ranking key: score desc, ``en`` breaks a tie, shorter URL
-    breaks a remaining tie, the URL string is the final deterministic
-    tiebreak (total order — LML#1192 round 2, C1: two callers can see the
-    same candidate set in different input orders). Shared by
-    :func:`_select_best` (picks rank 0) and
-    ``lookup.wikipedia_pick_validation`` (round 4, P0-2 — needs the full
-    ranked list to try candidates against a live fetch in order).
-
-    Round 3 found sorting the bare URL alone picks the qualified
-    (frequently WRONG — a disambiguation/type page) URL 100% of a tie,
-    since a bare slug always string-prefixes its qualified sibling. Round
-    4 found "prefer shorter" is ALSO wrong standalone — verified live:
-    ``Low``/``Sade``'s BARE titles are real disambiguation pages (the
-    qualified url is correct); ``Sun Ra``/``Stereolab``/``Cat Power``'s
-    qualified slugs don't exist as pages at all (the bare url is correct).
-    No string rule can tell these apart — the deciding signal isn't in
-    either URL. This key therefore only orders TRY order now; the final
-    answer comes from validating each candidate against its fetched
-    payload (``lookup.wikipedia_pick_validation.resolve_and_validate_pick``),
-    falling through to the next-ranked candidate on rejection.
-    """
-    return (candidate.score, candidate.lang == "en", -len(candidate.url), candidate.url)
-
-
-def _select_best(scored: list[_ScoredCandidate]) -> _ScoredCandidate | None:
-    """The top-ranked candidate under :func:`_candidate_sort_key` — a
-    best-guess for the synchronous, no-fetch live path
-    (``pick_artist_wikipedia_url``, which cannot afford a live Wikipedia
-    call on ``/lookup``). Fetch-capable callers use
-    ``lookup.wikipedia_pick_validation`` instead for the full ranked list.
-    """
-    return max(scored, key=_candidate_sort_key, default=None)
 
 
 def _project_wikipedia_slug_pick(
@@ -378,7 +206,7 @@ class ExtractorComparison:
                 slug_score=self.slug_score,
                 below_floor=False,
             )
-        fallback_lang = _extract_lang(self.heuristic_pick or "")
+        fallback_lang = extract_lang(self.heuristic_pick or "")
         return PickedWikiUrl(
             url=self.heuristic_pick,
             lang=fallback_lang,
@@ -389,33 +217,23 @@ class ExtractorComparison:
 def compare_wikipedia_extractors(
     urls: Sequence[str] | None, artist_name: str
 ) -> ExtractorComparison:
-    """Run both extractors over ``urls`` and return their raw picks."""
-    heuristic_url = _first_wikipedia_match(urls)
-    best = _select_best(_score_candidates(urls, artist_name or ""))
+    """Run both extractors over ``urls`` and return their raw picks.
+
+    LML#1192 review round 6: ``score_candidates`` is called with
+    ``include_denylisted`` left at its default (``False``) — the
+    synchronous request path always keeps the hard-reject denylist fully
+    decisive, since it has no live fetch to validate a denylisted guess
+    against. See ``lookup/wikipedia_candidates.py``'s module docstring for
+    the fetch-capable/sync asymmetry this is one half of.
+    """
+    heuristic_url = first_wikipedia_match(urls)
+    best = select_best(score_candidates(urls, artist_name or ""))
     return ExtractorComparison(
         heuristic_pick=heuristic_url,
         slug_pick=best.url if best is not None else None,
         slug_score=best.score if best is not None else 0.0,
         slug_lang=best.lang if best is not None else None,
     )
-
-
-def wikipedia_title_from_url(url: str) -> str | None:
-    """Extract the decoded, space-form page title from a ``wikipedia.org``
-    ``/wiki/`` URL — the form ``clients.wikipedia.WikipediaClient.get_summary``
-    expects (it re-encodes internally, so the round trip is safe). ``None``
-    when ``url`` isn't a recognizable wiki URL, or its slug is empty.
-
-    Shared by ``lookup/enrichment/wikipedia_warm.py`` and
-    ``scripts/warm_wikipedia_bios.py``, both of which need to turn a stored
-    ``wikipedia_url`` back into a fetchable title.
-    """
-    match = _WIKI_URL_RE.match(url.strip())
-    if not match:
-        return None
-    raw_slug = match.group(2).split("#", 1)[0].split("?", 1)[0]
-    decoded = unquote(raw_slug).replace("_", " ").strip()
-    return decoded or None
 
 
 def pick_artist_wikipedia_url(urls: Sequence[str] | None, artist_name: str) -> PickedWikiUrl | None:

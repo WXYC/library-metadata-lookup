@@ -169,6 +169,103 @@ class TestTryOrderAndShortCircuit:
 
 
 @pytest.mark.asyncio
+class TestDenylistedCandidateIsAdmittedAndValidated:
+    """LML#1192 review round 6, P2-2: this is the fetch-capable caller, so a
+    hard-reject-denylisted candidate is admitted (score_candidates is called
+    with ``include_denylisted=True``) and, once the live payload confirms
+    it, WINS -- the whole point of demoting the denylist from hard-reject to
+    ranking penalty for a caller that already pays for the live fetch.
+    """
+
+    async def test_a_denylisted_slug_that_validates_wins(self):
+        # The Polish/Croatian band Film's real article lives at exactly
+        # this URL -- before this round, this candidate was deleted before
+        # ever reaching the fetch below, and this call would have returned
+        # the below-floor fallback instead.
+        urls = ["https://en.wikipedia.org/wiki/Film"]
+
+        async def fetch(url, lang):
+            return WikipediaSummary(extract="Film were a Polish rock band.")
+
+        result = await resolve_and_validate_pick(urls, "Film", fetch=fetch)
+        assert result.picked is not None
+        assert result.picked.below_floor is False
+        assert result.picked.url == "https://en.wikipedia.org/wiki/Film"
+        assert result.summary is not None
+
+    async def test_a_denylisted_candidate_is_tried_only_after_a_non_denylisted_one(self):
+        # A real artist page AND a denylisted-but-plausible one both above
+        # floor: the non-denylisted candidate must be tried FIRST -- if it
+        # validates, the denylisted one is never even fetched.
+        urls = [
+            "https://en.wikipedia.org/wiki/Film_(disambiguation)",  # scores lower, not denylisted
+            "https://en.wikipedia.org/wiki/Film",  # scores higher, denylisted
+        ]
+        calls: list[str] = []
+
+        async def fetch(url, lang):
+            calls.append(url)
+            if url == "https://en.wikipedia.org/wiki/Film_(disambiguation)":
+                return WikipediaSummary(extract="A disambiguation page, but not rejected by type.")
+            return WikipediaSummary(extract="Film were a Polish rock band.")
+
+        result = await resolve_and_validate_pick(urls, "Film", fetch=fetch)
+        assert calls == ["https://en.wikipedia.org/wiki/Film_(disambiguation)"]
+        assert result.picked is not None
+        assert result.picked.url == "https://en.wikipedia.org/wiki/Film_(disambiguation)"
+
+    async def test_a_denylisted_candidate_that_never_validates_falls_back_correctly(self):
+        # Every candidate -- denylisted or not -- genuinely rejected: falls
+        # back to the heuristic pick, same as any other exhausted list.
+        urls = ["https://en.wikipedia.org/wiki/Film"]
+
+        async def fetch(url, lang):
+            return None
+
+        result = await resolve_and_validate_pick(urls, "Film", fetch=fetch)
+        assert result.picked is not None
+        assert result.picked.below_floor is True
+        assert result.truncated is False
+
+    async def test_admitted_denylisted_candidates_cannot_crowd_a_legitimate_one_past_the_cap(self):
+        # LML#1192 review round 6, P2-2 second-order effect the coordinator
+        # flagged explicitly: admitting denylisted candidates means MORE
+        # candidates can reach max_candidates -- this must not let a
+        # denylisted guess push a legitimate candidate beyond the cap and
+        # recreate C2-1 (pass 1) by a different route. Five denylisted
+        # candidates -- verified via score_candidates to score an exactly
+        # TIED 100.0 against "Stereolab" (the worst case: nothing about
+        # score alone would deprioritize them) -- plus the one legitimate
+        # page, capped at 2: the legitimate one must still be tried,
+        # because candidate_sort_key always ranks every non-denylisted
+        # candidate ahead of every denylisted one regardless of score -- a
+        # denylisted candidate can only ever occupy a cap slot the
+        # non-denylisted pool left idle, never one it needed.
+        denylisted_urls = [
+            f"https://en.wikipedia.org/wiki/Stereolab_({qualifier})"
+            for qualifier in ("album", "song", "ep", "single", "mixtape")
+        ]
+        urls = [*denylisted_urls, "https://en.wikipedia.org/wiki/Stereolab"]
+        calls: list[str] = []
+
+        async def fetch(url, lang):
+            calls.append(url)
+            if url == "https://en.wikipedia.org/wiki/Stereolab":
+                return WikipediaSummary(extract="Stereolab are a band.")
+            return None
+
+        result = await resolve_and_validate_pick(urls, "Stereolab", fetch=fetch, max_candidates=2)
+
+        assert "https://en.wikipedia.org/wiki/Stereolab" in calls, (
+            "the legitimate candidate must be tried within the cap even "
+            "with five higher-scoring denylisted candidates competing for it"
+        )
+        assert result.picked is not None
+        assert result.picked.url == "https://en.wikipedia.org/wiki/Stereolab"
+        assert result.picked.below_floor is False
+
+
+@pytest.mark.asyncio
 class TestMaxCandidatesCap:
     """LML#1192 review round 5: ``max_candidates`` bounds a background
     warm's worst-case sequential fetch count (a single warm task holds its
