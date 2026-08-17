@@ -4981,7 +4981,10 @@ class TestWikipediaPreferredBioSwap:
 
         _, enriched = results[0]
         assert enriched.artist_bio == "Stereolab is a band from London."
-        # The served link never changes -- Phase B only swaps the text.
+        # This cache row's own wikipedia_url is what gets served (LML#1192
+        # review round 5: the read is keyed on discogs_artist_id alone, not
+        # a URL match against any sync pick) -- it just happens to equal
+        # this fixture's sync pick too, since nothing here diverges them.
         assert enriched.wikipedia_url == "https://en.wikipedia.org/wiki/Stereolab"
 
     @pytest.mark.asyncio
