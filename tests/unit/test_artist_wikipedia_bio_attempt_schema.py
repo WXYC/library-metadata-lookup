@@ -46,7 +46,7 @@ class TestCanonicalDDLReference:
 
     def test_discogs_artist_id_is_primary_key(self):
         ddl = _SQL_REFERENCE.read_text()
-        assert "discogs_artist_id INTEGER PRIMARY KEY" in ddl
+        assert "discogs_artist_id BIGINT PRIMARY KEY" in ddl
 
     def test_has_the_expected_columns(self):
         ddl = _SQL_REFERENCE.read_text()
@@ -90,7 +90,7 @@ class TestSetUpArtistWikipediaBioAttemptSchema:
         table_sql = conn.execute.await_args_list[2].args[0]
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in schema_sql
         assert "CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio_attempt" in table_sql
-        assert "discogs_artist_id INTEGER PRIMARY KEY" in table_sql
+        assert "discogs_artist_id BIGINT PRIMARY KEY" in table_sql
 
     async def test_runs_as_one_transaction_on_one_connection(self, mock_pg_tx):
         conn = mock_pg_tx._mock_conn

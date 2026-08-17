@@ -33,6 +33,54 @@ _SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/Stereolab"
 
 
 @pytest.mark.asyncio
+class TestConnectionReuse:
+    """LML#1192 review round 6, pass 3, A5: through this round,
+    ``get_summary`` opened a fresh ``httpx.AsyncClient`` — a full TLS
+    handshake and connection setup — on EVERY call, including retries
+    within the same call and repeat calls on the SAME ``WikipediaClient``
+    instance. Both real callers hold one ``WikipediaClient`` for their
+    whole scope (the background warm holds one across up to
+    ``MAX_CANDIDATES_PER_WARM`` candidate fetches; the offline drain
+    constructs exactly one for its entire session and passes it to every
+    ``process_candidate`` call), so this was pure avoidable overhead:
+    measured 3.45ms of event-loop-blocking CPU per fetch, and ~30k
+    avoidable TLS handshakes across a full drain. Mirrors
+    ``clients/streaming/base.py``'s ``async_singleton`` adoption
+    (``tests/unit/test_http_client.py``'s ``test_get_client_returns_same_instance``
+    is the same test, one client class over).
+    """
+
+    async def test_get_client_returns_same_instance_across_calls(self):
+        client = WikipediaClient()
+        http1 = await client._get_client()
+        http2 = await client._get_client()
+        assert http1 is http2
+        await client.aclose()
+
+    async def test_two_get_summary_calls_reuse_the_same_connection(self, httpx_mock):
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            json={"type": "standard", "extract": "Stereolab are a band.", "description": "Band"},
+        )
+        httpx_mock.add_response(
+            url="https://en.wikipedia.org/api/rest_v1/page/summary/Jessica_Pratt",
+            json={"type": "standard", "extract": "Jessica Pratt is a musician.", "description": ""},
+        )
+        client = WikipediaClient()
+        with patch(
+            "clients.wikipedia.httpx.AsyncClient", wraps=httpx.AsyncClient
+        ) as mock_async_client:
+            await client.get_summary("Stereolab", "en")
+            await client.get_summary("Jessica_Pratt", "en")
+        mock_async_client.assert_called_once()
+        await client.aclose()
+
+    async def test_close_is_safe_when_no_client_was_ever_built(self):
+        client = WikipediaClient()
+        await client.aclose()  # Must not raise.
+
+
+@pytest.mark.asyncio
 class TestStandardSummary:
     async def test_standard_page_returns_extract(self, httpx_mock):
         httpx_mock.add_response(

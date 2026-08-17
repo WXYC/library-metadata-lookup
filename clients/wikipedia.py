@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from urllib.parse import quote
 
 import httpx
+from wxyc_fastapi.http import async_singleton
 
 logger = logging.getLogger(__name__)
 
@@ -190,11 +191,40 @@ def _parse_retry_after(response: httpx.Response) -> float:
 class WikipediaClient:
     """Thin wrapper over the Wikipedia REST ``/page/summary`` endpoint.
 
-    A fresh ``httpx.AsyncClient`` is opened per call (mirrors
-    ``entity/sources.py``'s ``SparqlSource`` — this is a low-frequency,
-    background-only fetch, not a hot-path client that would want a shared
-    connection pool).
+    LML#1192 review round 6, pass 3, A5: through this round, a fresh
+    ``httpx.AsyncClient`` was opened on EVERY ``get_summary`` call
+    (mirroring ``entity/sources.py``'s ``SparqlSource``) -- but unlike that
+    module's genuinely one-shot SPARQL queries, both real callers hold one
+    ``WikipediaClient`` instance for their whole scope and call
+    ``get_summary`` repeatedly on it (the background warm, up to
+    ``MAX_CANDIDATES_PER_WARM`` times per warm; the offline drain, once per
+    artist across its entire session) -- so the per-call client was pure
+    avoidable overhead: measured 3.45ms of event-loop-blocking CPU per
+    fetch, ~30k avoidable TLS handshakes across a full drain. Now a
+    lazily-built, per-INSTANCE ``async_singleton``
+    (``wxyc_fastapi.http.async_singleton``, the LML#241/#242 FD-leak-race
+    fix -- mirrors ``clients/streaming/base.py``'s identical adoption),
+    reused across every ``get_summary`` call on this instance and released
+    via :meth:`aclose`.
     """
+
+    def __init__(self) -> None:
+        self._singleton_get, self._singleton_close = async_singleton(self._make_client)
+
+    async def _make_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=_TOTAL_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+        )
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        return await self._singleton_get()
+
+    async def aclose(self) -> None:
+        """Release the underlying connection. Safe to call even if no
+        request was ever made (the singleton was never built)."""
+        await self._singleton_close()
 
     async def get_summary(
         self, title: str, lang: str, *, max_retries: int = 1
@@ -211,63 +241,59 @@ class WikipediaClient:
         outer sleep-and-retry loop across the whole batch throttle.
         """
         url = _SUMMARY_URL_TEMPLATE.format(lang=lang, title=quote(title, safe=""))
-        async with httpx.AsyncClient(
-            timeout=_TOTAL_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            headers={"User-Agent": USER_AGENT},
-        ) as client:
-            attempt = 0
-            while True:
-                try:
-                    response = await client.get(url)
-                except httpx.HTTPError as exc:
-                    raise WikipediaFetchError(f"Wikipedia summary fetch failed: {exc}") from exc
+        client = await self._get_client()
+        attempt = 0
+        while True:
+            try:
+                response = await client.get(url)
+            except httpx.HTTPError as exc:
+                raise WikipediaFetchError(f"Wikipedia summary fetch failed: {exc}") from exc
 
-                if response.status_code == 429:
-                    if attempt >= max_retries:
-                        raise WikipediaFetchError(
-                            f"Wikipedia summary fetch rate-limited after {attempt + 1} attempt(s)"
-                        )
-                    delay = _parse_retry_after(response)
-                    logger.info(
-                        "Wikipedia summary fetch 429 for %s (%s); retrying in %.1fs",
-                        title,
-                        lang,
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-                    attempt += 1
-                    continue
-
-                if response.status_code == 404:
-                    return None
-
-                if response.status_code != 200:
+            if response.status_code == 429:
+                if attempt >= max_retries:
                     raise WikipediaFetchError(
-                        f"Wikipedia summary fetch returned HTTP {response.status_code}"
+                        f"Wikipedia summary fetch rate-limited after {attempt + 1} attempt(s)"
                     )
+                delay = _parse_retry_after(response)
+                logger.info(
+                    "Wikipedia summary fetch 429 for %s (%s); retrying in %.1fs",
+                    title,
+                    lang,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                attempt += 1
+                continue
 
-                # LML#1192 review (B1-3): a malformed/non-JSON 200 body
-                # (an upstream error page misrouted through a proxy, a
-                # truncated response, ...) previously raised a raw
-                # json.JSONDecodeError -- or, for well-formed-but-wrong-
-                # shaped JSON (a bare list instead of an object), a raw
-                # AttributeError out of _parse_summary's dict access --
-                # neither of which is WikipediaFetchError, so both escaped
-                # every caller's `except WikipediaFetchError` handling.
-                # ``json.JSONDecodeError`` is a ``ValueError`` subclass.
-                try:
-                    payload = response.json()
-                except ValueError as exc:
-                    raise WikipediaFetchError(
-                        f"Wikipedia summary fetch returned a non-JSON body: {exc}"
-                    ) from exc
-                if not isinstance(payload, dict):
-                    raise WikipediaFetchError(
-                        "Wikipedia summary fetch returned a non-object JSON body "
-                        f"({type(payload).__name__})"
-                    )
-                return _parse_summary(payload)
+            if response.status_code == 404:
+                return None
+
+            if response.status_code != 200:
+                raise WikipediaFetchError(
+                    f"Wikipedia summary fetch returned HTTP {response.status_code}"
+                )
+
+            # LML#1192 review (B1-3): a malformed/non-JSON 200 body
+            # (an upstream error page misrouted through a proxy, a
+            # truncated response, ...) previously raised a raw
+            # json.JSONDecodeError -- or, for well-formed-but-wrong-
+            # shaped JSON (a bare list instead of an object), a raw
+            # AttributeError out of _parse_summary's dict access --
+            # neither of which is WikipediaFetchError, so both escaped
+            # every caller's `except WikipediaFetchError` handling.
+            # ``json.JSONDecodeError`` is a ``ValueError`` subclass.
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise WikipediaFetchError(
+                    f"Wikipedia summary fetch returned a non-JSON body: {exc}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise WikipediaFetchError(
+                    "Wikipedia summary fetch returned a non-object JSON body "
+                    f"({type(payload).__name__})"
+                )
+            return _parse_summary(payload)
 
 
 def _parse_summary(payload: dict) -> WikipediaSummary | None:
