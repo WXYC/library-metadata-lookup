@@ -131,17 +131,12 @@ class TestOwnershipBoilerplate:
     text true again)."""
 
     def test_spec_header_embeds_the_shared_ownership_paragraph(self):
+        # The generated .sql necessarily carries the same paragraph: the
+        # LML#1204 item-7 byte-identical sidecar pin covers file<->spec
+        # parity, and build_reference embeds spec.header verbatim.
         from scripts.regenerate_lml_cache_sql import _MODULES, _ownership_boilerplate
 
         expected = _ownership_boilerplate(
             "artist_wikipedia_bio_attempt", "set_up_artist_wikipedia_bio_attempt_schema"
         )
         assert expected in _MODULES["artist_wikipedia_bio_attempt"].header
-
-    def test_generated_sidecar_carries_the_shared_paragraph(self):
-        from scripts.regenerate_lml_cache_sql import _ownership_boilerplate
-
-        expected = _ownership_boilerplate(
-            "artist_wikipedia_bio_attempt", "set_up_artist_wikipedia_bio_attempt_schema"
-        )
-        assert expected in _SQL_REFERENCE.read_text()

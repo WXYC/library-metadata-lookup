@@ -306,10 +306,8 @@ async def execute_write(
 
 def _build_client(*, rate: float, search_limit: int) -> YouTubeMusicClient:
     """Build the drain's client with the operator ``--rate`` routed through
-    ``scripts._lib.ratelimit`` (LML#1204 item 6) — the direct tuple form
-    (``rate_limit=(rate, 1)``) raises ``ValueError`` on the first acquisition
-    for any fractional rate, so an operator throttling to ``--rate 0.5``
-    under 429 pressure would have killed the run instead of slowing it."""
+    ``scripts._lib.ratelimit`` (LML#1204 item 6 — see that module's docstring
+    for the fractional-rate trap the direct tuple form falls into)."""
     return YouTubeMusicClient(rate_limit=per_second_rate_limit(rate), limit=search_limit)
 
 
