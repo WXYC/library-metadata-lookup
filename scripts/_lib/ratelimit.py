@@ -16,26 +16,38 @@ operator ``--rate`` flags through it.
 
 from __future__ import annotations
 
+import math
+
 from aiolimiter import AsyncLimiter
 
 _RATE_FLOOR = 0.01
-"""Fallback for a non-positive operator rate (a typo) — throttle hard rather
-than divide by zero or go negative, matching the pre-promotion private copy."""
+"""Floor for ANY operator rate below it (not just non-positive typos) —
+throttle hard rather than divide by zero, go negative, or overflow: a
+denormal-tiny positive rate (e.g. ``5e-324``) passes a bare ``> 0`` check
+but overflows ``1 / rate`` to ``inf``, minting a limiter that never refills
+(the run hangs after one acquisition)."""
 
 
 def per_second_rate_limit(rate_per_second: float) -> tuple[float, float]:
-    """The ``(max_rate, time_period)`` pair correct for ANY positive rate.
+    """The ``(max_rate, time_period)`` pair correct for ANY finite rate.
 
     For call sites that hand a tuple to a client constructor
     (``clients.streaming.youtube_music.YouTubeMusicClient(rate_limit=...)``)
     rather than holding an ``AsyncLimiter`` themselves.
+
+    A non-finite rate (``argparse type=float`` happily parses ``inf``,
+    ``1e999``, and ``nan``) is rejected outright: ``1 / inf == 0.0`` makes
+    ``AsyncLimiter`` raise ``ZeroDivisionError`` at construction, and there
+    is no sensible throttle to substitute for "infinitely fast" — the
+    operator should re-run with a real number.
     """
-    effective_rate = rate_per_second if rate_per_second > 0 else _RATE_FLOOR
-    return (1, 1 / effective_rate)
+    if not math.isfinite(rate_per_second):
+        raise ValueError(f"operator rate (--rate) must be a finite number, got {rate_per_second!r}")
+    return (1, 1 / max(rate_per_second, _RATE_FLOOR))
 
 
 def build_rate_limiter(rate_per_second: float) -> AsyncLimiter:
     """Construct an ``AsyncLimiter`` honoring ``rate_per_second``, correct for
-    any positive rate — see the module docstring for the fractional-rate trap
-    this avoids."""
+    any finite rate (see the module docstring for the fractional-rate trap
+    this avoids; non-finite rates raise per :func:`per_second_rate_limit`)."""
     return AsyncLimiter(*per_second_rate_limit(rate_per_second))

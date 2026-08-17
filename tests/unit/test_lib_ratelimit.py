@@ -32,3 +32,29 @@ class TestBuildRateLimiter:
         for rate in (0.0, -5.0):
             limiter = build_rate_limiter(rate)
             await limiter.acquire()
+
+
+class TestFloatExtremes:
+    """LML#1204 review (execution-confirmed): ``argparse type=float`` accepts
+    ``inf``/``1e999`` — ``inf > 0`` passed the old floor check, then
+    ``1/inf == 0.0`` made ``AsyncLimiter`` raise ``ZeroDivisionError`` at
+    construction; and a denormal-tiny positive rate (``5e-324``) slipped
+    past the ``> 0`` floor, overflowed ``1/rate`` to ``inf``, and produced a
+    limiter that never refills — the run HANGS after one acquisition."""
+
+    @pytest.mark.parametrize("rate", [float("inf"), float("-inf"), float("nan"), float("1e999")])
+    def test_non_finite_rates_are_rejected_with_a_clear_error(self, rate):
+        with pytest.raises(ValueError, match="--rate"):
+            per_second_rate_limit(rate)
+
+    @pytest.mark.parametrize("rate", [5e-324, 1e-300, 0.001])
+    def test_sub_floor_positive_rates_are_floored_not_overflowed(self, rate):
+        # The floor applies to ALL rates below it, not just <= 0 — a
+        # denormal-tiny rate must never mint an infinite refill period.
+        assert per_second_rate_limit(rate) == (1, 1 / 0.01)
+
+    @pytest.mark.asyncio
+    async def test_a_denormal_rate_builds_an_acquirable_limiter(self):
+        limiter = build_rate_limiter(5e-324)
+        assert limiter.time_period != float("inf")
+        await limiter.acquire()  # must not raise (and must not hang forever)
