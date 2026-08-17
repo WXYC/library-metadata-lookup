@@ -216,3 +216,45 @@ class TestCachedValue:
         cached = CachedValue(value=1, was_present=True)
         with pytest.raises(AttributeError):
             cached.value = 2  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+class TestSwallowingExecuteLevel:
+    """LML#1204 item 4: an opt-in ``level`` so a caller wanting WARNING
+    severity (``entity/artist_wikipedia_bio_attempt.py``) can adopt the
+    toolkit instead of hand-rolling the try/except it exists to own."""
+
+    async def test_default_level_stays_error_with_exc_info(self, caplog):
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(side_effect=RuntimeError("pg down"))
+
+        with caplog.at_level(logging.ERROR, logger=_LOGGER.name):
+            await swallowing_execute(
+                pg, "UPDATE t SET x = $1", "k", logger=_LOGGER, log_label="t write failed"
+            )
+
+        record = caplog.records[0]
+        assert record.levelno == logging.ERROR
+        assert record.exc_info
+
+    async def test_warning_level_logs_at_warning_preserving_message_and_exc_info(self, caplog):
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(side_effect=RuntimeError("pg down"))
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER.name):
+            result = await swallowing_execute(
+                pg,
+                "UPDATE t SET x = $1",
+                "Juana Molina",
+                logger=_LOGGER,
+                log_label="t set failed for %s",
+                log_args=("Juana Molina",),
+                level=logging.WARNING,
+            )
+
+        assert result is None
+        record = caplog.records[0]
+        assert record.levelno == logging.WARNING
+        assert record.getMessage() == "t set failed for Juana Molina"
+        assert record.name == _LOGGER.name
+        assert record.exc_info
