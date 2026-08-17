@@ -37,18 +37,13 @@ This can only live where a live fetch is already happening. The offline
 drain (``scripts/warm_wikipedia_bios.py``) uses it — that is its primary
 purpose, and it is the primary population mechanism for the existing
 catalog. The background miss-warm (``lookup/enrichment/wikipedia_warm.py``)
-is the OTHER live-fetch site sharing this exact tiebreak exposure (it also
-writes ``lml_cache.artist_wikipedia_bio`` from a single, unvalidated
-``PickedWikiUrl`` computed upstream by ``lookup.wikipedia_url.pick_artist_wikipedia_url``)
-but is **NOT yet wired to this module** — ``schedule_wikipedia_bio_warm``
-still takes a single pre-computed pick rather than the candidate URL list
-this function needs, so a Low/Sade/Sun-Ra-class wrong-page pick can still
-be written via that path even after the drain and any future re-drain are
-correct. Rewiring it requires threading the original ``urls``/``artist_name``
-through ``resolve_served_bio`` → ``_maybe_schedule_wikipedia_bio_warm`` →
-``schedule_wikipedia_bio_warm`` → ``_run_warm`` (four
-``lookup/enrichment/*.py`` files), a separate unit of work from LML#1192
-review round 4, P0-2 — tracked, not done.
+is the OTHER live-fetch site sharing this exact tiebreak exposure, and
+**is now wired to this module too** (LML#1192 review round 5, commit
+``987406a``): ``schedule_wikipedia_bio_warm``/``_run_warm`` take
+``artist_name``/``urls`` and run :func:`resolve_and_validate_pick` — the
+same picker the drain uses — instead of writing from a single, unvalidated
+``PickedWikiUrl``. Both live-fetch write sites now share this module; a
+Low/Sade/Sun-Ra-class wrong-page pick can no longer be written by either.
 
 The live ``/lookup`` request path's synchronous pick
 (``lookup.wikipedia_url.pick_artist_wikipedia_url``) is UNCHANGED and stays
@@ -56,11 +51,16 @@ that way by design — it still returns a best-guess (the single top-ranked
 candidate, unvalidated) for the response's ``wikipedia_url`` field, since
 the plan's Non-goals rule out a live Wikipedia dependency on the request
 path. The two pick strategies can therefore disagree on WHICH url the
-response cites vs. which the cache eventually serves text for — the
-existing self-healing URL-match predicate in
-``entity/artist_wikipedia_bio.py`` already handles that divergence (a
-cache row keyed on a since-superseded pick reads as a miss, not a stale
-hit), unchanged by this module.
+response cites vs. which the cache eventually serves text for. Through
+round 4 that divergence was handled by a read predicate that treated a
+cache row keyed on a since-superseded pick as a miss rather than a stale
+hit; round 5 deleted that predicate (it made a validated warm's own write
+permanently unreadable by a caller whose sync pick never changes — see
+``entity/artist_wikipedia_bio.py``'s module docstring for the full
+account) in favor of a simpler rule this module doesn't need to know
+about: the cache row is authoritative, read by ``discogs_artist_id`` alone,
+and always serves whichever ``wikipedia_url`` it itself carries alongside
+its ``extract`` — never the live request's own sync pick.
 
 Also fixes LML#1192 review round 4, P0-13 (folded in here rather than
 patched in ``ExtractorComparison.resolve()``): the below-floor fallback's
