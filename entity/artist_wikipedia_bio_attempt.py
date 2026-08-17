@@ -3,14 +3,17 @@
 ``scripts/warm_wikipedia_bios.py``'s ``incremental`` mode selects artist ids
 with NO row at all in ``lml_cache.artist_wikipedia_bio``, ordered by the
 fixed ``au.artist_id`` (no cursor column, since there is no row to carry
-one). Four outcomes leave NOTHING written there: ``fetch_error`` (a
-transient couldn't-ask, deliberately never negative-cached — see that
-module's docstring), ``unresolvable`` (defensive),
-``unexpected_error`` (an unhandled exception, caught one layer up in
-``run_drain``), and ``truncated`` (the background miss-warm's
-``MAX_CANDIDATES_PER_WARM`` cap ran out before every real candidate was
-tried — LML#1192 review round 6, C2-1/A1 — so no authoritative negative
-may be written). The vocabulary is owned HERE as the ``OUTCOME_*``
+one). The write-nothing outcomes: ``fetch_error`` (a transient
+couldn't-ask, deliberately never negative-cached — see that module's
+docstring), ``unresolvable`` (defensive), ``unexpected_error`` (an
+unhandled exception, caught one layer up in ``run_drain``), ``truncated``
+(the background miss-warm's ``MAX_CANDIDATES_PER_WARM`` cap ran out before
+every real candidate was tried — LML#1192 review round 6, C2-1/A1 — so no
+authoritative negative may be written), and ``declined`` (the background
+miss-warm's zero-fetch below-floor decline, LML#1204 review — warm-only
+today, since the offline drain instead records its declines as durable
+NULL-extract CONTENT rows per its module docstring, which is strictly
+stronger). The vocabulary is owned HERE as the ``OUTCOME_*``
 constants below (LML#1192 cross-PR review, round 7): writers import them
 rather than spelling literals, so a new outcome must be added to
 :data:`KNOWN_ATTEMPT_OUTCOMES` — and to this paragraph — to exist at all.
@@ -81,9 +84,16 @@ OUTCOME_FETCH_ERROR = "fetch_error"
 OUTCOME_UNRESOLVABLE = "unresolvable"
 OUTCOME_UNEXPECTED_ERROR = "unexpected_error"
 OUTCOME_TRUNCATED = "truncated"
+OUTCOME_DECLINED = "declined"
 
 KNOWN_ATTEMPT_OUTCOMES: frozenset[str] = frozenset(
-    {OUTCOME_FETCH_ERROR, OUTCOME_UNRESOLVABLE, OUTCOME_UNEXPECTED_ERROR, OUTCOME_TRUNCATED}
+    {
+        OUTCOME_FETCH_ERROR,
+        OUTCOME_UNRESOLVABLE,
+        OUTCOME_UNEXPECTED_ERROR,
+        OUTCOME_TRUNCATED,
+        OUTCOME_DECLINED,
+    }
 )
 """Every value the ``outcome`` column may carry. Kept in lockstep with the
 constants above and the module docstring's outcome paragraph."""

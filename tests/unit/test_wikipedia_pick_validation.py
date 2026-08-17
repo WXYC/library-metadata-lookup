@@ -583,3 +583,81 @@ class TestMakeSummaryFetcher:
 
         assert await fetch("https://example.com/not-wikipedia", "en") is None
         client.get_summary.assert_not_awaited()
+
+
+class TestWriteNothingAttemptOutcome:
+    """LML#1204 review: the verdict→attempt-outcome mapping used to live as
+    hand-maintained branch ladders in BOTH live-fetch callers, and twice a
+    verdict was wired into one caller and not the other. One derivation
+    beside ``ValidatedPick``; only pg/dry-run plumbing stays caller-side."""
+
+    def _pick(self, *, below_floor: bool):
+        from lookup.wikipedia_url import PickedWikiUrl
+
+        return PickedWikiUrl(
+            url="https://en.wikipedia.org/wiki/Stereolab",
+            lang="en",
+            slug_score=100.0,
+            below_floor=below_floor,
+        )
+
+    def test_no_candidate_at_all_is_unresolvable(self):
+        from entity.artist_wikipedia_bio_attempt import OUTCOME_UNRESOLVABLE
+        from lookup.wikipedia_pick_validation import (
+            ValidatedPick,
+            write_nothing_attempt_outcome,
+        )
+
+        result = ValidatedPick(picked=None, summary=None)
+        assert write_nothing_attempt_outcome(result) is OUTCOME_UNRESOLVABLE
+
+    def test_truncated_is_truncated(self):
+        from entity.artist_wikipedia_bio_attempt import OUTCOME_TRUNCATED
+        from lookup.wikipedia_pick_validation import (
+            ValidatedPick,
+            write_nothing_attempt_outcome,
+        )
+
+        result = ValidatedPick(
+            picked=self._pick(below_floor=True),
+            summary=None,
+            truncated=True,
+            live_fetch_attempted=True,
+        )
+        assert write_nothing_attempt_outcome(result) is OUTCOME_TRUNCATED
+
+    def test_zero_fetch_below_floor_is_declined(self):
+        from entity.artist_wikipedia_bio_attempt import OUTCOME_DECLINED
+        from lookup.wikipedia_pick_validation import (
+            ValidatedPick,
+            write_nothing_attempt_outcome,
+        )
+
+        result = ValidatedPick(
+            picked=self._pick(below_floor=True), summary=None, live_fetch_attempted=False
+        )
+        assert write_nothing_attempt_outcome(result) is OUTCOME_DECLINED
+
+    def test_a_fetched_and_exhausted_negative_supports_a_content_write(self):
+        from lookup.wikipedia_pick_validation import (
+            ValidatedPick,
+            write_nothing_attempt_outcome,
+        )
+
+        result = ValidatedPick(
+            picked=self._pick(below_floor=True), summary=None, live_fetch_attempted=True
+        )
+        assert write_nothing_attempt_outcome(result) is None
+
+    def test_a_winning_pick_supports_a_content_write(self):
+        from lookup.wikipedia_pick_validation import (
+            ValidatedPick,
+            write_nothing_attempt_outcome,
+        )
+
+        result = ValidatedPick(
+            picked=self._pick(below_floor=False),
+            summary=_SUMMARY,
+            live_fetch_attempted=True,
+        )
+        assert write_nothing_attempt_outcome(result) is None

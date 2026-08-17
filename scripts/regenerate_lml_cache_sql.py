@@ -196,8 +196,8 @@ _MODULES: dict[str, SidecarSpec] = {
 -- (LML#1192 review round 4, P0-8).
 --
 -- Canonical DDL reference for `lml_cache.artist_wikipedia_bio_attempt`: one
--- row per Discogs artist id that a couldn't-ask outcome (fetch_error /
--- unresolvable / unexpected_error / truncated) was recorded for, whether by the offline
+-- row per Discogs artist id that a write-nothing outcome (fetch_error /
+-- unresolvable / unexpected_error / truncated / declined) was recorded for, whether by the offline
 -- drain (`scripts/warm_wikipedia_bios.py`) or the background miss-warm task
 -- (`lookup/enrichment/wikipedia_warm.py`). Without this record, the drain's
 -- `--incremental` mode's fixed `au.artist_id` ordering with no cursor
@@ -233,7 +233,7 @@ _MODULES: dict[str, SidecarSpec] = {
 -- outcome refreshes it via the UPSERT rather than growing a second row.
 -- `outcome` -- the label recorded (a member of the OUTCOME_* vocabulary
 -- entity/artist_wikipedia_bio_attempt.py owns: "fetch_error" / "unresolvable" /
--- "unexpected_error" / "truncated"), audit-only, never compared.""",
+-- "unexpected_error" / "truncated" / "declined"), audit-only, never compared.""",
         },
     ),
     "compilation_track_identity": SidecarSpec(

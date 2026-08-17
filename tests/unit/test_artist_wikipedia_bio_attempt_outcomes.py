@@ -29,6 +29,7 @@ from pathlib import Path
 
 from entity.artist_wikipedia_bio_attempt import (
     KNOWN_ATTEMPT_OUTCOMES,
+    OUTCOME_DECLINED,
     OUTCOME_FETCH_ERROR,
     OUTCOME_TRUNCATED,
     OUTCOME_UNEXPECTED_ERROR,
@@ -56,6 +57,7 @@ class TestOutcomeVocabularyOwnership:
         assert OUTCOME_UNRESOLVABLE == "unresolvable"
         assert OUTCOME_UNEXPECTED_ERROR == "unexpected_error"
         assert OUTCOME_TRUNCATED == "truncated"
+        assert OUTCOME_DECLINED == "declined"
 
     def test_roster_is_total_over_the_constants(self):
         assert KNOWN_ATTEMPT_OUTCOMES == frozenset(
@@ -64,6 +66,7 @@ class TestOutcomeVocabularyOwnership:
                 OUTCOME_UNRESOLVABLE,
                 OUTCOME_UNEXPECTED_ERROR,
                 OUTCOME_TRUNCATED,
+                OUTCOME_DECLINED,
             }
         )
 

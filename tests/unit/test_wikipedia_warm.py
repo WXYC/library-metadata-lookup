@@ -450,3 +450,35 @@ class TestNoResolvablePickRecordsAttempt:
 
         mock_set.assert_not_awaited()
         mock_record.assert_awaited_once_with(pg, discogs_artist_id=99, outcome=OUTCOME_UNRESOLVABLE)
+
+
+@pytest.mark.asyncio
+class TestZeroFetchDeclineRecordsAttempt:
+    """LML#1204 review: the below-floor zero-fetch decline used to return
+    without any durable record — leaving the artist a schedulable miss
+    forever, the exact pathology the attempt record exists to prevent, and
+    a divergence from the offline drain (which durably records its declines
+    as content rows). The warm now records a ``declined`` attempt via the
+    shared verdict mapping."""
+
+    async def test_zero_fetch_decline_records_a_durable_declined_attempt(self):
+        from entity.artist_wikipedia_bio_attempt import OUTCOME_DECLINED
+
+        pg = AsyncMock(spec=PgSource)
+        # A wikipedia.org URL whose slug can't clear the floor against the
+        # artist name: below-floor pick, no candidate ranked, zero fetches.
+        urls = ["https://en.wikipedia.org/wiki/Something_Entirely_Different"]
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_warm.set_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+            ) as mock_set,
+            patch(
+                "lookup.enrichment.wikipedia_warm.record_artist_wikipedia_bio_attempt",
+                new_callable=AsyncMock,
+            ) as mock_record,
+        ):
+            await wikipedia_warm._run_warm(99, "Stereolab", urls, pg)
+
+        mock_set.assert_not_awaited()
+        mock_record.assert_awaited_once_with(pg, discogs_artist_id=99, outcome=OUTCOME_DECLINED)

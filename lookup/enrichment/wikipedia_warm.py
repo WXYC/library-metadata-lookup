@@ -33,12 +33,15 @@ from core.observability import capture_unsampled_counter
 from entity.artist_wikipedia_bio import set_cached_artist_wikipedia_bio
 from entity.artist_wikipedia_bio_attempt import (
     OUTCOME_FETCH_ERROR,
-    OUTCOME_TRUNCATED,
     OUTCOME_UNRESOLVABLE,
     record_artist_wikipedia_bio_attempt,
 )
 from entity.sources import PgSource
-from lookup.wikipedia_pick_validation import make_summary_fetcher, resolve_and_validate_pick
+from lookup.wikipedia_pick_validation import (
+    make_summary_fetcher,
+    resolve_and_validate_pick,
+    write_nothing_attempt_outcome,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,48 +192,32 @@ async def _run_warm(
                 )
                 return
 
-            picked = result.picked
-            if picked is None or picked.url is None:
-                logger.warning(
-                    "Wikipedia bio warm: no resolvable pick for artist_id=%s (%r) despite "
-                    "a genuine cache miss having been scheduled -- skipping",
+            # LML#1192 review round 6, C2-1 / LML#1204 review: the shared
+            # mapping decides which picker verdicts must NOT write content
+            # (a negative must mean "asked about the right page, no page,"
+            # never "ran out of budget" or "didn't ask") and which durable
+            # write-nothing attempt outcome each records instead — so a new
+            # verdict can't be wired into this warm and not the drain, or
+            # vice versa (unresolvable and the zero-fetch decline both were).
+            attempt_outcome = write_nothing_attempt_outcome(result)
+            if attempt_outcome is not None:
+                log = logger.warning if attempt_outcome == OUTCOME_UNRESOLVABLE else logger.info
+                log(
+                    "Wikipedia bio warm: no content write for artist_id=%s (%r) -- "
+                    "recording %s attempt",
                     discogs_artist_id,
                     artist_name,
+                    attempt_outcome,
                 )
-                # LML#1204 item 2: record the attempt durably, matching the
-                # offline drain's "unresolvable" policy -- without it this
-                # artist stays a schedulable miss forever.
                 await record_artist_wikipedia_bio_attempt(
                     discogs_cache_pg,
                     discogs_artist_id=discogs_artist_id,
-                    outcome=OUTCOME_UNRESOLVABLE,
+                    outcome=attempt_outcome,
                 )
                 return
 
-            # LML#1192 review round 6, C2-1: never write a negative for a
-            # candidate list we didn't finish trying (truncated) or never
-            # tried at all (below_floor with zero live fetches) -- a
-            # negative must mean "asked about the right page, no page,"
-            # never "ran out of budget" or "didn't ask."
-            if result.truncated:
-                # Pass 3, A1: unlike the zero-fetch branch below, real
-                # fetches DID happen here -- record that durably (a
-                # distinct outcome from "fetch_error", since nothing
-                # transient failed) so --retry-misses can pick this artist
-                # back up, the same shape C2-3 already gives WikipediaFetchError.
-                if result.live_fetch_attempted:
-                    logger.info(
-                        "Wikipedia bio warm truncated for artist_id=%s -- recording attempt",
-                        discogs_artist_id,
-                    )
-                    await record_artist_wikipedia_bio_attempt(
-                        discogs_cache_pg,
-                        discogs_artist_id=discogs_artist_id,
-                        outcome=OUTCOME_TRUNCATED,
-                    )
-                return
-            if picked.below_floor and not result.live_fetch_attempted:
-                return
+            picked = result.picked
+            assert picked is not None and picked.url is not None  # the mapping's None contract
 
             extract = result.summary.extract if result.summary is not None else None
             _capture_fetch_outcome(

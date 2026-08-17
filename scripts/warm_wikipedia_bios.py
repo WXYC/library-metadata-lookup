@@ -198,6 +198,7 @@ from entity.artist_wikipedia_bio import (
     set_up_artist_wikipedia_bio_schema,
 )
 from entity.artist_wikipedia_bio_attempt import (
+    OUTCOME_DECLINED,
     OUTCOME_FETCH_ERROR,
     OUTCOME_UNEXPECTED_ERROR,
     OUTCOME_UNRESOLVABLE,
@@ -205,7 +206,11 @@ from entity.artist_wikipedia_bio_attempt import (
     set_up_artist_wikipedia_bio_attempt_schema,
 )
 from entity.sources import PgSource
-from lookup.wikipedia_pick_validation import make_summary_fetcher, resolve_and_validate_pick
+from lookup.wikipedia_pick_validation import (
+    make_summary_fetcher,
+    resolve_and_validate_pick,
+    write_nothing_attempt_outcome,
+)
 from scripts._lib.ratelimit import build_rate_limiter
 from scripts.build_filtered_discogs import extract_library_artists
 
@@ -613,20 +618,29 @@ async def process_candidate(
             )
         return OUTCOME_FETCH_ERROR
 
-    picked = result.picked
-    if picked is None or picked.url is None:
+    # LML#1204 review: the shared verdict mapping, so a new picker verdict
+    # can't be wired into the background warm and not this drain (or vice
+    # versa). One deliberate upgrade: a zero-fetch OUTCOME_DECLINED falls
+    # through to the below_floor content write below -- this drain records
+    # declines as durable NULL-extract content rows (the artist counts as
+    # attempted; see the module docstring), strictly stronger than an
+    # attempt row. `truncated` is unreachable here (no max_candidates cap).
+    attempt_outcome = write_nothing_attempt_outcome(result)
+    if attempt_outcome is not None and attempt_outcome != OUTCOME_DECLINED:
         logger.warning(
-            "no resolvable Wikipedia pick for artist_id=%s (%r) despite the seed's "
-            "wikipedia.org match -- skipping",
+            "no content write for artist_id=%s (%r): %s -- recording attempt",
             candidate.artist_id,
             candidate.artist_name,
+            attempt_outcome,
         )
         if not dry_run:
             await record_artist_wikipedia_bio_attempt(
-                pg, discogs_artist_id=candidate.artist_id, outcome=OUTCOME_UNRESOLVABLE
+                pg, discogs_artist_id=candidate.artist_id, outcome=attempt_outcome
             )
-        return OUTCOME_UNRESOLVABLE
+        return attempt_outcome
 
+    picked = result.picked
+    assert picked is not None and picked.url is not None  # the mapping's contract
     lang = picked.lang or "en"
 
     if picked.below_floor:
