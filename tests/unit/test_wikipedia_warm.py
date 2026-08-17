@@ -305,7 +305,7 @@ class TestRunWarm:
         wikipedia_warm._warm_semaphore.__aenter__.assert_awaited_once()
         wikipedia_warm._warm_semaphore.__aexit__.assert_awaited_once()
 
-    async def test_a_truncated_below_floor_fallback_writes_nothing(self):
+    async def test_a_truncated_below_floor_fallback_writes_nothing_to_the_content_cache(self):
         # LML#1192 review round 6, C2-1: with only above-floor candidates
         # rejected WITHIN the cap, and at least one ranked candidate left
         # untried by MAX_CANDIDATES_PER_WARM, the fallback is a truncation,
@@ -333,6 +333,47 @@ class TestRunWarm:
 
         mock_set.assert_not_awaited()
         mock_capture.assert_not_called()
+
+    async def test_a_truncated_result_still_records_a_durable_attempt(self):
+        # LML#1192 review round 6 pass 3, A1: the C2-1 fix above (pass 2)
+        # correctly stopped the truncated-fallback write, but recorded
+        # NOTHING anywhere else either -- reproduced with the reviewer's
+        # exact scenario (four ranked candidates, cap 3, none of the three
+        # tried candidates validate): nothing lands in the content cache
+        # AND nothing lands in the attempt table, unlike the sibling
+        # WikipediaFetchError branch (C2-3, pass 1), which already records
+        # a durable "fetch_error" attempt on its own couldn't-ask. Three
+        # REAL live fetches happened here (attempted_a_live_fetch is True)
+        # -- this must record its own durable attempt (a distinct outcome,
+        # "truncated", since this is not a transient couldn't-ask -- we
+        # asked, got real answers, and simply ran out of budget) so the
+        # offline drain's --retry-misses seed can eventually pick this
+        # artist back up, the same shape C2-3 already established.
+        pg = AsyncMock(spec=PgSource)
+        cap = wikipedia_warm.MAX_CANDIDATES_PER_WARM
+        langs = ["en", "fr", "de", "es"]
+        urls = [f"https://{lang}.wikipedia.org/wiki/Stereolab" for lang in langs]
+        assert len(urls) == cap + 1, "the reviewer's exact four-candidates-cap-3 reproduction"
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_warm.WikipediaClient.get_summary",
+                new_callable=AsyncMock,
+                return_value=None,  # every within-cap candidate rejected
+            ) as mock_get_summary,
+            patch(
+                "lookup.enrichment.wikipedia_warm.set_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+            ) as mock_set,
+            patch(
+                "lookup.enrichment.wikipedia_warm.record_artist_wikipedia_bio_attempt",
+                new_callable=AsyncMock,
+            ) as mock_record,
+        ):
+            await wikipedia_warm._run_warm(99, "Stereolab", urls, pg)
+
+        assert mock_get_summary.await_count == cap, "the reviewer's own reproduction shape"
+        mock_set.assert_not_awaited()
+        mock_record.assert_awaited_once_with(pg, discogs_artist_id=99, outcome="truncated")
 
     async def test_a_below_floor_pick_with_zero_live_fetches_writes_nothing(self):
         # LML#1192 review round 6, C2-1: no above-floor candidate exists at

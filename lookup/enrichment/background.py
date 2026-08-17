@@ -67,8 +67,7 @@ def maybe_schedule_discogs_bio_warm(
     *,
     warm_cache: bool,
     top1_bio: str | None,
-    top1_bio_surfaced: bool,
-    served_bio_is_discogs: bool,
+    profile_tokens_shipped: bool,
     discogs_service: DiscogsService,
 ) -> None:
     """Schedule the fire-and-forget deep-parse Discogs-bio warm, when eligible.
@@ -81,14 +80,20 @@ def maybe_schedule_discogs_bio_warm(
     parse fires per-ref Discogs API calls (cache -> API -> write-back), so
     wasting those on a bio no client will ever read is pure quota burn.
 
-    LML#513/#1192 re-spec: ``top1_bio_surfaced`` alone no longer answers
-    "was the Discogs bio surfaced" once the coordinator can serve a
-    Wikipedia extract instead (Phase B) -- ``served_bio_is_discogs``
-    additionally requires the SERVED text to be the Discogs one. When
-    Wikipedia text is what iOS renders, deep-parsing the unrendered Discogs
-    profile's refs is exactly the same quota burn LML#504 prohibits.
+    LML#1192 review round 6, pass 3, A3: dropped the round-5
+    ``served_bio_is_discogs`` requirement -- ``profile_tokens`` is parsed
+    from the raw Discogs profile and ships on the response independently
+    of which text wins the ``artist_bio`` slot (see
+    ``generated/api_models.py``'s ``profile_tokens`` field and
+    ``tests/unit/test_background_discogs_bio_warm.py`` for the full wire-
+    contract rationale), so gating on the ``artist_bio`` source was always
+    the wrong question. ``profile_tokens_shipped`` -- the caller's own
+    ``top1_enriched_result.profile_tokens is not None`` -- is the right
+    one: it already folds in ``profile_tokens``'s own two gates
+    (``extended`` and the LML#504 identity check) without this module
+    re-deriving either.
     """
-    if not (warm_cache and top1_bio and top1_bio_surfaced and served_bio_is_discogs):
+    if not (warm_cache and top1_bio and profile_tokens_shipped):
         return
     task = asyncio.create_task(_warm_bio_cache(top1_bio, discogs_service))
     _background_tasks.add(task)

@@ -348,7 +348,13 @@ async def enrich_artwork_results(
     enriched_top1_wiki = (
         top1_enriched_result.wikipedia_url if top1_enriched_result is not None else None
     )
-    bio_surfaced = wikipedia_bio.finalize_bio(
+    # Return value (whether the bio actually reached the wire post-gate)
+    # deliberately unused past round 6, pass 3, A3 -- it used to also gate
+    # the Discogs ref-warm below (`top1_bio_surfaced`), which was the wrong
+    # question for that gate to ask (see background.py's docstring). The
+    # call's own adoption-telemetry + Wikipedia-miss-warm side effects
+    # still run regardless.
+    wikipedia_bio.finalize_bio(
         bio_resolution,
         enriched_top1_bio=enriched_top1_bio,
         enriched_top1_wiki=enriched_top1_wiki,
@@ -357,12 +363,19 @@ async def enrich_artwork_results(
     )
 
     # Discogs ref-warm (relocated to background.maybe_schedule_discogs_bio_warm
-    # — full LML#504 + LML#513/#1192 re-spec rationale lives there).
+    # — full LML#504 rationale, and the LML#1192 review round 6, pass 3, A3
+    # correction removing the Wikipedia/Discogs source check, live there).
+    # profile_tokens_shipped reads the actual, already-gated field off the
+    # enriched result -- the exact fact the ref-warm's contract promise
+    # ("subsequent reads render richer") is about -- rather than
+    # re-deriving `extended and is_artist_derived_eligible` here.
+    profile_tokens_shipped = (
+        top1_enriched_result is not None and top1_enriched_result.profile_tokens is not None
+    )
     background.maybe_schedule_discogs_bio_warm(
         warm_cache=warm_cache,
         top1_bio=top1_bio,
-        top1_bio_surfaced=bio_surfaced,
-        served_bio_is_discogs=bio_resolution.source is wikipedia_bio.BioSource.DISCOGS,
+        profile_tokens_shipped=profile_tokens_shipped,
         discogs_service=discogs_service,
     )
 
