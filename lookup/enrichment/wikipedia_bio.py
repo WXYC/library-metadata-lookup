@@ -70,7 +70,7 @@ from enum import Enum, auto
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from discogs.models import ArtistDetails
-from entity.artist_wikipedia_bio import get_cached_artist_wikipedia_bio
+from entity.artist_wikipedia_bio import WikipediaBioReadError, get_cached_artist_wikipedia_bio
 from entity.sources import PgSource
 from lookup.enrichment import wikipedia_warm
 from lookup.wikipedia_url import PickedWikiUrl
@@ -184,6 +184,12 @@ async def resolve_served_bio(
     immediately here — it's true regardless of what the response ends up
     surfacing. Adoption telemetry and warm-scheduling are deliberately NOT
     done here (LML#1192 review, B2-1/B2-2) — see :func:`finalize_bio`.
+
+    LML#1192 review round 6, C2-3: a genuine PG failure on the read raises
+    ``entity.artist_wikipedia_bio.WikipediaBioReadError`` rather than
+    degrading to a miss shape — caught here and degraded to the Discogs
+    pair WITHOUT carrying ``miss_details`` forward, so a couldn't-ask can
+    never be mistaken for a genuine miss eligible for a live warm.
     """
     wiki_url = pick.url if pick is not None else None
     discogs_resolution = ServedBioResolution(
@@ -201,9 +207,20 @@ async def resolve_served_bio(
     if discogs_cache_pg is None or not isinstance(discogs_artist_id, int) or discogs_artist_id <= 0:
         return discogs_resolution
 
-    cached = await get_cached_artist_wikipedia_bio(
-        discogs_cache_pg, discogs_artist_id=discogs_artist_id
-    )
+    try:
+        cached = await get_cached_artist_wikipedia_bio(
+            discogs_cache_pg, discogs_artist_id=discogs_artist_id
+        )
+    except WikipediaBioReadError:
+        # LML#1192 review round 6, C2-3: "couldn't ask" degrades to the
+        # Discogs pair WITHOUT carrying miss_details forward -- unlike a
+        # genuine miss, this must NOT be eligible for a live warm. Through
+        # round 5 a PG failure here degraded to was_present=False, which
+        # this same branch structure treated as a genuine miss, so a
+        # discogs-cache PG outage silently inverted "cache down, degrade
+        # quietly" into sustained outbound Wikipedia traffic. No cache-fact
+        # counter either -- a couldn't-ask is neither a hit nor a negative.
+        return discogs_resolution
 
     if cached.was_present and cached.value is not None and cached.value.extract is not None:
         _record(CACHE_HIT_STAT_KEY)

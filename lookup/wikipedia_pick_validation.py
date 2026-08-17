@@ -92,10 +92,21 @@ class ValidatedPick:
     whenever ``picked`` is the below-floor fallback (never fetched) or
     every above-floor candidate was tried and rejected. ``picked`` is
     ``None`` only when there was no wikipedia.org candidate at all.
+
+    ``truncated`` (LML#1192 review round 6, C2-1) is ``True`` only on a
+    below-floor-fallback outcome where ``max_candidates`` left at least one
+    ranked above-floor candidate untried. It distinguishes "we ran out of
+    budget before trying every real candidate" from "we tried every real
+    candidate and none validated" -- two outcomes a caller must NOT treat
+    the same way, since only the second is a genuine negative result. Always
+    ``False`` on a WINNING pick (an answer was found, so there's nothing
+    left to be ambiguous about) and on the no-candidate-at-all outcome
+    (nothing was ever truncatable).
     """
 
     picked: PickedWikiUrl | None
     summary: WikipediaSummary | None
+    truncated: bool = False
 
 
 async def resolve_and_validate_pick(
@@ -131,6 +142,12 @@ async def resolve_and_validate_pick(
     above-floor candidate, which the offline drain
     (``scripts/warm_wikipedia_bios.py`` — an explicit, deliberately-invoked
     batch job with no per-request latency budget) still wants.
+
+    LML#1192 review round 6, C2-1: a capped, below-floor-fallback outcome
+    sets :attr:`ValidatedPick.truncated` when the cap left a ranked
+    above-floor candidate untried — a caller must check this before ever
+    treating the fallback as an authoritative negative (see that field's
+    docstring).
     """
     heuristic_pick = _first_wikipedia_match(urls)
     if heuristic_pick is None:
@@ -142,6 +159,9 @@ async def resolve_and_validate_pick(
         key=_candidate_sort_key,
         reverse=True,
     )
+    # LML#1192 review round 6, C2-1: computed BEFORE slicing -- True only
+    # when the cap actually left a ranked, above-floor candidate untried.
+    truncated = max_candidates is not None and len(ranked) > max_candidates
     if max_candidates is not None:
         ranked = ranked[:max_candidates]
     for candidate in ranked:
@@ -153,7 +173,9 @@ async def resolve_and_validate_pick(
                 slug_score=candidate.score,
                 below_floor=False,
             )
-            return ValidatedPick(picked=picked, summary=summary)
+            # A win is never "truncated" -- an answer was found, regardless
+            # of whether the cap left other candidates untried.
+            return ValidatedPick(picked=picked, summary=summary, truncated=False)
 
     # LML#1192 review round 4, P0-13: the heuristic url's OWN score, not a
     # different (higher-scoring, rejected) candidate's -- 0.0 if it was
@@ -165,4 +187,4 @@ async def resolve_and_validate_pick(
         slug_score=heuristic_score,
         below_floor=True,
     )
-    return ValidatedPick(picked=picked, summary=None)
+    return ValidatedPick(picked=picked, summary=None, truncated=truncated)

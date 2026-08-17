@@ -18,8 +18,7 @@ LML#1192 review round 5: takes ``artist_name``/``urls``, not a pre-computed
 can't validate against a live fetch, so for an artist like Low or Sade it
 names the bare, disambiguation-page url. Runs the SAME fetch-validated
 picker the offline drain got in round 4's P0-2 fix
-(``lookup.wikipedia_pick_validation.resolve_and_validate_pick``) — the
-other live-fetch site sharing that exact tiebreak exposure.
+(``lookup.wikipedia_pick_validation.resolve_and_validate_pick``).
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ from wxyc_fastapi.observability import get_cache_stats_recorder, get_posthog_cli
 from clients.wikipedia import WikipediaClient, WikipediaFetchError, WikipediaSummary
 from config.settings import get_settings
 from entity.artist_wikipedia_bio import set_cached_artist_wikipedia_bio
+from entity.artist_wikipedia_bio_attempt import record_artist_wikipedia_bio_attempt
 from entity.sources import PgSource
 from lookup.wikipedia_pick_validation import resolve_and_validate_pick
 from lookup.wikipedia_url import wikipedia_title_from_url
@@ -44,16 +44,12 @@ small (this is a background courtesy warm, not a bulk drain; the offline
 drain, Phase C, is the actual population mechanism)."""
 
 MAX_CANDIDATES_PER_WARM = 3
-"""Bounds how many candidates :data:`_warm_semaphore` can be held for.
+"""Bounds how many candidates :data:`_warm_semaphore` can be held for --
 ``resolve_and_validate_pick`` runs entirely inside the semaphore and can
-issue one fetch per candidate; uncapped, one artist could hold a permit for
-an unbounded run of sequential fetches. A real Discogs record rarely lists
-more than a couple genuine ``wikipedia.org`` urls, so this is a latency
-ceiling, not a real-traffic tuning knob. Worst case under one permit:
-``MAX_CANDIDATES_PER_WARM * (1 + max_retries)`` = 6 sequential HTTP
-attempts, at this value and :func:`_run_warm`'s ``max_retries=1``. The
-offline drain passes no cap — an explicit batch job, no request-latency
-budget."""
+issue one fetch per candidate, so uncapped is an unbounded permit-hold. A
+latency ceiling, not a real-traffic tuning knob (worst case: 6 sequential
+HTTP attempts at this value and :func:`_run_warm`'s ``max_retries=1``). The
+offline drain passes no cap -- an explicit batch job, no latency budget."""
 
 _QUEUE_DEPTH_MULTIPLIER = 8
 """Pending-plus-running depth bound = ``WARM_CONCURRENCY * this``. Fixed
@@ -72,16 +68,12 @@ FETCH_REJECT_STAT_KEY = "wikipedia_bio_fetch_reject"
 warm TASK runs detached from any request's cache_stats context, so these do
 NOT use the per-request recorder.
 
-LML#1192 review, B2-4 correction: the ``cache_stats`` dict itself is NOT
-copied per task. ``asyncio.create_task`` binds the new task to a shallow
-copy of the parent's ContextVar *bindings*, but the dict object a
-``cache_stats`` binding points to is the SAME shared mutable object in both
-contexts -- a write from this detached task would mutate the very dict the
-request handler already read. The reason a write here still wouldn't count
-is ordering, not isolation: by the time this task's first ``await``
-resolves, the request that scheduled it has already read and reported its
-``cache_stats`` snapshot and returned, so a late write lands in a dict
-nobody will read again -- silently dropped, not orphaned into a copy."""
+LML#1192 review, B2-4 correction: the ``cache_stats`` dict object a
+detached task's copied ContextVar binding points to is the SAME shared
+mutable object the request handler read -- but by the time this task's
+first ``await`` resolves, that handler has already read and returned its
+snapshot, so a write here lands in a dict nobody will read again (ordering,
+not isolation, is why a per-request recorder still wouldn't count)."""
 
 _POSTHOG_EVENT_PREFIX = "wikipedia_bio_warm"
 _POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
@@ -155,21 +147,27 @@ async def _run_warm(
     can't write the WRONG page the way a single-candidate pick could (the
     Low/Sade case: the sync pick names a disambiguation page). The fetch
     closure reuses ``WikipediaClient``/``wikipedia_title_from_url`` exactly
-    as before; a :class:`~clients.wikipedia.WikipediaFetchError` still
-    writes NOTHING (propagates out of the picker by design — a couldn't-ask
-    on one candidate says nothing about a different one). Any other
-    exception is logged and swallowed — the task must never propagate to
-    the event loop.
+    as before. Any unhandled exception is logged and swallowed — the task
+    must never propagate to the event loop. Candidates are capped at
+    :data:`MAX_CANDIDATES_PER_WARM`, the whole selection inside
+    :data:`_warm_semaphore` (see that constant's docstring for the bound).
 
-    Candidates are capped at :data:`MAX_CANDIDATES_PER_WARM`; the whole
-    selection runs inside :data:`_warm_semaphore` (see that constant's
-    docstring for the worst-case bound this implies).
+    LML#1192 review round 6: a :class:`~clients.wikipedia.WikipediaFetchError`
+    (C2-3) writes nothing to the content table but now records a durable
+    attempt, so a couldn't-ask is no longer invisible everywhere. A
+    below-floor fallback (C2-1) never writes a negative unless it genuinely
+    asked about every above-floor candidate the cap allowed — see
+    :attr:`~lookup.wikipedia_pick_validation.ValidatedPick.truncated`.
     """
     global _warm_semaphore
     if _warm_semaphore is None:
         _warm_semaphore = asyncio.Semaphore(WARM_CONCURRENCY)
 
+    attempted_a_live_fetch = False
+
     async def fetch(url: str, lang: str) -> WikipediaSummary | None:
+        nonlocal attempted_a_live_fetch
+        attempted_a_live_fetch = True
         title = wikipedia_title_from_url(url)
         if title is None:
             return None
@@ -184,6 +182,9 @@ async def _run_warm(
                 )
             except WikipediaFetchError as e:
                 logger.info("Wikipedia bio warm shed for artist_id=%s: %s", discogs_artist_id, e)
+                await record_artist_wikipedia_bio_attempt(
+                    discogs_cache_pg, discogs_artist_id=discogs_artist_id, outcome="fetch_error"
+                )
                 return
 
             picked = result.picked
@@ -193,6 +194,17 @@ async def _run_warm(
                     "a genuine cache miss having been scheduled -- skipping",
                     discogs_artist_id,
                     artist_name,
+                )
+                return
+
+            # LML#1192 review round 6, C2-1: never write a negative for a
+            # candidate list we didn't finish trying (truncated) or never
+            # tried at all (below_floor with zero live fetches) -- a
+            # negative must mean "asked about the right page, no page,"
+            # never "ran out of budget" or "didn't ask."
+            if result.truncated or (picked.below_floor and not attempted_a_live_fetch):
+                logger.info(
+                    "Wikipedia bio warm skip (no negative write): artist_id=%s", discogs_artist_id
                 )
                 return
 

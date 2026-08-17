@@ -229,6 +229,30 @@ class TestRunWarm:
 
         mock_set.assert_not_awaited()
 
+    async def test_transient_fetch_error_records_a_durable_attempt(self):
+        # LML#1192 review round 6, C2-3: the drain's P0-8 attempt record
+        # was never shared with the runtime warm task -- a couldn't-ask
+        # here wrote NOTHING anywhere, so a discogs-cache PG outage
+        # silently inverted "cache down, degrade quietly" into sustained
+        # outbound Wikipedia traffic with a 0% write-back rate. The warm
+        # task now records the same durable "fetch_error" attempt the
+        # drain already does.
+        pg = AsyncMock(spec=PgSource)
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_warm.WikipediaClient.get_summary",
+                new_callable=AsyncMock,
+                side_effect=WikipediaFetchError("timed out"),
+            ),
+            patch(
+                "lookup.enrichment.wikipedia_warm.record_artist_wikipedia_bio_attempt",
+                new_callable=AsyncMock,
+            ) as mock_record,
+        ):
+            await wikipedia_warm._run_warm(99, _ARTIST_NAME, _URLS, pg)
+
+        mock_record.assert_awaited_once_with(pg, discogs_artist_id=99, outcome="fetch_error")
+
     async def test_no_wikipedia_url_at_all_writes_nothing(self):
         # Defensive: schedule_wikipedia_bio_warm is only ever called after a
         # genuine miss whose sync pick already cleared the floor, so this
@@ -280,6 +304,57 @@ class TestRunWarm:
             await wikipedia_warm._run_warm(99, "Sun Ra", urls, pg)
         wikipedia_warm._warm_semaphore.__aenter__.assert_awaited_once()
         wikipedia_warm._warm_semaphore.__aexit__.assert_awaited_once()
+
+    async def test_a_truncated_below_floor_fallback_writes_nothing(self):
+        # LML#1192 review round 6, C2-1: with only above-floor candidates
+        # rejected WITHIN the cap, and at least one ranked candidate left
+        # untried by MAX_CANDIDATES_PER_WARM, the fallback is a truncation,
+        # not an exhausted negative -- writing here would key an
+        # authoritative 7-day negative to a URL that was never fetched,
+        # for an artist whose correct page was never tried.
+        pg = AsyncMock(spec=PgSource)
+        cap = wikipedia_warm.MAX_CANDIDATES_PER_WARM
+        langs = ["en", "fr", "de", "es", "it", "pt", "nl", "sv", "pl", "da"]
+        urls = [f"https://{lang}.wikipedia.org/wiki/Stereolab" for lang in langs]
+        assert len(urls) > cap, "fixture must supply more candidates than the cap to be meaningful"
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_warm.WikipediaClient.get_summary",
+                new_callable=AsyncMock,
+                return_value=None,  # every within-cap candidate rejected
+            ),
+            patch(
+                "lookup.enrichment.wikipedia_warm.set_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+            ) as mock_set,
+            patch.object(wikipedia_warm, "_capture_fetch_outcome") as mock_capture,
+        ):
+            await wikipedia_warm._run_warm(99, "Stereolab", urls, pg)
+
+        mock_set.assert_not_awaited()
+        mock_capture.assert_not_called()
+
+    async def test_a_below_floor_pick_with_zero_live_fetches_writes_nothing(self):
+        # LML#1192 review round 6, C2-1: no above-floor candidate exists at
+        # all, so the loop never runs and nothing was ever actually asked
+        # about -- "we didn't ask" must never produce a negative either,
+        # independent of the truncation case above.
+        pg = AsyncMock(spec=PgSource)
+        urls = ["https://en.wikipedia.org/wiki/Totally_Unrelated_Page"]
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_warm.WikipediaClient.get_summary",
+                new_callable=AsyncMock,
+            ) as mock_get_summary,
+            patch(
+                "lookup.enrichment.wikipedia_warm.set_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+            ) as mock_set,
+        ):
+            await wikipedia_warm._run_warm(99, "Stereolab", urls, pg)
+
+        mock_get_summary.assert_not_awaited()
+        mock_set.assert_not_awaited()
 
     async def test_candidates_tried_are_capped(self):
         # LML#1192 review round 5, MAX_CANDIDATES_PER_WARM: a multi-

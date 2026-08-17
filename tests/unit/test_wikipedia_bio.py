@@ -32,7 +32,7 @@ import pytest
 from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
 
 from discogs.models import ArtistDetails
-from entity.artist_wikipedia_bio import WikipediaBioHit
+from entity.artist_wikipedia_bio import WikipediaBioHit, WikipediaBioReadError
 from entity.cache_toolkit import CachedValue
 from entity.sources import PgSource
 from lookup.enrichment.wikipedia_bio import (
@@ -190,6 +190,50 @@ class TestFlagOnAbovefloorCacheOutcomes:
         assert resolution.discogs_artist_id == _DETAILS.artist_id
         stats = get_cache_stats()
         assert stats.get(CACHE_MISS_WARM_SCHEDULED_STAT_KEY) is None
+
+
+@pytest.mark.asyncio
+class TestReadErrorDegradesWithoutWarm:
+    """LML#1192 review round 6, C2-3: a genuine PG failure on the cache read
+    now raises ``WikipediaBioReadError`` (entity/artist_wikipedia_bio.py)
+    instead of degrading to ``was_present=False``. Through round 5 that
+    shape was indistinguishable from a genuine miss, and a genuine miss
+    carries ``miss_details`` forward for the coordinator to schedule a live
+    warm -- so a discogs-cache PG outage silently inverted "cache down,
+    degrade quietly" into sustained outbound Wikipedia traffic. This must
+    degrade to the Discogs pair WITHOUT any warm-scheduling opportunity,
+    and without recording either cache-fact counter (a couldn't-ask is
+    neither a hit nor a negative)."""
+
+    async def test_read_error_degrades_to_discogs_pair_with_no_miss_details(self, monkeypatch):
+        monkeypatch.setenv(BIO_PREFER_WIKIPEDIA_ENV_VAR, "true")
+        pg = AsyncMock(spec=PgSource)
+        with patch(
+            "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+            new_callable=AsyncMock,
+            side_effect=WikipediaBioReadError("artist_wikipedia_bio read degraded"),
+        ):
+            resolution = await resolve_served_bio(_PICK, _DISCOGS_BIO, _DETAILS, pg)
+        assert resolution.bio == _DISCOGS_BIO
+        assert resolution.wiki_url == _PICK.url
+        assert resolution.source is BioSource.DISCOGS
+        # No warm-scheduling opportunity -- "couldn't ask" must never look
+        # like a genuine miss to the post-gate scheduler.
+        assert resolution.miss_details is None
+        assert resolution.discogs_artist_id is None
+
+    async def test_read_error_records_neither_cache_fact_counter(self, monkeypatch):
+        monkeypatch.setenv(BIO_PREFER_WIKIPEDIA_ENV_VAR, "true")
+        pg = AsyncMock(spec=PgSource)
+        with patch(
+            "lookup.enrichment.wikipedia_bio.get_cached_artist_wikipedia_bio",
+            new_callable=AsyncMock,
+            side_effect=WikipediaBioReadError("artist_wikipedia_bio read degraded"),
+        ):
+            await resolve_served_bio(_PICK, _DISCOGS_BIO, _DETAILS, pg)
+        stats = get_cache_stats()
+        assert stats.get(CACHE_HIT_STAT_KEY) is None
+        assert stats.get(CACHE_NEGATIVE_STAT_KEY) is None
 
 
 @pytest.mark.asyncio
