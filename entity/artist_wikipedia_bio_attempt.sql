@@ -3,7 +3,7 @@
 --
 -- Canonical DDL reference for `lml_cache.artist_wikipedia_bio_attempt`: one
 -- row per Discogs artist id that a couldn't-ask outcome (fetch_error /
--- unresolvable / unexpected_error) was recorded for, whether by the offline
+-- unresolvable / unexpected_error / truncated) was recorded for, whether by the offline
 -- drain (`scripts/warm_wikipedia_bios.py`) or the background miss-warm task
 -- (`lookup/enrichment/wikipedia_warm.py`). Without this record, the drain's
 -- `--incremental` mode's fixed `au.artist_id` ordering with no cursor
@@ -48,8 +48,9 @@ CREATE SCHEMA IF NOT EXISTS lml_cache;
 -- itself correct today). `attempted_at`
 -- -- when this attempt was last (re-)recorded; a repeated write-nothing
 -- outcome refreshes it via the UPSERT rather than growing a second row.
--- `outcome` -- the label recorded ("fetch_error" / "unresolvable" /
--- "unexpected_error"), audit-only, never compared.
+-- `outcome` -- the label recorded (a member of the OUTCOME_* vocabulary
+-- entity/artist_wikipedia_bio_attempt.py owns: "fetch_error" / "unresolvable" /
+-- "unexpected_error" / "truncated"), audit-only, never compared.
 
 CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio_attempt (
     discogs_artist_id BIGINT PRIMARY KEY,

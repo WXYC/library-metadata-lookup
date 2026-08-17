@@ -198,6 +198,9 @@ from entity.artist_wikipedia_bio import (
     set_up_artist_wikipedia_bio_schema,
 )
 from entity.artist_wikipedia_bio_attempt import (
+    OUTCOME_FETCH_ERROR,
+    OUTCOME_UNEXPECTED_ERROR,
+    OUTCOME_UNRESOLVABLE,
     record_artist_wikipedia_bio_attempt,
     set_up_artist_wikipedia_bio_attempt_schema,
 )
@@ -599,9 +602,9 @@ async def process_candidate(
         # this candidate resurfaces at the front of every future
         # incremental run forever, since there's no row and no cursor.
         await record_artist_wikipedia_bio_attempt(
-            pg, discogs_artist_id=candidate.artist_id, outcome="fetch_error"
+            pg, discogs_artist_id=candidate.artist_id, outcome=OUTCOME_FETCH_ERROR
         )
-        return "fetch_error"
+        return OUTCOME_FETCH_ERROR
 
     picked = result.picked
     if picked is None or picked.url is None:
@@ -612,9 +615,9 @@ async def process_candidate(
             candidate.artist_name,
         )
         await record_artist_wikipedia_bio_attempt(
-            pg, discogs_artist_id=candidate.artist_id, outcome="unresolvable"
+            pg, discogs_artist_id=candidate.artist_id, outcome=OUTCOME_UNRESOLVABLE
         )
-        return "unresolvable"
+        return OUTCOME_UNRESOLVABLE
 
     lang = picked.lang or "en"
 
@@ -716,10 +719,10 @@ def _build_rate_limiter(rate_per_second: float) -> AsyncLimiter:
 # on the drain reaching completion before the prod flag flip.
 _FAILURE_ISH_OUTCOMES = frozenset(
     {
-        "fetch_error",
-        "unexpected_error",
+        OUTCOME_FETCH_ERROR,
+        OUTCOME_UNEXPECTED_ERROR,
         "repick_kept_existing",
-        "unresolvable",
+        OUTCOME_UNRESOLVABLE,
     }
 )
 
@@ -773,9 +776,9 @@ async def run_drain(
             # record_artist_wikipedia_bio_attempt already swallows its own
             # errors, so this can't turn one exception into two.
             await record_artist_wikipedia_bio_attempt(
-                pg, discogs_artist_id=candidate.artist_id, outcome="unexpected_error"
+                pg, discogs_artist_id=candidate.artist_id, outcome=OUTCOME_UNEXPECTED_ERROR
             )
-            outcome = "unexpected_error"
+            outcome = OUTCOME_UNEXPECTED_ERROR
 
         report.record(outcome)
         consecutive_failures = consecutive_failures + 1 if outcome in _FAILURE_ISH_OUTCOMES else 0

@@ -3,11 +3,18 @@
 ``scripts/warm_wikipedia_bios.py``'s ``incremental`` mode selects artist ids
 with NO row at all in ``lml_cache.artist_wikipedia_bio``, ordered by the
 fixed ``au.artist_id`` (no cursor column, since there is no row to carry
-one). Three outcomes leave NOTHING written there: ``fetch_error`` (a
+one). Four outcomes leave NOTHING written there: ``fetch_error`` (a
 transient couldn't-ask, deliberately never negative-cached — see that
-module's docstring), ``unresolvable`` (defensive), and
+module's docstring), ``unresolvable`` (defensive),
 ``unexpected_error`` (an unhandled exception, caught one layer up in
-``run_drain``). Without a durable record of the attempt, none of these
+``run_drain``), and ``truncated`` (the background miss-warm's
+``MAX_CANDIDATES_PER_WARM`` cap ran out before every real candidate was
+tried — LML#1192 review round 6, C2-1/A1 — so no authoritative negative
+may be written). The vocabulary is owned HERE as the ``OUTCOME_*``
+constants below (LML#1192 cross-PR review, round 7): writers import them
+rather than spelling literals, so a new outcome must be added to
+:data:`KNOWN_ATTEMPT_OUTCOMES` — and to this paragraph — to exist at all.
+Without a durable record of the attempt, none of these
 ever exits ``incremental``'s population: the SAME artist ids resurface,
 in the SAME fixed order, on every future run. Once the catalog otherwise
 drains, this residue in effect BECOMES the incremental candidate list —
@@ -60,6 +67,25 @@ from entity.ddl import bootstrap_lml_cache_table
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
+
+# The attempt-outcome vocabulary (LML#1192 cross-PR review, round 7). This
+# module owns the ``outcome`` column, so it owns the spellings: writers
+# (``lookup/enrichment/wikipedia_warm.py``, ``scripts/warm_wikipedia_bios.py``)
+# import these instead of spelling literals -- through round 6 the five write
+# sites used bare strings and the prose inventory drifted one outcome stale
+# within a single review cycle. The drain's per-candidate REPORT labels
+# ("negative", "declined", "refreshed", "positive", "repick_kept_existing")
+# are a different domain and deliberately stay script-local.
+OUTCOME_FETCH_ERROR = "fetch_error"
+OUTCOME_UNRESOLVABLE = "unresolvable"
+OUTCOME_UNEXPECTED_ERROR = "unexpected_error"
+OUTCOME_TRUNCATED = "truncated"
+
+KNOWN_ATTEMPT_OUTCOMES: frozenset[str] = frozenset(
+    {OUTCOME_FETCH_ERROR, OUTCOME_UNRESOLVABLE, OUTCOME_UNEXPECTED_ERROR, OUTCOME_TRUNCATED}
+)
+"""Every value the ``outcome`` column may carry. Kept in lockstep with the
+constants above and the module docstring's outcome paragraph."""
 
 _DDL_TABLE = """\
 CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio_attempt (
