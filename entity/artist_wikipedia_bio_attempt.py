@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 _DDL_TABLE = """\
 CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio_attempt (
-    discogs_artist_id INTEGER PRIMARY KEY,
+    discogs_artist_id BIGINT PRIMARY KEY,
     attempted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     outcome TEXT NOT NULL
 )\

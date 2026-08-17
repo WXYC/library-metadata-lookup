@@ -39,14 +39,19 @@
 
 CREATE SCHEMA IF NOT EXISTS lml_cache;
 
--- `discogs_artist_id` -- the PRIMARY KEY; one row per artist. `attempted_at`
+-- `discogs_artist_id` -- the PRIMARY KEY; one row per artist. BIGINT (not
+-- INTEGER, LML#1192 review round 6, pass 3, A6 -- this table is joined
+-- against `lml_cache.artist_wikipedia_bio.discogs_artist_id`, which is
+-- BIGINT; a mismatched column type on the join key is a latent index/plan
+-- hazard even where Postgres's implicit int4->int8 cast keeps the query
+-- itself correct today). `attempted_at`
 -- -- when this attempt was last (re-)recorded; a repeated write-nothing
 -- outcome refreshes it via the UPSERT rather than growing a second row.
 -- `outcome` -- the label recorded ("fetch_error" / "unresolvable" /
 -- "unexpected_error"), audit-only, never compared.
 
 CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio_attempt (
-    discogs_artist_id INTEGER PRIMARY KEY,
+    discogs_artist_id BIGINT PRIMARY KEY,
     attempted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     outcome TEXT NOT NULL
 );
