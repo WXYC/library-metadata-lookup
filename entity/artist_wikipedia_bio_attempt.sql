@@ -17,12 +17,11 @@
 -- which is created and migrated only via discogs-cache alembic migrations --
 -- and discogs-cache tooling never touches `lml_cache.*`.
 --
--- LML#1192 review round 6, C2-3: bootstrapped from LML's own FastAPI
--- lifespan, same as every other `lml_cache.*` table -- NOT just the offline
--- drain. Through round 5 this table was deliberately excluded from
--- `main.py`'s lifespan because nothing in the live app read or wrote it;
--- that stopped being true once the background miss-warm task started
--- recording its own `WikipediaFetchError` couldn't-asks here too.
+-- Bootstrapped from LML's own FastAPI lifespan (LML#1192 review round 6,
+-- C2-3), same as every other `lml_cache.*` table -- NOT just the offline
+-- drain; see `entity/artist_wikipedia_bio_attempt.py`'s module docstring
+-- for why (this generated comment intentionally does not restate it, to
+-- avoid a second copy that can drift).
 --
 -- This file exists so:
 --
@@ -30,6 +29,8 @@
 --   2. An operator can apply the schema directly to a non-discogs-cache PG
 --      (e.g. local dev) without booting the full LML app.
 --
+-- GENERATED FILE -- regenerate via:
+--   uv run python -m scripts.regenerate_lml_cache_sql
 -- Statements come verbatim from `entity/artist_wikipedia_bio_attempt.py`;
 -- do not hand-edit this file -- `tests/unit/test_artist_wikipedia_bio_attempt_schema.py`
 -- pins the statement text. The runtime source of truth is

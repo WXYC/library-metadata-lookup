@@ -189,14 +189,15 @@ _MODULES: dict[str, SidecarSpec] = {
     ),
     "artist_wikipedia_bio_attempt": SidecarSpec(
         header="""\
--- Durable write-nothing attempt record for the offline Wikipedia bio drain
+-- Durable write-nothing attempt record for the Wikipedia bio program
 -- (LML#1192 review round 4, P0-8).
 --
 -- Canonical DDL reference for `lml_cache.artist_wikipedia_bio_attempt`: one
--- row per Discogs artist id that a drain session attempted but wrote
--- NOTHING for (fetch_error / unresolvable / unexpected_error -- see
--- `scripts/warm_wikipedia_bios.py`'s module docstring). Without this
--- record, `--incremental`'s fixed `au.artist_id` ordering with no cursor
+-- row per Discogs artist id that a couldn't-ask outcome (fetch_error /
+-- unresolvable / unexpected_error) was recorded for, whether by the offline
+-- drain (`scripts/warm_wikipedia_bios.py`) or the background miss-warm task
+-- (`lookup/enrichment/wikipedia_warm.py`). Without this record, the drain's
+-- `--incremental` mode's fixed `au.artist_id` ordering with no cursor
 -- re-selects the same write-nothing artist ids, in the same order, on
 -- every future run -- once the catalog otherwise drains, this residue
 -- becomes the candidate list, 100% failure-ish, aborting every session
@@ -207,17 +208,17 @@ _MODULES: dict[str, SidecarSpec] = {
 -- which is created and migrated only via discogs-cache alembic migrations --
 -- and discogs-cache tooling never touches `lml_cache.*`.
 --
--- UNLIKE most `lml_cache.*` tables, this one is deliberately NOT
--- bootstrapped from LML's own FastAPI lifespan -- nothing in the live app
--- (the `/lookup` request path, the background miss-warm task) ever reads
--- or writes it; it exists solely for the offline drain's own bookkeeping,
--- so only `scripts/warm_wikipedia_bios.py` bootstraps it.
+-- Bootstrapped from LML's own FastAPI lifespan (LML#1192 review round 6,
+-- C2-3), same as every other `lml_cache.*` table -- NOT just the offline
+-- drain; see `entity/artist_wikipedia_bio_attempt.py`'s module docstring
+-- for why (this generated comment intentionally does not restate it, to
+-- avoid a second copy that can drift).
 --
 -- This file exists so:
 --
 --   1. The LML PR's reviewer has the DDL inline for comparison.
 --   2. An operator can apply the schema directly to a non-discogs-cache PG
---      (e.g. local dev) without running the drain.
+--      (e.g. local dev) without booting the full LML app.
 --
 -- GENERATED FILE -- regenerate via:
 --   uv run python -m scripts.regenerate_lml_cache_sql
@@ -226,14 +227,19 @@ _MODULES: dict[str, SidecarSpec] = {
 -- pins the statement text. The runtime source of truth is
 -- `entity/artist_wikipedia_bio_attempt.py`'s
 -- `set_up_artist_wikipedia_bio_attempt_schema`, which issues these
--- statements (`IF NOT EXISTS` forms) at the start of every drain session.""",
+-- statements (`IF NOT EXISTS` forms) on every boot.""",
         statements=(
             artist_wikipedia_bio_attempt._DDL_SCHEMA,
             artist_wikipedia_bio_attempt._DDL_TABLE,
         ),
         comments={
             "CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio_attempt (": """\
--- `discogs_artist_id` -- the PRIMARY KEY; one row per artist. `attempted_at`
+-- `discogs_artist_id` -- the PRIMARY KEY; one row per artist. BIGINT (not
+-- INTEGER, LML#1192 review round 6, pass 3, A6 -- this table is joined
+-- against `lml_cache.artist_wikipedia_bio.discogs_artist_id`, which is
+-- BIGINT; a mismatched column type on the join key is a latent index/plan
+-- hazard even where Postgres's implicit int4->int8 cast keeps the query
+-- itself correct today). `attempted_at`
 -- -- when this attempt was last (re-)recorded; a repeated write-nothing
 -- outcome refreshes it via the UPSERT rather than growing a second row.
 -- `outcome` -- the label recorded ("fetch_error" / "unresolvable" /

@@ -4870,12 +4870,19 @@ class TestBandcampStreamingUrlPostprocessWiring:
             )
 
         _, enriched = results[0]
-        # LML#1192 review round 4, P1-12: this specific startswith check
-        # (not just is-not-None) had drifted 286 lines away into
-        # TestWikipediaPreferredBioSwap::test_artist_identity_split_gate_nulls_served_pair_together,
-        # a test about an unrelated concern (the LML#504 identity-split
-        # gate) that happened to also exercise this fallback path
-        # incidentally. Restored here, where it actually belongs.
+        # LML#1192 review round 4, P1-12: this test's OWN concern is just
+        # "the deferred search-URL fallback fills bandcamp_url when
+        # post-process leaves it None" -- is-not-None is the right-scoped
+        # assertion for that. The more specific startswith("https://bandcamp
+        # .com/search?q=") shape check still lives where it actually
+        # belongs, in TestWikipediaPreferredBioSwap
+        # ::test_artist_identity_split_gate_nulls_served_pair_together,
+        # which exercises this same fallback path incidentally while
+        # testing the unrelated LML#504 identity-split gate -- P1-12 was
+        # never carried out as a literal move; this comment previously
+        # claimed it had been, which was itself stale. See that other
+        # test's assertion (LML#1192 review round 6, pass 3, B5) if the
+        # exact-URL-shape check is what you're looking for.
         assert enriched.bandcamp_url is not None
 
 
