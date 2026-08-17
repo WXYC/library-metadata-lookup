@@ -138,17 +138,17 @@ CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio (
     lang TEXT NOT NULL,
     extract TEXT,
     fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_attempted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_refused_at TIMESTAMPTZ
 )\
 """
-# last_checked_at (LML#1192 review round 3, finding 13): fetched_at and
-# last_checked_at look identical on a freshly-written row (both default to
+# last_attempted_at (LML#1192 review round 3, finding 13): fetched_at and
+# last_attempted_at look identical on a freshly-written row (both default to
 # now()) but diverge whenever a drain candidate is checked without its
 # content actually changing -- e.g. a refusal (mark_artist_wikipedia_bio_refused
-# advances last_checked_at, never fetched_at). Two
+# advances last_attempted_at, never fetched_at). Two
 # meanings that used to share one column: fetched_at is CONTENT age (the
-# TTL clock get_cached_artist_wikipedia_bio reads, below); last_checked_at
+# TTL clock get_cached_artist_wikipedia_bio reads, below); last_attempted_at
 # is the DRAIN's own progress cursor (which seed queries order by, so a
 # --limit-bounded session advances instead of re-selecting the same rows).
 # A --repick pass that only re-verified a pick would previously grant the
@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio (
 # backfill: this table has no rows in prod (the drain hasn't run yet).
 
 # LML#1192 review round 4, P0-1: this table is created ONLY here (#1194) --
-# the drain PR (#1196) reads/writes last_checked_at but its OWN
+# the drain PR (#1196) reads/writes last_attempted_at but its OWN
 # CREATE TABLE IF NOT EXISTS is a no-op once this one has already run once.
 # Without this ALTER, the deploy sequence "#1194 merges and deploys (table
 # created without the column) -> #1196 merges" leaves the column
@@ -171,15 +171,49 @@ CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio (
 # AccessExclusiveLock on ADD COLUMN IF NOT EXISTS even on that no-op path,
 # so it must not share a transaction with (and risk rolling back) the
 # CREATE TABLE/SCHEMA step above.
-_DDL_ADD_LAST_CHECKED_AT_COLUMN = (
+_DDL_ADD_LAST_ATTEMPTED_AT_COLUMN = (
     "ALTER TABLE lml_cache.artist_wikipedia_bio "
-    "ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+    "ADD COLUMN IF NOT EXISTS last_attempted_at TIMESTAMPTZ NOT NULL DEFAULT now()"
 )
+
+# LML#1192 cross-PR review, round 7: this column was named
+# ``last_checked_at`` through the stack's merge -- a cross-schema homonym
+# (on the streaming URL caches ``last_checked_at`` is the read-gating TTL
+# clock; here it is the drain's progress cursor, advancing on refusals and
+# never gating the read). Renamed to ``last_attempted_at``, joining the
+# ``attempted_at`` family (``artist_wikipedia_bio_attempt``,
+# ``compilation_track_identity``) whose semantics it already had. The table
+# had zero prod rows at rename time, but staging's lifespan may have
+# already created the old shape, so the rename ships as a guarded in-place
+# migration: RENAME COLUMN has no IF EXISTS form, so a DO block checks the
+# old column exists AND the new one doesn't (a fresh table, an
+# already-migrated table, and a double-run all no-op). Runs as its own
+# bootstrap_lml_cache_table call for the same P0-1 lock-isolation reason as
+# the ALTERs on either side of it, and BEFORE the additive
+# last_attempted_at ALTER so an old-shape table renames instead of ending
+# up with both columns.
+_DDL_RENAME_LAST_CHECKED_AT_COLUMN = """\
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'lml_cache' AND table_name = 'artist_wikipedia_bio'
+          AND column_name = 'last_checked_at'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'lml_cache' AND table_name = 'artist_wikipedia_bio'
+          AND column_name = 'last_attempted_at'
+    ) THEN
+        ALTER TABLE lml_cache.artist_wikipedia_bio
+            RENAME COLUMN last_checked_at TO last_attempted_at;
+    END IF;
+END $$\
+"""
 
 # LML#1192 review round 6, C1-1: same P0-1 treatment as the ALTER above --
 # its own separate bootstrap_lml_cache_table call, since PG16 still takes an
 # AccessExclusiveLock on ADD COLUMN IF NOT EXISTS even on the no-op path.
-# Nullable (unlike last_checked_at): most rows never get refused, and
+# Nullable (unlike last_attempted_at): most rows never get refused, and
 # "never refused" is meaningfully different from "refused at some known
 # past instant" -- a NULL default (rather than, say, epoch) keeps the
 # read predicate below simple (`> $4` is never accidentally true for a
@@ -224,7 +258,7 @@ WHERE discogs_artist_id = $1
 # write (a fresh fetch, a --repick correction) always replaces the prior
 # row wholesale -- including wikipedia_url -- which is exactly the
 # self-healing the read side relies on. Sets BOTH fetched_at and
-# last_checked_at: a real fetch is by definition a fresh check too, so the
+# last_attempted_at: a real fetch is by definition a fresh check too, so the
 # drain's progress cursor advances on every real write.
 #
 # LML#1192 review round 4, P0-5: the WHERE clause is the SQL-level
@@ -239,7 +273,7 @@ WHERE discogs_artist_id = $1
 # no-ops at the database itself, rather than destroying the row.
 _UPSERT_SQL = """\
 INSERT INTO lml_cache.artist_wikipedia_bio
-    (discogs_artist_id, wikipedia_url, slug_score, lang, extract, fetched_at, last_checked_at)
+    (discogs_artist_id, wikipedia_url, slug_score, lang, extract, fetched_at, last_attempted_at)
 VALUES ($1, $2, $3, $4, $5, now(), now())
 ON CONFLICT (discogs_artist_id) DO UPDATE
 SET wikipedia_url = EXCLUDED.wikipedia_url,
@@ -247,25 +281,25 @@ SET wikipedia_url = EXCLUDED.wikipedia_url,
     lang = EXCLUDED.lang,
     extract = EXCLUDED.extract,
     fetched_at = EXCLUDED.fetched_at,
-    last_checked_at = EXCLUDED.last_checked_at
+    last_attempted_at = EXCLUDED.last_attempted_at
 WHERE NOT (
     lml_cache.artist_wikipedia_bio.extract IS NOT NULL AND EXCLUDED.extract IS NULL
 )\
 """
 
 # LML#1192 review round 6, pass 3, B5: a narrower content-free
-# last_checked_at-only bump used to live here, for a --repick short-circuit
+# last_attempted_at-only bump used to live here, for a --repick short-circuit
 # ("the UPSERT above deliberately doesn't run for an already-correct row")
 # that round 4's P0-2/P0-3 retired -- --repick now pays for a live fetch and
 # a real UPSERT on every candidate, unchanged pick or not, so that UPSERT
-# already advances last_checked_at and the narrower bump had no remaining
+# already advances last_attempted_at and the narrower bump had no remaining
 # caller. Deleted rather than left dead; see scripts/warm_wikipedia_bios.py's
 # _write_bio docstring (C1-2 comment) for the historical note.
 
 # LML#1192 review round 6, C1-1: the third clock. fetched_at owns content
-# age; last_checked_at owns the drain's progress cursor (round 3/4,
+# age; last_attempted_at owns the drain's progress cursor (round 3/4,
 # finding 13); last_refused_at owns "when did we last try and fail to
-# refresh this row" -- distinct from both. Advances last_checked_at TOO
+# refresh this row" -- distinct from both. Advances last_attempted_at TOO
 # (a refusal is still an attempt, same as any other outcome the drain's
 # cursor tracks) but NEVER fetched_at/extract/wikipedia_url/slug_score/lang
 # -- a refusal is, by definition, the case where nothing new was actually
@@ -273,7 +307,7 @@ WHERE NOT (
 _MARK_REFUSED_SQL = """\
 UPDATE lml_cache.artist_wikipedia_bio
 SET last_refused_at = now(),
-    last_checked_at = now()
+    last_attempted_at = now()
 WHERE discogs_artist_id = $1\
 """
 
@@ -287,14 +321,19 @@ async def set_up_artist_wikipedia_bio_schema(pg: PgSource) -> None:
     one transaction on one acquired connection, behind a ``lock_timeout``
     preamble (``entity.ddl.bootstrap_lml_cache_table``).
 
-    The ``last_checked_at`` column ALTER (LML#1192 review round 4, P0-1)
-    and the ``last_refused_at`` column ALTER (LML#1192 review round 6, C1-1)
-    each run as their OWN, SEPARATE ``bootstrap_lml_cache_table`` call — see
-    :data:`_DDL_ADD_LAST_CHECKED_AT_COLUMN`'s docstring for why neither can
-    share a transaction with the step above (or with each other).
+    The round-7 conditional column rename
+    (:data:`_DDL_RENAME_LAST_CHECKED_AT_COLUMN`), the ``last_attempted_at``
+    column ALTER (LML#1192 review round 4, P0-1), and the
+    ``last_refused_at`` column ALTER (LML#1192 review round 6, C1-1) each
+    run as their OWN, SEPARATE ``bootstrap_lml_cache_table`` call — see
+    :data:`_DDL_ADD_LAST_ATTEMPTED_AT_COLUMN`'s docstring for why none can
+    share a transaction with the step above (or with each other). The
+    rename runs BEFORE the additive ALTER so an old-shape table renames in
+    place rather than gaining a second, empty clock column.
     """
     await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE)
-    await bootstrap_lml_cache_table(pg, _DDL_ADD_LAST_CHECKED_AT_COLUMN)
+    await bootstrap_lml_cache_table(pg, _DDL_RENAME_LAST_CHECKED_AT_COLUMN)
+    await bootstrap_lml_cache_table(pg, _DDL_ADD_LAST_ATTEMPTED_AT_COLUMN)
     await bootstrap_lml_cache_table(pg, _DDL_ADD_LAST_REFUSED_AT_COLUMN)
 
 
@@ -424,7 +463,7 @@ async def mark_artist_wikipedia_bio_refused(pg: PgSource, *, discogs_artist_id: 
 
     LML#1192 review round 6, C1-1: advances ``last_refused_at`` (a new
     clock, distinct from ``fetched_at``'s content age and
-    ``last_checked_at``'s drain-progress cursor) AND ``last_checked_at`` (a
+    ``last_attempted_at``'s drain-progress cursor) AND ``last_attempted_at`` (a
     refusal is still an attempt), but NEVER ``fetched_at`` or any content
     column -- a refusal is, by definition, the case where nothing new was
     collected. Called automatically by :func:`set_cached_artist_wikipedia_bio`

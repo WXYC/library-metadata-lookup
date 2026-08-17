@@ -520,3 +520,72 @@ class TestDualTTL:
         assert negative.was_present is False
         assert positive.was_present is True
         assert positive.value.extract == "Still fresh."
+
+
+@pytest.mark.pg
+class TestLastCheckedAtRenameMigration:
+    """LML#1192 cross-PR review, round 7: an environment whose lifespan
+    already created the pre-rename shape (staging deployed the stack before
+    this rename landed) must migrate in place -- column renamed, data
+    preserved -- and a fresh or already-migrated table must no-op."""
+
+    @pytest.mark.asyncio
+    async def test_old_shape_table_migrates_with_data_preserved(self, pg_source, pg_pool):
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS lml_cache.artist_wikipedia_bio")
+            await conn.execute(
+                """
+                CREATE TABLE lml_cache.artist_wikipedia_bio (
+                    discogs_artist_id BIGINT PRIMARY KEY,
+                    wikipedia_url TEXT NOT NULL,
+                    slug_score SMALLINT NOT NULL,
+                    lang TEXT NOT NULL,
+                    extract TEXT,
+                    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    last_refused_at TIMESTAMPTZ
+                )
+                """
+            )
+            await conn.execute(
+                "INSERT INTO lml_cache.artist_wikipedia_bio "
+                "(discogs_artist_id, wikipedia_url, slug_score, lang, extract, last_checked_at) "
+                "VALUES (7, $1, 90, 'en', 'Kept text.', now() - interval '3 days')",
+                _URL,
+            )
+
+        await set_up_artist_wikipedia_bio_schema(pg_source)
+
+        async with pg_pool.acquire() as conn:
+            names = {
+                r["column_name"]
+                for r in await conn.fetch(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'lml_cache' AND table_name = 'artist_wikipedia_bio'"
+                )
+            }
+            row = await conn.fetchrow(
+                "SELECT extract, last_attempted_at, now() - last_attempted_at AS age "
+                "FROM lml_cache.artist_wikipedia_bio WHERE discogs_artist_id = 7"
+            )
+        assert "last_attempted_at" in names
+        assert "last_checked_at" not in names
+        assert row["extract"] == "Kept text."
+        # The migrated value is the ORIGINAL timestamp, not a fresh default.
+        assert row["age"] >= timedelta(days=2)
+
+    @pytest.mark.asyncio
+    async def test_migrated_table_boots_again_as_a_no_op(self, pg_source, pg_pool):
+        # The autouse fixture already bootstrapped the new shape; a second
+        # boot (rename guard false both ways) must not raise or duplicate.
+        await set_up_artist_wikipedia_bio_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            names = [
+                r["column_name"]
+                for r in await conn.fetch(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'lml_cache' AND table_name = 'artist_wikipedia_bio' "
+                    "AND column_name LIKE 'last_%'"
+                )
+            ]
+        assert sorted(names) == ["last_attempted_at", "last_refused_at"]
