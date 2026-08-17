@@ -476,3 +476,110 @@ class TestSlugScoreMatchesTheServedUrl:
         # real words with "Partially Matching Artist" -- its own score
         # must be reflected, not a different candidate's.
         assert result.picked.slug_score > 0.0
+
+
+@pytest.mark.asyncio
+class TestLiveFetchAttempted:
+    """LML#1204 item 2: ``ValidatedPick.live_fetch_attempted`` — "did the
+    picker ever touch the network" is a fact only the candidate loop knows,
+    so both live-fetch callers used to reconstruct it with a hand-built
+    ``nonlocal`` closure around ``fetch``. The pick itself now carries it."""
+
+    async def test_a_winning_pick_records_the_attempt(self):
+        row = _TEN_PAGE_TABLE["Stereolab"]
+        fetch, _ = _make_fetch(row)
+        result = await resolve_and_validate_pick([row["bare_url"]], row["artist_name"], fetch=fetch)
+        assert result.summary is not None
+        assert result.live_fetch_attempted is True
+
+    async def test_an_all_rejected_fallback_records_the_attempt(self):
+        row = _TEN_PAGE_TABLE["Low"]
+        fetch, _ = _make_fetch(row)
+        result = await resolve_and_validate_pick([row["bare_url"]], row["artist_name"], fetch=fetch)
+        assert result.summary is None
+        assert result.live_fetch_attempted is True
+
+    async def test_a_below_floor_decline_records_no_attempt(self):
+        async def fetch(url: str, lang: str):
+            raise AssertionError("a below-floor decline must never fetch")
+
+        result = await resolve_and_validate_pick(
+            ["https://en.wikipedia.org/wiki/Something_Entirely_Different"],
+            "Stereolab",
+            fetch=fetch,
+        )
+        assert result.picked is not None and result.picked.below_floor is True
+        assert result.live_fetch_attempted is False
+
+    async def test_no_candidate_at_all_records_no_attempt(self):
+        async def fetch(url: str, lang: str):
+            raise AssertionError("no candidate, no fetch")
+
+        result = await resolve_and_validate_pick(
+            ["https://example.com/not-wikipedia"], "Stereolab", fetch=fetch
+        )
+        assert result.picked is None
+        assert result.live_fetch_attempted is False
+
+    async def test_a_zero_cap_truncation_records_no_attempt(self):
+        """``max_candidates`` slicing happens before any fetch — a cap that
+        empties the ranked list is a truncation with zero live fetches."""
+
+        async def fetch(url: str, lang: str):
+            raise AssertionError("an emptied ranked list must never fetch")
+
+        row = _TEN_PAGE_TABLE["Stereolab"]
+        result = await resolve_and_validate_pick(
+            [row["bare_url"]], row["artist_name"], fetch=fetch, max_candidates=0
+        )
+        assert result.truncated is True
+        assert result.live_fetch_attempted is False
+
+
+@pytest.mark.asyncio
+class TestMakeSummaryFetcher:
+    """LML#1204 item 2: the URL→title conversion wrapper both live-fetch
+    callers used to hand-build around ``WikipediaClient.get_summary``."""
+
+    async def test_converts_the_url_to_a_title_and_forwards_the_knobs(self):
+        from unittest.mock import AsyncMock
+
+        from lookup.wikipedia_pick_validation import make_summary_fetcher
+
+        client = AsyncMock()
+        client.get_summary = AsyncMock(return_value=_SUMMARY)
+        limiter = object()
+        fetch = make_summary_fetcher(client, max_retries=5, rate_limiter=limiter)
+
+        got = await fetch("https://en.wikipedia.org/wiki/Sun_Ra", "en")
+
+        assert got is _SUMMARY
+        client.get_summary.assert_awaited_once_with(
+            "Sun Ra", "en", max_retries=5, rate_limiter=limiter
+        )
+
+    async def test_rate_limiter_defaults_to_none(self):
+        from unittest.mock import AsyncMock
+
+        from lookup.wikipedia_pick_validation import make_summary_fetcher
+
+        client = AsyncMock()
+        client.get_summary = AsyncMock(return_value=None)
+        fetch = make_summary_fetcher(client, max_retries=1)
+
+        await fetch("https://en.wikipedia.org/wiki/Stereolab", "en")
+
+        client.get_summary.assert_awaited_once_with(
+            "Stereolab", "en", max_retries=1, rate_limiter=None
+        )
+
+    async def test_an_unparseable_url_returns_none_without_fetching(self):
+        from unittest.mock import AsyncMock
+
+        from lookup.wikipedia_pick_validation import make_summary_fetcher
+
+        client = AsyncMock()
+        fetch = make_summary_fetcher(client, max_retries=1)
+
+        assert await fetch("https://example.com/not-wikipedia", "en") is None
+        client.get_summary.assert_not_awaited()

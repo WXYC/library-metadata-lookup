@@ -150,9 +150,13 @@ class TestRunWarm:
             extract="Stereolab are a band.",
         )
         mock_capture.assert_called_once_with(wikipedia_warm.FETCH_OK_STAT_KEY)
-        # The fetch closure reuses wikipedia_title_from_url's conversion --
-        # a page TITLE (spaces, not underscores), never a raw URL.
-        mock_get_summary.assert_awaited_once_with("Stereolab", "en", max_retries=1)
+        # The shared make_summary_fetcher (LML#1204 item 2) reuses
+        # wikipedia_title_from_url's conversion -- a page TITLE (spaces, not
+        # underscores), never a raw URL -- with this warm's single-retry
+        # knob and no rate limiter.
+        mock_get_summary.assert_awaited_once_with(
+            "Stereolab", "en", max_retries=1, rate_limiter=None
+        )
 
     async def test_a_rejected_candidate_falls_through_to_the_next_one(self):
         # LML#1192 review round 5's whole point: a single-candidate,
@@ -418,3 +422,31 @@ class TestRunWarm:
         ):
             await wikipedia_warm._run_warm(99, "Stereolab", urls, pg)
         assert mock_get_summary.await_count == cap
+
+
+@pytest.mark.asyncio
+class TestNoResolvablePickRecordsAttempt:
+    """LML#1204 item 2: the no-resolvable-pick branch used to diverge from
+    the offline drain (which records a durable ``unresolvable`` attempt) by
+    recording nothing — an attempt that found no resolvable candidate is
+    still information, and without the record the artist resurfaces as a
+    schedulable miss forever."""
+
+    async def test_no_resolvable_pick_records_a_durable_unresolvable_attempt(self):
+        from entity.artist_wikipedia_bio_attempt import OUTCOME_UNRESOLVABLE
+
+        pg = AsyncMock(spec=PgSource)
+        with (
+            patch(
+                "lookup.enrichment.wikipedia_warm.set_cached_artist_wikipedia_bio",
+                new_callable=AsyncMock,
+            ) as mock_set,
+            patch(
+                "lookup.enrichment.wikipedia_warm.record_artist_wikipedia_bio_attempt",
+                new_callable=AsyncMock,
+            ) as mock_record,
+        ):
+            await wikipedia_warm._run_warm(99, _ARTIST_NAME, [], pg)
+
+        mock_set.assert_not_awaited()
+        mock_record.assert_awaited_once_with(pg, discogs_artist_id=99, outcome=OUTCOME_UNRESOLVABLE)
