@@ -16,10 +16,15 @@ Pins the three primitives this module introduces:
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
+from wxyc_fastapi.testing import CountingPosthog
+
+from config.settings import get_settings
+from core import observability
 
 
 class TestObservabilityGuard:
@@ -559,34 +564,26 @@ class TestCaptureUnsampledCounter:
     """LML#1204 item 1: the detached-background-task PostHog counter shape
     previously copied byte-for-byte by ``discogs.service._capture_artist_breaker_shed``
     (LML#1049), ``discogs.ratelimit._capture_fail_open`` (LML#879),
-    ``lookup.enrichment.bandcamp_probe._capture_shed``, and the Wikipedia
-    warm task's fetch-outcome counters (LML#513/#1192), consolidated into
-    one shared helper. Per-site adoption behavior (which event fires on
-    which trigger) stays pinned by each site's own tests."""
+    ``lookup.enrichment.bandcamp_probe._capture_shed``, the Wikipedia warm
+    task's fetch-outcome counters (LML#513/#1192), and the two
+    ``identity/router.py`` fail-open counters, consolidated into one shared
+    helper. Per-site adoption behavior (which event fires on which trigger)
+    stays pinned by each site's own tests. Uses the shared
+    ``wxyc_fastapi.testing.CountingPosthog`` recording fake."""
 
     def _stub_settings(self, *, enable_telemetry: bool = True, environment: str = "unit-test-env"):
-        from types import SimpleNamespace
-
         return SimpleNamespace(enable_telemetry=enable_telemetry, environment=environment)
 
     def test_emits_with_service_distinct_id_prefix_and_merged_environment(self, monkeypatch):
         """One capture: the service-wide distinct id, the caller's event, and
         the caller's properties with ``environment`` merged in — the exact
         payload shape every pre-consolidation copy emitted."""
-        from core import observability
-
-        events: list[dict[str, Any]] = []
+        fake = CountingPosthog()
         prefixes: list[str] = []
-
-        class _FakePosthog:
-            def capture(self, *, distinct_id, event, properties):
-                events.append(
-                    {"distinct_id": distinct_id, "event": event, "properties": properties}
-                )
 
         def _accessor(event_prefix):
             prefixes.append(event_prefix)
-            return _FakePosthog()
+            return fake
 
         monkeypatch.setattr(observability, "get_posthog_client", _accessor)
         observability.capture_unsampled_counter(
@@ -597,41 +594,24 @@ class TestCaptureUnsampledCounter:
         )
 
         assert prefixes == ["stereolab_probe"]
-        assert events == [
-            {
-                "distinct_id": observability.SERVICE_POSTHOG_DISTINCT_ID,
-                "event": "stereolab_probe_shed",
-                "properties": {"reason": "breaker_open", "environment": "unit-test-env"},
-            }
-        ]
+        assert len(fake.captures) == 1
+        captured = fake.captures[0]
+        assert captured.distinct_id == observability.SERVICE_POSTHOG_DISTINCT_ID
+        assert captured.event == "stereolab_probe_shed"
+        assert captured.properties == {"reason": "breaker_open", "environment": "unit-test-env"}
 
     def test_omitted_properties_still_carry_environment(self, monkeypatch):
         """The wikipedia-warm shape: no caller properties at all, environment only."""
-        from core import observability
-
-        events: list[dict[str, Any]] = []
-
-        class _FakePosthog:
-            def capture(self, *, distinct_id, event, properties):
-                events.append({"event": event, "properties": properties})
-
-        monkeypatch.setattr(
-            observability, "get_posthog_client", lambda event_prefix: _FakePosthog()
-        )
+        fake = CountingPosthog()
+        monkeypatch.setattr(observability, "get_posthog_client", lambda event_prefix: fake)
         observability.capture_unsampled_counter(
             "wikipedia_bio_warm", "wikipedia_bio_fetch_ok", settings=self._stub_settings()
         )
 
-        assert events == [
-            {
-                "event": "wikipedia_bio_fetch_ok",
-                "properties": {"environment": "unit-test-env"},
-            }
-        ]
+        assert fake.events == ["wikipedia_bio_fetch_ok"]
+        assert fake.captures[0].properties == {"environment": "unit-test-env"}
 
     def test_disabled_telemetry_never_touches_the_accessor(self, monkeypatch):
-        from core import observability
-
         accessor = Mock()
         monkeypatch.setattr(observability, "get_posthog_client", accessor)
         observability.capture_unsampled_counter(
@@ -640,8 +620,6 @@ class TestCaptureUnsampledCounter:
         accessor.assert_not_called()
 
     def test_none_client_is_a_noop(self, monkeypatch):
-        from core import observability
-
         monkeypatch.setattr(observability, "get_posthog_client", lambda event_prefix: None)
         # Must simply return — nothing to assert beyond "no raise".
         observability.capture_unsampled_counter("p", "e", settings=self._stub_settings())
@@ -650,7 +628,6 @@ class TestCaptureUnsampledCounter:
         """Best-effort: a broken accessor logs the per-site message shape
         (``Failed to emit %s counter``) and never raises — a telemetry
         failure must not turn the event being counted into something worse."""
-        from core import observability
 
         def _exploding(event_prefix):
             raise RuntimeError("posthog accessor broken")
@@ -667,24 +644,15 @@ class TestCaptureUnsampledCounter:
     def test_omitted_settings_reads_the_cached_global_settings(self, monkeypatch):
         """Callers with no DI settings in hand (the discogs retry loop, the
         warm task) omit ``settings`` and get ``config.settings.get_settings()``."""
-        from config.settings import get_settings
-        from core import observability
-
         monkeypatch.setenv("ENABLE_TELEMETRY", "true")
         monkeypatch.setenv("ENVIRONMENT", "unit-test-env")
         get_settings.cache_clear()
-        events: list[dict[str, Any]] = []
-
-        class _FakePosthog:
-            def capture(self, *, distinct_id, event, properties):
-                events.append({"event": event, "properties": properties})
-
-        monkeypatch.setattr(
-            observability, "get_posthog_client", lambda event_prefix: _FakePosthog()
-        )
+        fake = CountingPosthog()
+        monkeypatch.setattr(observability, "get_posthog_client", lambda event_prefix: fake)
         try:
             observability.capture_unsampled_counter("p", "e")
         finally:
             get_settings.cache_clear()
 
-        assert events == [{"event": "e", "properties": {"environment": "unit-test-env"}}]
+        assert fake.events == ["e"]
+        assert fake.captures[0].properties == {"environment": "unit-test-env"}

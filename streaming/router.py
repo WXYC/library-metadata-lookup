@@ -16,7 +16,11 @@ from clients.streaming.deezer import DeezerClient
 from clients.streaming.spotify import SpotifyClient
 from config.settings import get_settings
 from core.dependencies import get_streaming_posthog_client
-from core.observability import observability_guard, project_capped
+from core.observability import (
+    SERVICE_POSTHOG_DISTINCT_ID,
+    observability_guard,
+    project_capped,
+)
 from core.search import resolve_positive_int_env
 from streaming.dependencies import (
     get_apple_music_client,
@@ -235,7 +239,7 @@ async def handle_streaming_check(
     init_cache_stats()
     telemetry = RequestTelemetry(
         api_call_keys=list(_STREAMING_SERVICES),
-        distinct_id="library-metadata-lookup-service",
+        distinct_id=SERVICE_POSTHOG_DISTINCT_ID,
         event_prefix="streaming_check",
     )
 

@@ -1547,7 +1547,7 @@ class TestIncludeTracksCompilationStore:
                 )
 
         monkeypatch.setattr(
-            "identity.router.get_posthog_client", lambda event_prefix: _FakePosthog()
+            "core.observability.get_posthog_client", lambda event_prefix: _FakePosthog()
         )
 
         async def failing_load(pg, legacy_release_ids):
@@ -1977,7 +1977,7 @@ class TestIncludeTracksSingleArtistDerivation:
                 )
 
         monkeypatch.setattr(
-            "identity.router.get_posthog_client", lambda event_prefix: _FakePosthog()
+            "core.observability.get_posthog_client", lambda event_prefix: _FakePosthog()
         )
 
         async def failing_pins(pg, legacy_release_ids):

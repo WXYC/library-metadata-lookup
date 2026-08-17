@@ -43,6 +43,7 @@ from core.dependencies import (
     get_discogs_cache_service_from_pool,
     get_discogs_service,
 )
+from core.observability import SERVICE_POSTHOG_DISTINCT_ID
 from core.service_unavailable import service_unavailable_detail
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.service import BREAKER_OPEN_STAT_KEY, DiscogsService
@@ -347,7 +348,7 @@ async def resolve_bulk(
     # guarantee rather than an accident of no step being tracked yet.
     telemetry = RequestTelemetry(
         api_call_keys=["discogs"],
-        distinct_id="library-metadata-lookup-service",
+        distinct_id=SERVICE_POSTHOG_DISTINCT_ID,
         event_prefix="artist_resolve",
         emit_step_events=False,
     )
