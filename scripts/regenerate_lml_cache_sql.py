@@ -160,21 +160,30 @@ _MODULES: dict[str, SidecarSpec] = {
 -- on `extract IS NULL` (`entity/artist_wikipedia_bio.py`'s module
 -- docstring has the full freshness rationale). `last_checked_at` -- the
 -- offline drain's own progress cursor (LML#1192 review round 4, finding
--- 13), distinct from `fetched_at`'s content-age meaning -- see the footer
--- below for tables that predate the column.""",
+-- 13), distinct from `fetched_at`'s content-age meaning. `last_refused_at`
+-- -- when a refresh for this row was last refused by the P0-5
+-- null-overwrite guard (LML#1192 review round 6, C1-1); NULL for a row
+-- that has never been refused. A third clock distinct from the two above:
+-- neither `fetched_at` (content age) nor `last_checked_at` alone (the
+-- drain's cursor, which a refusal ALSO advances) could answer "when did we
+-- last try and fail" -- see `mark_artist_wikipedia_bio_refused` and the
+-- read predicate's widened positive arm. See the footer below for tables
+-- that predate either column.""",
         },
         footer=f"""\
--- LML#1192 review round 4, P0-1: this table is created ONLY here
--- (#1194) -- the drain PR (#1196) reads/writes `last_checked_at` but its
--- own `CREATE TABLE IF NOT EXISTS` is a no-op once this one has already
--- run. A fresh install already has the column from the CREATE TABLE
--- above; the runtime bootstrap additionally issues this idempotent ALTER
--- (not shown as a top-level statement -- it is a follow-up upgrade for a
--- table that predates the column, a no-op once the column exists) so an
--- existing prod table gains it in place. Mirrors
+-- LML#1192 review round 4, P0-1 / round 6, C1-1: this table is created
+-- ONLY here (#1194) -- the drain PR (#1196) reads/writes `last_checked_at`
+-- but its own `CREATE TABLE IF NOT EXISTS` is a no-op once this one has
+-- already run. A fresh install already has both columns from the CREATE
+-- TABLE above; the runtime bootstrap additionally issues these idempotent
+-- ALTERs, each as its OWN bootstrap_lml_cache_table call (not shown as
+-- top-level statements -- each is a follow-up upgrade for a table that
+-- predates the column, a no-op once the column exists), so an existing
+-- prod table gains them in place. Mirrors
 -- `entity/streaming_url_cache.py`'s `is_error` upgrade (LML#1121):
 --
---   {artist_wikipedia_bio._DDL_ADD_LAST_CHECKED_AT_COLUMN};""",
+--   {artist_wikipedia_bio._DDL_ADD_LAST_CHECKED_AT_COLUMN};
+--   {artist_wikipedia_bio._DDL_ADD_LAST_REFUSED_AT_COLUMN};""",
     ),
     "compilation_track_identity": SidecarSpec(
         header=f"""\

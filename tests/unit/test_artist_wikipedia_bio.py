@@ -23,8 +23,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from entity.artist_wikipedia_bio import (
+    DEFAULT_REFUSAL_COOLDOWN,
     DEFAULT_SUCCESS_TTL,
     get_cached_artist_wikipedia_bio,
+    mark_artist_wikipedia_bio_refused,
     set_cached_artist_wikipedia_bio,
     set_up_artist_wikipedia_bio_schema,
     touch_artist_wikipedia_bio_last_checked_at,
@@ -70,20 +72,24 @@ class TestGetCachedArtistWikipediaBio:
         assert result.value.extract is None
         assert result.value.wikipedia_url == _URL
 
-    async def test_binds_artist_id_and_both_cutoffs_no_url_param(self):
+    async def test_binds_artist_id_and_all_three_cutoffs_no_url_param(self):
         # LML#1192 review round 5: no wikipedia_url parameter exists at all
         # anymore -- the row is authoritative, read by discogs_artist_id
-        # alone.
+        # alone. Round 6, C1-1: a third cutoff joins the two TTL cutoffs --
+        # the refusal-cooldown cutoff that lets a row whose refresh was
+        # recently refused keep serving its existing (aging) extract
+        # instead of reading as a miss forever (see TestRefusalCooldown).
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
 
         await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
 
         args = pg.fetchone.await_args.args
-        sql, artist_id, positive_cutoff, negative_cutoff = args
+        sql, artist_id, positive_cutoff, negative_cutoff, refusal_cutoff = args
         assert artist_id == _ARTIST_ID
         assert positive_cutoff == _NOW - DEFAULT_SUCCESS_TTL
         assert negative_cutoff == _NOW - DEFAULT_MISS_TTL
+        assert refusal_cutoff == _NOW - DEFAULT_REFUSAL_COOLDOWN
         assert "wikipedia_url = $" not in sql
 
     async def test_pg_error_degrades_to_absent(self):
@@ -190,6 +196,132 @@ class TestSetCachedArtistWikipediaBio:
             lang="en",
             extract="Text.",
         )
+
+    async def test_a_refused_upsert_marks_the_row_refused(self):
+        # LML#1192 review round 6, C1-1: "INSERT 0 0" is the asyncpg command
+        # tag for this UPSERT if and only if the P0-5 null-overwrite guard
+        # fired (a conflict occurred and its WHERE clause was false) --
+        # verified live against real Postgres (see the round-6 report). On
+        # that exact tag, the write must follow up with
+        # mark_artist_wikipedia_bio_refused so the read side can widen its
+        # predicate and the drain's ordering can deprioritize this row,
+        # rather than leaving it silently wedged.
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(return_value="INSERT 0 0")
+
+        await set_cached_artist_wikipedia_bio(
+            pg,
+            discogs_artist_id=_ARTIST_ID,
+            wikipedia_url=_URL,
+            slug_score=0.0,
+            lang="en",
+            extract=None,
+        )
+
+        # Two execute calls: the refused UPSERT itself, then the mark-refused UPDATE.
+        assert pg.execute.await_count == 2
+        second_call_sql = pg.execute.await_args_list[1].args[0]
+        second_call_artist_id = pg.execute.await_args_list[1].args[1]
+        assert "last_refused_at" in second_call_sql
+        assert second_call_artist_id == _ARTIST_ID
+
+    async def test_a_successful_insert_does_not_mark_the_row_refused(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+
+        await set_cached_artist_wikipedia_bio(
+            pg,
+            discogs_artist_id=_ARTIST_ID,
+            wikipedia_url=_URL,
+            slug_score=97.0,
+            lang="en",
+            extract="Text.",
+        )
+
+        assert pg.execute.await_count == 1
+
+    async def test_a_refused_upserts_own_mark_refused_follow_up_is_also_swallowed(self):
+        # The follow-up write is itself best-effort -- a PG hiccup on the
+        # mark-refused UPDATE must not raise out of the original set call.
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(side_effect=["INSERT 0 0", RuntimeError("PG unreachable")])
+
+        await set_cached_artist_wikipedia_bio(
+            pg,
+            discogs_artist_id=_ARTIST_ID,
+            wikipedia_url=_URL,
+            slug_score=0.0,
+            lang="en",
+            extract=None,
+        )  # must not raise
+
+
+@pytest.mark.asyncio
+class TestMarkArtistWikipediaBioRefused:
+    """LML#1192 review round 6, C1-1: the third clock. ``fetched_at`` owns
+    content age; ``last_checked_at`` owns the drain's progress cursor (round
+    3/4, finding 13); ``last_refused_at`` owns "when did we last try and
+    fail to refresh this row" -- distinct from both, since a refusal
+    advances neither of the other two under the pre-round-6 code, which is
+    exactly how a wedged row became permanently unreadable (see
+    ``tests/integration/test_artist_wikipedia_bio.py::TestRefusedRefreshDoesNotWedgeTheRow``).
+    """
+
+    async def test_advances_both_last_refused_at_and_last_checked_at(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(return_value="UPDATE 1")
+
+        await mark_artist_wikipedia_bio_refused(pg, discogs_artist_id=_ARTIST_ID)
+
+        args = pg.execute.await_args.args
+        sql, artist_id = args
+        assert artist_id == _ARTIST_ID
+        assert "last_refused_at" in sql
+        assert "last_checked_at" in sql
+        # Content columns must never move on a refusal.
+        assert "fetched_at = " not in sql
+        assert "extract = " not in sql
+
+    async def test_write_failure_is_swallowed(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(side_effect=RuntimeError("PG unreachable"))
+
+        # Must not raise.
+        await mark_artist_wikipedia_bio_refused(pg, discogs_artist_id=_ARTIST_ID)
+
+
+@pytest.mark.asyncio
+class TestRefusalCooldownReadPredicate:
+    """LML#1192 review round 6, C1-1: a recent refusal widens the POSITIVE
+    read arm so a row whose refresh was refused stays readable -- serving
+    the existing, aging extract -- instead of reading as a miss on every
+    subsequent request forever. Never widens the NEGATIVE arm: a refused
+    write only ever protects an existing POSITIVE row (that's what the
+    P0-5 guard blocks), so there's nothing to rescue on the negative side.
+    """
+
+    async def test_binds_the_refusal_cutoff_as_a_default_kwarg(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+
+        await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
+
+        refusal_cutoff = pg.fetchone.await_args.args[4]
+        assert refusal_cutoff == _NOW - DEFAULT_REFUSAL_COOLDOWN
+
+    async def test_a_custom_refusal_cooldown_is_honored(self):
+        from datetime import timedelta
+
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        custom_cooldown = timedelta(days=3)
+
+        await get_cached_artist_wikipedia_bio(
+            pg, discogs_artist_id=_ARTIST_ID, now=_NOW, refusal_cooldown=custom_cooldown
+        )
+
+        refusal_cutoff = pg.fetchone.await_args.args[4]
+        assert refusal_cutoff == _NOW - custom_cooldown
 
     async def test_upsert_also_advances_last_checked_at(self):
         # LML#1192 review round 3/4, finding 13: fetched_at describes
@@ -341,3 +473,30 @@ class TestSchemaCarriesLastCheckedAtColumn:
         await set_up_artist_wikipedia_bio_schema(pg)
 
         assert pg.acquire_count >= 2
+
+
+@pytest.mark.asyncio
+class TestSchemaCarriesLastRefusedAtColumn:
+    """LML#1192 review round 6, C1-1: same P0-1 treatment as
+    last_checked_at above, one column later -- last_refused_at was
+    introduced after #1194 may already have deployed a table without it,
+    so both the CREATE TABLE (fresh installs) and an idempotent
+    ADD COLUMN IF NOT EXISTS (an already-existing table) must exist, and
+    the ALTER must run as its own bootstrap call, not share a transaction
+    with CREATE TABLE/SCHEMA.
+    """
+
+    async def test_bootstrap_issues_an_add_column_statement_for_last_refused_at(self):
+        pg = _FakePgSource()
+
+        await set_up_artist_wikipedia_bio_schema(pg)
+
+        assert any("CREATE TABLE" in s and "last_refused_at" in s for s in pg.executed)
+        assert any("ADD COLUMN IF NOT EXISTS" in s and "last_refused_at" in s for s in pg.executed)
+
+    async def test_the_add_column_alter_runs_as_its_own_bootstrap_call(self):
+        pg = _FakePgSource()
+
+        await set_up_artist_wikipedia_bio_schema(pg)
+
+        assert pg.acquire_count >= 3  # schema+table, last_checked_at ALTER, last_refused_at ALTER

@@ -100,10 +100,29 @@ class TestSetUpArtistWikipediaBioSchema:
             "ALTER TABLE" in sql and "ADD COLUMN IF NOT EXISTS" in sql and "last_checked_at" in sql
             for sql in executed
         )
-        assert mock_pg_tx.acquire.call_count == 2, (
-            "the CREATE TABLE step and the additive ALTER must run as TWO "
-            "separate bootstrap_lml_cache_table calls, not one shared transaction"
+
+    async def test_last_refused_at_column_is_added_via_its_own_bootstrap_call(self, mock_pg_tx):
+        # LML#1192 review round 6, C1-1: same P0-1 treatment, one column
+        # later -- its own bootstrap_lml_cache_table call, separate from
+        # both the CREATE TABLE step and the last_checked_at ALTER.
+        conn = mock_pg_tx._mock_conn
+
+        await set_up_artist_wikipedia_bio_schema(mock_pg_tx)
+
+        executed = [call.args[0] for call in conn.execute.await_args_list]
+        assert any(
+            "ALTER TABLE" in sql and "ADD COLUMN IF NOT EXISTS" in sql and "last_refused_at" in sql
+            for sql in executed
         )
+
+    async def test_three_separate_bootstrap_calls_not_one_shared_transaction(self, mock_pg_tx):
+        # CREATE TABLE, the last_checked_at ALTER, and the last_refused_at
+        # ALTER each acquire their own connection/transaction -- a
+        # lock_timeout on any one must not roll back an already-succeeded
+        # earlier step.
+        await set_up_artist_wikipedia_bio_schema(mock_pg_tx)
+
+        assert mock_pg_tx.acquire.call_count == 3
 
     async def test_does_not_read_or_backfill(self, mock_pg_tx):
         conn = mock_pg_tx._mock_conn
