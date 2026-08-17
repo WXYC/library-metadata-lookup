@@ -216,21 +216,14 @@ WHERE NOT (
 )\
 """
 
-# Content-free progress-cursor bump: advances ONLY last_checked_at, NEVER
-# fetched_at (fetched_at is content age; conflating the two would grant an
-# unchanged repick's prose another full DEFAULT_SUCCESS_TTL of freshness
-# authority it didn't earn). Used by scripts/warm_wikipedia_bios.py's
-# --repick mode when a re-run of the extractor confirms the stored pick is
-# still correct -- the UPSERT above deliberately doesn't run for an
-# already-correct row (the "only divergent rows are written" data-safety
-# rule), but that means an unchanged row's cursor never advances without
-# this, so a cursor-ordered seed query would keep re-selecting the SAME
-# already-verified rows forever instead of progressing through the table.
-_TOUCH_LAST_CHECKED_AT_SQL = """\
-UPDATE lml_cache.artist_wikipedia_bio
-SET last_checked_at = now()
-WHERE discogs_artist_id = $1\
-"""
+# LML#1192 review round 6, pass 3, B5: a narrower content-free
+# last_checked_at-only bump used to live here, for a --repick short-circuit
+# ("the UPSERT above deliberately doesn't run for an already-correct row")
+# that round 4's P0-2/P0-3 retired -- --repick now pays for a live fetch and
+# a real UPSERT on every candidate, unchanged pick or not, so that UPSERT
+# already advances last_checked_at and the narrower bump had no remaining
+# caller. Deleted rather than left dead; see scripts/warm_wikipedia_bios.py's
+# _write_bio docstring (C1-2 comment) for the historical note.
 
 # LML#1192 review round 6, C1-1: the third clock. fetched_at owns content
 # age; last_checked_at owns the drain's progress cursor (round 3/4,
@@ -378,29 +371,6 @@ async def set_cached_artist_wikipedia_bio(
     )
     if tag == "INSERT 0 0":
         await mark_artist_wikipedia_bio_refused(pg, discogs_artist_id=discogs_artist_id)
-
-
-async def touch_artist_wikipedia_bio_last_checked_at(
-    pg: PgSource, *, discogs_artist_id: int
-) -> None:
-    """Bump ``last_checked_at`` to now without touching ``fetched_at`` or
-    any other column.
-
-    Used by ``scripts/warm_wikipedia_bios.py``'s ``--repick`` mode when a
-    re-run of the extractor confirms the stored pick is still correct (see
-    :data:`_TOUCH_LAST_CHECKED_AT_SQL` for why this needs to exist
-    separately from the UPSERT above, and why it must never touch
-    ``fetched_at``). A no-op if the row doesn't exist. Best-effort, same
-    posture as every other write in this module.
-    """
-    await swallowing_execute(
-        pg,
-        _TOUCH_LAST_CHECKED_AT_SQL,
-        discogs_artist_id,
-        logger=logger,
-        log_label="artist_wikipedia_bio touch failed for discogs_artist_id=%s",
-        log_args=(discogs_artist_id,),
-    )
 
 
 async def mark_artist_wikipedia_bio_refused(pg: PgSource, *, discogs_artist_id: int) -> None:

@@ -95,9 +95,10 @@ async def record_artist_wikipedia_bio_attempt(
     """Upsert a durable record that this artist was attempted and nothing
     was written to the content table.
 
-    Best-effort, like :func:`~entity.artist_wikipedia_bio.touch_artist_wikipedia_bio_last_checked_at`
-    -- a failure here must never take down a multi-hour drain session, so
-    any PG error is logged and swallowed rather than raised.
+    Best-effort, like every other write in this module and its
+    ``entity/artist_wikipedia_bio.py`` sibling -- a failure here must never
+    take down a multi-hour drain session, so any PG error is logged and
+    swallowed rather than raised.
     """
     try:
         await pg.execute(_UPSERT_SQL, discogs_artist_id, outcome)

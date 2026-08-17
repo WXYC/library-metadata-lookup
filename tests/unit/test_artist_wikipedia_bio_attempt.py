@@ -38,9 +38,9 @@ class TestRecordArtistWikipediaBioAttempt:
         assert outcome == "fetch_error"
 
     async def test_write_failure_is_swallowed(self):
-        # Mirrors set_cached_artist_wikipedia_bio/touch_artist_wikipedia_bio_last_checked_at:
-        # a best-effort bookkeeping write must never take down a multi-hour
-        # drain session.
+        # Mirrors set_cached_artist_wikipedia_bio and every other write in
+        # this module's sibling: a best-effort bookkeeping write must never
+        # take down a multi-hour drain session.
         pg = AsyncMock(spec=PgSource)
         pg.execute = AsyncMock(side_effect=RuntimeError("PG unreachable"))
 
