@@ -1,9 +1,9 @@
-"""Regenerate nine ``lml_cache.*`` DDL sidecars from their runtime Python constants (LML#1038).
+"""Regenerate the ``lml_cache.*`` DDL sidecars from their runtime Python constants (LML#1038).
 
 Companion to ``scripts/regenerate_streaming_catalog_sql.py`` (kept separate:
 ``entity/streaming_catalog.py``'s DDL is a 22-statement, per-statement-commented
 reference with its own generator and its own richer parity test). This script
-covers the other eight ``entity/*.py`` modules that own a ``lml_cache.*``
+covers every other ``entity/*.py`` module that owns a ``lml_cache.*``
 table, each simple enough to share one small rendering routine: a file-level
 header, then each statement preceded by its own prose comment (never inline
 within the statement -- inline per-column ``--`` comments were, before this
@@ -191,7 +191,7 @@ _MODULES: dict[str, SidecarSpec] = {
 --   {artist_wikipedia_bio._DDL_ADD_LAST_REFUSED_AT_COLUMN};""",
     ),
     "artist_wikipedia_bio_attempt": SidecarSpec(
-        header="""\
+        header=f"""\
 -- Durable write-nothing attempt record for the Wikipedia bio program
 -- (LML#1192 review round 4, P0-8).
 --
@@ -206,31 +206,17 @@ _MODULES: dict[str, SidecarSpec] = {
 -- becomes the candidate list, 100% failure-ish, aborting every session
 -- immediately and masking real progress elsewhere in the catalog.
 --
--- It lives in the LML-owned `lml_cache.*` schema (per WXYC/discogs-etl#288,
--- Option 3) -- not the discogs-cache-owned `entity.*` identity contract,
--- which is created and migrated only via discogs-cache alembic migrations --
--- and discogs-cache tooling never touches `lml_cache.*`.
+-- Lifespan-bootstrapped since LML#1192 review round 6 (C2-3) -- NOT just
+-- the offline drain's private bookkeeping; see
+-- `entity/artist_wikipedia_bio_attempt.py`'s module docstring for why
+-- (this generated comment intentionally does not restate it, to avoid a
+-- second copy that can drift).
 --
--- Bootstrapped from LML's own FastAPI lifespan (LML#1192 review round 6,
--- C2-3), same as every other `lml_cache.*` table -- NOT just the offline
--- drain; see `entity/artist_wikipedia_bio_attempt.py`'s module docstring
--- for why (this generated comment intentionally does not restate it, to
--- avoid a second copy that can drift).
---
--- This file exists so:
---
---   1. The LML PR's reviewer has the DDL inline for comparison.
---   2. An operator can apply the schema directly to a non-discogs-cache PG
---      (e.g. local dev) without booting the full LML app.
---
--- GENERATED FILE -- regenerate via:
---   uv run python -m scripts.regenerate_lml_cache_sql
--- Statements come verbatim from `entity/artist_wikipedia_bio_attempt.py`;
--- do not hand-edit this file -- `tests/unit/test_artist_wikipedia_bio_attempt_schema.py`
--- pins the statement text. The runtime source of truth is
--- `entity/artist_wikipedia_bio_attempt.py`'s
--- `set_up_artist_wikipedia_bio_attempt_schema`, which issues these
--- statements (`IF NOT EXISTS` forms) on every boot.""",
+{
+            _ownership_boilerplate(
+                "artist_wikipedia_bio_attempt", "set_up_artist_wikipedia_bio_attempt_schema"
+            )
+        }""",
         statements=(
             artist_wikipedia_bio_attempt._DDL_SCHEMA,
             artist_wikipedia_bio_attempt._DDL_TABLE,

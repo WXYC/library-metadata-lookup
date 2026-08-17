@@ -121,3 +121,27 @@ class TestSetUpArtistWikipediaBioAttemptSchema:
         executed = [call.args[0] for call in conn.execute.await_args_list]
         assert not any("artist_wikipedia_bio (" in sql for sql in executed)
         assert not any("discogs_rate_bucket" in sql for sql in executed)
+
+
+class TestOwnershipBoilerplate:
+    """LML#1204 item 5: the attempt entry's header uses the shared
+    ``_ownership_boilerplate`` paragraph instead of a hand-inlined
+    near-verbatim copy (round-5 residue: the fork was correct only while
+    this table wasn't lifespan-bootstrapped; round 6 C2-3 made the helper's
+    text true again)."""
+
+    def test_spec_header_embeds_the_shared_ownership_paragraph(self):
+        from scripts.regenerate_lml_cache_sql import _MODULES, _ownership_boilerplate
+
+        expected = _ownership_boilerplate(
+            "artist_wikipedia_bio_attempt", "set_up_artist_wikipedia_bio_attempt_schema"
+        )
+        assert expected in _MODULES["artist_wikipedia_bio_attempt"].header
+
+    def test_generated_sidecar_carries_the_shared_paragraph(self):
+        from scripts.regenerate_lml_cache_sql import _ownership_boilerplate
+
+        expected = _ownership_boilerplate(
+            "artist_wikipedia_bio_attempt", "set_up_artist_wikipedia_bio_attempt_schema"
+        )
+        assert expected in _SQL_REFERENCE.read_text()
