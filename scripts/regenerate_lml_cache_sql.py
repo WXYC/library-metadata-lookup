@@ -1,9 +1,9 @@
-"""Regenerate eight ``lml_cache.*`` DDL sidecars from their runtime Python constants (LML#1038).
+"""Regenerate nine ``lml_cache.*`` DDL sidecars from their runtime Python constants (LML#1038).
 
 Companion to ``scripts/regenerate_streaming_catalog_sql.py`` (kept separate:
 ``entity/streaming_catalog.py``'s DDL is a 22-statement, per-statement-commented
 reference with its own generator and its own richer parity test). This script
-covers the other seven ``entity/*.py`` modules that own a ``lml_cache.*``
+covers the other eight ``entity/*.py`` modules that own a ``lml_cache.*``
 table, each simple enough to share one small rendering routine: a file-level
 header, then each statement preceded by its own prose comment (never inline
 within the statement -- inline per-column ``--`` comments were, before this
@@ -41,6 +41,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 from entity import (  # noqa: E402
     api_keys,
     artist_wikipedia_bio,
+    artist_wikipedia_bio_attempt,
     compilation_track_identity,
     compilation_track_location,
     discogs_rate_bucket,
@@ -185,6 +186,59 @@ _MODULES: dict[str, SidecarSpec] = {
 --
 --   {artist_wikipedia_bio._DDL_ADD_LAST_CHECKED_AT_COLUMN};
 --   {artist_wikipedia_bio._DDL_ADD_LAST_REFUSED_AT_COLUMN};""",
+    ),
+    "artist_wikipedia_bio_attempt": SidecarSpec(
+        header="""\
+-- Durable write-nothing attempt record for the offline Wikipedia bio drain
+-- (LML#1192 review round 4, P0-8).
+--
+-- Canonical DDL reference for `lml_cache.artist_wikipedia_bio_attempt`: one
+-- row per Discogs artist id that a drain session attempted but wrote
+-- NOTHING for (fetch_error / unresolvable / unexpected_error -- see
+-- `scripts/warm_wikipedia_bios.py`'s module docstring). Without this
+-- record, `--incremental`'s fixed `au.artist_id` ordering with no cursor
+-- re-selects the same write-nothing artist ids, in the same order, on
+-- every future run -- once the catalog otherwise drains, this residue
+-- becomes the candidate list, 100% failure-ish, aborting every session
+-- immediately and masking real progress elsewhere in the catalog.
+--
+-- It lives in the LML-owned `lml_cache.*` schema (per WXYC/discogs-etl#288,
+-- Option 3) -- not the discogs-cache-owned `entity.*` identity contract,
+-- which is created and migrated only via discogs-cache alembic migrations --
+-- and discogs-cache tooling never touches `lml_cache.*`.
+--
+-- UNLIKE most `lml_cache.*` tables, this one is deliberately NOT
+-- bootstrapped from LML's own FastAPI lifespan -- nothing in the live app
+-- (the `/lookup` request path, the background miss-warm task) ever reads
+-- or writes it; it exists solely for the offline drain's own bookkeeping,
+-- so only `scripts/warm_wikipedia_bios.py` bootstraps it.
+--
+-- This file exists so:
+--
+--   1. The LML PR's reviewer has the DDL inline for comparison.
+--   2. An operator can apply the schema directly to a non-discogs-cache PG
+--      (e.g. local dev) without running the drain.
+--
+-- GENERATED FILE -- regenerate via:
+--   uv run python -m scripts.regenerate_lml_cache_sql
+-- Statements come verbatim from `entity/artist_wikipedia_bio_attempt.py`;
+-- do not hand-edit this file -- `tests/unit/test_artist_wikipedia_bio_attempt_schema.py`
+-- pins the statement text. The runtime source of truth is
+-- `entity/artist_wikipedia_bio_attempt.py`'s
+-- `set_up_artist_wikipedia_bio_attempt_schema`, which issues these
+-- statements (`IF NOT EXISTS` forms) at the start of every drain session.""",
+        statements=(
+            artist_wikipedia_bio_attempt._DDL_SCHEMA,
+            artist_wikipedia_bio_attempt._DDL_TABLE,
+        ),
+        comments={
+            "CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio_attempt (": """\
+-- `discogs_artist_id` -- the PRIMARY KEY; one row per artist. `attempted_at`
+-- -- when this attempt was last (re-)recorded; a repeated write-nothing
+-- outcome refreshes it via the UPSERT rather than growing a second row.
+-- `outcome` -- the label recorded ("fetch_error" / "unresolvable" /
+-- "unexpected_error"), audit-only, never compared.""",
+        },
     ),
     "compilation_track_identity": SidecarSpec(
         header=f"""\

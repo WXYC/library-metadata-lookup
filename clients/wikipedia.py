@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from urllib.parse import quote
 
 import httpx
+from aiolimiter import AsyncLimiter
 from wxyc_fastapi.http import async_singleton
 
 logger = logging.getLogger(__name__)
@@ -227,7 +228,12 @@ class WikipediaClient:
         await self._singleton_close()
 
     async def get_summary(
-        self, title: str, lang: str, *, max_retries: int = 1
+        self,
+        title: str,
+        lang: str,
+        *,
+        max_retries: int = 1,
+        rate_limiter: AsyncLimiter | None = None,
     ) -> WikipediaSummary | None:
         """Fetch the lead-paragraph summary for ``title`` on ``{lang}.wikipedia.org``.
 
@@ -237,13 +243,26 @@ class WikipediaClient:
         delay when absent or unparseable). Callers choose the policy: the
         background miss-warm passes a single retry then treats an
         exhausted 429 as a shed (this function raising is exactly that
-        signal); the offline drain wraps calls to this method in its own
-        outer sleep-and-retry loop across the whole batch throttle.
+        signal).
+
+        ``rate_limiter`` (LML#1192 review round 2, C4), when given, is
+        acquired immediately before EVERY actual HTTP attempt — the initial
+        request AND each retry. This must live here, not in an outer
+        wrapper around the whole call: a caller-side "one slot per call"
+        throttle (the offline drain's original design) still lets a single
+        429-heavy candidate fire up to ``max_retries + 1`` requests inside
+        one slot, bursting past the configured rate exactly when 429
+        pressure is highest. The background miss-warm doesn't pass one —
+        its own concurrency cap (``lookup/enrichment/wikipedia_warm.py``)
+        is a different, coarser throttle appropriate for its much lower
+        volume.
         """
         url = _SUMMARY_URL_TEMPLATE.format(lang=lang, title=quote(title, safe=""))
         client = await self._get_client()
         attempt = 0
         while True:
+            if rate_limiter is not None:
+                await rate_limiter.acquire()
             try:
                 response = await client.get(url)
             except httpx.HTTPError as exc:

@@ -142,6 +142,20 @@ CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio (
     last_refused_at TIMESTAMPTZ
 )\
 """
+# last_checked_at (LML#1192 review round 3, finding 13): fetched_at and
+# last_checked_at look identical on a freshly-written row (both default to
+# now()) but diverge whenever a drain candidate is checked without its
+# content actually changing -- e.g. a refusal (mark_artist_wikipedia_bio_refused
+# advances last_checked_at, never fetched_at). Two
+# meanings that used to share one column: fetched_at is CONTENT age (the
+# TTL clock get_cached_artist_wikipedia_bio reads, below); last_checked_at
+# is the DRAIN's own progress cursor (which seed queries order by, so a
+# --limit-bounded session advances instead of re-selecting the same rows).
+# A --repick pass that only re-verified a pick would previously grant the
+# existing prose another full DEFAULT_SUCCESS_TTL of content-freshness
+# authority it hadn't earned, and made "fetched 200 days ago" and "checked
+# yesterday" indistinguishable. Plain column addition -- no migration, no
+# backfill: this table has no rows in prod (the drain hasn't run yet).
 
 # LML#1192 review round 4, P0-1: this table is created ONLY here (#1194) --
 # the drain PR (#1196) reads/writes last_checked_at but its OWN

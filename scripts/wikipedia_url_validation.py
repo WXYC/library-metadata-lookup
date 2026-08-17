@@ -217,11 +217,18 @@ def compute_ground_truth_summary(rows: list[dict[str, Any]]) -> GroundTruthSumma
     regressions = 0
     improvements = 0
     for row in rows:
-        heuristic_raw = row.get("heuristic_correct", "")
-        slug_raw = row.get("slug_correct", "")
+        # LML#1192 review round 4, P1-11: row.get(key, "")'s default only
+        # applies when the key is absent entirely. csv.DictReader's
+        # restval for a column a SHORT row doesn't reach is None -- the key
+        # IS present, so the default never kicks in and .strip() on None
+        # raises. `or ""` coerces both "absent" and "present but None" to
+        # the same fail-safe-to-excluded empty string this function's
+        # docstring already promises.
+        heuristic_raw = row.get("heuristic_correct") or ""
+        slug_raw = row.get("slug_correct") or ""
         if not heuristic_raw.strip() or not slug_raw.strip():
             continue
-        if not _is_true(row.get("clears_floor", "")):
+        if not _is_true(row.get("clears_floor") or ""):
             continue
         classified += 1
         heuristic_correct = _is_true(heuristic_raw)

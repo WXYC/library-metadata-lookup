@@ -4870,6 +4870,12 @@ class TestBandcampStreamingUrlPostprocessWiring:
             )
 
         _, enriched = results[0]
+        # LML#1192 review round 4, P1-12: this specific startswith check
+        # (not just is-not-None) had drifted 286 lines away into
+        # TestWikipediaPreferredBioSwap::test_artist_identity_split_gate_nulls_served_pair_together,
+        # a test about an unrelated concern (the LML#504 identity-split
+        # gate) that happened to also exercise this fallback path
+        # incidentally. Restored here, where it actually belongs.
         assert enriched.bandcamp_url is not None
 
 
