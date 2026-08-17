@@ -58,7 +58,10 @@ jobs:
       # GITHUB_TOKEN authenticates the raw.githubusercontent.com download of
       # api.yaml: anonymous fetches share a per-IP budget across the runner
       # pool and intermittently 429 (#1205). The workflow's contents:read
-      # token is enough -- wxyc-shared is public.
+      # token is enough -- wxyc-shared is public. The step-level env is only
+      # the delivery mechanism: the script captures the token for the download
+      # and unsets it before the codegen toolchain runs, so datamodel-codegen
+      # and its dependency tree never see it.
       - run: bash scripts/generate_api_models.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
