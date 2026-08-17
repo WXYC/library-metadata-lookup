@@ -39,7 +39,7 @@ bare titles are real disambiguation pages while ``Sun Ra``/``Stereolab``/
 rule can distinguish these; the deciding signal (what the page actually
 IS) only exists in the fetched payload. ``resolve_and_validate_pick``
 ranks candidates by score/lang/shortness/url (still a deterministic TRY
-order, not a final answer — see ``lookup.wikipedia_url._candidate_sort_key``),
+order, not a final answer — see ``lookup.wikipedia_candidates.candidate_sort_key``),
 then live-fetches each in turn until one validates (``clients.wikipedia
 .WikipediaClient.get_summary`` already returns ``None`` for exactly the
 right reasons — a disambiguation page's ``type`` fails its ``"standard"``
@@ -190,8 +190,8 @@ from entity.artist_wikipedia_bio_attempt import (
     set_up_artist_wikipedia_bio_attempt_schema,
 )
 from entity.sources import PgSource
+from lookup.wikipedia_candidates import wikipedia_title_from_url
 from lookup.wikipedia_pick_validation import resolve_and_validate_pick
-from lookup.wikipedia_url import wikipedia_title_from_url
 from scripts.build_filtered_discogs import extract_library_artists
 
 logger = logging.getLogger(__name__)
@@ -213,7 +213,7 @@ class ArtistCandidate:
     before aggregating, unlike the runtime ``ArtistDetails.urls`` shape
     (which carries every URL type; ``lookup.wikipedia_pick_validation
     .resolve_and_validate_pick`` filters non-wikipedia URLs out internally
-    via ``_score_candidates``'s own ``_WIKI_URL_RE`` match). Both callers
+    via ``lookup.wikipedia_candidates.score_candidates``'s own URL match). Both callers
     therefore feed the same picker the same effective wikipedia.org
     candidate SET for a given artist -- pre-filtered here, filtered
     internally there. ``stored_wikipedia_url`` is populated ONLY for
