@@ -26,6 +26,7 @@ from clients.wikipedia import (
     WikipediaClient,
     WikipediaFetchError,
     WikipediaSummary,
+    _is_rejected_description,
 )
 
 _SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/Stereolab"
@@ -235,6 +236,112 @@ class TestNegativeResults:
         )
         client = WikipediaClient()
         assert await client.get_summary("Stereolab", "en") is not None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "1977 British disco band",
+            "1970 American disco group",
+            "Canción de autor española",
+        ],
+    )
+    async def test_genre_word_coinciding_with_a_release_noun_is_not_rejected(
+        self, httpx_mock, description
+    ):
+        # LML#1192 review round 6, P2-1: "disco" is in _RELEASE_NOUNS for its
+        # Spanish/Italian "record" sense, but is also an ordinary English
+        # genre word -- pattern 1's unbounded `.*` let a leading year plus
+        # ANY intervening text reach a bare \bdisco\b anywhere in the
+        # description, so "1977 British disco band" and "1970 American
+        # disco group" both matched even though "disco" here modifies
+        # "band"/"group", not "album"/"song". Both writers (the warm task,
+        # the drain) then cached extract=NULL for a band with a perfectly
+        # good article, suppressed for the full 7-day miss TTL and frozen
+        # downstream by BS#1747. "Canción de autor española" (the standard
+        # Spanish genre label for "singer-songwriter") is a second false
+        # positive on pattern 2 -- the round-4 anchor only fixed the
+        # mid-sentence spelling of this same collision, not the
+        # sentence-initial one.
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            json={
+                "type": "standard",
+                "extract": "An artist.",
+                "description": description,
+            },
+        )
+        client = WikipediaClient()
+        assert await client.get_summary("Stereolab", "en") is not None
+
+
+class TestIsRejectedDescriptionDirectly:
+    """Direct, synchronous calls to ``_is_rejected_description`` -- no httpx
+    mocking needed. Table-drives every reviewer-executed string from LML#1192
+    review round 6, P2-1 as a regression guard alongside every pre-existing
+    true positive, so a future loosening of either pattern can't silently
+    reopen this exact false-positive class without also breaking a
+    true-positive row in the SAME table.
+
+    LML#1192 review round 6, P2-1 root cause: both patterns used to reject
+    on a release noun ANYWHERE in (or at the start of) the description,
+    without requiring it to actually be functioning as "TYPE by ARTIST" --
+    "disco" (in ``_RELEASE_NOUNS`` for its Spanish/Italian "record" sense)
+    is also an ordinary English genre word, and "canción" opens the
+    standard Spanish idiom for "singer-songwriter" as readily as it opens
+    a real "song by X" description. Fixed by requiring the release noun be
+    IMMEDIATELY followed by a preposition (not just present via a loose
+    ``\\b...\\b`` check), plus a second, case-SENSITIVE check that a
+    capitalized word (the artist name) appears somewhere after that
+    match -- a genre-descriptor idiom never has one; a real release-page
+    description always does.
+    """
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            # LML#1192 review round 6, P2-1 -- the exact three strings the
+            # reviewer executed against the shipped code, each confirmed
+            # (before this fix) to return True.
+            "1977 British disco band",
+            "1970 American disco group",
+            "Canción de autor española",
+            # Pre-existing false positives this must keep rejecting-nothing on.
+            "Peruvian musical duo",
+            "German record producer",
+            "compositeur français",
+            "cantante italiana",
+            "cantante de canción de autor española",
+            "chanteur de chanson de variété française",
+            "grupo de música disco de Estados Unidos",
+            "American musician",
+        ],
+    )
+    def test_genuine_person_descriptions_are_not_rejected(self, description):
+        assert _is_rejected_description(description) is False
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "1975 studio album by Some Artist",
+            "2001 EP by Some Artist",
+            "song by Some Artist",
+            "single by Some Artist",
+            "mixtape by Some Artist",
+            "2019 mixtape by Some Artist",
+            "album de Sessa",
+            "Album von Stereolab",
+            "álbum de estudio de Sessa",
+            "album di Sessa",
+        ],
+    )
+    def test_genuine_release_page_descriptions_are_still_rejected(self, description):
+        assert _is_rejected_description(description) is True
+
+    def test_none_is_not_rejected(self):
+        assert _is_rejected_description(None) is False
+
+    def test_empty_string_is_not_rejected(self):
+        assert _is_rejected_description("") is False
 
 
 @pytest.mark.asyncio
