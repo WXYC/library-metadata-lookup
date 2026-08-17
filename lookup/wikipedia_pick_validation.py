@@ -78,6 +78,11 @@ from typing import TYPE_CHECKING
 
 from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
 from clients.wikipedia import WikipediaSummary
+from entity.artist_wikipedia_bio_attempt import (
+    OUTCOME_DECLINED,
+    OUTCOME_TRUNCATED,
+    OUTCOME_UNRESOLVABLE,
+)
 from lookup.wikipedia_candidates import (
     candidate_sort_key,
     extract_lang,
@@ -196,11 +201,14 @@ async def resolve_and_validate_pick(
     truncated = max_candidates is not None and len(ranked) > max_candidates
     if max_candidates is not None:
         ranked = ranked[:max_candidates]
-    # LML#1204 item 2: ``fetch`` is called exactly once per loop iteration
-    # below, so "the network was touched" is precisely "the sliced ranked
-    # list is non-empty" -- whether the loop wins early or runs dry.
-    live_fetch_attempted = bool(ranked)
+    # LML#1204 item 2 (review-hardened): recorded beside the actual fetch
+    # call, not inferred from the ranked list's shape -- a future pre-fetch
+    # guard inside the loop (deadline check, skip-refused-URL, cache probe)
+    # must not silently break the flag the drain writes durable
+    # negative-vs-declined rows off.
+    live_fetch_attempted = False
     for candidate in ranked:
+        live_fetch_attempted = True
         summary = await fetch(candidate.url, candidate.lang)
         if summary is not None:
             picked = PickedWikiUrl(
@@ -212,7 +220,10 @@ async def resolve_and_validate_pick(
             # A win is never "truncated" -- an answer was found, regardless
             # of whether the cap left other candidates untried.
             return ValidatedPick(
-                picked=picked, summary=summary, truncated=False, live_fetch_attempted=True
+                picked=picked,
+                summary=summary,
+                truncated=False,
+                live_fetch_attempted=live_fetch_attempted,
             )
 
     # LML#1192 review round 4, P0-13: the heuristic url's OWN score, not a
@@ -231,6 +242,30 @@ async def resolve_and_validate_pick(
         truncated=truncated,
         live_fetch_attempted=live_fetch_attempted,
     )
+
+
+def write_nothing_attempt_outcome(result: ValidatedPick) -> str | None:
+    """The durable write-nothing attempt outcome ``result`` implies, or
+    ``None`` when it supports a content write (a WINNING pick, or a
+    fetched-and-exhausted below-floor negative).
+
+    LML#1204 review: previously hand-maintained branch ladders in BOTH
+    live-fetch callers, and twice a verdict got wired into one caller and
+    not the other (``unresolvable``, then the zero-fetch ``declined``);
+    deriving it here leaves only pg/dry-run plumbing caller-side. The
+    exception-path outcomes (``fetch_error``, ``unexpected_error``) stay
+    caller-side by nature — no ``ValidatedPick`` exists to derive from. A
+    caller may upgrade a verdict to something STRONGER: the offline drain
+    records a zero-fetch ``declined`` as a durable NULL-extract content
+    row rather than an attempt row, per its module docstring.
+    """
+    if result.picked is None or result.picked.url is None:
+        return OUTCOME_UNRESOLVABLE
+    if result.truncated:
+        return OUTCOME_TRUNCATED
+    if result.picked.below_floor and not result.live_fetch_attempted:
+        return OUTCOME_DECLINED
+    return None
 
 
 def make_summary_fetcher(

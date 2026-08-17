@@ -167,7 +167,17 @@ MODULE_BUDGETS: dict[str, int] = {
     # asymmetry -- one new import line, a module-docstring paragraph, and a
     # call-site comment -- measured 204 lines. 1.3x that is 265.2; smallest
     # multiple of 50 at or above -> 300.
-    "lookup/wikipedia_pick_validation.py": 300,
+    #
+    # Recalibrated (LML#1204 items 2 + review): the module gained two
+    # review-directed shared concerns -- make_summary_fetcher (the fetch
+    # closure both live-fetch callers hand-built) and
+    # write_nothing_attempt_outcome (the verdict->attempt-outcome mapping
+    # both callers hand-maintained) -- landing at 298/300, the exact
+    # four-lines-left condition this table's own comments warn about. The
+    # standard 1.3x rule at 298 would license 400 (387.4 rounded up); 350
+    # is a deliberate under-grant (~17% headroom), matching the
+    # wikipedia_bio.py/wikipedia_url.py tight-on-purpose precedents.
+    "lookup/wikipedia_pick_validation.py": 350,
     "lookup/external_search.py": 350,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
     # transparent-fold calibration): the module gained the empty-vs-degraded
