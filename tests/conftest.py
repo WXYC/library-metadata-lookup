@@ -249,6 +249,34 @@ def _reset_bio_warm_semaphore():
     _background_mod._warm_cache_semaphore = None
 
 
+@pytest.fixture(autouse=True)
+def _reset_wikipedia_warm_state():
+    """Suite-wide reset of the Wikipedia bio-warm module globals (LML#748).
+
+    Third sibling of ``reset_streaming_warm_state`` / ``_reset_bio_warm_semaphore``
+    for the same failure mode: ``lookup.enrichment.wikipedia_warm`` lazily
+    binds ``_warm_semaphore`` to whichever event loop runs the first warm and
+    keeps a process-global dedup set + task anchor. Through the LML#1192
+    stack this reset lived only inside ``tests/unit/test_wikipedia_warm.py``,
+    while ``tests/integration/test_wikipedia_bio_warm_round_trip.py`` drives
+    the real ``_run_warm`` (binding the semaphore) with no reset in scope —
+    protection coextensive with one file for state that is process-global.
+    Any other file's later real warm would inherit a dead-loop semaphore and
+    silently no-op inside the warm's blanket except, flaking by test order —
+    exactly the shape LML#748 already diagnosed once.
+    """
+    from lookup.enrichment import wikipedia_warm as _wikipedia_warm_mod
+
+    def _reset_wikipedia_warm() -> None:
+        _wikipedia_warm_mod._pending_artist_ids.clear()
+        _wikipedia_warm_mod._background_tasks.clear()
+        _wikipedia_warm_mod._warm_semaphore = None
+
+    _reset_wikipedia_warm()
+    yield
+    _reset_wikipedia_warm()
+
+
 def make_lml_telemetry() -> RequestTelemetry:
     """Build a `RequestTelemetry` with LML's production parameters.
 
