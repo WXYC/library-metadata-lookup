@@ -1528,6 +1528,33 @@ class TestDisambiguationSuffixRecall:
         )
 
     @pytest.mark.asyncio
+    async def test_exact_credit_wins_tie_over_suffix_stripped_widening(self, mock_discogs_service):
+        """AC (review finding 2) — a bare-name query against a candidate set holding
+        BOTH an exact raw-name credit and a suffixed credit sharing the SAME album now
+        ties 100/100 on both candidates post-widening. The exact credit must win the
+        tie, not whichever candidate happens to sort first by ascending release_id
+        (LML#1097). Pre-fix this picked release_id=100 (``"Mavi (12)"``, which only
+        ties via the suffix-stripped widening) over release_id=900 (``"Mavi"``, the
+        exact credit) purely because 100 < 900 — an exact-name credit losing to a
+        different, numerically-disambiguated artist on id comparison alone.
+        """
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(release_id=900, artist="Mavi", album=self.ALBUM),
+                make_discogs_result(release_id=100, artist=self.SUFFIXED_ARTIST, album=self.ALBUM),
+            ]
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Mavi", self.ALBUM), discogs_service=mock_discogs_service
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == 900, (
+            "the exact-name credit (900) must win the tie over the credit that only "
+            f"ties via suffix-stripped widening (100); got {discogs_result.release_id}"
+        )
+
+    @pytest.mark.asyncio
     async def test_qualifier_suffix_not_widened(self, mock_discogs_service):
         """AC — ``broad=False`` (numeric-only) semantics: a non-numeric
         qualifier suffix like ``"(UK)"`` must NOT be treated as a

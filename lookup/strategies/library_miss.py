@@ -14,49 +14,18 @@ Strategy-adjacent, so it lives in this package (LML#727).
 import logging
 
 from clients.streaming.matching import find_best_typed_match
-from discogs.matching import strip_discogs_suffix
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResponse, DiscogsSearchResult
 from discogs.service import DiscogsService
 from library.models import LibraryItem
-from lookup.matching import is_self_titled
+from lookup.matching import (
+    artist_variant_tie_break_key,
+    artist_variants_with_stripped_suffix,
+    is_self_titled,
+)
 from lookup.strategies.va_rescue import find_va_comp_match
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
-
-
-def _artist_variants_with_stripped_suffix(result: DiscogsSearchResult) -> list[str | None]:
-    """Candidate-side artist scoring variants, widened with each raw variant's
-    Discogs-disambiguation-suffix-stripped form (LML#1206).
-
-    Discogs assigns a trailing ``(N)`` suffix to a cached credit whenever
-    multiple Discogs artists share a name (``"Mavi (12)"``). The 80/80
-    floor's fuzzy comparison (``score_match`` -> ``fuzz.token_sort_ratio``)
-    treats that suffix as ordinary title content: ``score_match("MAVI",
-    "Mavi (12)")`` measures 61.5, under the 80.0 acceptance floor, even
-    though retrieval already had the right release in hand (every arm --
-    PG-cache and live API alike -- surfaces the same raw suffixed credit and
-    floor-fails identically). A bare-name query for such a credit returned no
-    results on every arm.
-
-    Adding the numeric-only (``broad=False``) stripped form as an *extra*
-    variant lets a bare-name query clear via its own exact match, without
-    disturbing the raw variant (a caller who already types the suffixed form
-    keeps matching that too) and without widening to non-numeric qualifier
-    suffixes like ``"(UK)"`` -- those score exactly as before, deliberately
-    narrower than ``clients.streaming.matching.strip_discogs_disambig``
-    (``broad=True``, used elsewhere for canonical-artist resolution).
-
-    The title axis is untouched, so this can never mint a match on the
-    artist axis alone: when the cache holds multiple suffixed variants of
-    one bare name, every variant's artist axis can clear via its own
-    stripped form, but only the one whose album also matches the query
-    clears ``is_acceptable_match`` -- the existing album confirmation stays
-    the conservative gate, not this variant list.
-    """
-    raw_variants = result.artist_variants()
-    stripped_variants = [strip_discogs_suffix(v) for v in raw_variants if v]
-    return [*raw_variants, *stripped_variants]
 
 
 async def _library_miss_discogs_search(
@@ -126,12 +95,15 @@ async def _library_miss_discogs_search(
             query_artist=artist,
             query_title=album,
             # LML#1206: widened with the suffix-stripped form of each
-            # candidate variant -- see the function's own docstring.
-            artist_fn=_artist_variants_with_stripped_suffix,
+            # candidate variant -- see lookup.matching.artist_variants_with_stripped_suffix.
+            artist_fn=artist_variants_with_stripped_suffix,
             title_fn=lambda r: r.album,
-            # LML#1097: deterministic tie-break by release_id, mirroring
-            # release_resolution.py's (-score, release_id) sort key.
-            key_fn=lambda r: r.release_id,
+            # LML#1097's release_id tie-break, guarded by LML#1206's exact-
+            # raw-credit preference (lookup.matching.artist_variant_tie_break_key):
+            # a bare-name query that ties an exact credit against a suffix-
+            # widened one must keep the exact credit, not whichever sorts
+            # first by release_id.
+            key_fn=lambda r: artist_variant_tie_break_key(artist, r),
         )
 
     try:

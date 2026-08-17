@@ -13,7 +13,9 @@ import re
 from wxyc_etl.text import is_compilation_artist, strip_leading_article
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
-from discogs.models import ReleaseInfo
+from clients.streaming.matching import score_match
+from discogs.matching import strip_discogs_suffix
+from discogs.models import DiscogsSearchResult, ReleaseInfo
 from library.models import LibraryItem
 from services.parser import ParsedRequest
 
@@ -370,3 +372,88 @@ def album_title_acceptable(query_lower: str, result_lower: str) -> bool:
 # (Remastered)`` strips to ``Album``, not ``Album (Live)`` which would still be
 # an FTS5 syntax error.
 _TRAILING_PARENTHETICAL_RE = re.compile(r"(?:\s*\([^)]*\)\s*)+$")
+
+
+# ---------------------------------------------------------------------------
+# LML#1206 — Discogs disambiguation-suffix candidate widening + tie-break
+# ---------------------------------------------------------------------------
+#
+# Moved here from lookup/strategies/library_miss.py (its sole caller) so this
+# pure candidate-side widening lives alongside this module's other leaf
+# predicates rather than crowding library_miss.py's own module-line budget.
+
+
+def artist_variants_with_stripped_suffix(result: DiscogsSearchResult) -> list[str | None]:
+    """Candidate-side artist scoring variants, widened with each raw variant's
+    Discogs-disambiguation-suffix-stripped form (LML#1206).
+
+    Discogs assigns a trailing ``(N)`` suffix to a cached credit whenever
+    multiple Discogs artists share a name (``"Mavi (12)"``). The 80/80
+    floor's fuzzy comparison (``score_match`` -> ``fuzz.token_sort_ratio``)
+    treats that suffix as ordinary title content: ``score_match("MAVI",
+    "Mavi (12)")`` measures 61.5, under the 80.0 acceptance floor, even
+    though retrieval already had the right release in hand (every arm --
+    PG-cache and live API alike -- surfaces the same raw suffixed credit and
+    floor-fails identically). A bare-name query for such a credit returned no
+    results on every arm.
+
+    Adding the numeric-only (``broad=False``) stripped form as an *extra*
+    variant lets a bare-name query clear via its own exact match, without
+    disturbing the raw variant (a caller who already types the suffixed form
+    keeps matching that too) and without widening to non-numeric qualifier
+    suffixes like ``"(UK)"`` -- those score exactly as before, deliberately
+    narrower than ``clients.streaming.matching.strip_discogs_disambig``
+    (``broad=True``, used elsewhere for canonical-artist resolution).
+    ``dict.fromkeys`` dedups the concatenation while preserving order: the
+    overwhelmingly common case is a credit with no suffix at all, where the
+    stripped form is byte-identical to the raw one, so without this every
+    ordinary candidate would score twice for nothing (review finding 5).
+
+    The sole caller, ``lookup.strategies.library_miss._library_miss_discogs_search``,
+    leaves its title axis untouched by this widening: when the cache holds
+    multiple suffixed variants of one bare name, every variant's artist axis
+    can clear via its own stripped form, but only the one whose album also
+    matches the query clears ``is_acceptable_match`` -- on that caller's
+    normal path, the existing album confirmation stays the conservative gate.
+
+    That confirmation is NOT independent on the caller's self-titled path
+    (``if is_self_titled(album): album = artist``) -- there the title axis
+    becomes a copy of the artist name, so it confirms nothing this widening
+    didn't already decide on the artist axis alone. That collapse predates
+    LML#1206 (an unsuffixed candidate matched a self-titled query identically
+    on unmodified ``main``); this widening only routes more candidates
+    through the already-unguarded path. Tracked separately: see
+    WXYC/library-metadata-lookup#1208.
+    """
+    raw_variants = result.artist_variants()
+    stripped_variants = [strip_discogs_suffix(v) for v in raw_variants if v]
+    return list(dict.fromkeys([*raw_variants, *stripped_variants]))
+
+
+def artist_variant_tie_break_key(query_artist: str, result: DiscogsSearchResult) -> tuple[int, int]:
+    """Secondary tie-break for ``find_best_typed_match`` over
+    ``artist_variants_with_stripped_suffix``-widened candidates (LML#1206
+    review finding 2), applied before the LML#1097 ascending-``release_id``
+    tie-break the caller's own ``key_fn`` already sorts by.
+
+    Widening the artist axis with a suffix-stripped form means a bare-name
+    query can now tie 100/100 against BOTH an exact raw-credit candidate
+    (``"Mavi"``) and an unrelated suffixed one (``"Mavi (12)"``) that shares
+    the same album -- without this, LML#1097's release_id order decides the
+    tie, which can pick the numerically-disambiguated (wrong) artist purely
+    because its release_id sorts first. Returns ``(0, release_id)`` when the
+    RAW credit alone already reaches this candidate's widened max score (an
+    exact or already-passing match), or ``(1, release_id)`` when only the
+    suffix-stripped widening reached it -- tuples sort ascending, so an exact
+    match always outranks a stripped-only one, and release_id still breaks
+    any remaining tie within each group.
+    """
+    raw_score = max(
+        (score_match(query_artist, v) for v in result.artist_variants() if v), default=0.0
+    )
+    widened_score = max(
+        (score_match(query_artist, v) for v in artist_variants_with_stripped_suffix(result) if v),
+        default=0.0,
+    )
+    stripped_only_helped = raw_score < widened_score
+    return (1 if stripped_only_helped else 0, result.release_id)
