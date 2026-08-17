@@ -32,16 +32,10 @@ _ARTIST_NAME = "Stereolab"
 _URLS = ["https://en.wikipedia.org/wiki/Stereolab"]
 
 
-@pytest.fixture(autouse=True)
-def _reset_module_state():
-    """LML#748 lesson: process-global warm state must reset per test."""
-    wikipedia_warm._pending_artist_ids.clear()
-    wikipedia_warm._background_tasks.clear()
-    wikipedia_warm._warm_semaphore = None
-    yield
-    wikipedia_warm._pending_artist_ids.clear()
-    wikipedia_warm._background_tasks.clear()
-    wikipedia_warm._warm_semaphore = None
+# LML#748 module-state reset: owned suite-wide by tests/conftest.py's
+# autouse ``_reset_wikipedia_warm_state`` (LML#1192 cross-PR review, round 7
+# promoted it there -- the state is process-global, so a file-local reset
+# left every OTHER file unprotected; see the conftest docstring).
 
 
 @pytest.fixture(autouse=True)
