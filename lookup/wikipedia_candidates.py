@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from urllib.parse import unquote
 
 from clients.streaming.matching import score_match, strip_discogs_disambig
+from clients.wikipedia import NON_ARTIST_PAGE_TYPES, RELEASE_NOUNS
 
 _WIKI_URL_RE = re.compile(r"^https?://([a-z0-9.-]+)\.wikipedia\.org/wiki/(.+)$", re.IGNORECASE)
 _LANG_ONLY_RE = re.compile(r"^https?://([a-z0-9.-]+)\.wikipedia\.org", re.IGNORECASE)
@@ -96,19 +97,20 @@ _LANG_ONLY_RE = re.compile(r"^https?://([a-z0-9.-]+)\.wikipedia\.org", re.IGNORE
 # soundtrack page" without looking at the actual page). The fix is the
 # include_denylisted asymmetry in :func:`score_candidates` below, not a
 # smarter regex.
-_HARD_REJECT_QUALIFIERS: frozenset[str] = frozenset(
-    {
-        "album",
-        "song",
-        "single",
-        "ep",
-        "soundtrack",
-        "film",
-        "tv series",
-        "discography",
-        "mixtape",
-        "compilation",
-    }
+# LML#1192 cross-PR review, round 7: DERIVED from the shared vocabulary in
+# ``clients/wikipedia.py`` rather than hand-maintained -- the two lists
+# encoding this one policy drifted apart within a single review cycle when
+# each site was patched separately (see that module's vocabulary comment).
+# The union widens this list beyond its round-6 members: the non-English
+# release nouns ("álbum", "canción", "chanson", ...) now reject non-English
+# qualifier slugs like ``Grace_(álbum)`` that the English-only list passed,
+# and ordinary-word members like "disco"/"lied" join "film"/"single"/"ep"
+# in the KNOWN over-breadth the P2-2 paragraph above already adjudicates:
+# an artist name ending in one of these words is demoted (never deleted)
+# for fetch-capable callers, and the sync path this hard-rejects is
+# flag-gated and link-only.
+_HARD_REJECT_QUALIFIERS: frozenset[str] = frozenset(RELEASE_NOUNS) | frozenset(
+    NON_ARTIST_PAGE_TYPES
 )
 # Longest-first so "tv series" (which itself contains no shorter alternative
 # as a strict prefix) and any future multi-word entry can't be pre-empted by

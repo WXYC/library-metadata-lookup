@@ -65,7 +65,16 @@ _SUMMARY_URL_TEMPLATE = "https://{lang}.wikipedia.org/api/rest_v1/page/summary/{
 # the correct trade here. Python's ``re.IGNORECASE`` case-folds non-ASCII
 # letters correctly (``Álbum`` matches ``álbum``), so no separate
 # diacritic-stripping step is needed.
-_RELEASE_NOUNS = (
+# PUBLIC (LML#1192 cross-PR review, round 7): this module owns the
+# "work, not artist" vocabulary for BOTH rejection sites -- the slug
+# denylist in ``lookup/wikipedia_candidates.py`` derives from the union of
+# these two tuples, so a new word added here reaches both defenses at
+# once. Through round 6 the two lists were hand-maintained separately and
+# drifted within a single review cycle ("mixtape" was added to each by
+# different findings), leaving film/soundtrack/TV/discography pages with
+# no payload backstop at all after P2-2 demoted the slug denylist for
+# fetch-capable callers.
+RELEASE_NOUNS = (
     "album",
     "ep",
     "single",
@@ -82,8 +91,23 @@ _RELEASE_NOUNS = (
     "disco",
     "canzone",  # Italian
 )
+"""Things credited TO an artist via a preposition ("album by X", "álbum de
+X") -- the noun+preposition+capitalized-artist description grammar below."""
+
+NON_ARTIST_PAGE_TYPES = (
+    "film",
+    "soundtrack",
+    "discography",
+    "tv series",
+    "television series",
+)
+"""Page KINDS that are never an artist. Unlike release nouns these head
+their descriptions without a crediting preposition ("1995 American crime
+film directed by ...", "American television series"), so they get their own
+head-position grammar below rather than joining the release-noun one."""
+
 _RELEASE_PREPOSITIONS = ("by", "de", "von", "di", "par", "do", "da")
-_RELEASE_NOUN_ALTERNATION = "|".join(re.escape(n) for n in _RELEASE_NOUNS)
+_RELEASE_NOUN_ALTERNATION = "|".join(re.escape(n) for n in RELEASE_NOUNS)
 _RELEASE_PREPOSITION_ALTERNATION = "|".join(re.escape(p) for p in _RELEASE_PREPOSITIONS)
 # LML#1192 review round 4, finding 9: pattern 2 used to match
 # `\b(noun)\b\s+(prep)\s+` ANYWHERE in the description, not just at the
@@ -132,6 +156,24 @@ _RELEASE_NOUN_PREP_ALTERNATION = (
     rf"(?:{_RELEASE_NOUN_ALTERNATION})\b\s+(?:{_RELEASE_PREPOSITION_ALTERNATION})\b\s+"
 )
 _CAPITALIZED_WORD_RE = re.compile(r"[A-ZÀ-Þ]")  # deliberately NOT re.IGNORECASE
+# LML#1192 cross-PR review, round 7: the page-TYPE grammar. A film/TV/
+# discography/soundtrack description names its type as the phrase HEAD --
+# start-anchored, at most a few modifier tokens deep ("1995 American crime
+# film directed by ...", "American television series"), and followed by
+# end-of-phrase or a WORKS continuation (directed/starring/of/by/...).
+# The head-position + follower requirement is what keeps PEOPLE described
+# via film/TV work out: "American film composer" and "composer of film and
+# television scores" put another noun (or "and") right after the type
+# word, which is not in the follower set. Longest-first alternation so
+# "television series" can't be pre-empted by a shorter member.
+_PAGE_TYPE_ALTERNATION = "|".join(
+    re.escape(t) for t in sorted(NON_ARTIST_PAGE_TYPES, key=len, reverse=True)
+)
+_PAGE_TYPE_HEAD_RE = (
+    rf"^(?:\d{{4}}\s+)?(?:[\w!'-]+\s+){{0,4}}(?:{_PAGE_TYPE_ALTERNATION})"
+    rf"(?:\s*$|[,.]|\s+(?:directed|starring|by|based|about|of|written|produced|released|from)\b)"
+)
+_PAGE_TYPE_HEAD_PATTERN = re.compile(_PAGE_TYPE_HEAD_RE, re.IGNORECASE)
 _DESCRIPTION_REJECT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(rf"^\d{{4}}\s+.*\b{_RELEASE_NOUN_PREP_ALTERNATION}", re.IGNORECASE),
     re.compile(rf"^{_RELEASE_NOUN_PREP_ALTERNATION}", re.IGNORECASE),
@@ -156,7 +198,12 @@ def _is_rejected_description(description: str | None) -> bool:
         match = pattern.search(description)
         if match and _CAPITALIZED_WORD_RE.search(description, match.end()):
             return True
-    return False
+    # The capitalized-word post-condition above belongs to the CREDITING
+    # grammar (a real release description names its artist after the
+    # preposition -- round 6, P2-1). A page-TYPE description needs no
+    # artist at all ("American television series" simply ends), so the
+    # head-position pattern stands on its own follower-set precision.
+    return _PAGE_TYPE_HEAD_PATTERN.search(description) is not None
 
 
 _MAX_RETRY_DELAY_SECONDS = 30.0
