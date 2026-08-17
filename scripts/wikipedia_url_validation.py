@@ -41,6 +41,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lookup.wikipedia_url import compare_wikipedia_extractors
+from scripts.warm_wikipedia_bios import (
+    _LIBRARY_ARTIST_INTERSECTION_PREDICATE,
+    DEFAULT_LIBRARY_DB_PATH,
+    _load_library_artist_names,
+)
 
 if TYPE_CHECKING:
     import psycopg
@@ -53,6 +58,24 @@ _CANDIDATE_IDS_SQL = """
     SELECT DISTINCT artist_id
     FROM artist_url
     WHERE url ILIKE %s
+    LIMIT 50000
+"""
+
+# LML#1192 cross-PR review, round 7: the drain's library-artist
+# intersection predicate (round 3, finding 6 + round 4, P0-4 — the raw
+# discogs-cache ``artist``/``artist_url`` tables are NOT library-exclusive
+# in prod, so the un-intersected universe is a superset of the population
+# the feature serves), reused verbatim with only the placeholder style
+# adapted (asyncpg ``$1`` → psycopg ``%s``). This sampler is the empirical
+# gate for the ``LML_WIKIPEDIA_SLUG_MATCH`` flip; measuring the drain's own
+# population is the point, so intersection is the DEFAULT — see
+# ``--skip-library-intersection`` for the documented superset mode.
+_INTERSECTED_CANDIDATE_IDS_SQL = f"""
+    SELECT DISTINCT au.artist_id
+    FROM artist_url au
+    JOIN artist a ON a.id = au.artist_id
+    WHERE au.url ILIKE %s
+      AND {_LIBRARY_ARTIST_INTERSECTION_PREDICATE.replace("$1", "%s")}
     LIMIT 50000
 """
 
@@ -89,10 +112,22 @@ class ArtistSample:
     urls: list[str]
 
 
-def fetch_candidate_artist_ids(conn: psycopg.Connection) -> list[int]:
-    """Distinct artist ids with at least one ``wikipedia.org`` URL."""
+def fetch_candidate_artist_ids(
+    conn: psycopg.Connection, *, library_artist_names: list[str] | None = None
+) -> list[int]:
+    """Distinct artist ids with at least one ``wikipedia.org`` URL.
+
+    With ``library_artist_names``, the seed is intersected with WXYC library
+    artists via the drain's own normalization predicate, so the empirical
+    gate samples the same population ``scripts/warm_wikipedia_bios.py`` will
+    actually drain; ``None`` samples the raw superset (the pre-round-7
+    behavior, kept behind ``--skip-library-intersection``).
+    """
     with conn.cursor() as cur:
-        cur.execute(_CANDIDATE_IDS_SQL, ("%wikipedia.org%",))
+        if library_artist_names is None:
+            cur.execute(_CANDIDATE_IDS_SQL, ("%wikipedia.org%",))
+        else:
+            cur.execute(_INTERSECTED_CANDIDATE_IDS_SQL, ("%wikipedia.org%", library_artist_names))
         return [row[0] for row in cur.fetchall()]
 
 
@@ -263,7 +298,7 @@ def print_ground_truth_summary(rows: list[dict[str, Any]]) -> None:
     print(f"\nLML#513 gate (regression rate < 2%): {gate}")
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample-size", type=int, default=300)
     parser.add_argument("--seed", type=int, default=513)
@@ -275,7 +310,29 @@ def main(argv: list[str] | None = None) -> int:
         help="Compute the regression/improvement rates from an already "
         "hand-classified CSV instead of sampling (no DB connection).",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--library-db",
+        default=DEFAULT_LIBRARY_DB_PATH,
+        help=(
+            "Path to library.db for the library-artist seed intersection -- the same "
+            f"population the drain serves (default {DEFAULT_LIBRARY_DB_PATH})."
+        ),
+    )
+    parser.add_argument(
+        "--skip-library-intersection",
+        action="store_true",
+        help=(
+            "Sample the RAW artist_url universe instead (pre-round-7 behavior). The raw "
+            "tables include resolve-minted non-library artists, so this measures a "
+            "SUPERSET of the population the feature serves -- only use it deliberately, "
+            "e.g. to compare the two populations."
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
 
     if args.report is not None:
         with args.report.open(newline="") as f:
@@ -290,8 +347,18 @@ def main(argv: list[str] | None = None) -> int:
 
     import psycopg
 
+    if args.skip_library_intersection:
+        library_artist_names = None
+        print("Sampling the RAW artist_url universe (library intersection SKIPPED)")
+    else:
+        library_artist_names = _load_library_artist_names(args.library_db)
+        print(
+            f"Intersecting the seed with {len(library_artist_names)} library artist "
+            f"name(s) from {args.library_db}"
+        )
+
     with psycopg.connect(dsn) as conn:
-        candidate_ids = fetch_candidate_artist_ids(conn)
+        candidate_ids = fetch_candidate_artist_ids(conn, library_artist_names=library_artist_names)
         sampled_ids = sample_artist_ids(candidate_ids, args.sample_size, args.seed)
         samples = fetch_artist_samples(conn, sampled_ids)
 
