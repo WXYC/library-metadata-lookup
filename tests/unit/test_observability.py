@@ -641,6 +641,29 @@ class TestCaptureUnsampledCounter:
             for record in caplog.records
         )
 
+    def test_settings_stub_missing_environment_still_emits(self, monkeypatch):
+        """Duck-typing tolerance (LML#1204 review): the pre-consolidation
+        bandcamp copy read both fields via getattr with defaults, so a
+        settings-like stub missing ``environment`` must still emit (with
+        ``environment: None``) rather than raise inside the guard and drop
+        the counter with a spurious warning."""
+        fake = CountingPosthog()
+        monkeypatch.setattr(observability, "get_posthog_client", lambda event_prefix: fake)
+        observability.capture_unsampled_counter(
+            "p", "e", settings=SimpleNamespace(enable_telemetry=True)
+        )
+
+        assert fake.events == ["e"]
+        assert fake.captures[0].properties == {"environment": None}
+
+    def test_settings_stub_missing_enable_telemetry_skips(self, monkeypatch):
+        """Same getattr default as the pre-consolidation copy: a stub with
+        no ``enable_telemetry`` attribute reads as disabled, not an error."""
+        accessor = Mock()
+        monkeypatch.setattr(observability, "get_posthog_client", accessor)
+        observability.capture_unsampled_counter("p", "e", settings=SimpleNamespace())
+        accessor.assert_not_called()
+
     def test_omitted_settings_reads_the_cached_global_settings(self, monkeypatch):
         """Callers with no DI settings in hand (the discogs retry loop, the
         warm task) omit ``settings`` and get ``config.settings.get_settings()``."""

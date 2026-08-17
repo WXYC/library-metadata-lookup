@@ -96,7 +96,11 @@ def capture_unsampled_counter(
     try:
         if settings is None:
             settings = get_settings()
-        if not settings.enable_telemetry:
+        # getattr with defaults, not plain attribute access (LML#1204 review):
+        # the pre-consolidation bandcamp copy tolerated settings-like stubs
+        # missing either field, and a missing attribute must degrade the same
+        # way (disabled / environment None), never raise-and-drop the counter.
+        if not getattr(settings, "enable_telemetry", False):
             return
         client = get_posthog_client(event_prefix=event_prefix)
         if client is None:
@@ -104,7 +108,10 @@ def capture_unsampled_counter(
         client.capture(
             distinct_id=SERVICE_POSTHOG_DISTINCT_ID,
             event=event,
-            properties={**(properties or {}), "environment": settings.environment},
+            properties={
+                **(properties or {}),
+                "environment": getattr(settings, "environment", None),
+            },
         )
     except Exception:
         logger.warning("Failed to emit %s counter", event, exc_info=True)

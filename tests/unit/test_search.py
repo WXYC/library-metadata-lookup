@@ -1936,7 +1936,15 @@ class TestResolveBoolEnv:
 
     @pytest.fixture(autouse=True)
     def _clean_env(self, monkeypatch):
+        from core import search as search_module
+
         monkeypatch.delenv(self._ENV_VAR, raising=False)
+        # The junk WARN is memoized per env-var name for the process's life
+        # (see TestResolveBoolEnvWarnMemoization) — reset so each test case
+        # observes its own first read.
+        search_module._warned_bool_env_vars.clear()
+        yield
+        search_module._warned_bool_env_vars.clear()
 
     @pytest.mark.parametrize("default", [True, False])
     def test_unset_returns_the_default(self, default):
@@ -1987,3 +1995,43 @@ class TestResolveBoolEnv:
         ]
         assert _TRUE_BOOL_ENV_VALUES == frozenset(t for t, _ in pairs)
         assert _FALSE_BOOL_ENV_VALUES == frozenset(f for _, f in pairs)
+
+
+class TestResolveBoolEnvWarnMemoization:
+    """LML#1204 review: adopters sit on per-request/per-item hot paths, so a
+    typo'd Railway var must warn once per process per env-var name — not
+    ~100+ times per bulk request, indefinitely (the replaced inline readers
+    were silent; once is the observability win without the flood). The
+    memoization is the ``_warned_prefixes`` idiom
+    ``wxyc_fastapi.observability.posthog.get_posthog_client`` already uses."""
+
+    _ENV_VAR = "LML_TEST_BOOL_FLAG_MEMO"
+    _OTHER_ENV_VAR = "LML_TEST_BOOL_FLAG_MEMO_OTHER"
+
+    @pytest.fixture(autouse=True)
+    def _clean_state(self, monkeypatch):
+        from core import search as search_module
+
+        monkeypatch.delenv(self._ENV_VAR, raising=False)
+        monkeypatch.delenv(self._OTHER_ENV_VAR, raising=False)
+        search_module._warned_bool_env_vars.clear()
+        yield
+        search_module._warned_bool_env_vars.clear()
+
+    def test_junk_warns_once_per_env_var_not_per_read(self, monkeypatch, caplog):
+        monkeypatch.setenv(self._ENV_VAR, "ture")
+        with caplog.at_level(logging.WARNING, logger="core.search"):
+            for _ in range(5):
+                assert resolve_bool_env(self._ENV_VAR, default=False) is False
+        warns = [r for r in caplog.records if self._ENV_VAR in r.getMessage()]
+        assert len(warns) == 1
+
+    def test_a_different_env_var_still_gets_its_own_warn(self, monkeypatch, caplog):
+        monkeypatch.setenv(self._ENV_VAR, "ture")
+        monkeypatch.setenv(self._OTHER_ENV_VAR, "flase")
+        with caplog.at_level(logging.WARNING, logger="core.search"):
+            resolve_bool_env(self._ENV_VAR, default=False)
+            resolve_bool_env(self._OTHER_ENV_VAR, default=True)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(self._ENV_VAR in m for m in messages)
+        assert any(self._OTHER_ENV_VAR in m for m in messages)
