@@ -21,6 +21,8 @@ import pytest
 
 from core.exceptions import BreakerOpenError
 from core.search import (
+    _FALSE_BOOL_ENV_VALUES,
+    _TRUE_BOOL_ENV_VALUES,
     DEFAULT_SEARCH_BUDGET_MS,
     DEFAULT_SEARCH_HARD_TIMEOUT_MS,
     TRANSPORT_OVERHEAD_MS,
@@ -35,6 +37,7 @@ from core.search import (
     no_results_and_ambiguous_format,
     no_results_and_song_but_no_artist,
     no_results_and_song_but_no_artist_track_fallback,
+    resolve_bool_env,
     resolve_effective_search_budget_ms,
     resolve_search_budget_ms,
     resolve_search_hard_timeout_ms,
@@ -1937,8 +1940,6 @@ class TestResolveBoolEnv:
 
     @pytest.mark.parametrize("default", [True, False])
     def test_unset_returns_the_default(self, default):
-        from core.search import resolve_bool_env
-
         assert resolve_bool_env(self._ENV_VAR, default=default) is default
 
     @pytest.mark.parametrize("default", [True, False])
@@ -1947,16 +1948,12 @@ class TestResolveBoolEnv:
         """Env vars outrank the .env source, and empty behaves like unset
         throughout this codebase — matching every replaced copy, where an
         empty string fell through to the site's default."""
-        from core.search import resolve_bool_env
-
         monkeypatch.setenv(self._ENV_VAR, value)
         assert resolve_bool_env(self._ENV_VAR, default=default) is default
 
     @pytest.mark.parametrize("default", [True, False])
     @pytest.mark.parametrize("value", ["1", "true", "True", "yes", "YES", "on", " on ", "enabled"])
     def test_true_spellings_enable_regardless_of_default(self, monkeypatch, value, default):
-        from core.search import resolve_bool_env
-
         monkeypatch.setenv(self._ENV_VAR, value)
         assert resolve_bool_env(self._ENV_VAR, default=default) is True
 
@@ -1965,8 +1962,6 @@ class TestResolveBoolEnv:
         "value", ["0", "false", "False", "no", "NO", "off", " off ", "disabled"]
     )
     def test_false_spellings_disable_regardless_of_default(self, monkeypatch, value, default):
-        from core.search import resolve_bool_env
-
         monkeypatch.setenv(self._ENV_VAR, value)
         assert resolve_bool_env(self._ENV_VAR, default=default) is False
 
@@ -1974,8 +1969,6 @@ class TestResolveBoolEnv:
     def test_junk_falls_back_to_the_default_with_a_warn(self, monkeypatch, caplog, default):
         """Same operator-typo contract as ``resolve_positive_int_env``: junk
         must not 500 anything, and must not silently flip a flag either way."""
-        from core.search import resolve_bool_env
-
         monkeypatch.setenv(self._ENV_VAR, "garbage")
         with caplog.at_level(logging.WARNING, logger="core.search"):
             assert resolve_bool_env(self._ENV_VAR, default=default) is default
@@ -1985,8 +1978,6 @@ class TestResolveBoolEnv:
         """Every true spelling has a false counterpart (1/0, true/false,
         yes/no, on/off, enabled/disabled) — the asymmetry this consolidation
         retires from ``lookup/artist_resolution.py``."""
-        from core.search import _FALSE_BOOL_ENV_VALUES, _TRUE_BOOL_ENV_VALUES
-
         pairs = [
             ("1", "0"),
             ("true", "false"),

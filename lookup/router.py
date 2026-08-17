@@ -43,7 +43,11 @@ from core.dependencies import (
     get_posthog_client,
 )
 from core.event_loop_lag import get_event_loop_lag_ms
-from core.observability import observability_guard, project_capped
+from core.observability import (
+    SERVICE_POSTHOG_DISTINCT_ID,
+    observability_guard,
+    project_capped,
+)
 from core.search import SEARCH_API_CALL_CAP_FIRED_STAT_KEY, resolve_positive_int_env
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
@@ -736,7 +740,7 @@ async def handle_lookup(
                 # the wait is reported separately via the Sentry measurement.
                 telemetry = RequestTelemetry(
                     api_call_keys=["discogs"],
-                    distinct_id="library-metadata-lookup-service",
+                    distinct_id=SERVICE_POSTHOG_DISTINCT_ID,
                     event_prefix="lookup",
                     # Emit only the `lookup_completed` summary, not the ~9
                     # per-step `lookup_<step>` events (wxyc-fastapi>=1.3.0). No
@@ -999,7 +1003,7 @@ async def handle_bulk_lookup(
     # accident of no step being tracked yet.
     batch_telemetry = RequestTelemetry(
         api_call_keys=["discogs"],
-        distinct_id="library-metadata-lookup-service",
+        distinct_id=SERVICE_POSTHOG_DISTINCT_ID,
         event_prefix="lookup.bulk",
         emit_step_events=False,
     )
@@ -1050,7 +1054,7 @@ async def handle_bulk_lookup(
             # path in this file -- the exact shape of the 2026-08-04 incident.
             telemetry = RequestTelemetry(
                 api_call_keys=["discogs"],
-                distinct_id="library-metadata-lookup-service",
+                distinct_id=SERVICE_POSTHOG_DISTINCT_ID,
                 event_prefix="lookup.bulk",
                 emit_step_events=False,
             )

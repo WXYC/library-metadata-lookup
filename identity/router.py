@@ -19,9 +19,7 @@ from collections import Counter
 
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from wxyc_fastapi.observability import get_posthog_client
 
-from config.settings import get_settings
 from core.bulk_body import (
     TRANSIENT_PG_ERRORS,
     parse_bulk_body,
@@ -34,6 +32,7 @@ from core.bulk_concurrency import (
     watch_disconnect,
 )
 from core.dependencies import discogs_pool_max_size, get_discogs_cache_pg
+from core.observability import capture_unsampled_counter
 from discogs.ratelimit import set_discogs_low_priority
 from entity.compilation_track_identity import CompilationTrackIdentityRow
 from entity.release_tracklist import ReleaseTracklistRow
@@ -91,7 +90,6 @@ _BULK_RESOLVE_INPUT_CAP = resolve_input_cap(BulkResolveLibrariesRequest, "inputs
 # `compilation_result`'s docstring on the two `(False, [])` causes).
 _COMPILATION_TRACK_READ_FAIL_OPEN_EVENT = "compilation_track_read_fail_open"
 _COMPILATION_TRACK_READ_POSTHOG_EVENT_PREFIX = "compilation_track_read"
-_COMPILATION_TRACK_READ_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
 
 
 def _capture_compilation_track_read_fail_open(
@@ -100,31 +98,18 @@ def _capture_compilation_track_read_fail_open(
     """Emit the unsampled PostHog counter for one degraded
     ``compilation_track_identity`` batched-read failure.
 
-    Best-effort, gated by ``Settings.enable_telemetry``, wired through the
-    shared ``wxyc_fastapi.observability.get_posthog_client`` accessor. Every
-    branch is wrapped so a telemetry failure can never turn the graceful
-    degrade into something worse.
+    Delegates to ``core.observability.capture_unsampled_counter`` (LML#1204):
+    best-effort, telemetry-gated, and unable to raise — a telemetry failure
+    can never turn the graceful degrade into something worse.
     """
-    try:
-        settings = get_settings()
-        if not settings.enable_telemetry:
-            return
-        client = get_posthog_client(event_prefix=_COMPILATION_TRACK_READ_POSTHOG_EVENT_PREFIX)
-        if client is None:
-            return
-        client.capture(
-            distinct_id=_COMPILATION_TRACK_READ_POSTHOG_DISTINCT_ID,
-            event=_COMPILATION_TRACK_READ_FAIL_OPEN_EVENT,
-            properties={
-                "error_type": type(exc).__name__,
-                "legacy_release_id_count": legacy_release_id_count,
-                "environment": settings.environment,
-            },
-        )
-    except Exception:
-        logger.warning(
-            "Failed to emit %s counter", _COMPILATION_TRACK_READ_FAIL_OPEN_EVENT, exc_info=True
-        )
+    capture_unsampled_counter(
+        _COMPILATION_TRACK_READ_POSTHOG_EVENT_PREFIX,
+        _COMPILATION_TRACK_READ_FAIL_OPEN_EVENT,
+        {
+            "error_type": type(exc).__name__,
+            "legacy_release_id_count": legacy_release_id_count,
+        },
+    )
 
 
 # Sibling counter for the LML#1138 single_artist derivation's batched reads
@@ -137,7 +122,6 @@ def _capture_compilation_track_read_fail_open(
 # docs/observability-rowless-flag.md.
 _SINGLE_ARTIST_TRACK_READ_FAIL_OPEN_EVENT = "single_artist_track_read_fail_open"
 _SINGLE_ARTIST_TRACK_READ_POSTHOG_EVENT_PREFIX = "single_artist_track_read"
-_SINGLE_ARTIST_TRACK_READ_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
 
 
 def _capture_single_artist_track_read_fail_open(
@@ -147,29 +131,17 @@ def _capture_single_artist_track_read_fail_open(
     derivation batched-read failure (pins or tracklists — one counter for
     the pair, since either failing degrades the same rows the same way).
 
-    Best-effort, gated by ``Settings.enable_telemetry`` — same posture as
+    Same ``capture_unsampled_counter`` delegation and posture as
     ``_capture_compilation_track_read_fail_open`` above.
     """
-    try:
-        settings = get_settings()
-        if not settings.enable_telemetry:
-            return
-        client = get_posthog_client(event_prefix=_SINGLE_ARTIST_TRACK_READ_POSTHOG_EVENT_PREFIX)
-        if client is None:
-            return
-        client.capture(
-            distinct_id=_SINGLE_ARTIST_TRACK_READ_POSTHOG_DISTINCT_ID,
-            event=_SINGLE_ARTIST_TRACK_READ_FAIL_OPEN_EVENT,
-            properties={
-                "error_type": type(exc).__name__,
-                "legacy_release_id_count": legacy_release_id_count,
-                "environment": settings.environment,
-            },
-        )
-    except Exception:
-        logger.warning(
-            "Failed to emit %s counter", _SINGLE_ARTIST_TRACK_READ_FAIL_OPEN_EVENT, exc_info=True
-        )
+    capture_unsampled_counter(
+        _SINGLE_ARTIST_TRACK_READ_POSTHOG_EVENT_PREFIX,
+        _SINGLE_ARTIST_TRACK_READ_FAIL_OPEN_EVENT,
+        {
+            "error_type": type(exc).__name__,
+            "legacy_release_id_count": legacy_release_id_count,
+        },
+    )
 
 
 def _bulk_resolve_default_concurrency() -> int:
