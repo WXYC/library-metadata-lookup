@@ -231,6 +231,29 @@ uv run python -m scripts.wikipedia_url_validation --report lml-513-sample.csv
 
 `--report` mode makes no DB connection — it only reads the already-classified CSV back and computes the regression rate (heuristic right, slug wrong) and improvement rate (heuristic wrong, slug right); rows with either column left blank are excluded from the denominator (not yet classified). The gate: a regression rate under 2% before flipping `LML_WIKIPEDIA_SLUG_MATCH` on staging, then prod. `--sample-size` (default 300), `--seed` (default 513, for a reproducible sample), `--out` (default `wikipedia_url_validation_sample.csv`). Read-only; never writes to PG.
 
+## Wikipedia Bio Cache Drain (`scripts/warm_wikipedia_bios.py`)
+
+The **primary population mechanism** for `lml_cache.artist_wikipedia_bio` (LML#513/#1192 Phase C; `docs/plans/lml-1192-wikipedia-artist-bio.md`). The lazy background miss-warm (`lookup/enrichment/wikipedia_warm.py`) only extends coverage to artists newly entering the flowsheet going forward — this drain is what covers the *existing* catalog, and per BS#1747 (Backend-Service freezes the first LML answer for an album permanently) it must run to completion **before** `LML_BIO_PREFER_WIKIPEDIA` flips in production, or a cold-cache first ask after the flip freezes the Discogs fallback for that artist instead of self-healing.
+
+Seed: distinct discogs-cache artist ids carrying a `wikipedia.org` `artist_url` row (same candidate universe as `scripts/wikipedia_url_validation.py`; the discogs-cache `artist` table is already WXYC-library-filtered by the discogs-etl pipeline). Each candidate runs through the same flag-independent slug-scored extractor (`lookup.wikipedia_url.compare_wikipedia_extractors`) Phase A ships — `resolve_drain_pick` replicates the flag-ON branch of `pick_artist_wikipedia_url` so the written `wikipedia_url` always matches what the live read path's self-healing predicate will later look for. A below-floor pick is declined without a live fetch (same "never fetch text for an unconfident pick" rule the read path follows) but still writes a `extract IS NULL` row so the artist counts as attempted.
+
+**Usage:**
+```bash
+# default: incremental -- only artist ids with no existing row
+DATABASE_URL_DISCOGS=postgresql://... uv run python -m scripts.warm_wikipedia_bios
+
+# retry rows that previously found nothing (a fetch miss OR a below-floor decline)
+DATABASE_URL_DISCOGS=postgresql://... uv run python -m scripts.warm_wikipedia_bios --retry-misses --limit 5000
+
+# operator lever: rewrite already-successful rows whose pick has since diverged
+# (e.g. after a Phase-A extractor recalibration)
+DATABASE_URL_DISCOGS=postgresql://... uv run python -m scripts.warm_wikipedia_bios --repick --limit 500
+```
+
+Three mutually exclusive modes (collapsed into one `_MODE_SQL` + `fetch_candidates(pg, *, mode, ...)`, LML#1192 review round 3): default (the no-flag mode, never-attempted artist ids only), `--retry-misses` (only `extract IS NULL` rows — never touches a positive row, the data-safety rule), `--repick` (only already-successful rows, and only rewrites the subset whose current pick differs from the stored `wikipedia_url` — and never turns a positive `extract` into `NULL`, even when the fresh pick diverges into a negative; see the module docstring's data-safety section). Every mode's seed is intersected with WXYC library artists (`--library-db`, default `library.db`, reusing `scripts/build_filtered_discogs.py`'s `extract_library_artists`) — the discogs-cache `artist`/`artist_url` tables are not library-exclusive in prod (`LML_RESOLVE_NONLIBRARY_RELEASE` and the bulk artist-resolve drain both accumulate non-library artists into them), so an un-intersected seed would silently grow past the plan's target population. `--limit` caps candidates selected per session; `--rate-per-second` (default 3, correct for any positive rate including fractional) and `--max-retries` (default 5, honoring `Retry-After` on a 429 via `clients.wikipedia.WikipediaClient`'s own retry loop, which now acquires the rate limiter once per actual HTTP attempt rather than once per candidate) throttle live fetches. A transient `WikipediaFetchError` (timeout, network error, exhausted retries) writes **nothing** — the row stays selectable by a future default/`--retry-misses` pass rather than being poisoned as a confirmed negative. A session aborts (non-zero exit) after too many consecutive failure-ish outcomes in a row, rather than grinding through the rest of the candidates making zero progress. Rough scale: bounded by LIBRARY artists with a Discogs-known Wikipedia URL — expect low-tens-of-thousands; at 3 rps that's a few hours across 1-2 sessions. Read-only against the WXYC catalog; the only writes are to `lml_cache.artist_wikipedia_bio`.
+
+**Not yet run against real data.** Like `scripts/wikipedia_url_validation.py`, the candidate-selection SQL (JOINs against the discogs-cache `artist`/`artist_url` tables) was written against `discogs/cache_service.py`'s known schema usage but has not been exercised end-to-end — the local discogs-cache PostgreSQL instances available in development are empty of that schema. Unit-tested throughout (mocked PG); the operator's first `--limit`-bounded run against a populated cache is the de facto integration test.
+
 ## Artist Name Variation Audit (`scripts/variation_audit/`)
 
 Cross-references WXYC library catalog artist name variations against local Discogs and MusicBrainz datasets. Classifies each relationship (ALIAS, MEMBER_OF_GROUP, SEPARATE_ARTIST, COLLABORATION, SPELLING_VARIANT, SPLIT_RELEASE) and identifies artists that should have their own library code. Output includes flowsheet play counts and own-release counts for prioritization.

@@ -254,3 +254,23 @@ class TestComputeGroundTruthSummary:
         rows = [{"heuristic_correct": "TRUE", "slug_correct": "FALSE"}]
         summary = compute_ground_truth_summary(rows)
         assert summary.classified == 0
+
+    def test_a_short_csv_row_fails_safe_to_excluded_not_a_crash(self):
+        # LML#1192 review round 4, P1-11: csv.DictReader's restval for a
+        # column a SHORT row doesn't reach is None, not "" -- unlike a
+        # column simply absent from the dict (test_missing_clears_floor_
+        # column_defaults_to_excluded above), the key IS present here, so
+        # row.get(key, "")'s default never kicks in and .strip() is called
+        # on None. This is the realistic case for a hand-edited CSV: an
+        # operator deletes a trailing column's value (or a stray newline
+        # truncates a row) rather than removing the column entirely.
+        import csv
+        import io
+
+        csv_text = "heuristic_correct,slug_correct,clears_floor\nTRUE,FALSE\n"
+        rows = list(csv.DictReader(io.StringIO(csv_text)))
+        assert rows[0]["clears_floor"] is None  # confirms the DictReader restval premise
+
+        summary = compute_ground_truth_summary(rows)  # must not raise
+
+        assert summary.classified == 0

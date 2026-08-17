@@ -509,6 +509,45 @@ class TestRateLimitRetry:
             await client.get_summary("Stereolab", "en", max_retries=1)
         mock_sleep.assert_awaited_once_with(0.0)
 
+
+@pytest.mark.asyncio
+class TestRateLimiterPerRequest:
+    """LML#1192 review round 2, C4: scripts/warm_wikipedia_bios.py's offline
+    drain acquires its ``AsyncLimiter`` slot once per CANDIDATE, but a single
+    candidate can issue up to ``max_retries + 1`` actual HTTP requests via
+    the 429-retry loop above -- so a 429 storm (exactly when the caller most
+    needs to slow down) burst up to that many requests inside one rate-limit
+    slot. The fix is here, not in the drain script: an optional
+    ``rate_limiter`` is acquired immediately before EVERY actual HTTP
+    attempt, retries included, so the caller-supplied rate genuinely bounds
+    the request rate regardless of how many 429s a single candidate hits.
+    """
+
+    async def test_acquires_the_limiter_once_per_actual_http_attempt(self, httpx_mock):
+        httpx_mock.add_response(url=_SUMMARY_URL, status_code=429, headers={"Retry-After": "1"})
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            json={"type": "standard", "extract": "An artist.", "description": "musician"},
+        )
+        client = WikipediaClient()
+        fake_limiter = AsyncMock()
+        with patch("clients.wikipedia.asyncio.sleep", new_callable=AsyncMock):
+            summary = await client.get_summary(
+                "Stereolab", "en", max_retries=1, rate_limiter=fake_limiter
+            )
+        assert summary is not None
+        assert len(httpx_mock.get_requests()) == 2
+        assert fake_limiter.acquire.await_count == 2
+
+    async def test_no_rate_limiter_is_a_no_op(self, httpx_mock):
+        httpx_mock.add_response(
+            url=_SUMMARY_URL,
+            json={"type": "standard", "extract": "An artist.", "description": "musician"},
+        )
+        client = WikipediaClient()
+        summary = await client.get_summary("Stereolab", "en", max_retries=1, rate_limiter=None)
+        assert summary is not None
+
     async def test_absurdly_large_retry_after_is_clamped_to_a_ceiling(self, httpx_mock):
         httpx_mock.add_response(
             url=_SUMMARY_URL, status_code=429, headers={"Retry-After": "99999999999999"}
