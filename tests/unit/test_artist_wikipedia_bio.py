@@ -25,6 +25,7 @@ import pytest
 from entity.artist_wikipedia_bio import (
     DEFAULT_REFUSAL_COOLDOWN,
     DEFAULT_SUCCESS_TTL,
+    WikipediaBioReadError,
     get_cached_artist_wikipedia_bio,
     mark_artist_wikipedia_bio_refused,
     set_cached_artist_wikipedia_bio,
@@ -91,14 +92,33 @@ class TestGetCachedArtistWikipediaBio:
         assert refusal_cutoff == _NOW - DEFAULT_REFUSAL_COOLDOWN
         assert "wikipedia_url = $" not in sql
 
-    async def test_pg_error_degrades_to_absent(self):
+    async def test_pg_error_raises_a_typed_read_error_instead_of_degrading(self):
+        # LML#1192 review round 6, C2-3: through round 5 this degraded to
+        # was_present=False, indistinguishable from a genuine miss -- the
+        # sole production caller (lookup/enrichment/wikipedia_bio.py's
+        # resolve_served_bio) then took the "genuine miss" branch and
+        # scheduled a live warm, so a discogs-cache PG outage silently
+        # inverted "cache down, degrade quietly" into sustained outbound
+        # Wikipedia traffic with a 0% write-back rate. Mirrors
+        # entity.compilation_track_location's CompilationTrackLocationProbeError
+        # (LML#1026): this read's emptiness must be distinguishable from a
+        # couldn't-ask, so a "could not consult the cache" outcome raises
+        # instead of masquerading as "cache says miss."
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(side_effect=RuntimeError("PG unreachable"))
 
-        result = await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
+        with pytest.raises(WikipediaBioReadError):
+            await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
 
-        assert result.was_present is False
-        assert result.value is None
+    async def test_read_error_chains_the_original_exception(self):
+        pg = AsyncMock(spec=PgSource)
+        original = RuntimeError("PG unreachable")
+        pg.fetchone = AsyncMock(side_effect=original)
+
+        with pytest.raises(WikipediaBioReadError) as exc_info:
+            await get_cached_artist_wikipedia_bio(pg, discogs_artist_id=_ARTIST_ID, now=_NOW)
+
+        assert exc_info.value.__cause__ is original
 
 
 @pytest.mark.asyncio

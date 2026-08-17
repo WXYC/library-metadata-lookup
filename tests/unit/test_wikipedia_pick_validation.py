@@ -195,6 +195,9 @@ class TestMaxCandidatesCap:
         assert result.picked is not None
         assert result.picked.below_floor is True
         assert len(calls) == 5
+        # No cap given -- nothing was ever left untried, so this can never
+        # be a truncation (LML#1192 review round 6, C2-1).
+        assert result.truncated is False
 
     async def test_a_positive_cap_stops_after_that_many_candidates(self):
         langs = ["en", "fr", "de", "es", "it"]
@@ -209,6 +212,11 @@ class TestMaxCandidatesCap:
         assert result.picked is not None
         assert result.picked.below_floor is True
         assert len(calls) == 2
+        # LML#1192 review round 6, C2-1: three above-floor candidates were
+        # never tried at all -- this below-floor fallback must be
+        # distinguishable from a genuinely exhausted candidate list, so a
+        # caller can refuse to write an authoritative negative for it.
+        assert result.truncated is True
 
     async def test_the_cap_does_not_prevent_a_within_cap_candidate_from_winning(self):
         # Try order for an all-tied score is en first (the lang==en
@@ -229,6 +237,43 @@ class TestMaxCandidatesCap:
         assert result.picked.below_floor is False
         assert result.picked.url == "https://fr.wikipedia.org/wiki/Stereolab"
         assert calls == ["en", "fr"]
+        # LML#1192 review round 6, C2-1: a WIN is never "truncated," even
+        # when the cap left other candidates untried -- an answer was
+        # found, so there's no ambiguity left for a caller to worry about.
+        assert result.truncated is False
+
+    async def test_a_beyond_the_cap_candidate_that_would_validate_is_never_reached_and_the_fallback_is_flagged_truncated(
+        self,
+    ):
+        # LML#1192 review round 6, C2-1: the exact scenario the finding
+        # names -- a truncated candidate list where only a beyond-the-cap
+        # candidate would have validated. All within-cap candidates reject
+        # (the fixture never even defines a validating response for the
+        # 4th, since it must never be reached); the fallback must come
+        # back distinguishable as "we ran out of budget," not "we asked
+        # about every real candidate and there wasn't one."
+        # Verified try-order for four all-tied (score 100.0) candidates:
+        # en first (the lang==en tiebreak), then the remaining three by
+        # descending URL string -- "fr" > "es" > "de". With
+        # max_candidates=3, "de" is the one beyond-the-cap candidate.
+        langs = ["en", "fr", "de", "es"]
+        urls = [f"https://{lang}.wikipedia.org/wiki/Stereolab" for lang in langs]
+        calls: list[str] = []
+
+        async def fetch(url, lang):
+            calls.append(lang)
+            if lang == "de":
+                raise AssertionError(
+                    "the beyond-the-cap candidate (max_candidates=3) must never be fetched"
+                )
+            return None  # every within-cap candidate rejects
+
+        result = await resolve_and_validate_pick(urls, "Stereolab", fetch=fetch, max_candidates=3)
+
+        assert calls == ["en", "fr", "es"]
+        assert result.picked is not None
+        assert result.picked.below_floor is True
+        assert result.truncated is True
 
 
 @pytest.mark.asyncio
@@ -249,6 +294,8 @@ class TestNoCandidateValidates:
         assert result.picked.below_floor is True
         assert result.picked.url == urls[0]
         assert result.summary is None
+        # No cap given -- there was never anything left untried.
+        assert result.truncated is False
 
     async def test_every_above_floor_candidate_rejected_falls_back_to_heuristic(self):
         # Both candidates clear the floor (same slug, so both score high)
@@ -268,6 +315,9 @@ class TestNoCandidateValidates:
         assert result.picked.below_floor is True
         assert result.picked.url == urls[0]
         assert result.summary is None
+        # Both candidates WERE tried (no cap given) -- an exhausted list is
+        # not a truncated one.
+        assert result.truncated is False
 
     async def test_no_wikipedia_url_at_all_returns_no_pick_and_never_fetches(self):
         async def fetch(url, lang):
@@ -276,6 +326,7 @@ class TestNoCandidateValidates:
         result = await resolve_and_validate_pick([], "Stereolab", fetch=fetch)
         assert result.picked is None
         assert result.summary is None
+        assert result.truncated is False
 
 
 @pytest.mark.asyncio

@@ -56,12 +56,15 @@ could validate a pick differently — it was self-healing to whichever pick
 happened to be RIGHT more often by construction, not a real correctness
 signal.
 
-Reads/writes wrapped in ``swallowing_fetch``/``swallowing_execute`` so a PG
-hiccup degrades to a cache miss (or a silently-dropped write) instead of
-breaking ``/lookup`` — this cache is never on the request path regardless
-(see the plan's Non-goals), but the read-path caller (``lookup/enrichment/
-wikipedia_bio.py``, PR-B2) still wants the same best-effort posture every
-other ``lml_cache.*`` module has.
+Writes wrapped in ``swallowing_execute`` so a PG hiccup degrades to a
+silently-dropped write instead of breaking ``/lookup`` — this cache is
+never on the request path regardless (see the plan's Non-goals). The read
+is DIFFERENT (LML#1192 review round 6, C2-3): a genuine PG failure raises
+:class:`WikipediaBioReadError` rather than degrading to a miss shape,
+because the sole production caller (``lookup/enrichment/wikipedia_bio.py``)
+schedules a live warm on a miss -- see that class's docstring for the
+outage this prevents. Deliberately NOT ``entity.cache_toolkit.swallowing_fetch``
+for the read, unlike every sibling ``lml_cache.*`` module.
 """
 
 from __future__ import annotations
@@ -70,12 +73,32 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute, swallowing_fetch
+from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.ddl import bootstrap_lml_cache_table
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
+
+
+class WikipediaBioReadError(Exception):
+    """The bio cache could not be consulted (PG failure) -- raised instead
+    of degrading to a miss shape (LML#1192 review round 6, C2-3).
+
+    Mirrors ``entity.compilation_track_location.CompilationTrackLocationProbeError``
+    (LML#1026): through round 5, ``get_cached_artist_wikipedia_bio`` wrapped
+    its read in ``swallowing_fetch``, so a genuine PG error was
+    indistinguishable from "no row" -- both returned ``was_present=False``.
+    The sole production caller (``lookup.enrichment.wikipedia_bio.resolve_served_bio``)
+    treats that shape as a genuine miss and schedules a live warm, so a
+    discogs-cache PG outage silently inverted "cache down, degrade quietly"
+    into sustained outbound Wikipedia traffic with a 0% write-back rate.
+    Callers that want the old best-effort posture catch this explicitly and
+    choose their own degrade policy (``resolve_served_bio`` degrades to the
+    Discogs pair WITHOUT scheduling a warm -- "couldn't ask" must never
+    look like "asked and it was empty").
+    """
+
 
 # How long a fresh POSITIVE extract stays authoritative. Deliberately much
 # shorter than the sibling release-resolution cache's 90-day positive TTL
@@ -296,32 +319,40 @@ async def get_cached_artist_wikipedia_bio(
 
     LML#1192 review round 5: no longer takes a ``wikipedia_url`` parameter
     — the read is keyed on ``discogs_artist_id`` alone (see the module
-    docstring). PG failures degrade to ``was_present=False`` (best-effort,
-    same posture as every sibling ``lml_cache.*`` read). ``now`` is exposed
-    for testability; production callers leave it at the default.
+    docstring). ``now`` is exposed for testability; production callers
+    leave it at the default.
 
     LML#1192 review round 6, C1-1: a positive row also counts as fresh when
     a refresh attempt was refused within ``refusal_cooldown`` (see
     :data:`DEFAULT_REFUSAL_COOLDOWN`'s docstring for the wedge this
     prevents) -- ``mark_artist_wikipedia_bio_refused`` is the only writer
     of that clock.
+
+    LML#1192 review round 6, C2-3: a genuine PG failure raises
+    :class:`WikipediaBioReadError` instead of degrading to
+    ``was_present=False`` -- see that class's docstring for why this read's
+    emptiness must be distinguishable from "could not ask." Deliberately
+    NOT ``entity.cache_toolkit.swallowing_fetch`` for this one reason.
     """
     reference_now = now or datetime.now(UTC)
     positive_cutoff = reference_now - success_ttl
     negative_cutoff = reference_now - miss_ttl
     refusal_cutoff = reference_now - refusal_cooldown
-    row = await swallowing_fetch(
-        pg,
-        _SELECT_SQL,
-        discogs_artist_id,
-        positive_cutoff,
-        negative_cutoff,
-        refusal_cutoff,
-        miss=None,
-        logger=logger,
-        log_label="artist_wikipedia_bio get failed for discogs_artist_id=%s",
-        log_args=(discogs_artist_id,),
-    )
+    try:
+        row = await pg.fetchone(
+            _SELECT_SQL,
+            discogs_artist_id,
+            positive_cutoff,
+            negative_cutoff,
+            refusal_cutoff,
+        )
+    except Exception as exc:
+        logger.exception(
+            "artist_wikipedia_bio get failed for discogs_artist_id=%s", discogs_artist_id
+        )
+        raise WikipediaBioReadError(
+            f"artist_wikipedia_bio read degraded for discogs_artist_id={discogs_artist_id}: {exc!r}"
+        ) from exc
     if row is None:
         return CachedValue(value=None, was_present=False)
     hit = WikipediaBioHit(wikipedia_url=row["wikipedia_url"], extract=row["extract"])
