@@ -97,12 +97,42 @@ _RELEASE_PREPOSITION_ALTERNATION = "|".join(re.escape(p) for p in _RELEASE_PREPO
 # description (narrowed, not reverted -- the broadened non-English
 # vocabulary itself stays) keeps every true positive and drops the false
 # ones. Anchored, not `\b`-prefixed: `^` already implies a word boundary.
+#
+# LML#1192 review round 6, P2-1: the anchor alone didn't close two further
+# false-positive classes, both fixed by tightening what "a release noun"
+# means here rather than by adding more excluded phrases (which would just
+# be the next round's whack-a-mole):
+#
+# 1. Pattern 1's `.*` was UNBOUNDED between the year and the noun, and
+#    matched the noun via a loose `\b...\b` with nothing required after
+#    it. "disco" is in _RELEASE_NOUNS for its Spanish/Italian "record"
+#    sense, but is also an ordinary English genre word -- "1977 British
+#    disco band" / "1970 American disco group" both matched on that bare
+#    `\bdisco\b`, even though "disco" here modifies "band"/"group", never
+#    "album"/"song". A release noun only actually MEANS "this is a
+#    release" when it's immediately followed by one of the prepositions
+#    below ("disco album BY X", never "disco band"), so both patterns now
+#    share that requirement via `_RELEASE_NOUN_PREP_ALTERNATION`.
+# 2. Even a genuine noun+preposition match isn't enough on its own:
+#    "Canción de autor española" (the standard Spanish genre label for
+#    "singer-songwriter") opens with "canción de" exactly like a real
+#    "canción de Sessa" would. What actually distinguishes them is what
+#    comes next -- a real release-page description always names the
+#    ARTIST after the preposition (capitalized: "by Radiohead", "de
+#    Sessa"), never a lowercase common noun ("de autor"). Checked
+#    case-SENSITIVELY (unlike the rest of this module) via
+#    `_CAPITALIZED_WORD_RE`, searched from the noun+prep match's END so a
+#    merely sentence-initial capital can't satisfy it by accident, and
+#    over the whole REMAINDER (not just the next word) so
+#    "álbum de estudio de Sessa" -- a real positive where the artist name
+#    is one hop further out, past an infix noun -- still matches.
+_RELEASE_NOUN_PREP_ALTERNATION = (
+    rf"(?:{_RELEASE_NOUN_ALTERNATION})\b\s+(?:{_RELEASE_PREPOSITION_ALTERNATION})\b\s+"
+)
+_CAPITALIZED_WORD_RE = re.compile(r"[A-ZÀ-Þ]")  # deliberately NOT re.IGNORECASE
 _DESCRIPTION_REJECT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(rf"^\d{{4}}\s+.*\b(?:{_RELEASE_NOUN_ALTERNATION})\b", re.IGNORECASE),
-    re.compile(
-        rf"^(?:{_RELEASE_NOUN_ALTERNATION})\b\s+(?:{_RELEASE_PREPOSITION_ALTERNATION})\s+",
-        re.IGNORECASE,
-    ),
+    re.compile(rf"^\d{{4}}\s+.*\b{_RELEASE_NOUN_PREP_ALTERNATION}", re.IGNORECASE),
+    re.compile(rf"^{_RELEASE_NOUN_PREP_ALTERNATION}", re.IGNORECASE),
 )
 
 
@@ -120,7 +150,11 @@ class WikipediaSummary:
 def _is_rejected_description(description: str | None) -> bool:
     if not description:
         return False
-    return any(pattern.search(description) for pattern in _DESCRIPTION_REJECT_PATTERNS)
+    for pattern in _DESCRIPTION_REJECT_PATTERNS:
+        match = pattern.search(description)
+        if match and _CAPITALIZED_WORD_RE.search(description, match.end()):
+            return True
+    return False
 
 
 _MAX_RETRY_DELAY_SECONDS = 30.0
