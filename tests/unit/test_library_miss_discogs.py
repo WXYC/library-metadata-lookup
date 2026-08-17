@@ -1420,3 +1420,166 @@ class TestLibraryMissNoPoison:
         )
         assert result is None
         assert mock_discogs_service.search.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# LML#1206 — Discogs disambiguation suffix defeats the 80/80 floor
+# ---------------------------------------------------------------------------
+
+
+class TestDisambiguationSuffixRecall:
+    """A Discogs disambiguation suffix on the cached artist credit
+    (``"Mavi (12)"``, the ``(N)`` Discogs appends whenever multiple artists
+    share a name) defeated the 80/80 floor for a bare-name query. Measured
+    against prod: ``MAVI`` / ``Mavi`` / *The Pilot* / ``31 Days`` returned
+    zero results, while ``Mavi (12)`` / *The Pilot* / ``31 Days`` returned one
+    (release 37193856).
+
+    Root cause traced to ``_floor_best``'s call into
+    ``find_best_typed_match``: the artist axis scores
+    ``score_match(query_artist, r.artist_variants())`` — plain
+    ``fuzz.token_sort_ratio`` over the RAW candidate credit, with no
+    disambiguation-suffix strip on either side. ``score_match("MAVI", "Mavi
+    (12)")`` measures 61.5, well under the shared 80.0
+    ``SCORE_MATCH_ACCEPTANCE_FLOOR`` (``clients/streaming/matching.py``), so
+    ``is_acceptable_match`` rejects the candidate outright — retrieval
+    already had the right release in hand (the PG cache's own
+    trigram-similarity ordering clears its floor comfortably at this pair),
+    but this scoring gate discarded it before it ever reached the response.
+    ``score_match("Mavi (12)", "Mavi (12)")`` measures 100, which is why the
+    exact suffixed query worked.
+    """
+
+    RELEASE_ID = 37193856
+    ALBUM = "The Pilot"
+    SUFFIXED_ARTIST = "Mavi (12)"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("query_artist", ["MAVI", "Mavi", "mavi"])
+    async def test_bare_name_resolves_suffixed_credit(self, mock_discogs_service, query_artist):
+        """Every case form of the bare name must retrieve the suffix-credited
+        release — case was never the variable in the ticket's prod measurement,
+        the suffix was."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=self.RELEASE_ID,
+                    artist=self.SUFFIXED_ARTIST,
+                    album=self.ALBUM,
+                )
+            ]
+        )
+        result = await _library_miss_discogs_search(
+            _parsed(query_artist, self.ALBUM), discogs_service=mock_discogs_service
+        )
+        assert result is not None, (
+            f"query_artist={query_artist!r} did not resolve the "
+            f"{self.SUFFIXED_ARTIST!r}-credited release despite the exact album match"
+        )
+        _, discogs_result = result
+        assert discogs_result.release_id == self.RELEASE_ID
+
+    @pytest.mark.asyncio
+    async def test_no_suffix_control_unaffected(self, mock_discogs_service):
+        """AC — a bare name whose cached credit has NO suffix must not regress."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(release_id=self.RELEASE_ID, artist="Mavi", album=self.ALBUM)
+            ]
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Mavi", self.ALBUM), discogs_service=mock_discogs_service
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == self.RELEASE_ID
+        assert discogs_result.artist == "Mavi"
+
+    @pytest.mark.asyncio
+    async def test_conservative_multi_variant_resolution(self, mock_discogs_service):
+        """AC — when the cache holds multiple suffixed variants of one bare
+        name, the album axis is what disambiguates: only the variant whose
+        album ALSO matches the query is accepted. The artist axis alone must
+        never mint a match — a hypothetical ``"Mavi (3)"`` on an unrelated
+        album must not win just because its stripped form also reads
+        "Mavi"."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=self.RELEASE_ID,
+                    artist=self.SUFFIXED_ARTIST,
+                    album=self.ALBUM,
+                ),
+                make_discogs_result(
+                    release_id=99999999,
+                    artist="Mavi (3)",
+                    album="A Completely Different Album",
+                ),
+            ]
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Mavi", self.ALBUM), discogs_service=mock_discogs_service
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == self.RELEASE_ID, (
+            "the hypothetical Mavi (3) / unrelated-album candidate must not win — "
+            f"got {discogs_result.release_id}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_qualifier_suffix_not_widened(self, mock_discogs_service):
+        """AC — ``broad=False`` (numeric-only) semantics: a non-numeric
+        qualifier suffix like ``"(UK)"`` must NOT be treated as a
+        disambiguation suffix and promoted for a bare-name query."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[make_discogs_result(release_id=88888888, artist="Mavi (UK)", album=self.ALBUM)]
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Mavi", self.ALBUM), discogs_service=mock_discogs_service
+        )
+        assert result is None, (
+            "a non-numeric qualifier suffix must not be promoted by the LML#1206 fix"
+        )
+
+
+class TestPerformLookupDisambiguationSuffixRecall:
+    """End-to-end replay of the LML#1206 prod measurement through the real
+    ``perform_lookup`` spine, with a faked cache layer standing in for
+    prod discogs-cache — the caller-facing shape of the bug: a library miss
+    plus a live Discogs candidate credited under a disambiguation suffix
+    (``release_id=37193856``, ``"Mavi (12)"``, *The Pilot*) must resolve for
+    the bare-name caller, not just for the internal helper."""
+
+    @pytest.mark.asyncio
+    async def test_bare_name_query_gets_a_match(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        mock_library_db.search.return_value = []
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=37193856,
+                    artist="Mavi (12)",
+                    album="The Pilot",
+                )
+            ]
+        )
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="MAVI",
+            album="The Pilot",
+            song="31 Days",
+            raw_message="MAVI - 31 Days - The Pilot",
+        )
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert len(response.results) == 1, (
+            "MAVI / The Pilot / 31 Days must resolve release 37193856 through the "
+            f"library-miss path; got {response.results}"
+        )
+        item = response.results[0]
+        assert item.artwork is not None
+        assert item.artwork.release_id == 37193856
