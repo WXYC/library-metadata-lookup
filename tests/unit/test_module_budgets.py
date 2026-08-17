@@ -146,19 +146,15 @@ MODULE_BUDGETS: dict[str, int] = {
     # durable attempt record on the truncated-skip branch, matching C2-3's
     # existing WikipediaFetchError treatment) needed the unsampled
     # fetch-outcome PostHog counters extracted to their own module
-    # (wikipedia_warm_telemetry.py, own entry below) to fit without a
-    # ceiling raise. Measured 226 lines post-extraction -- left at 250
-    # rather than recalibrated down, since this extraction (unlike round
-    # 6's wikipedia_url.py one) didn't shed a large fraction of the file;
-    # 226/250 is still real headroom, not the four-lines-left condition
-    # that forced the wikipedia_url.py recalibration.
+    # (wikipedia_warm_telemetry.py) to fit without a ceiling raise.
+    #
+    # LML#1204 item 1: that extraction was module-budget-driven, not a
+    # concern boundary — once the emit mechanics consolidated into
+    # core.observability.capture_unsampled_counter, the residue (two stat
+    # keys, a prefix, a one-line wrapper) dissolved back in here and
+    # wikipedia_warm_telemetry.py was deleted. Fits under the unchanged
+    # 250 ceiling.
     "lookup/enrichment/wikipedia_warm.py": 250,
-    # New (LML#1192 review round 6, pass 3, A1): the background warm
-    # task's own unsampled PostHog fetch-outcome counters, extracted from
-    # lookup/enrichment/wikipedia_warm.py once that module needed room for
-    # this pass's durable-attempt fix. Measured 66 lines; 1.3x that is
-    # 85.8, smallest multiple of 50 at or above -> 100.
-    "lookup/enrichment/wikipedia_warm_telemetry.py": 100,
     # LML#1192 review round 4, P0-2 / round 5: fetch-validated Wikipedia
     # page selection. Moved down from #1196 (the drain PR) to #1195 (round
     # 5) -- this is the earliest branch that can host it, since it needs

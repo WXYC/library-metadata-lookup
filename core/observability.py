@@ -23,6 +23,12 @@ hand-rolled ``try/except`` at each site:
 - :func:`drop_fast_pool_reset_spans` -- the ``before_send_transaction`` hook
   wired at ``main.py``'s ``init_sentry`` call, which sheds asyncpg's
   pool-release bookkeeping span before it leaves the process (LML#1175).
+- :func:`capture_unsampled_counter` -- the detached-background-task PostHog
+  counter (LML#1204): best-effort, telemetry-gated, one service-wide
+  distinct id, ``environment`` merged into the properties. Consolidates the
+  byte-shape-identical copies that grew in ``discogs/service.py`` (LML#1049),
+  ``discogs/ratelimit.py`` (LML#879), ``lookup/enrichment/bandcamp_probe.py``,
+  and the Wikipedia warm task (LML#513/#1192).
 
 Neither ``project_transaction`` nor ``project_capped`` swallows exceptions on
 its own -- compose them with :func:`observability_guard` at the call site.
@@ -44,11 +50,64 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import sentry_sdk
+from wxyc_fastapi.observability import get_posthog_client
+
+from config.settings import get_settings
 
 if TYPE_CHECKING:
     from sentry_sdk.types import Event, Hint
 
+    from config.settings import Settings
+
 logger = logging.getLogger(__name__)
+
+SERVICE_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
+"""The one distinct id every service-emitted (non-request-scoped) PostHog
+counter uses -- previously restated per emitting module (LML#1204)."""
+
+
+def capture_unsampled_counter(
+    event_prefix: str,
+    event: str,
+    properties: dict[str, Any] | None = None,
+    *,
+    settings: Settings | None = None,
+) -> None:
+    """Emit one unsampled PostHog counter from a detached (non-request) context.
+
+    The detached-background-task counter shape formerly copied byte-for-byte
+    by ``discogs.service._capture_artist_breaker_shed`` (LML#1049),
+    ``discogs.ratelimit._capture_fail_open`` (LML#879),
+    ``lookup.enrichment.bandcamp_probe._capture_shed``, and the Wikipedia
+    warm task's fetch-outcome counters (LML#513/#1192) -- consolidated here
+    (LML#1204). Those sites run outside any request handler (deep in a retry
+    loop, or in a fire-and-forget task whose request scope has long closed),
+    so they cannot use FastAPI DI or the per-request cache-stats recorder --
+    they go through the shared ``wxyc_fastapi`` accessor instead.
+
+    Strictly best-effort and gated on ``Settings.enable_telemetry``: every
+    branch is wrapped so a telemetry failure can never turn the event being
+    counted into something worse. ``environment`` is always merged into
+    ``properties`` (staging and prod share infrastructure, so a counter must
+    say which process fired). ``settings`` lets a call site that already
+    holds DI-provided settings pass them through; when omitted, the cached
+    global ``config.settings.get_settings()`` is read.
+    """
+    try:
+        if settings is None:
+            settings = get_settings()
+        if not settings.enable_telemetry:
+            return
+        client = get_posthog_client(event_prefix=event_prefix)
+        if client is None:
+            return
+        client.capture(
+            distinct_id=SERVICE_POSTHOG_DISTINCT_ID,
+            event=event,
+            properties={**(properties or {}), "environment": settings.environment},
+        )
+    except Exception:
+        logger.warning("Failed to emit %s counter", event, exc_info=True)
 
 
 @contextlib.contextmanager

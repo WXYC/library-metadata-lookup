@@ -375,7 +375,7 @@ class TestBandcampLiveProbe:
 
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
-            patch("lookup.enrichment.bandcamp_probe.get_posthog_client", return_value=posthog),
+            patch("core.observability.get_posthog_client", return_value=posthog),
         ):
             results = await _run(bandcamp, pg, item, artwork)
 
@@ -400,7 +400,7 @@ class TestBandcampLiveProbe:
 
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
-            patch("lookup.enrichment.bandcamp_probe.get_posthog_client", return_value=posthog),
+            patch("core.observability.get_posthog_client", return_value=posthog),
         ):
             results = await _run(bandcamp, pg, item, artwork)
 
@@ -428,7 +428,7 @@ class TestBandcampLiveProbe:
 
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
-            patch("lookup.enrichment.bandcamp_probe.get_posthog_client", return_value=posthog),
+            patch("core.observability.get_posthog_client", return_value=posthog),
             patch("lookup.enrichment.bandcamp_probe.logger") as logger_mock,
         ):
             results = await _run(bandcamp, pg, item, artwork)
@@ -464,7 +464,7 @@ class TestBandcampLiveProbe:
 
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
-            patch("lookup.enrichment.bandcamp_probe.get_posthog_client", return_value=posthog),
+            patch("core.observability.get_posthog_client", return_value=posthog),
             patch("lookup.enrichment.bandcamp_probe.logger") as logger_mock,
         ):
             results = await _run(bandcamp, pg, item, artwork)
@@ -500,7 +500,7 @@ class TestBandcampLiveProbe:
         )
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
-            patch("lookup.enrichment.bandcamp_probe.get_posthog_client", return_value=posthog),
+            patch("core.observability.get_posthog_client", return_value=posthog),
             patch.object(SpineDeadline, "clamp_probe_timeout_s", return_value=0.01),
         ):
             results = await _run(bandcamp, pg, item, artwork, spine_deadline=deadline)

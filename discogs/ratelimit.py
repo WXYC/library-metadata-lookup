@@ -19,8 +19,8 @@ from typing import Protocol
 
 import sentry_sdk
 from aiolimiter import AsyncLimiter
-from wxyc_fastapi.observability import get_posthog_client
 
+from core.observability import capture_unsampled_counter
 from discogs.breaker import DiscogsCircuitBreaker
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,6 @@ logger = logging.getLogger(__name__)
 # counter".
 _FAIL_OPEN_EVENT = "discogs_rate_gate_fail_open"
 _QUEUE_WAIT_EVENT = "discogs_rate_gate_queue_wait"
-_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
 _POSTHOG_EVENT_PREFIX = "discogs_rate_gate"
 _QUEUE_WAIT_MEASUREMENT = "lml.discogs.rate_gate_queue_wait_ms"
 _QUEUE_SLEEP_MEASUREMENT = "lml.discogs.rate_gate_queue_sleeps"
@@ -368,24 +367,11 @@ def _capture_queue_wait(*, wait_ms: float, queue_sleeps: int) -> None:
     per-transaction max alongside traces for drill-down. Strictly best-effort:
     observability must never turn healthy saturation into a request failure.
     """
-    try:
-        from config.settings import get_settings
-
-        settings = get_settings()
-        if settings.enable_telemetry:
-            client = get_posthog_client(event_prefix=_POSTHOG_EVENT_PREFIX)
-            if client is not None:
-                client.capture(
-                    distinct_id=_POSTHOG_DISTINCT_ID,
-                    event=_QUEUE_WAIT_EVENT,
-                    properties={
-                        "wait_ms": wait_ms,
-                        "queue_sleeps": queue_sleeps,
-                        "environment": settings.environment,
-                    },
-                )
-    except Exception:
-        logger.warning("Failed to emit %s event", _QUEUE_WAIT_EVENT, exc_info=True)
+    capture_unsampled_counter(
+        _POSTHOG_EVENT_PREFIX,
+        _QUEUE_WAIT_EVENT,
+        {"wait_ms": wait_ms, "queue_sleeps": queue_sleeps},
+    )
 
     try:
         sentry_sdk.set_tag("lml.discogs.rate_gate_queued", "true")
@@ -410,32 +396,19 @@ def _capture_fail_open(exc: BaseException) -> None:
     """Emit the unsampled PostHog fail-open counter (see module constants).
 
     Runs deep in ``discogs/service._request_with_retry`` — outside any request
-    handler — so it goes through the shared ``wxyc_fastapi`` accessor the LML#683
-    ``cache.*`` counters use, not FastAPI DI. ``error_type`` keeps a real defect
-    (schema-drift ``KeyError``) distinguishable from a PG outage; ``environment``
-    identifies which process failed open, since staging and prod draw from the
-    same shared bucket. Strictly best-effort: a telemetry failure must never
-    turn a graceful fail-open into a hard error.
+    handler — so it delegates to ``core.observability.capture_unsampled_counter``
+    (LML#1204), the shared detached-task counter shape, not FastAPI DI.
+    ``error_type`` keeps a real defect (schema-drift ``KeyError``)
+    distinguishable from a PG outage; the merged ``environment`` identifies
+    which process failed open, since staging and prod draw from the same
+    shared bucket. Strictly best-effort: a telemetry failure must never turn
+    a graceful fail-open into a hard error.
     """
-    try:
-        from config.settings import get_settings
-
-        settings = get_settings()
-        if not settings.enable_telemetry:
-            return
-        client = get_posthog_client(event_prefix=_POSTHOG_EVENT_PREFIX)
-        if client is None:
-            return
-        client.capture(
-            distinct_id=_POSTHOG_DISTINCT_ID,
-            event=_FAIL_OPEN_EVENT,
-            properties={
-                "error_type": type(exc).__name__,
-                "environment": settings.environment,
-            },
-        )
-    except Exception:
-        logger.warning("Failed to emit %s counter", _FAIL_OPEN_EVENT, exc_info=True)
+    capture_unsampled_counter(
+        _POSTHOG_EVENT_PREFIX,
+        _FAIL_OPEN_EVENT,
+        {"error_type": type(exc).__name__},
+    )
 
 
 def _default_bucket_factory() -> BucketFactory:
