@@ -25,12 +25,11 @@ the live would-shed rate (the repo's measure-first idiom: #681, #879).
 from __future__ import annotations
 
 import logging
-import os
 
 import sentry_sdk
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
-from core.search import resolve_positive_int_env
+from core.search import resolve_bool_env, resolve_positive_int_env
 from generated.api_models import DegradedReason
 
 logger = logging.getLogger(__name__)
@@ -41,12 +40,6 @@ DEFAULT_ADMISSION_LOOP_LAG_SHED_MS = 500
 tail is a would-shed candidate. Calibration: `docs/env-vars.md`."""
 
 ADMISSION_SHED_ENFORCE_ENV_VAR = "LML_ADMISSION_SHED_ENFORCE"
-
-_TRUE_FLAG_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
-"""Spellings that enable a default-OFF boolean flag. Inverse polarity of
-``lookup.artist_resolution``'s ``_FALSE_FLAG_VALUES`` (disables a
-default-ON flag) — same "operator typing the same value gets the same
-result" intent, opposite polarity because this flag ships default-off."""
 
 ADMISSION_WOULD_SHED_STAT_KEY = "admission_would_shed"
 """Per-request cache-stats key, +1 whenever the shed predicate holds (shadow
@@ -83,12 +76,10 @@ def is_shed_enforced() -> bool:
 
     Default OFF (absent env → False): merging this module changes no
     response, only begins collecting ``would_shed`` telemetry. Read at
-    request time (no ``Settings`` indirection) — a no-redeploy Railway lever.
+    request time via the shared ``core.search.resolve_bool_env``
+    (LML#1204 item 3) — a no-redeploy Railway lever.
     """
-    raw = os.getenv(ADMISSION_SHED_ENFORCE_ENV_VAR)
-    if raw is None:
-        return False
-    return raw.strip().lower() in _TRUE_FLAG_VALUES
+    return resolve_bool_env(ADMISSION_SHED_ENFORCE_ENV_VAR, default=False)
 
 
 def project_admission_shed_telemetry(*, enforced: bool, lag_ms: float) -> None:
