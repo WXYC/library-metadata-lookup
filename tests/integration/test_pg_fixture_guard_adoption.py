@@ -131,24 +131,28 @@ def test_lml_cache_fixture_file_uses_table_scoped_guard(name: str) -> None:
     )
 
 
-def test_every_lml_cache_dropping_suite_is_registered() -> None:
-    """Discovery net for the roster itself: the two checks above only bind
-    files someone remembered to add to ``_LML_CACHE_FIXTURE_FILES``. Sweep
-    every integration file for the co-occurrence of ``lml_cache`` with a
-    ``DROP TABLE``/``TRUNCATE`` (coarse on purpose — a qualified name built
-    in an f-string still names the schema somewhere in the file) and require
-    each hit to be on the roster, so a new cache suite can't sit outside the
-    guard checks unnoticed. This file self-excludes: it exercises the guard
-    against scratch lml_cache tables by design."""
+def _discover_lml_cache_dropping_files() -> set[str]:
+    """Sweep every integration file for the co-occurrence of ``lml_cache``
+    with a ``DROP TABLE``/``TRUNCATE`` (coarse on purpose — a qualified name
+    built in an f-string still names the schema somewhere in the file). This
+    file self-excludes: it exercises the guard against scratch lml_cache
+    tables by design."""
     pattern = re.compile(r"DROP\s+TABLE|TRUNCATE", re.IGNORECASE)
-    flagged = {
+    return {
         path.name
         for path in Path(__file__).parent.glob("*.py")
         if path.name != Path(__file__).name
         and "lml_cache" in (src := path.read_text(encoding="utf-8"))
         and pattern.search(src)
     }
-    unregistered = flagged - set(_LML_CACHE_FIXTURE_FILES)
+
+
+def test_every_lml_cache_dropping_suite_is_registered() -> None:
+    """Discovery net for the roster itself: the two checks above only bind
+    files someone remembered to add to ``_LML_CACHE_FIXTURE_FILES``. Every
+    sweep hit must be on the roster, so a new cache suite can't sit outside
+    the guard checks unnoticed."""
+    unregistered = _discover_lml_cache_dropping_files() - set(_LML_CACHE_FIXTURE_FILES)
     assert not unregistered, (
         f"{sorted(unregistered)} touch lml_cache with DROP TABLE/TRUNCATE but are not in "
         "_LML_CACHE_FIXTURE_FILES — add them so the guard-adoption checks bind them "
@@ -275,3 +279,18 @@ async def test_trigram_fixture_setup_survives_empty_release_artist_residue(pg_po
             )
         finally:
             await conn.execute("DROP TABLE IF EXISTS release_artist")
+
+
+def test_discovery_finds_known_lml_cache_dropping_suites() -> None:
+    """Vacuity guard (LML#1204 item 8), mirroring
+    ``test_lifespan_bootstrap_totality.test_discovery_finds_the_known_bootstraps``
+    and the fd-leak net's ``len(hot_path_files) >= 2`` floor: this file's
+    discovery sweep is the safety-critical net guarding data-destroying
+    fixture drops, so the sweep itself must be proven to still bind — if the
+    pattern or the glob drifted to matching nothing, the totality check
+    below it would pass vacuously and a new unguarded cache suite would sail
+    through unnoticed."""
+    flagged = _discover_lml_cache_dropping_files()
+    assert flagged, "discovery sweep found NO lml_cache-dropping suites — pattern/glob drifted?"
+    assert "test_streaming_catalog.py" in flagged
+    assert "test_artist_wikipedia_bio.py" in flagged
