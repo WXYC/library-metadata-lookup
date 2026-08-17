@@ -123,15 +123,38 @@ async def test_tasquier_comp_resolves_via_tracklist_credit(service):
 
 @pytest.mark.asyncio
 async def test_mavi_disambiguation_suffix_resolves(service):
-    """LML#1206: the bare name ``"MAVI"`` must resolve *The Pilot* (release
-    37193856), cached under Discogs' disambiguation-suffixed credit
-    ``"Mavi (12)"`` — the live-API companion to the mocked reproduction in
+    """LML#1206: the bare name ``"MAVI"`` must resolve *The Pilot*, credited
+    under Discogs' disambiguation-suffixed form ``"Mavi (12)"`` — the live-API
+    companion to the mocked reproduction in
     ``tests/unit/test_library_miss_discogs.py::TestDisambiguationSuffixRecall``.
+
+    Both *The Pilot* pressings are correct and share master 4206252: 35940307
+    is the 2025-11-25 digital release, 37193856 the 2026-02-27 vinyl LP. Their
+    tracklists are identical and both carry the ticket's two victim tracks
+    (``31 Days`` and ``G-Annis Freestyle``), so either satisfies the enrichment
+    the ticket is about. The API arm this module exercises (no PG cache
+    attached) surfaces both at a 100/100 tie, which LML#1097 breaks
+    deterministically by ascending ``release_id`` — making 35940307 the
+    guaranteed pick here, while the ticket's prod measurement named 37193856
+    because the PG cache arm holds that pressing. Pinning the set rather than
+    one id mirrors ``test_anadol_and_marie_klock_resolves_either_pressing`` and
+    ``test_matmos_self_titled_placeholder_resolves`` above.
+
+    The credit assertion is what carries this test's protocol value: the
+    resolved candidate must be the *suffixed* credit, which is precisely what
+    could not clear the 80/80 floor before this fix
+    (``score_match("MAVI", "Mavi (12)")`` = 61.5).
     """
     result = await _library_miss_discogs_search(
         _parsed("MAVI", "The Pilot"),
         discogs_service=service,
     )
-    assert result is not None, "expected release 37193856; got no floor-clearing candidate"
+    assert result is not None, "expected a The Pilot pressing; got no floor-clearing candidate"
     _, best = result
-    assert best.release_id == 37193856, f"resolved wrong release {best.release_id}"
+    assert best.release_id in {35940307, 37193856}, f"resolved wrong release {best.release_id}"
+    assert best.artist == "Mavi (12)", (
+        f"expected the disambiguation-suffixed credit this fix targets; got {best.artist!r}"
+    )
+    assert (best.album or "").strip().lower() == "the pilot", (
+        f"resolved the wrong album {best.album!r}"
+    )
