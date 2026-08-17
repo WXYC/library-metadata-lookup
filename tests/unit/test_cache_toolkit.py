@@ -130,7 +130,15 @@ class TestSwallowingFetch:
 
 @pytest.mark.asyncio
 class TestSwallowingExecute:
-    async def test_executes_and_returns_none_on_success(self):
+    async def test_executes_and_returns_the_command_tag_on_success(self):
+        # LML#1192 review round 6, C1-1: widened from an always-None return
+        # so a caller that needs to distinguish "wrote" from "an
+        # ON CONFLICT ... WHERE guard silently refused" (the asyncpg command
+        # tag is the only place that distinction is observable) can inspect
+        # it without re-implementing this function's own try/except. Every
+        # pre-existing call site discards the return value already (grepped
+        # across all six production callers), so this is purely additive --
+        # no caller's behavior changes.
         pg = AsyncMock(spec=PgSource)
         pg.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -143,10 +151,10 @@ class TestSwallowingExecute:
             log_label="t set failed",
         )
 
-        assert result is None
+        assert result == "UPDATE 1"
         pg.execute.assert_awaited_once_with("UPDATE t SET x = $1 WHERE y = $2", "a", "b")
 
-    async def test_swallows_exception_and_logs_label_with_args(self, caplog):
+    async def test_swallows_exception_logs_label_with_args_and_returns_none(self, caplog):
         pg = AsyncMock(spec=PgSource)
         pg.execute = AsyncMock(side_effect=RuntimeError("pg down"))
 
@@ -160,6 +168,8 @@ class TestSwallowingExecute:
                 log_args=("Juana Molina",),
             )  # must not raise
 
+        # The exception path still degrades to None -- there is no tag to
+        # report when the write never happened at all.
         assert result is None
         assert len(caplog.records) == 1
         assert caplog.records[0].getMessage() == "t set failed for Juana Molina"

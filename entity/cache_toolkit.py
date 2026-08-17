@@ -20,8 +20,11 @@ hand-rolled ``try/except`` at each call site:
   (``many=True``), and on any exception logs via the CALLER's own ``logger``
   and returns the caller's ``miss`` sentinel instead of raising.
 - :func:`swallowing_execute` -- the write-side equivalent around
-  ``pg.execute``; never returns a value, since every UPSERT/UPDATE call site
-  treats a write failure as fire-and-forget.
+  ``pg.execute``; every UPSERT/UPDATE call site treats a write FAILURE as
+  fire-and-forget, but a caller may still want the asyncpg command tag on
+  SUCCESS (e.g. to detect an ``ON CONFLICT ... WHERE`` guard's silent
+  refusal, LML#1192 review round 6, C1-1) -- returns that tag, or ``None``
+  when the call raised.
 
 Both take the caller's ``logger`` (never one owned by this toolkit) so the
 emitted ``LogRecord.name`` still attributes to the owning module (e.g.
@@ -131,15 +134,25 @@ async def swallowing_execute(
     logger: logging.Logger,
     log_label: str,
     log_args: Sequence[Any] = (),
-) -> None:
+) -> str | None:
     """Run ``pg.execute(sql, *args)``, swallowing (and logging) any exception.
 
     Cache writes across every call site are fire-and-forget: a request that
     produced a real value still returns it even if the write-back fails.
     Same ``logger``/``log_label``/``log_args`` contract as
     :func:`swallowing_fetch`.
+
+    Returns the asyncpg command tag (e.g. ``"INSERT 0 1"``) on success, or
+    ``None`` on a swallowed exception (LML#1192 review round 6, C1-1) --
+    widened from an always-``None`` return so a caller with an
+    ``ON CONFLICT ... WHERE`` guard can tell "wrote" apart from "the guard
+    silently refused the write" (the command tag is the only place that
+    distinction is observable) without duplicating this function's own
+    try/except. Every pre-existing call site discards the return value
+    already, so this is purely additive.
     """
     try:
-        await pg.execute(sql, *args)
+        return await pg.execute(sql, *args)
     except Exception:
         logger.exception(log_label, *log_args)
+        return None

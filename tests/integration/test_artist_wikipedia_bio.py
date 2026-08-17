@@ -261,6 +261,89 @@ class TestSqlLevelNullOverwriteGuard:
 
 
 @pytest.mark.pg
+class TestRefusedRefreshDoesNotWedgeTheRow:
+    """LML#1192 review round 6, C1-1: a positive row that ages past its TTL,
+    then has its warm's negative re-check refused by the P0-5 null-overwrite
+    guard, must not become permanently unreadable.
+
+    Sequence: a positive row ages past ``DEFAULT_SUCCESS_TTL`` (so the NEXT
+    read is a genuine miss and a warm gets scheduled in production) -> the
+    warm re-fetches, finds nothing (the page was deleted/renamed), and
+    writes a negative -- the P0-5 guard at ``_UPSERT_SQL`` correctly refuses
+    that write outright (``WHERE NOT (existing.extract IS NOT NULL AND
+    EXCLUDED.extract IS NULL)`` is false), so the row's ``extract`` and
+    ``fetched_at`` are untouched -- but nothing else records that a refusal
+    JUST happened. A THIRD read, with no fix, re-evaluates the exact same
+    stale predicate against the exact same untouched ``fetched_at`` and
+    reports a miss again, forever: every subsequent request repeats the
+    refused re-check, and no offline drain mode can rescue it either
+    (``incremental`` skips it because the row exists; ``--retry-misses``
+    skips it because ``extract IS NULL`` is false; ``--repick``/
+    ``--refresh-stale`` both hit the same P0-5 refusal on their own retry).
+
+    This is the wedge, reproduced against real Postgres with no mocking:
+    the row genuinely holds a usable, if aging, extract the whole time, yet
+    is reported absent on every read once the refusal has happened once.
+    """
+
+    @pytest.mark.asyncio
+    async def test_row_survives_a_refused_post_ttl_refresh_and_stays_readable(
+        self, pg_source, pg_pool
+    ):
+        await set_cached_artist_wikipedia_bio(
+            pg_source,
+            discogs_artist_id=99,
+            wikipedia_url=_URL,
+            slug_score=95.0,
+            lang="en",
+            extract="Stereolab are a band.",
+        )
+        now = datetime(2026, 8, 14, tzinfo=UTC)
+        ancient = now - timedelta(days=31)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.artist_wikipedia_bio SET fetched_at = $1 "
+                "WHERE discogs_artist_id = 99",
+                ancient,
+            )
+
+        # First read past TTL: a genuine miss, as designed -- this is what
+        # schedules the warm in production. Not the bug by itself.
+        first = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99, now=now)
+        assert first.was_present is False
+
+        # The warm re-fetches live, finds nothing (deleted/renamed page),
+        # and attempts to write a negative -- the P0-5 guard refuses this
+        # at the database level, so extract/fetched_at are untouched.
+        await set_cached_artist_wikipedia_bio(
+            pg_source,
+            discogs_artist_id=99,
+            wikipedia_url=_URL,
+            slug_score=0.0,
+            lang="en",
+            extract=None,
+        )
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT extract, fetched_at FROM lml_cache.artist_wikipedia_bio "
+                "WHERE discogs_artist_id = 99"
+            )
+        assert row["extract"] == "Stereolab are a band.", "the P0-5 guard must have refused"
+        assert row["fetched_at"] == ancient, "a refused write must not touch fetched_at"
+
+        # The wedge: a third read, moments later, with nothing else having
+        # changed. The row still genuinely holds a usable extract -- it
+        # must be served as a hit, not reported absent forever.
+        third = await get_cached_artist_wikipedia_bio(pg_source, discogs_artist_id=99, now=now)
+        assert third.was_present is True, (
+            "a row whose refresh was refused must stay readable -- reporting it "
+            "absent forever re-triggers a live warm on every future request with "
+            "no drain mode able to rescue it"
+        )
+        assert third.value.extract == "Stereolab are a band."
+
+
+@pytest.mark.pg
 class TestRowIsAuthoritative:
     """LML#1192 review round 5: through round 4, a row stored under a
     DIFFERENT ``wikipedia_url`` than the caller's current pick was

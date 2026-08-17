@@ -90,6 +90,23 @@ DEFAULT_SUCCESS_TTL = timedelta(days=30)
 # as the sibling caches -- see this module's docstring for the negative-TTL
 # rationale.
 
+# LML#1192 review round 6, C1-1: how long a REFUSED refresh keeps serving
+# the row's existing, aging positive extract before it's eligible to read
+# as a genuine miss again. Without this, a positive row that ages past
+# DEFAULT_SUCCESS_TTL and then has a re-check refused by the P0-5
+# null-overwrite guard (the page was deleted/renamed) wedges permanently:
+# the read predicate matches neither arm, so every subsequent request
+# reads a miss, re-schedules a warm, gets refused again, forever -- and no
+# offline drain mode can rescue it either (see this module's
+# mark_artist_wikipedia_bio_refused and the read predicate below, plus
+# tests/integration/test_artist_wikipedia_bio.py::TestRefusedRefreshDoesNotWedgeTheRow
+# for the live-Postgres reproduction). A spelled-out literal, not a
+# re-export of DEFAULT_MISS_TTL, even though the values currently match --
+# these answer different questions ("how long is a known miss authoritative"
+# vs. "how long does a refused refresh protect the existing content before
+# we try again") and tuning one must not silently move the other.
+DEFAULT_REFUSAL_COOLDOWN = timedelta(days=7)
+
 _DDL_TABLE = """\
 CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio (
     discogs_artist_id BIGINT PRIMARY KEY,
@@ -98,7 +115,8 @@ CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio (
     lang TEXT NOT NULL,
     extract TEXT,
     fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_refused_at TIMESTAMPTZ
 )\
 """
 
@@ -121,6 +139,17 @@ _DDL_ADD_LAST_CHECKED_AT_COLUMN = (
     "ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now()"
 )
 
+# LML#1192 review round 6, C1-1: same P0-1 treatment as the ALTER above --
+# its own separate bootstrap_lml_cache_table call, since PG16 still takes an
+# AccessExclusiveLock on ADD COLUMN IF NOT EXISTS even on the no-op path.
+# Nullable (unlike last_checked_at): most rows never get refused, and
+# "never refused" is meaningfully different from "refused at some known
+# past instant" -- a NULL default (rather than, say, epoch) keeps the
+# read predicate below simple (`> $4` is never accidentally true for a
+# NULL) and keeps the column absent from `mark_artist_wikipedia_bio_refused`
+# for every row that has never actually been refused.
+_DDL_ADD_LAST_REFUSED_AT_COLUMN = "ALTER TABLE lml_cache.artist_wikipedia_bio ADD COLUMN IF NOT EXISTS last_refused_at TIMESTAMPTZ"
+
 # LML#1192 review round 5: the URL-match requirement this comment used to
 # describe ("staleness AND the self-healing URL-match both live in the
 # WHERE clause") is GONE -- see the module docstring's "The row is
@@ -131,12 +160,25 @@ _DDL_ADD_LAST_CHECKED_AT_COLUMN = (
 # wikipedia_url is SELECTed (not filtered on) so a hit can report whichever
 # url the row itself carries -- the caller no longer supplies one to
 # compare against.
+#
+# LML#1192 review round 6, C1-1: the POSITIVE arm ALSO matches when a
+# refresh was recently refused ($4 = now - refusal_cooldown). Without this,
+# a positive row aged past $2 whose re-check gets refused by the P0-5
+# null-overwrite guard (extract/fetched_at left untouched -- see
+# _UPSERT_SQL) reads as a miss on every subsequent request forever: the
+# refusal itself was never recorded anywhere the read side could see, so
+# the same stale predicate just re-fires. Widening the read (not touching
+# fetched_at, which stays content-age-only per round 3/4 finding 13) lets
+# the row keep serving its existing, if aging, extract for one more
+# cooldown window instead of wedging. Deliberately NOT applied to the
+# NEGATIVE arm: the P0-5 guard only ever protects an existing POSITIVE row,
+# so a negative row has nothing a refusal could be rescuing.
 _SELECT_SQL = """\
 SELECT extract, wikipedia_url
 FROM lml_cache.artist_wikipedia_bio
 WHERE discogs_artist_id = $1
   AND (
-    (extract IS NOT NULL AND fetched_at > $2)
+    (extract IS NOT NULL AND (fetched_at > $2 OR last_refused_at > $4))
     OR (extract IS NULL AND fetched_at > $3)
   )\
 """
@@ -190,6 +232,21 @@ SET last_checked_at = now()
 WHERE discogs_artist_id = $1\
 """
 
+# LML#1192 review round 6, C1-1: the third clock. fetched_at owns content
+# age; last_checked_at owns the drain's progress cursor (round 3/4,
+# finding 13); last_refused_at owns "when did we last try and fail to
+# refresh this row" -- distinct from both. Advances last_checked_at TOO
+# (a refusal is still an attempt, same as any other outcome the drain's
+# cursor tracks) but NEVER fetched_at/extract/wikipedia_url/slug_score/lang
+# -- a refusal is, by definition, the case where nothing new was actually
+# collected.
+_MARK_REFUSED_SQL = """\
+UPDATE lml_cache.artist_wikipedia_bio
+SET last_refused_at = now(),
+    last_checked_at = now()
+WHERE discogs_artist_id = $1\
+"""
+
 
 async def set_up_artist_wikipedia_bio_schema(pg: PgSource) -> None:
     """Apply the idempotent cache-schema DDL.
@@ -201,12 +258,14 @@ async def set_up_artist_wikipedia_bio_schema(pg: PgSource) -> None:
     preamble (``entity.ddl.bootstrap_lml_cache_table``).
 
     The ``last_checked_at`` column ALTER (LML#1192 review round 4, P0-1)
-    runs as its OWN, SEPARATE ``bootstrap_lml_cache_table`` call — see
-    :data:`_DDL_ADD_LAST_CHECKED_AT_COLUMN`'s docstring for why it can't
-    share a transaction with the step above.
+    and the ``last_refused_at`` column ALTER (LML#1192 review round 6, C1-1)
+    each run as their OWN, SEPARATE ``bootstrap_lml_cache_table`` call — see
+    :data:`_DDL_ADD_LAST_CHECKED_AT_COLUMN`'s docstring for why neither can
+    share a transaction with the step above (or with each other).
     """
     await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE)
     await bootstrap_lml_cache_table(pg, _DDL_ADD_LAST_CHECKED_AT_COLUMN)
+    await bootstrap_lml_cache_table(pg, _DDL_ADD_LAST_REFUSED_AT_COLUMN)
 
 
 @dataclass(frozen=True)
@@ -230,6 +289,7 @@ async def get_cached_artist_wikipedia_bio(
     discogs_artist_id: int,
     success_ttl: timedelta = DEFAULT_SUCCESS_TTL,
     miss_ttl: timedelta = DEFAULT_MISS_TTL,
+    refusal_cooldown: timedelta = DEFAULT_REFUSAL_COOLDOWN,
     now: datetime | None = None,
 ) -> CachedValue[WikipediaBioHit]:
     """Look up the cached bio for ``discogs_artist_id``.
@@ -246,16 +306,24 @@ async def get_cached_artist_wikipedia_bio(
     docstring). PG failures degrade to ``was_present=False`` (best-effort,
     same posture as every sibling ``lml_cache.*`` read). ``now`` is exposed
     for testability; production callers leave it at the default.
+
+    LML#1192 review round 6, C1-1: a positive row also counts as fresh when
+    a refresh attempt was refused within ``refusal_cooldown`` (see
+    :data:`DEFAULT_REFUSAL_COOLDOWN`'s docstring for the wedge this
+    prevents) -- ``mark_artist_wikipedia_bio_refused`` is the only writer
+    of that clock.
     """
     reference_now = now or datetime.now(UTC)
     positive_cutoff = reference_now - success_ttl
     negative_cutoff = reference_now - miss_ttl
+    refusal_cutoff = reference_now - refusal_cooldown
     row = await swallowing_fetch(
         pg,
         _SELECT_SQL,
         discogs_artist_id,
         positive_cutoff,
         negative_cutoff,
+        refusal_cutoff,
         miss=None,
         logger=logger,
         log_label="artist_wikipedia_bio get failed for discogs_artist_id=%s",
@@ -284,8 +352,19 @@ async def set_cached_artist_wikipedia_bio(
     value, not compared for equality anywhere) — 100 is representable, so no
     clamping is needed. Write failures are logged and swallowed: cache
     writes are best-effort.
+
+    LML#1192 review round 6, C1-1: ``"INSERT 0 0"`` is the asyncpg command
+    tag for this UPSERT if and only if a conflict occurred and the P0-5
+    null-overwrite guard's ``WHERE`` clause was false (verified live against
+    real Postgres — see the round-6 report) -- a fresh insert or a
+    successful conflict-update both return ``"INSERT 0 1"``. On that exact
+    tag, this follows up with :func:`mark_artist_wikipedia_bio_refused` so
+    the read predicate and the offline drain's ordering both learn a
+    refusal just happened, closing the wedge described at
+    :data:`DEFAULT_REFUSAL_COOLDOWN`. The follow-up write is itself
+    best-effort, like the UPSERT above.
     """
-    await swallowing_execute(
+    tag = await swallowing_execute(
         pg,
         _UPSERT_SQL,
         discogs_artist_id,
@@ -297,6 +376,8 @@ async def set_cached_artist_wikipedia_bio(
         log_label="artist_wikipedia_bio set failed for discogs_artist_id=%s",
         log_args=(discogs_artist_id,),
     )
+    if tag == "INSERT 0 0":
+        await mark_artist_wikipedia_bio_refused(pg, discogs_artist_id=discogs_artist_id)
 
 
 async def touch_artist_wikipedia_bio_last_checked_at(
@@ -318,5 +399,30 @@ async def touch_artist_wikipedia_bio_last_checked_at(
         discogs_artist_id,
         logger=logger,
         log_label="artist_wikipedia_bio touch failed for discogs_artist_id=%s",
+        log_args=(discogs_artist_id,),
+    )
+
+
+async def mark_artist_wikipedia_bio_refused(pg: PgSource, *, discogs_artist_id: int) -> None:
+    """Record that a refresh for ``discogs_artist_id`` was just refused by
+    the P0-5 null-overwrite guard.
+
+    LML#1192 review round 6, C1-1: advances ``last_refused_at`` (a new
+    clock, distinct from ``fetched_at``'s content age and
+    ``last_checked_at``'s drain-progress cursor) AND ``last_checked_at`` (a
+    refusal is still an attempt), but NEVER ``fetched_at`` or any content
+    column -- a refusal is, by definition, the case where nothing new was
+    collected. Called automatically by :func:`set_cached_artist_wikipedia_bio`
+    whenever its UPSERT's own command tag shows the guard fired, so every
+    caller gets this for free without having to detect the refusal itself.
+    A no-op if the row doesn't exist. Best-effort, same posture as every
+    other write in this module.
+    """
+    await swallowing_execute(
+        pg,
+        _MARK_REFUSED_SQL,
+        discogs_artist_id,
+        logger=logger,
+        log_label="artist_wikipedia_bio mark-refused failed for discogs_artist_id=%s",
         log_args=(discogs_artist_id,),
     )
