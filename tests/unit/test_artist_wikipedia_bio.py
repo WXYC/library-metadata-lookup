@@ -29,7 +29,6 @@ from entity.artist_wikipedia_bio import (
     mark_artist_wikipedia_bio_refused,
     set_cached_artist_wikipedia_bio,
     set_up_artist_wikipedia_bio_schema,
-    touch_artist_wikipedia_bio_last_checked_at,
 )
 from entity.cache_toolkit import DEFAULT_MISS_TTL
 from entity.sources import PgSource
@@ -373,35 +372,6 @@ class TestRefusalCooldownReadPredicate:
         assert "WHERE" in sql
         assert "extract IS NOT NULL" in sql
         assert "EXCLUDED.extract IS NULL" in sql
-
-
-@pytest.mark.asyncio
-class TestTouchArtistWikipediaBioLastCheckedAt:
-    """LML#1192 review round 3/4, finding 13: split fetched_at's two
-    meanings. The drain's ``--repick`` cursor-advance bumps ONLY
-    last_checked_at, never fetched_at, so a repick that confirms an
-    unchanged pick doesn't also grant the existing prose another full
-    DEFAULT_SUCCESS_TTL of content-freshness authority it didn't earn.
-    """
-
-    async def test_touches_last_checked_at_only(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="UPDATE 1")
-
-        await touch_artist_wikipedia_bio_last_checked_at(pg, discogs_artist_id=_ARTIST_ID)
-
-        args = pg.execute.await_args.args
-        sql, artist_id = args
-        assert artist_id == _ARTIST_ID
-        assert "last_checked_at" in sql
-        assert "fetched_at" not in sql
-
-    async def test_write_failure_is_swallowed(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(side_effect=RuntimeError("PG unreachable"))
-
-        # Must not raise.
-        await touch_artist_wikipedia_bio_last_checked_at(pg, discogs_artist_id=_ARTIST_ID)
 
 
 class _FakeTransaction:

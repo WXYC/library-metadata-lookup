@@ -29,11 +29,12 @@
 CREATE SCHEMA IF NOT EXISTS lml_cache;
 
 -- `discogs_artist_id` -- the PRIMARY KEY; one row per artist, no composite
--- key. `wikipedia_url` -- the Phase-A pick the extract came from; the read
--- side additionally filters on this matching the CALLER's current pick, so
--- a Phase-A recalibration (or an Discogs `artist_url` change) self-heals a
--- stale row to a miss rather than serving prose against a URL LML no
--- longer believes is right. `slug_score` -- the Phase-A extractor's
+-- key. `wikipedia_url` -- whichever Phase-A pick the stored `extract` came
+-- from; the read is keyed on `discogs_artist_id` ALONE (LML#1192 review
+-- round 5 -- see `entity/artist_wikipedia_bio.py`'s module docstring for
+-- the mechanism and why a prior URL-match read predicate was removed; this
+-- generated comment intentionally does not restate it, to avoid a second
+-- copy that can drift). `slug_score` -- the Phase-A extractor's
 -- confidence at fetch time (audit only, never compared). `lang` -- the
 -- Wikipedia edition the extract came from. `extract` -- NULL records a
 -- negative result (see `clients/wikipedia.py`); a positive result is never
