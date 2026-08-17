@@ -16,6 +16,16 @@
 # diff the committed snapshot against whatever upstream main currently says --
 # pinning it there would silence the drift signal. See WXYC/wxyc-shared#319 and
 # docs/scripts.md.
+#
+# When GITHUB_TOKEN (or GH_TOKEN) is set, the GitHub download authenticates via
+# a Bearer Authorization header: anonymous raw.githubusercontent.com requests
+# share a per-IP rate budget across the Actions runner pool and intermittently
+# 429 (#1205), while authenticated ones get a per-token budget. The token value
+# itself is never printed. Unset-token local runs are unchanged.
+#
+# --download-only stops after resolving/fetching api.yaml, skipping codegen and
+# formatting. It exists for the unit tests covering the download branch
+# (tests/unit/test_generate_api_models_auth.py).
 
 set -euo pipefail
 
@@ -24,8 +34,13 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT="$PROJECT_DIR/generated/api_models.py"
 
 REF="${WXYC_SHARED_REF:-}"
+DOWNLOAD_ONLY=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --download-only)
+            DOWNLOAD_ONLY=1
+            shift
+            ;;
         --ref)
             [[ $# -ge 2 ]] || { echo "Error: --ref requires a value" >&2; exit 2; }
             REF="$2"
@@ -81,8 +96,25 @@ else
         echo "Downloading api.yaml from GitHub..."
         echo "  Unpinned: resolving wxyc-shared 'main' as of now. Pass --ref <sha> to pin." >&2
     fi
-    curl -sSfL "https://raw.githubusercontent.com/WXYC/wxyc-shared/${REF}/api.yaml" -o "$API_YAML"
+    # Authenticate when a token is available (#1205): shared Actions runner IPs
+    # intermittently 429 anonymous raw downloads. Two separate curl invocations
+    # rather than a conditionally-built argument array: the no-token path stays
+    # byte-identical to the pre-#1205 command, and expanding an empty array
+    # under `set -u` is an unbound-variable error on macOS's bash 3.2.
+    API_YAML_URL="https://raw.githubusercontent.com/WXYC/wxyc-shared/${REF}/api.yaml"
+    AUTH_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [[ -n "$AUTH_TOKEN" ]]; then
+        echo "  Authenticated download: sending Authorization header (token value not logged)."
+        curl -sSfL -H "Authorization: Bearer ${AUTH_TOKEN}" "$API_YAML_URL" -o "$API_YAML"
+    else
+        curl -sSfL "$API_YAML_URL" -o "$API_YAML"
+    fi
     echo "Downloaded to $API_YAML"
+fi
+
+if [[ "$DOWNLOAD_ONLY" == 1 ]]; then
+    echo "--download-only: stopping before model generation."
+    exit 0
 fi
 
 # Ensure output directory exists

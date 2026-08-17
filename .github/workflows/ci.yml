@@ -55,7 +55,13 @@ jobs:
       # WXYC/library-metadata-lookup#249. The script prefers .venv/bin/ then
       # falls back to PATH, where the editable install lands the binaries.
       - run: pip install -e ".[dev]"
+      # GITHUB_TOKEN authenticates the raw.githubusercontent.com download of
+      # api.yaml: anonymous fetches share a per-IP budget across the runner
+      # pool and intermittently 429 (#1205). The workflow's contents:read
+      # token is enough -- wxyc-shared is public.
       - run: bash scripts/generate_api_models.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       # entity/*.sql are the canonical-DDL sidecars for the lml_cache.* store
       # modules (LML#1038): generated from the Python DDL constants, never
       # hand-edited. Two generators (streaming_catalog.py's own, plus the
