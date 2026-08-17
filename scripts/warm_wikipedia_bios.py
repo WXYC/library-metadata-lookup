@@ -190,7 +190,7 @@ from typing import Literal, Protocol
 import asyncpg
 from aiolimiter import AsyncLimiter
 
-from clients.wikipedia import WikipediaClient, WikipediaFetchError, WikipediaSummary
+from clients.wikipedia import WikipediaClient, WikipediaFetchError
 from entity.artist_wikipedia_bio import (
     DEFAULT_SUCCESS_TTL,
     mark_artist_wikipedia_bio_refused,
@@ -205,8 +205,7 @@ from entity.artist_wikipedia_bio_attempt import (
     set_up_artist_wikipedia_bio_attempt_schema,
 )
 from entity.sources import PgSource
-from lookup.wikipedia_candidates import wikipedia_title_from_url
-from lookup.wikipedia_pick_validation import resolve_and_validate_pick
+from lookup.wikipedia_pick_validation import make_summary_fetcher, resolve_and_validate_pick
 from scripts.build_filtered_discogs import extract_library_artists
 
 logger = logging.getLogger(__name__)
@@ -594,18 +593,7 @@ async def process_candidate(
     * ``"unresolvable"`` -- defensive: the seed's own wikipedia.org-match
       guarantee somehow didn't hold.
     """
-    attempted_a_live_fetch = False
-
-    async def fetch(url: str, lang: str) -> WikipediaSummary | None:
-        nonlocal attempted_a_live_fetch
-        attempted_a_live_fetch = True
-        title = wikipedia_title_from_url(url)
-        if title is None:
-            return None
-        return await client.get_summary(
-            title, lang, max_retries=max_retries, rate_limiter=rate_limiter
-        )
-
+    fetch = make_summary_fetcher(client, max_retries=max_retries, rate_limiter=rate_limiter)
     try:
         result = await resolve_and_validate_pick(candidate.urls, candidate.artist_name, fetch=fetch)
     except WikipediaFetchError as e:
@@ -640,7 +628,7 @@ async def process_candidate(
     lang = picked.lang or "en"
 
     if picked.below_floor:
-        outcome = "negative" if attempted_a_live_fetch else "declined"
+        outcome = "negative" if result.live_fetch_attempted else "declined"
         return await _write_bio(
             pg,
             candidate,

@@ -74,6 +74,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
 from clients.wikipedia import WikipediaSummary
@@ -82,8 +83,14 @@ from lookup.wikipedia_candidates import (
     extract_lang,
     first_wikipedia_match,
     score_candidates,
+    wikipedia_title_from_url,
 )
 from lookup.wikipedia_url import PickedWikiUrl
+
+if TYPE_CHECKING:
+    from aiolimiter import AsyncLimiter
+
+    from clients.wikipedia import WikipediaClient
 
 FetchSummary = Callable[[str, str], Awaitable[WikipediaSummary | None]]
 """``(url, lang) -> WikipediaSummary | None`` — a thin wrapper around
@@ -111,11 +118,22 @@ class ValidatedPick:
     ``False`` on a WINNING pick (an answer was found, so there's nothing
     left to be ambiguous about) and on the no-candidate-at-all outcome
     (nothing was ever truncatable).
+
+    ``live_fetch_attempted`` (LML#1204 item 2) is ``True`` iff
+    :func:`resolve_and_validate_pick` called ``fetch`` at least once — i.e.
+    the ranked, above-floor, cap-sliced candidate list was non-empty. "Did
+    the picker ever touch the network" is a fact only the candidate loop
+    knows, and both live-fetch callers used to reconstruct it with a
+    hand-built ``nonlocal`` closure; it now rides the pick. Callers use it
+    to split a network-touched negative (``"negative"``) from an untouched
+    decline (``"declined"``), and to refuse a negative write on a
+    zero-fetch fallback.
     """
 
     picked: PickedWikiUrl | None
     summary: WikipediaSummary | None
     truncated: bool = False
+    live_fetch_attempted: bool = False
 
 
 async def resolve_and_validate_pick(
@@ -178,6 +196,10 @@ async def resolve_and_validate_pick(
     truncated = max_candidates is not None and len(ranked) > max_candidates
     if max_candidates is not None:
         ranked = ranked[:max_candidates]
+    # LML#1204 item 2: ``fetch`` is called exactly once per loop iteration
+    # below, so "the network was touched" is precisely "the sliced ranked
+    # list is non-empty" -- whether the loop wins early or runs dry.
+    live_fetch_attempted = bool(ranked)
     for candidate in ranked:
         summary = await fetch(candidate.url, candidate.lang)
         if summary is not None:
@@ -189,7 +211,9 @@ async def resolve_and_validate_pick(
             )
             # A win is never "truncated" -- an answer was found, regardless
             # of whether the cap left other candidates untried.
-            return ValidatedPick(picked=picked, summary=summary, truncated=False)
+            return ValidatedPick(
+                picked=picked, summary=summary, truncated=False, live_fetch_attempted=True
+            )
 
     # LML#1192 review round 4, P0-13: the heuristic url's OWN score, not a
     # different (higher-scoring, rejected) candidate's -- 0.0 if it was
@@ -201,4 +225,39 @@ async def resolve_and_validate_pick(
         slug_score=heuristic_score,
         below_floor=True,
     )
-    return ValidatedPick(picked=picked, summary=None, truncated=truncated)
+    return ValidatedPick(
+        picked=picked,
+        summary=None,
+        truncated=truncated,
+        live_fetch_attempted=live_fetch_attempted,
+    )
+
+
+def make_summary_fetcher(
+    client: WikipediaClient,
+    *,
+    max_retries: int,
+    rate_limiter: AsyncLimiter | None = None,
+) -> FetchSummary:
+    """Build the standard :data:`FetchSummary` callable around ``client``.
+
+    LML#1204 item 2: both live-fetch callers of
+    :func:`resolve_and_validate_pick` (the background miss-warm,
+    ``lookup/enrichment/wikipedia_warm.py``, and the offline drain,
+    ``scripts/warm_wikipedia_bios.py``) hand-built the same closure — the
+    ``wikipedia_title_from_url`` conversion (``get_summary`` needs a page
+    TITLE, not a URL) plus their own retry/throttle knobs. ``max_retries``
+    and ``rate_limiter`` are forwarded verbatim to
+    ``WikipediaClient.get_summary``; an unparseable URL returns ``None``
+    without fetching, exactly as both hand-built copies did.
+    """
+
+    async def fetch(url: str, lang: str) -> WikipediaSummary | None:
+        title = wikipedia_title_from_url(url)
+        if title is None:
+            return None
+        return await client.get_summary(
+            title, lang, max_retries=max_retries, rate_limiter=rate_limiter
+        )
+
+    return fetch

@@ -28,17 +28,17 @@ import logging
 
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
-from clients.wikipedia import WikipediaClient, WikipediaFetchError, WikipediaSummary
+from clients.wikipedia import WikipediaClient, WikipediaFetchError
 from core.observability import capture_unsampled_counter
 from entity.artist_wikipedia_bio import set_cached_artist_wikipedia_bio
 from entity.artist_wikipedia_bio_attempt import (
     OUTCOME_FETCH_ERROR,
     OUTCOME_TRUNCATED,
+    OUTCOME_UNRESOLVABLE,
     record_artist_wikipedia_bio_attempt,
 )
 from entity.sources import PgSource
-from lookup.wikipedia_candidates import wikipedia_title_from_url
-from lookup.wikipedia_pick_validation import resolve_and_validate_pick
+from lookup.wikipedia_pick_validation import make_summary_fetcher, resolve_and_validate_pick
 
 logger = logging.getLogger(__name__)
 
@@ -155,10 +155,10 @@ async def _run_warm(
     cache write. No longer trusts a single pre-computed pick, so this warm
     can't write the WRONG page the way a single-candidate pick could (the
     Low/Sade case: the sync pick names a disambiguation page). The fetch
-    closure reuses ``WikipediaClient``/``wikipedia_title_from_url`` exactly
-    as before. Any unhandled exception is logged and swallowed — the task
-    must never propagate to the event loop. Candidates are capped at
-    :data:`MAX_CANDIDATES_PER_WARM`, the whole selection inside
+    callable is the shared ``make_summary_fetcher`` (LML#1204 item 2), with
+    this warm's single-retry knob. Any unhandled exception is logged and
+    swallowed — the task must never propagate to the event loop. Candidates
+    are capped at :data:`MAX_CANDIDATES_PER_WARM`, the whole selection inside
     :data:`_warm_semaphore` (see that constant's docstring for the bound).
 
     LML#1192 review round 6: a :class:`~clients.wikipedia.WikipediaFetchError`
@@ -172,19 +172,10 @@ async def _run_warm(
     if _warm_semaphore is None:
         _warm_semaphore = asyncio.Semaphore(WARM_CONCURRENCY)
 
-    attempted_a_live_fetch = False
-
-    async def fetch(url: str, lang: str) -> WikipediaSummary | None:
-        nonlocal attempted_a_live_fetch
-        attempted_a_live_fetch = True
-        title = wikipedia_title_from_url(url)
-        if title is None:
-            return None
-        return await client.get_summary(title, lang, max_retries=1)
-
     try:
         async with _warm_semaphore:
             client = WikipediaClient()
+            fetch = make_summary_fetcher(client, max_retries=1)
             try:
                 result = await resolve_and_validate_pick(
                     urls, artist_name, fetch=fetch, max_candidates=MAX_CANDIDATES_PER_WARM
@@ -206,6 +197,14 @@ async def _run_warm(
                     discogs_artist_id,
                     artist_name,
                 )
+                # LML#1204 item 2: record the attempt durably, matching the
+                # offline drain's "unresolvable" policy -- without it this
+                # artist stays a schedulable miss forever.
+                await record_artist_wikipedia_bio_attempt(
+                    discogs_cache_pg,
+                    discogs_artist_id=discogs_artist_id,
+                    outcome=OUTCOME_UNRESOLVABLE,
+                )
                 return
 
             # LML#1192 review round 6, C2-1: never write a negative for a
@@ -219,7 +218,7 @@ async def _run_warm(
                 # distinct outcome from "fetch_error", since nothing
                 # transient failed) so --retry-misses can pick this artist
                 # back up, the same shape C2-3 already gives WikipediaFetchError.
-                if attempted_a_live_fetch:
+                if result.live_fetch_attempted:
                     logger.info(
                         "Wikipedia bio warm truncated for artist_id=%s -- recording attempt",
                         discogs_artist_id,
@@ -230,7 +229,7 @@ async def _run_warm(
                         outcome=OUTCOME_TRUNCATED,
                     )
                 return
-            if picked.below_floor and not attempted_a_live_fetch:
+            if picked.below_floor and not result.live_fetch_attempted:
                 return
 
             extract = result.summary.extract if result.summary is not None else None
