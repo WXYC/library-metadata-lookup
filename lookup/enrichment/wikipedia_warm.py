@@ -33,8 +33,8 @@ from config.settings import get_settings
 from entity.artist_wikipedia_bio import set_cached_artist_wikipedia_bio
 from entity.artist_wikipedia_bio_attempt import record_artist_wikipedia_bio_attempt
 from entity.sources import PgSource
+from lookup.wikipedia_candidates import wikipedia_title_from_url
 from lookup.wikipedia_pick_validation import resolve_and_validate_pick
-from lookup.wikipedia_url import wikipedia_title_from_url
 
 logger = logging.getLogger(__name__)
 

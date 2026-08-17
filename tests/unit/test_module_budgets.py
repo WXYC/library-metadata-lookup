@@ -148,7 +148,12 @@ MODULE_BUDGETS: dict[str, int] = {
     # background miss-warm (this branch's own wikipedia_warm.py) a second
     # consumer alongside the offline drain. Measured 137 lines when first
     # added; budget set to 200 (smallest multiple of 50 at or above 1.3x).
-    "lookup/wikipedia_pick_validation.py": 200,
+    # Recalibrated (LML#1192 review round 6, P2-2): opting into
+    # lookup.wikipedia_candidates.score_candidates's include_denylisted=True
+    # asymmetry -- one new import line, a module-docstring paragraph, and a
+    # call-site comment -- measured 204 lines. 1.3x that is 265.2; smallest
+    # multiple of 50 at or above -> 300.
+    "lookup/wikipedia_pick_validation.py": 300,
     "lookup/external_search.py": 350,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
     # transparent-fold calibration): the module gained the empty-vs-degraded
@@ -270,7 +275,30 @@ MODULE_BUDGETS: dict[str, int] = {
     # artist-name disambig strip, and the telemetry fixes all added lines)
     # -- measured 342 at this PR's tip. Smallest multiple of 50 at or above
     # 1.3x that -> 450.
-    "lookup/wikipedia_url.py": 450,
+    #
+    # Recalibrated DOWN (LML#1192 review round 6): this module hit 446/450
+    # -- four lines of headroom -- once round 6's P2-2/P2-3 fixes needed to
+    # land, which is exactly the regrowth this guardrail exists to catch.
+    # Candidate URL parsing, slug scoring, the hard-reject denylist, and
+    # language normalization extracted to the new
+    # lookup/wikipedia_candidates.py (see its own budget entry below); this
+    # module kept only the SERVING decision (flag + floor gate) and shadow
+    # telemetry. Measured 264 lines post-extraction. Left at 450 (rather
+    # than shrunk to 1.3x264's 350) the guardrail would stay silent through
+    # another ~180 lines of exactly the regrowth that just happened --
+    # shrinking it keeps the ceiling meaningful going forward, not just at
+    # the moment of this fix.
+    "lookup/wikipedia_url.py": 350,
+    # New (LML#1192 review round 6): the scoring/rejection policy extracted
+    # from lookup/wikipedia_url.py once that module hit its ceiling --
+    # URL/slug parsing, the hard-reject denylist, language normalization,
+    # and the total-order try-ranking, shared by the synchronous
+    # lookup/wikipedia_url.py (include_denylisted=False, decisive) and the
+    # fetch-capable lookup/wikipedia_pick_validation.py
+    # (include_denylisted=True, a ranking penalty -- see this module's own
+    # docstring for the full asymmetry). Measured 357 lines; 1.3x that is
+    # 464.1, smallest multiple of 50 at or above -> 500.
+    "lookup/wikipedia_candidates.py": 500,
     # LML#751: strategy runner, SearchState, and budget/timeout machinery —
     # the pipeline's other regrowth attractor once every lookup/ file was
     # capped. 1033 measured lines (2026-07-29); smallest multiple of 50 at or
