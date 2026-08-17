@@ -78,6 +78,11 @@ _LML_CACHE_FIXTURE_FILES = (
     # LML#513/#1192 Phase B: the artist Wikipedia bio cache drops its own
     # scratch lml_cache.artist_wikipedia_bio rows.
     "test_artist_wikipedia_bio.py",
+    # LML#1192 review round 4, P0-8 (round 6, C2-3: moved here from the
+    # drain PR, #1194 is the earliest common ancestor of both the offline
+    # drain and the background miss-warm task): the write-nothing attempt
+    # record drops its own scratch lml_cache.artist_wikipedia_bio_attempt rows.
+    "test_artist_wikipedia_bio_attempt.py",
 )
 
 # Any DROP SCHEMA aimed at lml_cache, however spelled (with/without IF

@@ -356,6 +356,9 @@ async def lifespan(app: FastAPI):
         from core.dependencies import get_discogs_pool
         from entity.api_keys import set_up_api_keys_schema
         from entity.artist_wikipedia_bio import set_up_artist_wikipedia_bio_schema
+        from entity.artist_wikipedia_bio_attempt import (
+            set_up_artist_wikipedia_bio_attempt_schema,
+        )
         from entity.compilation_track_identity import (
             set_up_compilation_track_identity_schema,
         )
@@ -472,13 +475,27 @@ async def lifespan(app: FastAPI):
                 ),
                 # Artist Wikipedia bio cache (LML#513/#1192, Phase B of the
                 # Wikipedia-preferred-artist-bio program), another LML-owned
-                # lml_cache.* table. Same pool, same best-effort posture. No
-                # runtime reader yet -- lookup/enrichment/wikipedia_bio.py
-                # (PR-B2) and scripts/warm_wikipedia_bios.py (PR-C) are the
-                # consumers.
+                # lml_cache.* table. Same pool, same best-effort posture. Read
+                # by lookup/enrichment/wikipedia_bio.py, written by the
+                # background miss-warm task (lookup/enrichment/wikipedia_warm.py)
+                # and scripts/warm_wikipedia_bios.py.
                 (
                     "Artist Wikipedia bio cache",
                     set_up_artist_wikipedia_bio_schema,
+                ),
+                # Wikipedia bio write-nothing attempt record (LML#1192 review
+                # round 4, P0-8; round 6, C2-3), the couldn't-ask sibling of
+                # the cache above. LML#1192 review round 6: bootstrapped here
+                # too, not just by the offline drain -- the background
+                # miss-warm task now records its own WikipediaFetchError
+                # couldn't-asks here as well (see that module's docstring for
+                # why a runtime path with no durable write-nothing record
+                # silently inverts "cache down, degrade quietly" into
+                # sustained outbound Wikipedia traffic on a discogs-cache PG
+                # outage).
+                (
+                    "Wikipedia bio attempt record",
+                    set_up_artist_wikipedia_bio_attempt_schema,
                 ),
             )
             await _run_lml_cache_bootstraps(source, bootstraps)
