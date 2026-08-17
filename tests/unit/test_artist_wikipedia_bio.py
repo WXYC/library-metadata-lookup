@@ -278,7 +278,7 @@ class TestSetCachedArtistWikipediaBio:
 @pytest.mark.asyncio
 class TestMarkArtistWikipediaBioRefused:
     """LML#1192 review round 6, C1-1: the third clock. ``fetched_at`` owns
-    content age; ``last_checked_at`` owns the drain's progress cursor (round
+    content age; ``last_attempted_at`` owns the drain's progress cursor (round
     3/4, finding 13); ``last_refused_at`` owns "when did we last try and
     fail to refresh this row" -- distinct from both, since a refusal
     advances neither of the other two under the pre-round-6 code, which is
@@ -286,7 +286,7 @@ class TestMarkArtistWikipediaBioRefused:
     ``tests/integration/test_artist_wikipedia_bio.py::TestRefusedRefreshDoesNotWedgeTheRow``).
     """
 
-    async def test_advances_both_last_refused_at_and_last_checked_at(self):
+    async def test_advances_both_last_refused_at_and_last_attempted_at(self):
         pg = AsyncMock(spec=PgSource)
         pg.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -296,7 +296,7 @@ class TestMarkArtistWikipediaBioRefused:
         sql, artist_id = args
         assert artist_id == _ARTIST_ID
         assert "last_refused_at" in sql
-        assert "last_checked_at" in sql
+        assert "last_attempted_at" in sql
         # Content columns must never move on a refusal.
         assert "fetched_at = " not in sql
         assert "extract = " not in sql
@@ -342,10 +342,10 @@ class TestRefusalCooldownReadPredicate:
         refusal_cutoff = pg.fetchone.await_args.args[4]
         assert refusal_cutoff == _NOW - custom_cooldown
 
-    async def test_upsert_also_advances_last_checked_at(self):
+    async def test_upsert_also_advances_last_attempted_at(self):
         # LML#1192 review round 3/4, finding 13: fetched_at describes
         # CONTENT age (the TTL clock get_cached_artist_wikipedia_bio
-        # reads); last_checked_at is the offline drain's own progress
+        # reads); last_attempted_at is the offline drain's own progress
         # cursor. A real fetch (this UPSERT) advances BOTH -- new content
         # is by definition freshly checked too.
         pg = AsyncMock(spec=PgSource)
@@ -361,7 +361,7 @@ class TestRefusalCooldownReadPredicate:
         )
 
         sql = pg.execute.await_args.args[0]
-        assert "last_checked_at" in sql
+        assert "last_attempted_at" in sql
 
     async def test_upsert_never_overwrites_a_positive_extract_with_null_at_the_sql_level(self):
         # LML#1192 review round 4, P0-5: the Python-level guard in
@@ -434,7 +434,7 @@ class _FakePgSource:
 
 @pytest.mark.asyncio
 class TestSchemaCarriesLastCheckedAtColumn:
-    """LML#1192 review round 4, P0-1: last_checked_at was introduced only
+    """LML#1192 review round 4, P0-1: last_attempted_at was introduced only
     in #1196 (the downstream drain PR), not #1194 (the PR that actually
     creates lml_cache.artist_wikipedia_bio via CREATE TABLE IF NOT
     EXISTS) -- so #1194 alone deploys a table missing the column
@@ -444,13 +444,15 @@ class TestSchemaCarriesLastCheckedAtColumn:
     without it) must exist here, mirroring
     entity/streaming_url_cache.py's is_error column precedent."""
 
-    async def test_bootstrap_issues_an_add_column_statement_for_last_checked_at(self):
+    async def test_bootstrap_issues_an_add_column_statement_for_last_attempted_at(self):
         pg = _FakePgSource()
 
         await set_up_artist_wikipedia_bio_schema(pg)
 
-        assert any("CREATE TABLE" in s and "last_checked_at" in s for s in pg.executed)
-        assert any("ADD COLUMN IF NOT EXISTS" in s and "last_checked_at" in s for s in pg.executed)
+        assert any("CREATE TABLE" in s and "last_attempted_at" in s for s in pg.executed)
+        assert any(
+            "ADD COLUMN IF NOT EXISTS" in s and "last_attempted_at" in s for s in pg.executed
+        )
 
     async def test_the_add_column_alter_runs_as_its_own_bootstrap_call(self):
         # LML#1121 FIX 5 precedent: PG16 still takes an AccessExclusiveLock
@@ -468,7 +470,7 @@ class TestSchemaCarriesLastCheckedAtColumn:
 @pytest.mark.asyncio
 class TestSchemaCarriesLastRefusedAtColumn:
     """LML#1192 review round 6, C1-1: same P0-1 treatment as
-    last_checked_at above, one column later -- last_refused_at was
+    last_attempted_at above, one column later -- last_refused_at was
     introduced after #1194 may already have deployed a table without it,
     so both the CREATE TABLE (fresh installs) and an idempotent
     ADD COLUMN IF NOT EXISTS (an already-existing table) must exist, and
@@ -489,4 +491,4 @@ class TestSchemaCarriesLastRefusedAtColumn:
 
         await set_up_artist_wikipedia_bio_schema(pg)
 
-        assert pg.acquire_count >= 3  # schema+table, last_checked_at ALTER, last_refused_at ALTER
+        assert pg.acquire_count >= 3  # schema+table, last_attempted_at ALTER, last_refused_at ALTER

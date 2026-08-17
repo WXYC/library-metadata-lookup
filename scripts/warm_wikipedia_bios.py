@@ -76,7 +76,7 @@ selected ONLY when its row already has a positive extract; if the fresh
 pick diverges into anything that would write a negative (below-floor, or
 every above-floor candidate rejected), :func:`_write_bio` refuses the
 write and reports ``"repick_kept_existing"`` instead (still advancing
-``last_checked_at`` — LML#1192 review round 4, P0-8 partial) — this repo's
+``last_attempted_at`` — LML#1192 review round 4, P0-8 partial) — this repo's
 standing data-safety rule (never overwrite/reset successfully collected
 data without explicit approval) applies here just as much as any other
 cache.
@@ -104,7 +104,7 @@ in a row predicate, an ORDER BY, and one selected column):
   (outcome ``"refreshed"``). The accepted cost: every repick candidate now
   pays for a live fetch, even a confirmed-unchanged one — deliberate, since
   the whole point of running ``--repick`` is to catch previously-wrong
-  picks a cheap pre-check would miss. A row's ``last_checked_at`` always
+  picks a cheap pre-check would miss. A row's ``last_attempted_at`` always
   advances on every repick candidate — via the UPSERT on a write, or via
   :func:`_write_bio`'s refusal-path touch when a divergent pick is rejected
   (LML#1192 review round 2, C2; round 3, finding 13; round 4, P0-8
@@ -288,14 +288,14 @@ _MODE_SQL: dict[DrainMode, str] = {
     GROUP BY au.artist_id, a.name
     ORDER BY au.artist_id
 """,
-    # LML#1192 review round 2, C2 (round 3, finding 13: last_checked_at,
+    # LML#1192 review round 2, C2 (round 3, finding 13: last_attempted_at,
     # not fetched_at -- a dedicated drain-progress cursor, distinct from
     # content-age). ORDER BY au.artist_id made a --limit-bounded run
     # re-select the exact same lowest-N artist ids every session -- a
     # declined/negative row's extract stays NULL after every re-attempt
     # (never drops out of the WHERE clause), so nothing ever advanced past
-    # it. last_checked_at ASC (oldest-checked-first) fixes this:
-    # set_cached_artist_wikipedia_bio's UPSERT bumps last_checked_at on
+    # it. last_attempted_at ASC (oldest-checked-first) fixes this:
+    # set_cached_artist_wikipedia_bio's UPSERT bumps last_attempted_at on
     # every write, so a re-attempted row is pushed to the back of the
     # queue and the next --limit-bounded run naturally picks up where the
     # last one left off. A row a fetch attempt writes NOTHING for
@@ -324,15 +324,15 @@ _MODE_SQL: dict[DrainMode, str] = {
       AND {_LIBRARY_ARTIST_INTERSECTION_PREDICATE}
       AND b.extract IS NULL
       AND (b.discogs_artist_id IS NOT NULL OR ba.discogs_artist_id IS NOT NULL)
-    GROUP BY au.artist_id, a.name, b.last_checked_at, ba.attempted_at
-    ORDER BY GREATEST(b.last_checked_at, ba.attempted_at) ASC
+    GROUP BY au.artist_id, a.name, b.last_attempted_at, ba.attempted_at
+    ORDER BY GREATEST(b.last_attempted_at, ba.attempted_at) ASC
 """,
     # LML#1192 review round 6, C1-3: GREATEST, not COALESCE (Postgres's
     # GREATEST is NULL-ignoring, verified live). A write-nothing outcome
     # (fetch_error) only ever advances ba.attempted_at; a content-table
     # outcome (negative, or a refused refresh -- see mark_artist_wikipedia_bio_refused
-    # below) only ever advances b.last_checked_at. For an artist with BOTH
-    # rows, COALESCE always preferred b.last_checked_at even when
+    # below) only ever advances b.last_attempted_at. For an artist with BOTH
+    # rows, COALESCE always preferred b.last_attempted_at even when
     # ba.attempted_at was the more recently re-checked clock -- sorting a
     # repeatedly-failing artist ahead of successfully re-checked ones, and
     # under a sustained outage, re-pinning the same residue at the head of
@@ -343,7 +343,7 @@ _MODE_SQL: dict[DrainMode, str] = {
     # Same C2/finding-13 fix, and load-bearing here in a way --retry-misses
     # isn't: a repick candidate whose pick has since diverged into a
     # negative gets its write refused (see mark_artist_wikipedia_bio_refused
-    # below) rather than written via the normal UPSERT, so last_checked_at
+    # below) rather than written via the normal UPSERT, so last_attempted_at
     # alone wouldn't advance without process_candidate's paired call on that
     # outcome -- the two changes are a matched pair.
     "repick": f"""
@@ -354,8 +354,8 @@ _MODE_SQL: dict[DrainMode, str] = {
     WHERE au.url ILIKE '%wikipedia.org%'
       AND {_LIBRARY_ARTIST_INTERSECTION_PREDICATE}
       AND b.extract IS NOT NULL
-    GROUP BY au.artist_id, a.name, b.wikipedia_url, b.last_checked_at
-    ORDER BY b.last_checked_at ASC
+    GROUP BY au.artist_id, a.name, b.wikipedia_url, b.last_attempted_at
+    ORDER BY b.last_attempted_at ASC
 """,
     # LML#1192 review round 4, P0-3: a stale positive row could never be
     # refreshed under incremental (row already exists), --retry-misses
@@ -379,7 +379,7 @@ _MODE_SQL: dict[DrainMode, str] = {
     # these accumulate, every run processes exactly those refused rows,
     # aborts, and starves everything genuinely stale behind them --
     # `_write_bio`'s docstring claim (that the mark-refused call prevents
-    # this) only holds for a last_checked_at-ordered query, and refresh is
+    # this) only holds for a last_attempted_at-ordered query, and refresh is
     # not one. COALESCE(b.last_refused_at, b.fetched_at) deprioritizes a
     # recently-refused row without touching WHERE eligibility.
     "refresh": f"""
@@ -506,12 +506,12 @@ async def _write_bio(
 
     LML#1192 review round 4, P0-8 / round 6, C1-1: a refusal marks
     :func:`~entity.artist_wikipedia_bio.mark_artist_wikipedia_bio_refused`
-    -- advances ``last_checked_at`` (never ``fetched_at``/``extract``/etc.,
+    -- advances ``last_attempted_at`` (never ``fetched_at``/``extract``/etc.,
     same as before) AND the new ``last_refused_at`` clock. The former keeps
-    a ``last_checked_at``-ordered repick seed progressing past this row
+    a ``last_attempted_at``-ordered repick seed progressing past this row
     instead of re-selecting it forever; the latter is what lets
     ``--refresh-stale``'s ORDER BY (which reads ``fetched_at``, not
-    ``last_checked_at``) also deprioritize it -- see ``_MODE_SQL["refresh"]``'s
+    ``last_attempted_at``) also deprioritize it -- see ``_MODE_SQL["refresh"]``'s
     C1-2 comment for why the narrower ``touch_artist_wikipedia_bio_last_checked_at``
     this used to call wasn't enough.
     """

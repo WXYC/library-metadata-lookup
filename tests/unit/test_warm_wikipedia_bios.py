@@ -162,7 +162,7 @@ class TestProcessCandidate:
         # stale positive row could never be refreshed past its TTL under
         # any existing mode: incremental excludes it because a row exists,
         # retry_misses excludes it because extract IS NOT NULL, and the OLD
-        # repick short-circuited to a bare last_checked_at touch that never
+        # repick short-circuited to a bare last_attempted_at touch that never
         # advanced fetched_at). The accepted cost: repick/refresh
         # candidates now always pay for a live fetch, even on a
         # confirmed-unchanged pick -- the whole point of re-running one of
@@ -309,7 +309,7 @@ class TestRepickNeverDestroysAPositiveExtract:
     candidate tried and rejected by a live fetch -- the write must be
     refused and the existing positive extract preserved. LML#1192 review
     round 4, P0-8 (partial): the refusal still advances the row's
-    ``last_checked_at`` so a cursor-ordered repick/refresh session doesn't
+    ``last_attempted_at`` so a cursor-ordered repick/refresh session doesn't
     re-select the same divergent-but-protected row forever.
     This repo's standing data-safety rule (never overwrite/reset
     successfully collected data without explicit approval) applies here
@@ -317,7 +317,7 @@ class TestRepickNeverDestroysAPositiveExtract:
 
     LML#1192 review round 6, C1-1/C1-2: the refusal now marks
     ``mark_artist_wikipedia_bio_refused`` (advances BOTH ``last_refused_at``
-    and ``last_checked_at``) rather than the narrower
+    and ``last_attempted_at``) rather than the narrower
     ``touch_artist_wikipedia_bio_last_checked_at`` -- see
     ``entity/artist_wikipedia_bio.py`` for why a third clock exists at all.
     """
@@ -347,11 +347,11 @@ class TestRepickNeverDestroysAPositiveExtract:
         client.get_summary.assert_not_called()
         # LML#1192 review round 4, P0-8 (partial): a refused write must
         # still advance the drain's own progress cursor, or a
-        # last_checked_at-ordered repick/refresh session would re-select
+        # last_attempted_at-ordered repick/refresh session would re-select
         # this same divergent-but-protected row forever instead of moving
         # on to the next stalest candidate. Round 6, C1-1/C1-2: it must ALSO
         # advance last_refused_at, so --refresh-stale's own ordering (which
-        # reads that clock, not last_checked_at) doesn't starve behind it.
+        # reads that clock, not last_attempted_at) doesn't starve behind it.
         mock_mark_refused.assert_awaited_once_with(pg, discogs_artist_id=1)
 
     async def test_diverged_pick_that_fetches_negative_keeps_the_existing_positive_extract(self):
@@ -521,14 +521,14 @@ class TestFetchCandidates:
         assert "LEFT JOIN" in sql
 
     async def test_retry_misses_orders_by_staleness_not_artist_id(self):
-        # LML#1192 review round 2, C2 (round 3, finding 13: last_checked_at,
+        # LML#1192 review round 2, C2 (round 3, finding 13: last_attempted_at,
         # not fetched_at -- the drain's own progress cursor, distinct from
         # content-age). ORDER BY au.artist_id made `--retry-misses --limit N`
         # re-select the exact same lowest-N artist ids forever (a
         # declined/negative row's extract stays NULL after every
         # re-attempt, so it never drops out of the WHERE clause).
-        # last_checked_at ASC progresses instead, since a re-attempted
-        # row's last_checked_at is bumped by set_cached_artist_wikipedia_bio's
+        # last_attempted_at ASC progresses instead, since a re-attempted
+        # row's last_attempted_at is bumped by set_cached_artist_wikipedia_bio's
         # UPSERT on every write, pushing it to the back of the queue.
         pg = AsyncMock(spec=PgSource)
         pg.fetchall = AsyncMock(return_value=[])
@@ -537,15 +537,15 @@ class TestFetchCandidates:
         # LML#1192 review round 6, C1-3: GREATEST, not COALESCE. A
         # write-nothing outcome (fetch_error) only ever advances
         # ba.attempted_at; a content-table outcome (negative/refused
-        # refresh) only ever advances b.last_checked_at. For an artist with
-        # BOTH rows, COALESCE always preferred b.last_checked_at even when
+        # refresh) only ever advances b.last_attempted_at. For an artist with
+        # BOTH rows, COALESCE always preferred b.last_attempted_at even when
         # ba.attempted_at was the more recent re-check -- sorting the
         # failing artist ahead of successfully re-checked ones and, under a
         # sustained outage, re-pinning the same rows at the head of every
         # --limit-bounded session. GREATEST is NULL-ignoring in Postgres
         # (verified live), so it correctly picks whichever clock is
         # actually more recent.
-        assert "ORDER BY GREATEST(b.last_checked_at, ba.attempted_at) ASC" in sql
+        assert "ORDER BY GREATEST(b.last_attempted_at, ba.attempted_at) ASC" in sql
         assert "ORDER BY au.artist_id" not in sql
 
     async def test_repick_candidates_carry_the_stored_url(self):
@@ -576,8 +576,8 @@ class TestFetchCandidates:
         # LML#1192 review round 2, C2 (round 3, finding 13): same
         # starvation risk as --retry-misses. LML#1192 review round 4, P0-2:
         # every repick candidate now writes -- either a fresh extract
-        # ("positive"/"refreshed", advancing last_checked_at via the
-        # UPSERT) or, on a refused divergence, a bare last_checked_at touch
+        # ("positive"/"refreshed", advancing last_attempted_at via the
+        # UPSERT) or, on a refused divergence, a bare last_attempted_at touch
         # (P0-8 partial) -- so this ordering is what lets successive
         # --repick --limit N runs actually progress through the table
         # instead of re-checking the same already-verified rows forever.
@@ -585,7 +585,7 @@ class TestFetchCandidates:
         pg.fetchall = AsyncMock(return_value=[])
         await fetch_candidates(pg, mode="repick", library_artist_names=["X"], limit=None)
         sql = pg.fetchall.await_args.args[0]
-        assert "ORDER BY b.last_checked_at ASC" in sql
+        assert "ORDER BY b.last_attempted_at ASC" in sql
         assert "ORDER BY au.artist_id" not in sql
 
     async def test_incremental_and_retry_misses_never_select_a_stored_url_column(self):
@@ -639,7 +639,7 @@ class TestFetchCandidates:
         # refreshed under any other mode -- incremental excludes it because
         # a row already exists, retry_misses excludes it because
         # extract IS NOT NULL, and (pre-round-4) --repick short-circuited an
-        # unchanged pick to a bare last_checked_at touch that never advanced
+        # unchanged pick to a bare last_attempted_at touch that never advanced
         # fetched_at. --refresh-stale is scoped to ONLY genuinely-stale rows
         # (unlike a full --repick sweep, which now re-fetches every positive
         # row regardless of freshness) via a fetched_at < now() - TTL
@@ -666,7 +666,7 @@ class TestFetchCandidates:
         assert "LIMIT $3" in sql
         assert pg.fetchall.await_args.args[-1] == 250
 
-    async def test_refresh_orders_by_fetched_at_not_last_checked_at(self):
+    async def test_refresh_orders_by_fetched_at_not_last_attempted_at(self):
         # The whole point of --refresh-stale is content freshness, not
         # attempt-cursor progression -- it should refresh the OLDEST content
         # first, not the least-recently-touched row.
