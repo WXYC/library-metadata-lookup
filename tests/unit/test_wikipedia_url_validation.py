@@ -274,3 +274,44 @@ class TestComputeGroundTruthSummary:
         summary = compute_ground_truth_summary(rows)  # must not raise
 
         assert summary.classified == 0
+
+
+class TestLibraryIntersection:
+    """LML#1192 cross-PR review, round 7: the sampler is the empirical gate
+    for the LML_WIKIPEDIA_SLUG_MATCH flip, but it sampled the RAW
+    ``artist_url`` universe while round 3/P0-4 forced the drain to intersect
+    with WXYC library artists (the raw tables are polluted by
+    resolve-minted non-library artists) -- so the <2% regression gate was
+    calibrated on a population the feature partly never serves. The sampler
+    now takes the same library-name set and applies the drain's own
+    normalization predicate; ``library_artist_names=None`` keeps the
+    documented superset mode (``--skip-library-intersection``)."""
+
+    def test_candidate_sql_threads_the_library_names(self):
+        conn = _fake_conn([(1,), (2,)])
+        ids = fetch_candidate_artist_ids(conn, library_artist_names=["Stereolab", "Sessa"])
+        assert ids == [1, 2]
+        cur = conn.cursor.return_value
+        sql, params = cur.execute.call_args.args
+        # The drain's own normalization predicate (P0-4): NFC/diacritic and
+        # Discogs "(2)"-suffix handling on BOTH sides, in SQL.
+        assert "unnest" in sql and "f_unaccent" in sql and "JOIN artist a" in sql
+        assert params == ("%wikipedia.org%", ["Stereolab", "Sessa"])
+
+    def test_none_keeps_the_unfiltered_superset(self):
+        conn = _fake_conn([(7,)])
+        ids = fetch_candidate_artist_ids(conn, library_artist_names=None)
+        assert ids == [7]
+        cur = conn.cursor.return_value
+        sql, params = cur.execute.call_args.args
+        assert "unnest" not in sql
+        assert params == ("%wikipedia.org%",)
+
+    def test_cli_default_intersects_and_the_escape_hatch_exists(self):
+        from scripts.wikipedia_url_validation import _build_arg_parser
+
+        args = _build_arg_parser().parse_args([])
+        assert args.library_db is not None
+        assert args.skip_library_intersection is False
+        args = _build_arg_parser().parse_args(["--skip-library-intersection"])
+        assert args.skip_library_intersection is True
