@@ -32,11 +32,11 @@ from wxyc_fastapi.http import async_singleton
 from wxyc_fastapi.observability import (
     add_breadcrumb,
     get_cache_stats_recorder,
-    get_posthog_client,
     timed_api,
 )
 
 from config.settings import get_settings
+from core.observability import capture_unsampled_counter
 from discogs.admission import admit_or_shed, retry_429
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.fallthrough import apply_request_ctx_tags, fallthrough, request_context
@@ -157,35 +157,21 @@ BREAKER_OPEN_STAT_KEY = "discogs_breaker_open_shed"
 # observable without reintroducing the LML#805 per-event Sentry flood.
 _ARTIST_BREAKER_SHED_EVENT = "discogs_artist_breaker_shed"
 _ARTIST_BREAKER_POSTHOG_EVENT_PREFIX = "discogs_artist_breaker"
-_ARTIST_BREAKER_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
 
 
 def _capture_artist_breaker_shed(artist_id: int) -> None:
     """Emit the unsampled PostHog counter for one artist-path breaker shed.
 
-    Mirrors ``discogs.ratelimit._capture_fail_open`` (LML#879): best-effort,
-    gated by ``Settings.enable_telemetry``, wired through the shared
-    ``wxyc_fastapi.observability.get_posthog_client`` accessor. A telemetry
-    failure must never turn the shed's re-raise into something worse — every
-    branch below is wrapped so this function cannot raise.
+    Delegates to ``core.observability.capture_unsampled_counter`` (LML#1204),
+    the shared detached-task counter shape: best-effort, gated by
+    ``Settings.enable_telemetry``, and unable to raise — a telemetry failure
+    must never turn the shed's re-raise into something worse.
     """
-    try:
-        settings = get_settings()
-        if not settings.enable_telemetry:
-            return
-        client = get_posthog_client(event_prefix=_ARTIST_BREAKER_POSTHOG_EVENT_PREFIX)
-        if client is None:
-            return
-        client.capture(
-            distinct_id=_ARTIST_BREAKER_POSTHOG_DISTINCT_ID,
-            event=_ARTIST_BREAKER_SHED_EVENT,
-            properties={
-                "artist_id": artist_id,
-                "environment": settings.environment,
-            },
-        )
-    except Exception:
-        logger.warning("Failed to emit %s counter", _ARTIST_BREAKER_SHED_EVENT, exc_info=True)
+    capture_unsampled_counter(
+        _ARTIST_BREAKER_POSTHOG_EVENT_PREFIX,
+        _ARTIST_BREAKER_SHED_EVENT,
+        {"artist_id": artist_id},
+    )
 
 
 # Log fingerprint for `search_artists`' malformed-item page-distrust path.

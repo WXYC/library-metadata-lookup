@@ -125,7 +125,7 @@ def captured_posthog(monkeypatch):
             events.append({"distinct_id": distinct_id, "event": event, "properties": properties})
 
     monkeypatch.setattr(
-        "discogs.ratelimit.get_posthog_client",
+        "core.observability.get_posthog_client",
         lambda event_prefix: _FakePosthog(),
     )
     return events
@@ -401,7 +401,7 @@ async def test_counter_emission_failure_never_breaks_fail_open(
     def _exploding_accessor(event_prefix):
         raise RuntimeError("posthog accessor broken")
 
-    monkeypatch.setattr("discogs.ratelimit.get_posthog_client", _exploding_accessor)
+    monkeypatch.setattr("core.observability.get_posthog_client", _exploding_accessor)
     local = _RecordingLimiter()
     gate = DiscogsRateGate(
         local_limiter=local, bucket_factory=await _factory_returning(_RaisingBucket())

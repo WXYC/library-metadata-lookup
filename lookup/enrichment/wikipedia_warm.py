@@ -29,6 +29,7 @@ import logging
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from clients.wikipedia import WikipediaClient, WikipediaFetchError, WikipediaSummary
+from core.observability import capture_unsampled_counter
 from entity.artist_wikipedia_bio import set_cached_artist_wikipedia_bio
 from entity.artist_wikipedia_bio_attempt import (
     OUTCOME_FETCH_ERROR,
@@ -36,13 +37,6 @@ from entity.artist_wikipedia_bio_attempt import (
     record_artist_wikipedia_bio_attempt,
 )
 from entity.sources import PgSource
-from lookup.enrichment.wikipedia_warm_telemetry import (
-    FETCH_OK_STAT_KEY,
-    FETCH_REJECT_STAT_KEY,
-)
-from lookup.enrichment.wikipedia_warm_telemetry import (
-    capture_fetch_outcome as _capture_fetch_outcome,
-)
 from lookup.wikipedia_candidates import wikipedia_title_from_url
 from lookup.wikipedia_pick_validation import resolve_and_validate_pick
 
@@ -72,11 +66,26 @@ WARM_SHED_STAT_KEY = "wikipedia_bio_warm_shed"
 that triggered it, so this rides the standard contextvar-scoped recorder
 (mirrors ``lookup.streaming_warm_admission.record_depth_shed``)."""
 
-# FETCH_OK_STAT_KEY / FETCH_REJECT_STAT_KEY / the fetch-outcome capture
-# itself moved to lookup/enrichment/wikipedia_warm_telemetry.py (LML#1192
-# review round 6, pass 3, A1 -- this module's own budget-driven extraction)
-# -- imported above, re-exported under their original names so no other
-# call site or test patch target needs to change.
+FETCH_OK_STAT_KEY = "wikipedia_bio_fetch_ok"
+FETCH_REJECT_STAT_KEY = "wikipedia_bio_fetch_reject"
+"""Unsampled PostHog counters for the warm task's own fetch outcome — the
+warm TASK runs detached from any request's cache_stats context, so these do
+NOT use the per-request recorder (by the time the task's first ``await``
+resolves, the triggering handler has already read and returned its stats
+snapshot — LML#1192 review, B2-4). Emitted via
+:func:`_capture_fetch_outcome`. Dissolved back from the interim
+``wikipedia_warm_telemetry.py`` module once the emit mechanics moved to the
+shared ``core.observability.capture_unsampled_counter`` (LML#1204)."""
+
+_POSTHOG_EVENT_PREFIX = "wikipedia_bio_warm"
+
+
+def _capture_fetch_outcome(event: str) -> None:
+    """One unsampled, best-effort PostHog counter for a warm-task fetch
+    outcome — see :data:`FETCH_OK_STAT_KEY` for why the per-request recorder
+    can't carry these."""
+    capture_unsampled_counter(_POSTHOG_EVENT_PREFIX, event)
+
 
 _warm_semaphore: asyncio.Semaphore | None = None
 """Lazily-constructed (needs a running event loop). Re-bind on the first call."""

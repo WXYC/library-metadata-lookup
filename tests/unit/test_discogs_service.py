@@ -3509,7 +3509,7 @@ class TestGetArtistDetails:
                 )
 
         monkeypatch.setattr(
-            "discogs.service.get_posthog_client", lambda event_prefix: _FakePosthog()
+            "core.observability.get_posthog_client", lambda event_prefix: _FakePosthog()
         )
 
         with patch.object(
@@ -3542,7 +3542,7 @@ class TestGetArtistDetails:
         def _exploding_accessor(event_prefix):
             raise RuntimeError("posthog accessor broken")
 
-        monkeypatch.setattr("discogs.service.get_posthog_client", _exploding_accessor)
+        monkeypatch.setattr("core.observability.get_posthog_client", _exploding_accessor)
 
         with patch.object(
             service,

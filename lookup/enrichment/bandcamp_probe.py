@@ -23,11 +23,10 @@ import asyncio
 import logging
 from typing import NamedTuple
 
-from wxyc_fastapi.observability import get_posthog_client
-
 from clients.bandcamp import BandcampRateLimitedError, BandcampTransportError
 from config.settings import Settings
 from core.exceptions import BreakerOpenError
+from core.observability import capture_unsampled_counter
 from entity.streaming_url_cache import resolve_streaming_url_with_cache
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment.context import EnrichmentContext
@@ -54,7 +53,6 @@ _BANDCAMP_CACHE_CONFIG = STREAMING_URL_CACHE_CONFIG[StreamingService.BANDCAMP]
 
 _SHED_EVENT = "bandcamp_live_probe_shed"
 _SHED_POSTHOG_EVENT_PREFIX = "bandcamp_live_probe"
-_SHED_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
 
 # LML#1106 review round 2, FIX C: unlike the resolve-with-cache call above
 # (bounded by its own asyncio.wait_for, clamped to the caller budget), this
@@ -303,24 +301,13 @@ async def run_bandcamp_live_probe(
 def _capture_shed(reason: str, *, settings: Settings) -> None:
     """Emit the unsampled PostHog counter for one Bandcamp live-probe shed.
 
-    Mirrors ``discogs.service._capture_artist_breaker_shed`` (LML#1049):
-    best-effort, gated by ``enable_telemetry``, wired through the shared
-    ``get_posthog_client`` accessor. Every branch is wrapped so a telemetry
-    failure can never turn a shed into a lookup failure.
+    Delegates to ``core.observability.capture_unsampled_counter`` (LML#1204),
+    the shared detached-task counter shape: best-effort, gated by
+    ``enable_telemetry``, and unable to raise — a telemetry failure can never
+    turn a shed into a lookup failure. This site already holds the request's
+    DI-provided settings, so it passes them through rather than re-reading
+    the cached global.
     """
-    try:
-        if not getattr(settings, "enable_telemetry", False):
-            return
-        client = get_posthog_client(event_prefix=_SHED_POSTHOG_EVENT_PREFIX)
-        if client is None:
-            return
-        client.capture(
-            distinct_id=_SHED_POSTHOG_DISTINCT_ID,
-            event=_SHED_EVENT,
-            properties={
-                "reason": reason,
-                "environment": getattr(settings, "environment", None),
-            },
-        )
-    except Exception:
-        logger.warning("Failed to emit %s counter", _SHED_EVENT, exc_info=True)
+    capture_unsampled_counter(
+        _SHED_POSTHOG_EVENT_PREFIX, _SHED_EVENT, {"reason": reason}, settings=settings
+    )
