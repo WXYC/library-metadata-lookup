@@ -55,9 +55,12 @@ enriched ``artist_bio`` directly and reduces it to one ``bool()``, rather
 than re-deriving that fact via an explicit equality comparison against
 ``resolution.bio`` (the coordinator's pre-round-3 shape, and the same
 redundant shape the sibling Discogs ref-warm gate had for
-``top1_bio_is_discogs`` — see ``lookup/enrichment/background.py``, whose
-``served_bio_is_discogs`` param this module's :data:`BioSource` now also
-answers directly instead of via string comparison).
+``top1_bio_is_discogs`` — see ``lookup/enrichment/background.py``. That
+gate's ``served_bio_is_discogs`` param is itself gone as of round 6,
+pass 3, A3: the ref-warm now gates on ``profile_tokens_shipped`` read off
+the enriched result, decoupled from this module's bio-source resolution
+entirely — see background.py's A3 note for why "was the served bio
+Discogs" was the wrong question for that gate to ask).
 """
 
 from __future__ import annotations
@@ -322,10 +325,13 @@ def finalize_bio(
     calls (and the ``resolution_bio_surfaced`` boolean it hand-computed via
     an explicit ``== resolution.bio`` comparison — see the module
     docstring for why that comparison was always redundant with a plain
-    truthiness check). Returns ``bio_surfaced`` so the coordinator can pass
-    the SAME fact into the sibling Discogs ref-warm gate
-    (``background.maybe_schedule_discogs_bio_warm``'s
-    ``top1_bio_surfaced``), which needs it too.
+    truthiness check). Returns ``bio_surfaced`` (whether bio TEXT reached
+    the wire) — but as of round 6, pass 3, A3 no production caller
+    consumes it: the sibling Discogs ref-warm gate this return was minted
+    for now reads ``profile_tokens_shipped`` off the enriched result
+    instead (see ``background.py``'s A3 note), and the coordinator
+    deliberately ignores the return (documented at its call site). Kept as
+    a return value because the adoption-gate unit tests assert through it.
 
     LML#1192 review round 4, P0-6: adoption telemetry gates on
     ``bio_surfaced`` (bio TEXT reached the wire — the right question for
