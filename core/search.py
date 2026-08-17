@@ -129,6 +129,16 @@ def resolve_positive_int_env(env_var: str, default: int) -> int:
 _TRUE_BOOL_ENV_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on", "enabled"})
 _FALSE_BOOL_ENV_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off", "disabled"})
 
+_warned_bool_env_vars: set[str] = set()
+"""Env-var names whose unrecognized spelling has already been warned about —
+:func:`resolve_bool_env`'s adopters sit on per-request/per-item hot paths
+(the enrichment coordinator, per-item probes, the admission gate), so a
+typo'd Railway var must warn once per process, not once per read (the
+``_warned_prefixes`` idiom ``wxyc_fastapi.observability.posthog
+.get_posthog_client`` uses). Process-lifetime on purpose: the flags are
+no-redeploy levers, but a fixed var stops hitting the warn path at all, and
+a still-broken one doesn't need re-announcing."""
+
 
 def resolve_bool_env(env_var: str, *, default: bool) -> bool:
     """Read a boolean flag from ``env_var``, falling back to ``default``.
@@ -138,7 +148,8 @@ def resolve_bool_env(env_var: str, *, default: bool) -> bool:
     env var and operators flip without a restart), beside
     :func:`resolve_positive_int_env` and with the same operator-typo
     contract: an unrecognized spelling falls back to ``default`` with a
-    WARN — it must not 500 anything, and must not silently flip a flag in
+    WARN (once per process per env var — see :data:`_warned_bool_env_vars`)
+    — it must not 500 anything, and must not silently flip a flag in
     either direction. Case-insensitive, whitespace-trimmed; empty behaves
     like unset, matching every replaced per-module copy. Each call site
     keeps its own default polarity — this function unifies only the accept
@@ -154,9 +165,11 @@ def resolve_bool_env(env_var: str, *, default: bool) -> bool:
         return True
     if normalized in _FALSE_BOOL_ENV_VALUES:
         return False
-    logger.warning(
-        "%s=%r is not a recognized boolean spelling; falling back to %s", env_var, raw, default
-    )
+    if env_var not in _warned_bool_env_vars:
+        _warned_bool_env_vars.add(env_var)
+        logger.warning(
+            "%s=%r is not a recognized boolean spelling; falling back to %s", env_var, raw, default
+        )
     return default
 
 
