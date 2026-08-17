@@ -76,6 +76,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from clients.streaming.youtube_music import YouTubeMusicClient
+from scripts._lib.ratelimit import per_second_rate_limit
 from scripts.streaming_availability.results_db import ResultsDB
 from streaming.models import SourceMatch
 
@@ -303,6 +304,15 @@ async def execute_write(
     return tally
 
 
+def _build_client(*, rate: float, search_limit: int) -> YouTubeMusicClient:
+    """Build the drain's client with the operator ``--rate`` routed through
+    ``scripts._lib.ratelimit`` (LML#1204 item 6) — the direct tuple form
+    (``rate_limit=(rate, 1)``) raises ``ValueError`` on the first acquisition
+    for any fractional rate, so an operator throttling to ``--rate 0.5``
+    under 429 pressure would have killed the run instead of slowing it."""
+    return YouTubeMusicClient(rate_limit=per_second_rate_limit(rate), limit=search_limit)
+
+
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     # In --from-db mode, this connection stays open across the load and (if
     # --execute) the write, so execute_write reuses it instead of paying a
@@ -323,7 +333,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             args.concurrency,
             args.rate,
         )
-        client = YouTubeMusicClient(rate_limit=(args.rate, 1), limit=args.search_limit)
+        client = _build_client(rate=args.rate, search_limit=args.search_limit)
         outcomes = await resolve_candidates(client, candidates, concurrency=args.concurrency)
         report = summarize(outcomes, sample_size=args.sample_size)
         log.info(
