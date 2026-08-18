@@ -91,6 +91,17 @@ def build_reference(spec: SidecarSpec) -> str:
     return "\n\n".join(parts) + "\n"
 
 
+# The attempt-outcome vocabulary, rendered from the runtime frozenset rather
+# than hand-copied into the generated prose below. Adding an outcome used to
+# mean editing this list in two more places than the constants themselves, and
+# nothing tested the generator's copies -- the byte-pin only proves the .sql
+# matches whatever the spec says, so a stale roster stayed green in the one
+# artifact an operator reads when applying the schema by hand.
+_ATTEMPT_OUTCOMES = sorted(artist_wikipedia_bio_attempt.KNOWN_ATTEMPT_OUTCOMES)
+_ATTEMPT_OUTCOME_ROSTER = " / ".join(_ATTEMPT_OUTCOMES)
+_ATTEMPT_OUTCOME_ROSTER_QUOTED = " / ".join(f'"{outcome}"' for outcome in _ATTEMPT_OUTCOMES)
+
+
 def _ownership_boilerplate(module_name: str, setup_fn: str) -> str:
     """The paragraph every sidecar's header repeats: ``lml_cache`` ownership + why the file exists."""
     return f"""\
@@ -196,9 +207,10 @@ _MODULES: dict[str, SidecarSpec] = {
 -- (LML#1192 review round 4, P0-8).
 --
 -- Canonical DDL reference for `lml_cache.artist_wikipedia_bio_attempt`: one
--- row per Discogs artist id that a write-nothing outcome (fetch_error /
--- unresolvable / unexpected_error / truncated / declined) was recorded for, whether by the offline
--- drain (`scripts/warm_wikipedia_bios.py`) or the background miss-warm task
+-- row per Discogs artist id that a write-nothing outcome
+-- ({_ATTEMPT_OUTCOME_ROSTER})
+-- was recorded for, whether by the offline drain
+-- (`scripts/warm_wikipedia_bios.py`) or the background miss-warm task
 -- (`lookup/enrichment/wikipedia_warm.py`). Without this record, the drain's
 -- `--incremental` mode's fixed `au.artist_id` ordering with no cursor
 -- re-selects the same write-nothing artist ids, in the same order, on
@@ -222,7 +234,7 @@ _MODULES: dict[str, SidecarSpec] = {
             artist_wikipedia_bio_attempt._DDL_TABLE,
         ),
         comments={
-            "CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio_attempt (": """\
+            "CREATE TABLE IF NOT EXISTS lml_cache.artist_wikipedia_bio_attempt (": f"""\
 -- `discogs_artist_id` -- the PRIMARY KEY; one row per artist. BIGINT (not
 -- INTEGER, LML#1192 review round 6, pass 3, A6 -- this table is joined
 -- against `lml_cache.artist_wikipedia_bio.discogs_artist_id`, which is
@@ -232,8 +244,9 @@ _MODULES: dict[str, SidecarSpec] = {
 -- -- when this attempt was last (re-)recorded; a repeated write-nothing
 -- outcome refreshes it via the UPSERT rather than growing a second row.
 -- `outcome` -- the label recorded (a member of the OUTCOME_* vocabulary
--- entity/artist_wikipedia_bio_attempt.py owns: "fetch_error" / "unresolvable" /
--- "unexpected_error" / "truncated" / "declined"), audit-only, never compared.""",
+-- entity/artist_wikipedia_bio_attempt.py owns:
+-- {_ATTEMPT_OUTCOME_ROSTER_QUOTED}),
+-- audit-only, never compared.""",
         },
     ),
     "compilation_track_identity": SidecarSpec(

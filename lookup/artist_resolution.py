@@ -23,7 +23,7 @@ from clients.streaming.matching import (
     score_match,
     strip_discogs_disambig,
 )
-from core.search import resolve_bool_env
+from core.env import resolve_bool_env
 from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import create_ttl_cache, should_skip_cache
@@ -41,7 +41,7 @@ is ``true`` (on)."""
 
 def _artist_identity_split_gate_enabled() -> bool:
     """Read the rollback flag at request time via the shared
-    ``core.search.resolve_bool_env`` (LML#1204 item 3) so the knob can be
+    ``core.env.resolve_bool_env`` (LML#1204 item 3) so the knob can be
     flipped via Railway env vars without a redeploy. See
     ``LML_ARTIST_IDENTITY_SPLIT_GATE`` in ``docs/env-vars.md``."""
     return resolve_bool_env(_ARTIST_IDENTITY_SPLIT_GATE_ENV_VAR, default=True)
@@ -72,7 +72,7 @@ only — default is ``true`` (on)."""
 
 def _skip_prefetch_on_synthesis_enabled() -> bool:
     """Read the LML#507 rollback flag at request time via the shared
-    ``core.search.resolve_bool_env`` (LML#1204 item 3) so the knob can be
+    ``core.env.resolve_bool_env`` (LML#1204 item 3) so the knob can be
     flipped via Railway env vars without a redeploy. See
     ``LML_ENRICH_SKIP_PREFETCH_ON_SYNTHESIS`` in ``docs/env-vars.md``."""
     return resolve_bool_env(_SKIP_PREFETCH_ON_SYNTHESIS_ENV_VAR, default=True)

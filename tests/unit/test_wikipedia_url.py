@@ -6,7 +6,7 @@ cases first (red before ``lookup/wikipedia_url.py`` exists), the hard-reject
 denylist (must fire BEFORE disambig stripping, per the module design — a
 stripped ``Sessa (album)`` would score 100 against artist ``Sessa`` and slip
 past scoring), the ``LML_WIKIPEDIA_SLUG_MATCH`` flag gate (default OFF,
-``core.search.resolve_bool_env``'s true spellings), and the shadow telemetry
+``core.env.resolve_bool_env``'s true spellings), and the shadow telemetry
 pair that fires regardless of the flag.
 """
 

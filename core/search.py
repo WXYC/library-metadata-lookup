@@ -120,59 +120,6 @@ def resolve_positive_int_env(env_var: str, default: int) -> int:
     return value
 
 
-# The one boolean-env accept vocabulary (LML#1204 item 3): symmetric pairs
-# (1/0, true/false, yes/no, on/off, enabled/disabled), replacing three
-# per-module _TRUE_FLAG_VALUES copies and lookup/artist_resolution.py's
-# inverse-polarity _FALSE_FLAG_VALUES — whose accept-set was asymmetric
-# ("disabled" disabled a default-ON flag but "enabled" did NOT enable a
-# default-OFF one). tests/unit/test_search.py pins the pairing structurally.
-_TRUE_BOOL_ENV_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on", "enabled"})
-_FALSE_BOOL_ENV_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off", "disabled"})
-
-_warned_bool_env_vars: set[str] = set()
-"""Env-var names whose unrecognized spelling has already been warned about —
-:func:`resolve_bool_env`'s adopters sit on per-request/per-item hot paths
-(the enrichment coordinator, per-item probes, the admission gate), so a
-typo'd Railway var must warn once per process, not once per read (the
-``_warned_prefixes`` idiom ``wxyc_fastapi.observability.posthog
-.get_posthog_client`` uses). Process-lifetime on purpose: the flags are
-no-redeploy levers, but a fixed var stops hitting the warn path at all, and
-a still-broken one doesn't need re-announcing."""
-
-
-def resolve_bool_env(env_var: str, *, default: bool) -> bool:
-    """Read a boolean flag from ``env_var``, falling back to ``default``.
-
-    The shared reader for the repo's no-redeploy Railway boolean levers
-    (read per-call, no ``Settings`` indirection, so tests monkeypatch the
-    env var and operators flip without a restart), beside
-    :func:`resolve_positive_int_env` and with the same operator-typo
-    contract: an unrecognized spelling falls back to ``default`` with a
-    WARN (once per process per env var — see :data:`_warned_bool_env_vars`)
-    — it must not 500 anything, and must not silently flip a flag in
-    either direction. Case-insensitive, whitespace-trimmed; empty behaves
-    like unset, matching every replaced per-module copy. Each call site
-    keeps its own default polarity — this function unifies only the accept
-    vocabulary.
-    """
-    raw = os.environ.get(env_var)
-    if raw is None:
-        return default
-    normalized = raw.strip().lower()
-    if not normalized:
-        return default
-    if normalized in _TRUE_BOOL_ENV_VALUES:
-        return True
-    if normalized in _FALSE_BOOL_ENV_VALUES:
-        return False
-    if env_var not in _warned_bool_env_vars:
-        _warned_bool_env_vars.add(env_var)
-        logger.warning(
-            "%s=%r is not a recognized boolean spelling; falling back to %s", env_var, raw, default
-        )
-    return default
-
-
 SEARCH_API_CALL_CAP_FIRED_STAT_KEY = "search_api_call_cap_fired"
 """Per-request cache-stats key incremented on every LML#543 ``_chunked_gather``
 cap-fire. A counter for batch-aggregate PostHog/Sentry telemetry — the runner

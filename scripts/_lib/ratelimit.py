@@ -21,11 +21,8 @@ import math
 from aiolimiter import AsyncLimiter
 
 _RATE_FLOOR = 0.01
-"""Floor for ANY operator rate below it (not just non-positive typos) —
-throttle hard rather than divide by zero, go negative, or overflow: a
-denormal-tiny positive rate (e.g. ``5e-324``) passes a bare ``> 0`` check
-but overflows ``1 / rate`` to ``inf``, minting a limiter that never refills
-(the run hangs after one acquisition)."""
+"""Floor for ANY operator rate below it, not just non-positive typos — a
+bare ``> 0`` check is not enough (see :func:`per_second_rate_limit`)."""
 
 
 def per_second_rate_limit(rate_per_second: float) -> tuple[float, float]:
@@ -35,11 +32,17 @@ def per_second_rate_limit(rate_per_second: float) -> tuple[float, float]:
     (``clients.streaming.youtube_music.YouTubeMusicClient(rate_limit=...)``)
     rather than holding an ``AsyncLimiter`` themselves.
 
-    A non-finite rate (``argparse type=float`` happily parses ``inf``,
-    ``1e999``, and ``nan``) is rejected outright: ``1 / inf == 0.0`` makes
-    ``AsyncLimiter`` raise ``ZeroDivisionError`` at construction, and there
-    is no sensible throttle to substitute for "infinitely fast" — the
-    operator should re-run with a real number.
+    ``argparse type=float`` happily parses ``inf``, ``1e999``, ``nan``, and
+    denormals, so both extremes are handled here rather than trusted to the
+    caller:
+
+    * non-finite is rejected outright — ``1 / inf == 0.0`` makes
+      ``AsyncLimiter`` raise ``ZeroDivisionError`` at construction, and there
+      is no sensible throttle to substitute for "infinitely fast";
+    * anything below :data:`_RATE_FLOOR` is floored, which is what makes a
+      denormal-tiny positive rate (e.g. ``5e-324``, which passes ``> 0`` but
+      overflows ``1 / rate`` to ``inf``) throttle hard instead of minting a
+      limiter that never refills — the run would hang after one acquisition.
     """
     if not math.isfinite(rate_per_second):
         raise ValueError(f"operator rate (--rate) must be a finite number, got {rate_per_second!r}")

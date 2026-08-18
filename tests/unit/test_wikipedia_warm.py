@@ -25,6 +25,7 @@ import pytest
 from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
 
 from clients.wikipedia import WikipediaFetchError, WikipediaSummary
+from entity.artist_wikipedia_bio_attempt import OUTCOME_DECLINED, OUTCOME_UNRESOLVABLE
 from entity.sources import PgSource
 from lookup.enrichment import wikipedia_warm
 
@@ -425,16 +426,36 @@ class TestRunWarm:
 
 
 @pytest.mark.asyncio
-class TestNoResolvablePickRecordsAttempt:
-    """LML#1204 item 2: the no-resolvable-pick branch used to diverge from
-    the offline drain (which records a durable ``unresolvable`` attempt) by
-    recording nothing — an attempt that found no resolvable candidate is
-    still information, and without the record the artist resurfaces as a
-    schedulable miss forever."""
+class TestWriteNothingVerdictsRecordAnAttempt:
+    """LML#1204 item 2 + review: every write-nothing verdict leaves a durable
+    attempt row.
 
-    async def test_no_resolvable_pick_records_a_durable_unresolvable_attempt(self):
-        from entity.artist_wikipedia_bio_attempt import OUTCOME_UNRESOLVABLE
+    Both branches used to return without any record — leaving the artist a
+    schedulable miss forever (the exact pathology the attempt record exists
+    to prevent) and diverging from the offline drain, which records both.
+    They now share ``write_nothing_attempt_outcome``'s verdict mapping, so
+    they are parametrized over the one body rather than copied per verdict:
+    a future verdict is a new row here, not a third patch block.
+    """
 
+    @pytest.mark.parametrize(
+        "artist_name, urls, expected_outcome",
+        [
+            # No candidate URL at all -> no resolvable pick.
+            pytest.param(_ARTIST_NAME, [], OUTCOME_UNRESOLVABLE, id="unresolvable"),
+            # A wikipedia.org URL whose slug can't clear the floor against the
+            # artist name: below-floor pick, no candidate ranked, zero fetches.
+            pytest.param(
+                "Stereolab",
+                ["https://en.wikipedia.org/wiki/Something_Entirely_Different"],
+                OUTCOME_DECLINED,
+                id="zero-fetch-decline",
+            ),
+        ],
+    )
+    async def test_records_a_durable_attempt_and_writes_no_content(
+        self, artist_name, urls, expected_outcome
+    ):
         pg = AsyncMock(spec=PgSource)
         with (
             patch(
@@ -446,39 +467,7 @@ class TestNoResolvablePickRecordsAttempt:
                 new_callable=AsyncMock,
             ) as mock_record,
         ):
-            await wikipedia_warm._run_warm(99, _ARTIST_NAME, [], pg)
+            await wikipedia_warm._run_warm(99, artist_name, urls, pg)
 
         mock_set.assert_not_awaited()
-        mock_record.assert_awaited_once_with(pg, discogs_artist_id=99, outcome=OUTCOME_UNRESOLVABLE)
-
-
-@pytest.mark.asyncio
-class TestZeroFetchDeclineRecordsAttempt:
-    """LML#1204 review: the below-floor zero-fetch decline used to return
-    without any durable record — leaving the artist a schedulable miss
-    forever, the exact pathology the attempt record exists to prevent, and
-    a divergence from the offline drain (which durably records its declines
-    as content rows). The warm now records a ``declined`` attempt via the
-    shared verdict mapping."""
-
-    async def test_zero_fetch_decline_records_a_durable_declined_attempt(self):
-        from entity.artist_wikipedia_bio_attempt import OUTCOME_DECLINED
-
-        pg = AsyncMock(spec=PgSource)
-        # A wikipedia.org URL whose slug can't clear the floor against the
-        # artist name: below-floor pick, no candidate ranked, zero fetches.
-        urls = ["https://en.wikipedia.org/wiki/Something_Entirely_Different"]
-        with (
-            patch(
-                "lookup.enrichment.wikipedia_warm.set_cached_artist_wikipedia_bio",
-                new_callable=AsyncMock,
-            ) as mock_set,
-            patch(
-                "lookup.enrichment.wikipedia_warm.record_artist_wikipedia_bio_attempt",
-                new_callable=AsyncMock,
-            ) as mock_record,
-        ):
-            await wikipedia_warm._run_warm(99, "Stereolab", urls, pg)
-
-        mock_set.assert_not_awaited()
-        mock_record.assert_awaited_once_with(pg, discogs_artist_id=99, outcome=OUTCOME_DECLINED)
+        mock_record.assert_awaited_once_with(pg, discogs_artist_id=99, outcome=expected_outcome)

@@ -49,7 +49,7 @@ from dataclasses import dataclass
 import sentry_sdk
 
 from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
-from core.search import resolve_bool_env
+from core.env import resolve_bool_env
 from lookup.wikipedia_candidates import (
     extract_lang,
     first_wikipedia_match,
@@ -60,7 +60,7 @@ from lookup.wikipedia_candidates import (
 logger = logging.getLogger(__name__)
 
 WIKIPEDIA_SLUG_MATCH_ENV_VAR = "LML_WIKIPEDIA_SLUG_MATCH"
-"""When set to a true spelling (``core.search.resolve_bool_env``'s
+"""When set to a true spelling (``core.env.resolve_bool_env``'s
 vocabulary), the slug-scored pick is served (when it clears the floor)
 instead of the legacy first-match pick. Default OFF — see
 ``docs/env-vars.md``."""

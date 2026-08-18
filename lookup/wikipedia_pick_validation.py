@@ -201,11 +201,13 @@ async def resolve_and_validate_pick(
     truncated = max_candidates is not None and len(ranked) > max_candidates
     if max_candidates is not None:
         ranked = ranked[:max_candidates]
-    # LML#1204 item 2 (review-hardened): recorded beside the actual fetch
-    # call, not inferred from the ranked list's shape -- a future pre-fetch
-    # guard inside the loop (deadline check, skip-refused-URL, cache probe)
-    # must not silently break the flag the drain writes durable
-    # negative-vs-declined rows off.
+    # LML#1204 item 2 (review-hardened): set immediately before the await,
+    # not inferred from the ranked list's shape, so a future pre-fetch guard
+    # (deadline check, skip-refused-URL, cache probe) added at the top of the
+    # loop body -- above this line, where such a guard naturally goes -- can
+    # `continue` without falsely claiming a fetch. Keep the assignment
+    # adjacent to the await if you add anything here: the drain writes
+    # durable negative-vs-declined rows off this flag.
     live_fetch_attempted = False
     for candidate in ranked:
         live_fetch_attempted = True
