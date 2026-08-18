@@ -1,0 +1,44 @@
+name: Unsampled-counter doc classification
+
+# Asserts that every event name reaching `core.observability.capture_unsampled_counter`
+# is classified in docs/env-vars.md's POSTHOG_RATELIMIT_EXEMPT_EVENTS entry — listed
+# if exempt, explained if deliberately excluded — and that no name the entry records
+# as live has lost its emit site (LML#1217).
+#
+# Runs on doc-only PRs, which ci.yml's `paths-ignore: docs/**` skips. That is not a
+# nicety: the reverse/stale half of this net guards exactly the edit a doc-only PR
+# makes — dropping a name from the recorded list, or rewording the "Prod + staging
+# value:" fragment the check keys on. Without this workflow that half is unreachable
+# in CI, including on a push straight to prod.
+
+on:
+  pull_request:
+    paths:
+      - 'docs/env-vars.md'
+      - '**/*.py'
+      - '.github/workflows/unsampled-counter-docs.yml'
+  push:
+    branches: [main, prod]
+    paths:
+      - 'docs/env-vars.md'
+      - '**/*.py'
+      - '.github/workflows/unsampled-counter-docs.yml'
+
+# Workflow-level GITHUB_TOKEN scope. This job only reads the checked-out tree.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Counter doc classification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+      # The net itself imports only stdlib, but tests/conftest.py imports app
+      # modules at collection time, so pytest needs the package installed.
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/unit/test_unsampled_counter_documented.py -v

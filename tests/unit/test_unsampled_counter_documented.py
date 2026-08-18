@@ -12,38 +12,41 @@ decay the same way: the doc was correct when LML#1169 wrote it.
 
 So: discover every event name that reaches
 ``core.observability.capture_unsampled_counter`` and require each one to
-appear verbatim somewhere in that doc entry -- in the recorded comma list if
-exempt, in the prose if deliberately excluded. Substring presence rather than
-a parsed format is deliberate: the entry is a 300-word prose line, and a
-format contract over it would be brittle without catching anything this
-doesn't. A ninth counter fails here until its author writes the sentence.
+appear in that doc entry as a whole token -- in the recorded comma list if
+exempt, in the prose if deliberately excluded. Whole-token mention rather than
+a schema over the paragraph is deliberate: the entry is a 300-word prose line,
+and a format contract across all of it would be brittle without catching
+anything this doesn't. One narrow exception is load-bearing:
+:func:`_recorded_exempt_names` does pin the literal "Prod + staging value:"
+fragment, because the reverse/stale check ``docs/testing.md`` requires has to
+know which names the doc claims are live. Reword that fragment and this net
+fails pointing at the doc.
 
-Sibling net: ``tests/unit/test_lifespan_bootstrap_totality.py`` (same
-glob/discover/assert-roster shape, same three accessories ``docs/testing.md``
-requires of this family -- vacuity guard, reverse/stale check, exemption
-roster). Scope note: LML#1216 is an OPEN ticket proposing a *second*, disjoint
-net over the same helper -- that a module pairing ``get_posthog_client`` with
-``.capture(`` must be ``core/observability.py``. It is not written yet, so
-nothing currently guards against a hand-rolled copy of the emit mechanics;
-this net deliberately does not cover that and must not be read as doing so.
-It catches an undocumented event NAME, which is how LML#1217 actually
-happened (LML#1192 hand-rolled nothing after the LML#1204 consolidation).
+Sibling net: ``tests/unit/test_lifespan_bootstrap_totality.py`` -- same
+glob/discover/assert-roster shape, and the same accessories ``docs/testing.md``
+requires of this family. Scope: this net checks that an event NAME is
+classified; it does not check that the emit mechanics route through the shared
+helper, which is LML#1216.
 """
 
 from __future__ import annotations
 
 import ast
+import functools
+import os
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 _ENV_VARS_DOC = _ROOT / "docs" / "env-vars.md"
 _EMITTER = "capture_unsampled_counter"
 _DOC_ENTRY_MARKER = "- `POSTHOG_RATELIMIT_EXEMPT_EVENTS`"
 
-# Trees that cannot contain a production emit site. ``tests`` is excluded so a
-# fixture's stub event name never counts as a real counter needing docs.
-_SKIP_PARTS = frozenset(
+# Directory names never descended into. ``tests`` is skipped so a fixture's
+# stub event name never counts as a real counter needing docs; the rest are
+# vendored or build trees.
+_SKIP_DIRS = frozenset(
     {
         ".venv",
         "venv",
@@ -64,25 +67,33 @@ _SKIP_PARTS = frozenset(
 # exempting it would be legitimate and would never resolve to an LML call site.
 _STALE_LIST_EXEMPT: frozenset[str] = frozenset()
 
-# Discovered counters allowed to go unmentioned in the doc entry. Empty, and
-# adding an entry here defeats the point of the net -- "undocumented" is the
-# exact state LML#1217 reports. Present because ``docs/testing.md`` requires
-# this family to carry a named exemption roster rather than a weakened sweep.
-_UNDOCUMENTED_EXEMPT: frozenset[str] = frozenset()
-
 # How far the resolver will chase an event name through local wrapper calls.
 # One hop covers today's only indirect site (``wikipedia_warm``'s private
-# ``_capture_fetch_outcome(event)``); the cap keeps a cyclic helper from
-# recursing forever.
+# ``_capture_fetch_outcome(event)``); the cap is a cycle guard, so a self- or
+# mutually-recursive wrapper terminates instead of recursing forever.
 _MAX_RESOLVE_HOPS = 2
 
 
+class _Discovery(NamedTuple):
+    events: dict[str, str]
+    """Event name -> the ``path:line`` of the first call site that emits it."""
+    unresolved: list[str]
+    """Call sites whose event name could not be read. Never silently dropped:
+    an unreadable site is exactly as undocumented as a missing one."""
+
+
 def _source_files() -> list[Path]:
-    return [
-        path
-        for path in sorted(_ROOT.rglob("*.py"))
-        if not _SKIP_PARTS & set(path.relative_to(_ROOT).parts)
-    ]
+    """Every candidate source file.
+
+    ``os.walk`` with in-place pruning rather than ``rglob`` + filter: the
+    filter form yields every path under ``.venv`` and discards it afterwards,
+    which is ~95% of the paths and ~17x the wall time.
+    """
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(_ROOT):
+        dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
+        found.extend(Path(dirpath) / name for name in filenames if name.endswith(".py"))
+    return sorted(found)
 
 
 def _module_string_constants(tree: ast.Module) -> dict[str, str]:
@@ -108,13 +119,13 @@ def _emitter_local_names(tree: ast.Module) -> set[str]:
     """Local names the emitter is bound to by ``from ... import`` in this
     module, honouring ``as`` aliases. An aliased import that this ignored
     would make every one of its call sites invisible."""
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if alias.name == _EMITTER:
-                    names.add(alias.asname or alias.name)
-    return names
+    return {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.name == _EMITTER
+    }
 
 
 def _calls_by_name(tree: ast.Module, names: set[str]) -> list[ast.Call]:
@@ -136,8 +147,7 @@ def _emitter_calls(tree: ast.Module) -> list[ast.Call]:
     harmless (it can only demand that a name be documented), while
     under-matching silently reopens LML#1217.
     """
-    local = _emitter_local_names(tree)
-    calls = _calls_by_name(tree, local) if local else []
+    calls = _calls_by_name(tree, _emitter_local_names(tree))
     calls += [
         node
         for node in ast.walk(tree)
@@ -157,17 +167,6 @@ def _enclosing_function(
         ):
             return node
     return None
-
-
-def _parameter_names(function: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
-    """Positional-only, positional, and keyword-only parameters, in the order
-    a caller supplies them positionally. Keyword-only names are appended so
-    they can still be matched by keyword; their index is never used
-    positionally because a caller cannot pass them that way."""
-    args = function.args
-    return [arg.arg for arg in (*args.posonlyargs, *args.args)] + [
-        arg.arg for arg in args.kwonlyargs
-    ]
 
 
 def _resolve(expr: ast.expr, tree: ast.Module, consts: dict[str, str], hops: int = 0) -> set[str]:
@@ -193,28 +192,51 @@ def _resolve(expr: ast.expr, tree: ast.Module, consts: dict[str, str], hops: int
     if not isinstance(expr, ast.Name):
         return set()
     function = _enclosing_function(tree, expr)
-    params = _parameter_names(function) if function is not None else []
-    if function is None or expr.id not in params:
+    if function is None or expr.id not in _parameter_names(function):
         return {consts[expr.id]} if expr.id in consts else set()
-    index = params.index(expr.id)
-    positional = len(function.args.posonlyargs) + len(function.args.args)
+    # Pair names to arguments with zip rather than an index: a keyword-only
+    # name is absent from this list so it can never be matched positionally,
+    # and a call passing fewer arguments than the signature simply truncates.
+    positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
     resolved: set[str] = set()
     for call in _calls_by_name(tree, {function.name}):
-        if index < positional and len(call.args) > index:
-            resolved |= _resolve(call.args[index], tree, consts, hops + 1)
+        for param, argument in zip(positional, call.args, strict=False):
+            if param == expr.id:
+                resolved |= _resolve(argument, tree, consts, hops + 1)
         for keyword in call.keywords:
             if keyword.arg == expr.id:
                 resolved |= _resolve(keyword.value, tree, consts, hops + 1)
     return resolved
 
 
-def _discover_counters() -> tuple[dict[str, str], list[str]]:
-    """``({event name: "path:line"}, [unresolved site descriptions])``."""
+def _parameter_names(function: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Every parameter name, positional or keyword-only. Membership only --
+    ordering lives at the one place that needs it, in :func:`_resolve`."""
+    args = function.args
+    return {arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+
+
+@functools.cache
+def _discover_counters() -> _Discovery:
+    """Sweep the source tree for every event name reaching the emitter.
+
+    Cached: the sweep reads and parses ~240 modules for a result that cannot
+    change within a session, and each test below would otherwise repeat it.
+    """
     events: dict[str, str] = {}
     unresolved: list[str] = []
     for path in _source_files():
+        source = path.read_text(encoding="utf-8")
+        if _EMITTER not in source:
+            # Cheap pre-filter, and the reason this net stays sub-second: a
+            # call to the emitter -- direct, ``as``-aliased, or by attribute
+            # access -- must spell its name somewhere in the file, so a module
+            # that never mentions it cannot hold a call site. Skips parsing
+            # (and a full ``ast.walk``, ~2s across the tree) for the ~97% of
+            # modules that can't match. Cannot produce a false negative.
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = ast.parse(source)
         except SyntaxError:
             # A vendored or generated file that does not parse is not this
             # net's business; failing here would red a PostHog-counter test
@@ -234,9 +256,10 @@ def _discover_counters() -> tuple[dict[str, str], list[str]]:
                 unresolved.append(f"{site} (could not resolve the event-name expression)")
             for name in names:
                 events.setdefault(name, site)
-    return events, unresolved
+    return _Discovery(events, unresolved)
 
 
+@functools.cache
 def _doc_entry() -> str:
     for line in _ENV_VARS_DOC.read_text(encoding="utf-8").splitlines():
         if line.startswith(_DOC_ENTRY_MARKER):
@@ -277,19 +300,36 @@ def test_discovery_finds_the_known_unsampled_counters():
     assert "wikipedia_bio_fetch_reject" in events
 
 
+def test_the_doc_mention_check_rejects_a_name_the_entry_omits():
+    """Negative control for :func:`_is_named_in`, the predicate both checks
+    below rest on.
+
+    Without this, an ``_is_named_in`` that returned True unconditionally would
+    leave every other test in this file green -- the vacuity guard only probes
+    discovery, and the stale check never calls it. The net's central claim
+    would then be asserted but untested. Mirrors
+    ``test_lifespan_bootstrap_totality``'s synthetic-unregistration control.
+    """
+    entry = _doc_entry()
+    assert _is_named_in(entry, "wikipedia_bio_fetch_reject"), "a documented name must be found"
+    assert not _is_named_in(entry, "counter_the_entry_never_mentions")
+    # A prefix of a documented name must not free-ride on it.
+    assert not _is_named_in(entry, "wikipedia_bio_fetch")
+
+
 def test_every_unsampled_counter_event_is_classified_in_env_vars_doc():
     """Every discovered counter must be named in the
     ``POSTHOG_RATELIMIT_EXEMPT_EVENTS`` doc entry -- listed if it is exempt,
     explained if it is deliberately not. Silence is the failure mode LML#1217
     reports: an absent name reads identically whether it was excluded on
-    purpose or simply forgotten."""
-    events, _ = _discover_counters()
+    purpose or simply forgotten.
+
+    Deliberately has no exemption roster. The escape hatch for a counter that
+    should not be exempt already exists and is the point of the ticket: name
+    it in the entry's prose and say why."""
+    events = _discover_counters().events
     entry = _doc_entry()
-    undocumented = sorted(
-        name
-        for name in events
-        if name not in _UNDOCUMENTED_EXEMPT and not _is_named_in(entry, name)
-    )
+    undocumented = sorted(name for name in events if not _is_named_in(entry, name))
     assert not undocumented, (
         f"detached-task counters missing from {_ENV_VARS_DOC.name}'s "
         f"POSTHOG_RATELIMIT_EXEMPT_EVENTS entry: {undocumented}. Add each to the "
@@ -306,11 +346,10 @@ def test_no_stale_names_in_the_recorded_exempt_list():
     counter and the doc keeps advertising it while the Railway variable keeps
     exempting an event nothing emits. That is the same silent drift LML#1217
     reports, pointing the other way."""
-    events, _ = _discover_counters()
-    entry = _doc_entry()
+    events = _discover_counters().events
     stale = sorted(
         name
-        for name in _recorded_exempt_names(entry)
+        for name in _recorded_exempt_names(_doc_entry())
         if name not in _STALE_LIST_EXEMPT and name not in events
     )
     assert not stale, (
