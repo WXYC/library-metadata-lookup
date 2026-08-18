@@ -47,6 +47,10 @@ _WRITER_FILES = (
     _REPO_ROOT / "scripts" / "warm_wikipedia_bios.py",
 )
 
+# The layer that CHOOSES a write-nothing outcome, as of LML#1204 item 2. The
+# writer files above still pass the value; this is where it is decided.
+_VERDICT_MAPPING_FILE = _REPO_ROOT / "lookup" / "wikipedia_pick_validation.py"
+
 
 class TestOutcomeVocabularyOwnership:
     def test_constants_spellings_are_the_shipped_column_values(self):
@@ -82,15 +86,34 @@ class TestOutcomeVocabularyOwnership:
         )
         assert _FAILURE_ISH_OUTCOMES - KNOWN_ATTEMPT_OUTCOMES == frozenset({"repick_kept_existing"})
 
+    def test_the_shared_verdict_mapping_returns_only_named_constants(self):
+        # LML#1204 item 2 raised the outcome DECISION one layer, from the two
+        # writer modules to write_nothing_attempt_outcome. The writer net
+        # below still guards the call sites; this guards the layer that now
+        # chooses the value, where a new branch returning a bare "skipped"
+        # would otherwise mint a vocabulary member no roster knows about.
+        src = _VERDICT_MAPPING_FILE.read_text(encoding="utf-8")
+        start = src.index("def write_nothing_attempt_outcome(")
+        body = src[start : src.index("\ndef ", start + 1)]
+        returns = re.findall(r"^\s+return\s+(.+)$", body, re.M)
+        assert returns, "the mapping's body must be scannable for this net to mean anything"
+        offenders = [r for r in returns if r.startswith(('"', "'"))]
+        assert not offenders, (
+            f"bare string return {offenders} in write_nothing_attempt_outcome -- return an "
+            "OUTCOME_* constant from entity.artist_wikipedia_bio_attempt instead"
+        )
+
     def test_writers_never_pass_a_bare_outcome_literal(self):
         # Source-level: at every record_artist_wikipedia_bio_attempt call
         # site in the writer modules, the outcome kwarg must be a named
         # constant, never a string literal -- the literal form is exactly
         # how the vocabulary drifted across review rounds.
         offenders: list[str] = []
+        scanned = 0
         for path in _WRITER_FILES:
             src = path.read_text(encoding="utf-8")
             for match in re.finditer(r"record_artist_wikipedia_bio_attempt\(", src):
+                scanned += 1
                 # Scan only the call's own argument list (up to its closing
                 # paren), not trailing statements -- the drain assigns its
                 # script-local REPORT labels right after some calls, and
@@ -101,6 +124,10 @@ class TestOutcomeVocabularyOwnership:
                 if kwarg is not None:
                     line = src.count("\n", 0, match.start()) + 1
                     offenders.append(f"{path.name}:{line}")
+        # Vacuity guard (docs/testing.md): a renamed writer function or a moved
+        # module would otherwise leave this net scanning zero call sites and
+        # passing silently, which is the failure mode it exists to prevent.
+        assert scanned >= 4, f"expected the known writer call sites, scanned {scanned}"
         assert not offenders, (
             f'bare outcome="..." literal at {offenders} -- import the OUTCOME_* constant '
             "from entity.artist_wikipedia_bio_attempt instead"

@@ -29,7 +29,8 @@ import logging
 import sentry_sdk
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
-from core.search import resolve_bool_env, resolve_positive_int_env
+from core.env import resolve_bool_env
+from core.search import resolve_positive_int_env
 from generated.api_models import DegradedReason
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,7 @@ def is_shed_enforced() -> bool:
 
     Default OFF (absent env → False): merging this module changes no
     response, only begins collecting ``would_shed`` telemetry. Read at
-    request time via the shared ``core.search.resolve_bool_env``
+    request time via the shared ``core.env.resolve_bool_env``
     (LML#1204 item 3) — a no-redeploy Railway lever.
     """
     return resolve_bool_env(ADMISSION_SHED_ENFORCE_ENV_VAR, default=False)

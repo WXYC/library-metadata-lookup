@@ -36,10 +36,23 @@ the final answer, so it stays deterministic/total without needing to be
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from clients.wikipedia import WikipediaFetchError, WikipediaSummary
-from lookup.wikipedia_pick_validation import resolve_and_validate_pick
+from entity.artist_wikipedia_bio_attempt import (
+    OUTCOME_DECLINED,
+    OUTCOME_TRUNCATED,
+    OUTCOME_UNRESOLVABLE,
+)
+from lookup.wikipedia_pick_validation import (
+    ValidatedPick,
+    make_summary_fetcher,
+    resolve_and_validate_pick,
+    write_nothing_attempt_outcome,
+)
+from lookup.wikipedia_url import PickedWikiUrl
 
 # The ten-page table, keyed by pair name. Each fetch outcome mirrors the
 # live ground truth above via clients.wikipedia.WikipediaClient's own
@@ -542,9 +555,6 @@ class TestMakeSummaryFetcher:
     callers used to hand-build around ``WikipediaClient.get_summary``."""
 
     async def test_converts_the_url_to_a_title_and_forwards_the_knobs(self):
-        from unittest.mock import AsyncMock
-
-        from lookup.wikipedia_pick_validation import make_summary_fetcher
 
         client = AsyncMock()
         client.get_summary = AsyncMock(return_value=_SUMMARY)
@@ -559,9 +569,6 @@ class TestMakeSummaryFetcher:
         )
 
     async def test_rate_limiter_defaults_to_none(self):
-        from unittest.mock import AsyncMock
-
-        from lookup.wikipedia_pick_validation import make_summary_fetcher
 
         client = AsyncMock()
         client.get_summary = AsyncMock(return_value=None)
@@ -574,9 +581,6 @@ class TestMakeSummaryFetcher:
         )
 
     async def test_an_unparseable_url_returns_none_without_fetching(self):
-        from unittest.mock import AsyncMock
-
-        from lookup.wikipedia_pick_validation import make_summary_fetcher
 
         client = AsyncMock()
         fetch = make_summary_fetcher(client, max_retries=1)
@@ -592,8 +596,6 @@ class TestWriteNothingAttemptOutcome:
     beside ``ValidatedPick``; only pg/dry-run plumbing stays caller-side."""
 
     def _pick(self, *, below_floor: bool):
-        from lookup.wikipedia_url import PickedWikiUrl
-
         return PickedWikiUrl(
             url="https://en.wikipedia.org/wiki/Stereolab",
             lang="en",
@@ -602,22 +604,10 @@ class TestWriteNothingAttemptOutcome:
         )
 
     def test_no_candidate_at_all_is_unresolvable(self):
-        from entity.artist_wikipedia_bio_attempt import OUTCOME_UNRESOLVABLE
-        from lookup.wikipedia_pick_validation import (
-            ValidatedPick,
-            write_nothing_attempt_outcome,
-        )
-
         result = ValidatedPick(picked=None, summary=None)
         assert write_nothing_attempt_outcome(result) is OUTCOME_UNRESOLVABLE
 
     def test_truncated_is_truncated(self):
-        from entity.artist_wikipedia_bio_attempt import OUTCOME_TRUNCATED
-        from lookup.wikipedia_pick_validation import (
-            ValidatedPick,
-            write_nothing_attempt_outcome,
-        )
-
         result = ValidatedPick(
             picked=self._pick(below_floor=True),
             summary=None,
@@ -627,34 +617,18 @@ class TestWriteNothingAttemptOutcome:
         assert write_nothing_attempt_outcome(result) is OUTCOME_TRUNCATED
 
     def test_zero_fetch_below_floor_is_declined(self):
-        from entity.artist_wikipedia_bio_attempt import OUTCOME_DECLINED
-        from lookup.wikipedia_pick_validation import (
-            ValidatedPick,
-            write_nothing_attempt_outcome,
-        )
-
         result = ValidatedPick(
             picked=self._pick(below_floor=True), summary=None, live_fetch_attempted=False
         )
         assert write_nothing_attempt_outcome(result) is OUTCOME_DECLINED
 
     def test_a_fetched_and_exhausted_negative_supports_a_content_write(self):
-        from lookup.wikipedia_pick_validation import (
-            ValidatedPick,
-            write_nothing_attempt_outcome,
-        )
-
         result = ValidatedPick(
             picked=self._pick(below_floor=True), summary=None, live_fetch_attempted=True
         )
         assert write_nothing_attempt_outcome(result) is None
 
     def test_a_winning_pick_supports_a_content_write(self):
-        from lookup.wikipedia_pick_validation import (
-            ValidatedPick,
-            write_nothing_attempt_outcome,
-        )
-
         result = ValidatedPick(
             picked=self._pick(below_floor=False),
             summary=_SUMMARY,

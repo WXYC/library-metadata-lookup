@@ -130,13 +130,19 @@ class TestOwnershipBoilerplate:
     this table wasn't lifespan-bootstrapped; round 6 C2-3 made the helper's
     text true again)."""
 
-    def test_spec_header_embeds_the_shared_ownership_paragraph(self):
-        # The generated .sql necessarily carries the same paragraph: the
-        # LML#1204 item-7 byte-identical sidecar pin covers file<->spec
-        # parity, and build_reference embeds spec.header verbatim.
+    def test_every_spec_header_embeds_the_shared_ownership_paragraph(self):
+        # Asserted over the whole registry, not just the entry that regressed:
+        # binding one spec would let the eleventh -- or a future edit to any of
+        # the other nine -- re-inline a forked paragraph and stay green,
+        # including under the item-7 byte-pin, which only proves the .sql
+        # matches whatever the spec says. The generated .sql necessarily
+        # carries the same paragraph: build_reference embeds spec.header
+        # verbatim, and item 7 covers file<->spec parity.
         from scripts.regenerate_lml_cache_sql import _MODULES, _ownership_boilerplate
 
-        expected = _ownership_boilerplate(
-            "artist_wikipedia_bio_attempt", "set_up_artist_wikipedia_bio_attempt_schema"
-        )
-        assert expected in _MODULES["artist_wikipedia_bio_attempt"].header
+        assert _MODULES, "the registry must be non-empty for this net to mean anything"
+        for name, spec in _MODULES.items():
+            # Setup-function name by convention (all ten follow it), so a spec
+            # whose header names the WRONG setup function fails here too.
+            expected = _ownership_boilerplate(name, f"set_up_{name}_schema")
+            assert expected in spec.header, f"{name} does not use the shared ownership paragraph"
