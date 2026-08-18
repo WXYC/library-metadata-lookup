@@ -252,7 +252,7 @@ class TestBulkLookupEndpoint:
             async with AsyncClient(
                 transport=ASGITransport(app=app_client), base_url="http://test"
             ) as ac:
-                with caplog.at_level(logging.WARNING, logger="lookup.router"):
+                with caplog.at_level(logging.WARNING, logger="core.search"):
                     resp = await ac.post(
                         "/api/v1/lookup/bulk",
                         json={
@@ -294,7 +294,7 @@ class TestBulkLookupEndpoint:
             async with AsyncClient(
                 transport=ASGITransport(app=app_client), base_url="http://test"
             ) as ac:
-                with caplog.at_level(logging.WARNING, logger="lookup.router"):
+                with caplog.at_level(logging.WARNING, logger="core.search"):
                     resp = await ac.post(
                         "/api/v1/lookup/bulk",
                         json={
@@ -965,7 +965,7 @@ class TestBulkLookupEndpoint:
             async with AsyncClient(
                 transport=ASGITransport(app=app_client), base_url="http://test"
             ) as ac:
-                with caplog.at_level(logging.WARNING, logger="lookup.router"):
+                with caplog.at_level(logging.WARNING, logger="core.search"):
                     resp = await ac.post(
                         "/api/v1/lookup/bulk",
                         json={"items": [{"artist": "Cat Power", "album": "Moon Pix"}]},
@@ -978,7 +978,7 @@ class TestBulkLookupEndpoint:
         ), "Expected a fallback warning for malformed LML_BULK_MAX_CONCURRENT"
 
     @pytest.mark.asyncio
-    async def test_zero_concurrency_env_falls_back_to_the_default(self, app_client, monkeypatch):
+    async def test_zero_concurrency_env_does_not_hang_the_batch(self, app_client, monkeypatch):
         """`LML_BULK_MAX_CONCURRENT=0` must not hang the batch.
 
         Until LML#1215 this route floored `0` to 1 — serializing the batch,
