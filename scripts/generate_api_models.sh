@@ -18,17 +18,33 @@
 # pinning it there would silence the drift signal. See WXYC/wxyc-shared#319 and
 # docs/scripts.md.
 #
-# When GH_TOKEN or GITHUB_TOKEN is set (GH_TOKEN wins, matching gh's own
-# precedence -- `gh help environment`), the GitHub download authenticates via a
-# Bearer Authorization header: anonymous raw.githubusercontent.com requests
-# share a per-IP rate budget across the Actions runner pool and intermittently
-# 429 (#1205), while authenticated ones get a per-token budget. The header
-# rides curl's stdin, so the token value never reaches argv (visible in `ps`)
-# or the log, and both variables are unset after capture so the codegen
-# toolchain never sees them. A failed authenticated attempt retries once
-# anonymously -- GitHub 404s (not 401s) raw requests carrying a stale token, so
-# without the fallback an expired ambient token would break previously-working
-# local runs. Unset-token runs are unchanged.
+# CANONICAL RATIONALE for the token flow (#1205) -- ci.yml and the docs point
+# here rather than restating it. When GH_TOKEN or GITHUB_TOKEN is set (GH_TOKEN
+# wins, matching gh's own precedence -- `gh help environment`), the GitHub
+# download authenticates via a Bearer Authorization header: anonymous
+# raw.githubusercontent.com requests share a per-IP rate budget across the
+# Actions runner pool and intermittently 429, while authenticated ones get a
+# per-token budget. Three properties, each pinned by a test in
+# tests/unit/test_generate_api_models_auth.py:
+#
+#   1. The header rides curl's stdin (-H @-), so the token value never reaches
+#      argv (visible in `ps`) or the log.
+#   2. Both variables are unset at the top of the script -- above the
+#      source-resolution branch, so no child process inherits the token on
+#      EITHER arm. The sibling-checkout arm never downloads, so a scrub placed
+#      inside the download branch would miss the default local invocation.
+#   3. A failed authenticated attempt retries once anonymously, unconditionally.
+#      The motivating case is a stale token (GitHub 404s -- not 401s -- raw
+#      requests carrying one, with no server-side anonymous fallback), but the
+#      retry is not gated on that status: pre-#1205 anonymous behavior is the
+#      floor in every environment. On a transient failure it costs one extra
+#      attempt, which is the intended trade -- the anonymous per-IP budget is a
+#      different bucket from the per-token one, so it can still succeed after
+#      an authenticated 429.
+#
+# Unset-token runs are unchanged, apart from a stderr note saying the download
+# is anonymous -- so losing the CI token surfaces as a visible regression
+# rather than as a return of the original intermittent 429.
 #
 # --download-only stops after resolving/fetching api.yaml, skipping codegen and
 # formatting. It exists for the unit tests covering the download branch
@@ -71,6 +87,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Capture the ambient GitHub token (#1205; GH_TOKEN wins, matching gh's own
+# precedence -- `gh help environment`) and immediately drop both names from the
+# environment. Done HERE, before the source resolution below, because the scrub
+# is a property of the whole script rather than of the download arm: the
+# sibling-checkout arm never downloads, and leaving the unset inside the
+# download branch would hand the token to datamodel-codegen, ruff, and their
+# whole dependency tree on the default local invocation. Only the download
+# needs the value, and it travels from this variable, never the environment.
+AUTH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+unset GITHUB_TOKEN GH_TOKEN
+
 # Resolve api.yaml source. Inside a worktree, `git rev-parse --show-toplevel`
 # returns the worktree path, not the main repo, so use --git-common-dir to find
 # the real repo root.
@@ -104,34 +131,33 @@ else
         echo "  Unpinned: resolving wxyc-shared 'main' as of now. Pass --ref <sha> to pin." >&2
     fi
     API_YAML_URL="https://raw.githubusercontent.com/WXYC/wxyc-shared/${REF}/api.yaml"
-    # Ambient GitHub token (#1205): authenticated raw downloads get a per-token
-    # rate budget instead of the Actions runner pool's shared per-IP one, which
-    # intermittently 429s. GH_TOKEN is preferred over GITHUB_TOKEN, matching
-    # gh's own precedence (`gh help environment`). Captured into a shell
-    # variable and immediately dropped from the environment: only the download
-    # needs it, so the codegen/ruff child processes never inherit it.
-    AUTH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-    unset GITHUB_TOKEN GH_TOKEN
     # --max-time/--retry mirror wxyc-shared's generate-python-models.sh pin for
     # this same download; curl's --retry also covers 429/5xx, honoring
     # Retry-After, which directly serves the #1205 goal.
     CURL_OPTS=(-sSfL --max-time 30 --retry 3)
+    # One definition of the URL/output pairing, called with or without the
+    # header argument, so the three ways in can't drift apart.
+    _fetch_api_yaml() { curl "${CURL_OPTS[@]}" "$@" "$API_YAML_URL" -o "$API_YAML"; }
     if [[ -n "$AUTH_TOKEN" ]]; then
         echo "  Authenticated download: sending Authorization header (token value not logged)." >&2
         # -H @- reads the header from stdin, keeping the token off the process
-        # argv (visible in `ps` on shared hosts). A stale/revoked token makes
-        # raw.githubusercontent.com return 404 -- not 401 -- with no anonymous
-        # fallback server-side, so a failed authenticated attempt retries once
-        # anonymously: pre-#1205 anonymous behavior is the floor in every
-        # environment, and a genuinely bad ref still fails (the anonymous
-        # retry 404s too).
-        if ! printf 'Authorization: Bearer %s\n' "$AUTH_TOKEN" \
-            | curl "${CURL_OPTS[@]}" -H @- "$API_YAML_URL" -o "$API_YAML"; then
+        # argv (visible in `ps` on shared hosts). The retry below is
+        # deliberately UNconditional rather than gated on the stale-token 404
+        # described in the header: pre-#1205 anonymous behavior is the floor in
+        # every environment. It costs a second attempt on a transient failure,
+        # which is the intended trade -- the anonymous per-IP budget is a
+        # different bucket from the per-token one, so it can still succeed
+        # after an authenticated 429. A genuinely bad ref fails either way.
+        if ! printf 'Authorization: Bearer %s\n' "$AUTH_TOKEN" | _fetch_api_yaml -H @-; then
             echo "  Authenticated download failed; retrying anonymously (is the ambient token stale?)..." >&2
-            curl "${CURL_OPTS[@]}" "$API_YAML_URL" -o "$API_YAML"
+            _fetch_api_yaml
         fi
     else
-        curl "${CURL_OPTS[@]}" "$API_YAML_URL" -o "$API_YAML"
+        # Say so: without this line a dropped `GITHUB_TOKEN:` in the workflow
+        # step silently reverts CI to the anonymous path #1205 exists to leave,
+        # and the regression presents as the original intermittent 429.
+        echo "  No GH_TOKEN/GITHUB_TOKEN set: downloading anonymously (shared per-IP rate budget)." >&2
+        _fetch_api_yaml
     fi
     echo "Downloaded to $API_YAML"
 fi

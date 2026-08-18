@@ -11,8 +11,13 @@ properties pinned here:
 - a failed authenticated attempt retries once anonymously -- GitHub 404s (not
   401s) raw requests carrying a stale token, so without the fallback an expired
   ambient token would turn previously-working local runs into hard 404s;
-- the token is dropped from the environment after capture, so the codegen
-  toolchain that runs after the download never sees it.
+- the token is dropped from the environment at the top of the script, before
+  the source-resolution branch, so no child process inherits it on EITHER arm
+  -- the sibling-checkout arm never downloads, so a scrub placed inside the
+  download branch misses the default local invocation entirely.
+
+See the script's header comment for the canonical rationale; this module pins
+the properties, it does not restate the reasoning.
 
 Following the ``test_check_plan_links.py`` precedent, each test runs the real
 script via subprocess -- hermetically: a stub ``curl`` first on ``PATH``
@@ -56,9 +61,11 @@ def _install_curl_stub(tmp_path: Path) -> None:
     makes the auth-then-anonymous-fallback retry assertable as two distinct
     calls.
 
-    Failure knob: if ``curl_fail_remaining`` exists, the call exits 22 (curl's
-    HTTP-error code) after recording, and the file's counter is decremented
-    away -- write ``1`` to fail only the first call, ``2`` to fail both.
+    Failure knob: if ``curl_fail_remaining`` exists, calls up to and including
+    the number it contains exit 22 (curl's HTTP-error code) after recording --
+    write ``1`` to fail only the first call, ``2`` to fail both. Compared
+    against the call ordinal the stub already computes, so the marker file is
+    read-only state rather than a decrementing counter.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -74,17 +81,46 @@ def _install_curl_stub(tmp_path: Path) -> None:
         'for arg in "$@"; do printf "%s\\n" "$arg" >> "$calls_dir/$n.argv"; done\n'
         'cat > "$calls_dir/$n.stdin"\n'
         "env | grep -E '^(GITHUB_TOKEN|GH_TOKEN)=' > \"$calls_dir/$n.env\" || true\n"
-        'if [ -e "$fail_marker" ]; then\n'
-        '    remaining=$(cat "$fail_marker")\n'
-        '    if [ "$remaining" -gt 1 ]; then\n'
-        '        printf "%s\\n" "$((remaining - 1))" > "$fail_marker"\n'
-        "    else\n"
-        '        rm -f "$fail_marker"\n'
-        "    fi\n"
-        "    exit 22\n"
-        "fi\n"
+        '[ -e "$fail_marker" ] && [ "$n" -le "$(cat "$fail_marker")" ] && exit 22\n'
+        "exit 0\n"
     )
     stub.chmod(0o755)
+
+
+def _install_env_recording_stub(tmp_path: Path, name: str) -> None:
+    """Install a stub ``name`` on ``PATH`` that records its own environment.
+
+    Used for the codegen/ruff stages, which the curl stub can't stand in for:
+    the sibling-checkout arm never runs curl at all, so the token-scrub
+    property has to be observed at the tools that actually run after it.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / name
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"env | grep -E '^(GITHUB_TOKEN|GH_TOKEN)=' > \"{tmp_path}/{name}.env\" || true\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+
+
+def _set_up_sibling_checkout(tmp_path: Path) -> Path:
+    """Lay out a repo + sibling ``wxyc-shared/api.yaml`` and return the script copy.
+
+    The script resolves the sibling from its own location via
+    ``git rev-parse --git-common-dir``, so the copy needs a real repo around
+    it for the local-checkout arm to be selected.
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    script_copy = repo / "scripts" / "generate_api_models.sh"
+    shutil.copy(_SCRIPT, script_copy)
+    sibling = tmp_path / "wxyc-shared"
+    sibling.mkdir()
+    (sibling / "api.yaml").write_text("openapi: 3.0.0\n")
+    return script_copy
 
 
 class _CurlCall(TypedDict):
@@ -139,21 +175,16 @@ def _run_download(
     )
 
 
-def _assert_authenticated_argv(argv: list[str], ref: str = "deadbeef") -> None:
-    """The full authenticated invocation: pinned options, header via stdin
-    (``-H @-`` -- the token itself must never ride argv), the real raw URL,
-    and ``-o`` paired with a download target."""
-    *head, o_flag, out_path = argv
-    assert head == [*_CURL_COMMON, "-H", "@-", _url(ref)]
-    assert o_flag == "-o"
-    assert out_path
+def _assert_argv(argv: list[str], *, authenticated: bool, ref: str = "deadbeef") -> None:
+    """The full curl invocation, asserted as one expression.
 
-
-def _assert_anonymous_argv(argv: list[str], ref: str = "deadbeef") -> None:
-    """The full anonymous invocation: byte-identical to the pre-#1205 command
-    apart from the org-pinned --max-time/--retry options."""
+    The anonymous form is the pre-#1205 command plus the org-pinned
+    --max-time/--retry options; the authenticated form is that command plus
+    ``-H @-``, which reads the header from stdin so the token itself never
+    rides argv. Both end in ``-o`` paired with a download target.
+    """
     *head, o_flag, out_path = argv
-    assert head == [*_CURL_COMMON, _url(ref)]
+    assert head == [*_CURL_COMMON, *(["-H", "@-"] if authenticated else []), _url(ref)]
     assert o_flag == "-o"
     assert out_path
 
@@ -170,7 +201,7 @@ def test_token_attaches_authorization_header_without_leaking(tmp_path, token_var
     assert result.returncode == 0, result.stderr
     calls = _calls(tmp_path)
     assert len(calls) == 1
-    _assert_authenticated_argv(calls[0]["argv"])
+    _assert_argv(calls[0]["argv"], authenticated=True)
     assert calls[0]["stdin"] == f"Authorization: Bearer {_TOKEN}\n"
     assert not any(_TOKEN in arg for arg in calls[0]["argv"])
     # Acceptance: the authenticated path is observable in the log...
@@ -199,7 +230,13 @@ def test_gh_token_takes_precedence_over_github_token(tmp_path):
 
 def test_no_token_sends_no_authorization_header(tmp_path):
     """Unset-token local runs behave exactly as before: one anonymous download,
-    no Authorization header anywhere, no authenticated-path note."""
+    no Authorization header anywhere, no authenticated-path note.
+
+    The anonymous arm still says so on stderr. Without that advisory, dropping
+    ``GITHUB_TOKEN:`` from the workflow step would silently revert CI to the
+    unauthenticated path #1205 exists to leave, presenting as the original
+    intermittent 429 rather than as the configuration regression it is.
+    """
     _install_curl_stub(tmp_path)
 
     result = _run_download(tmp_path, {})
@@ -207,10 +244,11 @@ def test_no_token_sends_no_authorization_header(tmp_path):
     assert result.returncode == 0, result.stderr
     calls = _calls(tmp_path)
     assert len(calls) == 1
-    _assert_anonymous_argv(calls[0]["argv"])
+    _assert_argv(calls[0]["argv"], authenticated=False)
     assert "Authorization" not in calls[0]["stdin"]
     assert not any("Authorization" in arg for arg in calls[0]["argv"])
     assert "Authenticated download" not in result.stdout + result.stderr
+    assert "downloading anonymously" in result.stderr
 
 
 def test_failed_authenticated_download_falls_back_to_anonymous(tmp_path):
@@ -225,8 +263,8 @@ def test_failed_authenticated_download_falls_back_to_anonymous(tmp_path):
     assert result.returncode == 0, result.stderr
     calls = _calls(tmp_path)
     assert len(calls) == 2
-    _assert_authenticated_argv(calls[0]["argv"])
-    _assert_anonymous_argv(calls[1]["argv"])
+    _assert_argv(calls[0]["argv"], authenticated=True)
+    _assert_argv(calls[1]["argv"], authenticated=False)
     assert "retrying anonymously" in result.stderr
     assert _TOKEN not in result.stdout
     assert _TOKEN not in result.stderr
@@ -268,7 +306,7 @@ def test_unpinned_main_download_is_authenticated(tmp_path):
     assert result.returncode == 0, result.stderr
     calls = _calls(tmp_path)
     assert len(calls) == 1
-    _assert_authenticated_argv(calls[0]["argv"], ref="main")
+    _assert_argv(calls[0]["argv"], authenticated=True, ref="main")
     assert calls[0]["stdin"] == f"Authorization: Bearer {_TOKEN}\n"
 
 
@@ -284,3 +322,29 @@ def test_token_is_dropped_from_child_process_environment(tmp_path):
     calls = _calls(tmp_path)
     assert len(calls) == 1
     assert calls[0]["env"] == ""
+
+
+@pytest.mark.parametrize("tool", ["datamodel-codegen", "ruff"])
+def test_token_is_dropped_on_the_sibling_checkout_path_too(tmp_path, tool):
+    """The scrub is a property of the whole script, not of the download arm.
+
+    docs/env-vars.md, docs/scripts.md and the ci.yml comment all state it
+    unconditionally ("unsets both variables before the codegen toolchain
+    runs"), and the default local invocation -- an ambient GH_TOKEN plus a
+    sibling wxyc-shared checkout -- takes the arm that never downloads. If the
+    capture/unset lives inside the download branch, that arm hands the token
+    to datamodel-codegen, ruff, and their whole dependency tree.
+    """
+    _install_env_recording_stub(tmp_path, "datamodel-codegen")
+    _install_env_recording_stub(tmp_path, "ruff")
+    script_copy = _set_up_sibling_checkout(tmp_path)
+
+    result = _run_download(
+        tmp_path, {"GH_TOKEN": _TOKEN, "GITHUB_TOKEN": _TOKEN}, args=[], script=script_copy
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Using local api.yaml" in result.stdout, "fixture must exercise the sibling arm"
+    assert (tmp_path / f"{tool}.env").read_text() == ""
+    assert _TOKEN not in result.stdout
+    assert _TOKEN not in result.stderr

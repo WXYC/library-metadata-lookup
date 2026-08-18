@@ -56,12 +56,10 @@ jobs:
       # falls back to PATH, where the editable install lands the binaries.
       - run: pip install -e ".[dev]"
       # GITHUB_TOKEN authenticates the raw.githubusercontent.com download of
-      # api.yaml: anonymous fetches share a per-IP budget across the runner
-      # pool and intermittently 429 (#1205). The workflow's contents:read
-      # token is enough -- wxyc-shared is public. The step-level env is only
-      # the delivery mechanism: the script captures the token for the download
-      # and unsets it before the codegen toolchain runs, so datamodel-codegen
-      # and its dependency tree never see it.
+      # api.yaml (#1205). The step-level env is only the delivery mechanism --
+      # the script owns the handling, and its header comment is the one place
+      # the rationale and the token-safety properties are written down. The
+      # workflow's contents:read token is enough: wxyc-shared is public.
       - run: bash scripts/generate_api_models.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
