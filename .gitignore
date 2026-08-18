@@ -76,3 +76,9 @@ artifacts/
 
 # Claude Code local config
 .claude/
+
+# Artifacts of running scripts/install_actionlint.sh outside Actions, where
+# RUNNER_TEMP is unset and both the installer script and the ~6MB binary land
+# in the working directory.
+/actionlint
+/download-actionlint.bash

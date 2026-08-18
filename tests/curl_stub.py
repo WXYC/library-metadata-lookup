@@ -44,12 +44,6 @@ def install_curl_stub(tmp_path: Path) -> None:
     write ``1`` to fail only the first call, ``2`` to fail both. Compared
     against the call ordinal the stub already computes, so the marker file is
     read-only state rather than a decrementing counter.
-
-    Payload knob: if ``curl_payload`` exists, its contents are written to the
-    path following ``-o`` on a successful call. ``generate_api_models.sh``'s
-    tests stop the script before anything reads the download
-    (``--download-only``), but ``install_actionlint.sh`` immediately *executes*
-    what it fetched, so that suite needs the stub to produce a real file.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -58,24 +52,14 @@ def install_curl_stub(tmp_path: Path) -> None:
         "#!/usr/bin/env bash\n"
         f'calls_dir="{tmp_path / "curl_calls"}"\n'
         f'fail_marker="{tmp_path / "curl_fail_remaining"}"\n'
-        f'payload="{tmp_path / "curl_payload"}"\n'
         'mkdir -p "$calls_dir"\n'
-        "n=$(find \"$calls_dir\" -name '*.argv' | wc -l | tr -d ' ')\n"
+        "n=$(find \"$calls_dir\" -name '*.argv' | wc -l)\n"
         "n=$((n + 1))\n"
         ': > "$calls_dir/$n.argv"\n'
         'for arg in "$@"; do printf "%s\\n" "$arg" >> "$calls_dir/$n.argv"; done\n'
         'cat > "$calls_dir/$n.stdin"\n'
         "env | grep -E '^(GITHUB_TOKEN|GH_TOKEN)=' > \"$calls_dir/$n.env\" || true\n"
         '[ -e "$fail_marker" ] && [ "$n" -le "$(cat "$fail_marker")" ] && exit 22\n'
-        # -o's argument is the download target. Only written when the test asked
-        # for a payload, so the no-payload suites see the pre-existing behavior.
-        'if [ -e "$payload" ]; then\n'
-        '    prev=""\n'
-        '    for arg in "$@"; do\n'
-        '        if [ "$prev" = "-o" ]; then cp "$payload" "$arg"; break; fi\n'
-        '        prev="$arg"\n'
-        "    done\n"
-        "fi\n"
         "exit 0\n"
     )
     stub.chmod(0o755)
