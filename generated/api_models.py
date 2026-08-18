@@ -2540,7 +2540,14 @@ class LibrarySearchItem(BaseModel):
     A single item from LML's library catalog search.
     """
 
-    id: int
+    id: int | None = Field(
+        ...,
+        description="The release's Backend identifier — `wxyc_schema.library.id` — once the proxy id re-map (WXYC/Backend-Service#2168) ships. Until that deploy it still carries the library.db legacy id, the same value as `legacy_release_id` below, because library.db has no other id to give. The distinction is not cosmetic: the two spaces are numerically coextensive but unrelated, and an id read in the wrong one lands on a *different real release* 87.7% of the time (WXYC/dj-site#1179) — a silently wrong album link, not a miss.\n\nRequired but nullable. A `null` here comes only from Backend's proxy rewrite path (`GET /proxy/library/search`), for a row whose legacy id has no Backend counterpart: 609 of 64,731 library.db rows as measured 2026-08-14 (599 collapsed into a sibling sharing their `LIBRARY_CODE`, 10 absent outright), all of them already unreachable from the dj-site picker. LML's own `GET /library/search` never emits null here.\n",
+    )
+    legacy_release_id: int | None = Field(
+        None,
+        description="The library.db producer key — upstream tubafrenzy `LIBRARY_RELEASE.ID`, or the Backend mint floored at 1,000,000 for Backend-authored catalog rows (WXYC/Backend-Service#1963). This is the space LML's own per-release reads resolve against, and the id embedded in `library_url` below; Backend's serial `library.id` is not in it. Optional and nullable for wire compatibility only — absent means the producer predates WXYC/Backend-Service#2167, in which case `id` above still carries this value.\n",
+    )
     title: str | None = None
     artist: str | None = None
     call_letters: str | None = None
@@ -2554,7 +2561,7 @@ class LibrarySearchItem(BaseModel):
     call_number: str | None = Field(None, description='Computed call number (e.g. "Rock CD S 1/1")')
     library_url: str | None = Field(
         None,
-        description="Per-release dj.wxyc.org permalink for this release. Points at the dj-site legacy front door `/dashboard/album/legacy/{id}`, which resolves the legacy library `id` to the canonical release route server-side and 308-redirects. Null when unavailable.\n",
+        description="Per-release dj.wxyc.org permalink for this release. Points at the dj-site legacy front door `/dashboard/album/legacy/{id}`, whose `{id}` segment is the `legacy_release_id` above — not this row's `id`, which the proxy re-map (WXYC/Backend-Service#2168) moves into Backend's serial space. The front door resolves that legacy id to the canonical release route server-side and 308-redirects. Null when unavailable.\n",
     )
     matched_via: list[TrackMatchHint] | None = Field(
         None,
