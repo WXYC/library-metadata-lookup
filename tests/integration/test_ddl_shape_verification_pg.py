@@ -42,21 +42,12 @@ CREATE TABLE IF NOT EXISTS lml_cache.{_TABLE} (
 _DDL_ADD_COLUMN = f"ALTER TABLE lml_cache.{_TABLE} ADD COLUMN IF NOT EXISTS album TEXT"
 _DDL_INDEX = f"CREATE INDEX IF NOT EXISTS {_INDEX} ON lml_cache.{_TABLE} (artist)"
 
-# Two statements that both parse as the `album` column expectation but that
-# PostgreSQL rejects, standing in for the observed lock timeout without making
-# the test hold a conflicting lock for the bootstrap's full 10s lock_timeout.
-#
-# They fail for different reasons on purpose, because PG's IF NOT EXISTS
-# short-circuits BEFORE resolving the column type: the unresolvable-type form
-# fails only while the column is absent, and quietly succeeds once it exists.
-# So the "column absent" case needs the first form and the "column already
-# present" case needs the second, whose trailing clause fails either way.
+# Parses as the `album` column expectation and fails only while the column is
+# absent: PG's IF NOT EXISTS short-circuits BEFORE resolving the column type, so
+# once `album` exists this statement quietly succeeds. That makes it exactly the
+# "the ALTER failed and the column really is missing" fixture and nothing else.
 _DDL_ADD_COLUMN_FAILS_WHEN_ABSENT = (
     f"ALTER TABLE lml_cache.{_TABLE} ADD COLUMN IF NOT EXISTS album no_such_type"
-)
-_DDL_ADD_COLUMN_FAILS_ALWAYS = (
-    f"ALTER TABLE lml_cache.{_TABLE} ADD COLUMN IF NOT EXISTS album TEXT, "
-    "ADD COLUMN artist TEXT"  # artist already exists, and there is no IF NOT EXISTS
 )
 
 
@@ -118,6 +109,18 @@ class TestCatalogQueriesAgainstRealPostgres:
 
         assert missing == ["schema lml_cache_does_not_exist"]
 
+    async def test_an_unquoted_mixed_case_identifier_matches_the_folded_catalog(self, pg_source):
+        """Only PostgreSQL can prove this one: it folds unquoted identifiers to
+        lowercase and the catalog stores them folded, so an as-written capture
+        would read a perfectly healthy object as absent. The unit suite's fake
+        catalog cannot distinguish the two -- it stores whatever it is handed."""
+        with verifying_lml_cache_shape():
+            await bootstrap_lml_cache_table(pg_source, _DDL_SCHEMA, _DDL_TABLE, _DDL_ADD_COLUMN)
+
+        mixed_case = f"ALTER TABLE lml_cache.{_TABLE.upper()} ADD COLUMN IF NOT EXISTS ALBUM TEXT"
+
+        assert await _missing_objects(pg_source, parse_expected_shape((mixed_case,))) == []
+
     async def test_the_live_lml_cache_schema_is_present(self, pg_source):
         """The schema query's positive case. Without it, a query that returned
         nothing for everything would still pass the test above."""
@@ -142,14 +145,31 @@ class TestFailedDdlAgainstRealPostgres:
         assert f"column lml_cache.{_TABLE}.album" in str(excinfo.value)
         assert excinfo.value.__cause__ is not None, "the PG error must stay in the traceback"
 
-    async def test_a_failed_alter_whose_column_already_exists_is_a_no_op(self, pg_source, caplog):
+    async def test_a_failed_alter_whose_column_already_exists_is_a_no_op(
+        self, pg_pool, pg_source, caplog
+    ):
         """The incident as it actually happened: the statement failed against a
         table that already had the column, so nothing was degraded. It must warn
-        and return, leaving the caller free to run its remaining bootstraps."""
+        and return, leaving the caller free to run its remaining bootstraps.
+
+        Provoked with a genuine lock timeout, holding ACCESS EXCLUSIVE from a
+        second connection, because there is no cheaper way to reach this state
+        honestly: all four recognized DDL forms are idempotent by construction,
+        so once a statement's objects are deployed the statement cannot fail on
+        its own. A rejected statement whose expectation is nonetheless satisfied
+        therefore needs an EXTERNAL cause -- which is what the 2026-08-17 boot
+        hit. Costs the bootstrap's full 10s ``lock_timeout``; it is the only
+        slow test here and it buys the one path where a real failure is
+        provably harmless.
+        """
         with verifying_lml_cache_shape():
             await bootstrap_lml_cache_table(pg_source, _DDL_SCHEMA, _DDL_TABLE, _DDL_ADD_COLUMN)
 
-            with caplog.at_level("WARNING"):
-                await bootstrap_lml_cache_table(pg_source, _DDL_ADD_COLUMN_FAILS_ALWAYS)
+            async with pg_pool.acquire() as blocker:
+                async with blocker.transaction():
+                    await blocker.execute(f"LOCK TABLE lml_cache.{_TABLE} IN ACCESS EXCLUSIVE MODE")
+
+                    with caplog.at_level("WARNING"):
+                        await bootstrap_lml_cache_table(pg_source, _DDL_ADD_COLUMN)
 
         assert any("already satisfies" in rec.getMessage() for rec in caplog.records)

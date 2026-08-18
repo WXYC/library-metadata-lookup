@@ -260,7 +260,7 @@ class LmlCacheSchemaMismatchError(RuntimeError):
 # of a statement whose entire purpose is to apply only under a runtime
 # condition. Anchoring makes an unrecognized wrapper stay unrecognized.
 
-_CREATE_SCHEMA_RE = re.compile(r"CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+(\w+)\s*$", re.I)
+_CREATE_SCHEMA_RE = re.compile(r"CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+(\w+)\s*;?\s*$", re.I)
 _CREATE_TABLE_RE = re.compile(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+lml_cache\.(\w+)\s*\(", re.I)
 _ADD_COLUMN_RE = re.compile(
     r"ALTER\s+TABLE\s+lml_cache\.(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)\b", re.I
@@ -296,6 +296,21 @@ class ExpectedShape:
         """True when there is anything at all to verify."""
         return bool(self.schemas or self.tables or self.columns or self.indexes)
 
+    def describe(self) -> str:
+        """One-line rendering of this expectation set, for log messages.
+
+        Worded identically to :func:`_missing_objects` so an operator reading
+        both lines in one incident is not comparing two spellings of one object.
+        """
+        return ", ".join(
+            [
+                *(f"schema {s}" for s in sorted(self.schemas)),
+                *(f"table lml_cache.{t}" for t in sorted(self.tables)),
+                *(f"column lml_cache.{t}.{c}" for t, c in sorted(self.columns)),
+                *(f"index lml_cache.{i}" for i in sorted(self.indexes)),
+            ]
+        )
+
 
 def parse_expected_shape(statements: Iterable[LmlCacheBootstrapStatement]) -> ExpectedShape:
     """Read the catalog objects ``statements`` ensure, one statement at a time.
@@ -314,31 +329,43 @@ def parse_expected_shape(statements: Iterable[LmlCacheBootstrapStatement]) -> Ex
     table one column short: the silent-degradation case ``entity/
     artist_wikipedia_bio.py``'s P0-1 comment describes.
     """
-    shape = ExpectedShape()
+    schemas: set[str] = set()
+    tables: set[str] = set()
+    columns: set[tuple[str, str]] = set()
+    indexes: set[str] = set()
     understood = True
+    # Captures are folded to lowercase because PostgreSQL folds unquoted
+    # identifiers and the catalog stores them folded; comparing an as-written
+    # capture would report a healthy object as absent. A quoted identifier
+    # never reaches here -- \w+ cannot match a quote -- so folding is
+    # unconditionally correct.
     for statement in statements:
         if callable(statement):
             understood = False
             continue
         text = statement.strip()
         if match := _CREATE_SCHEMA_RE.match(text):
-            shape.schemas.add(match.group(1))
+            schemas.add(match.group(1).lower())
         elif match := _CREATE_TABLE_RE.match(text):
-            shape.tables.add(match.group(1))
+            tables.add(match.group(1).lower())
         elif match := _ADD_COLUMN_RE.match(text):
-            shape.columns.add((match.group(1), match.group(2)))
+            # A multi-clause ALTER ("ADD COLUMN a, ADD COLUMN b") and a
+            # semicolon-joined pair both match this pattern while hiding every
+            # clause after the first, and PG applies the clauses atomically --
+            # so a failure anywhere rolls back the hidden ones too. An
+            # expectation that UNDER-reports its statement's effect is the one
+            # direction that is unsafe: it would let the failure path prove
+            # "already satisfied" about a table that is genuinely short.
+            if "," in text[match.end() :] or ";" in text:
+                understood = False
+            else:
+                columns.add((match.group(1).lower(), match.group(2).lower()))
         elif match := _CREATE_INDEX_RE.match(text):
-            shape.indexes.add(match.group(1))
-            shape.tables.add(match.group(2))
+            indexes.add(match.group(1).lower())
+            tables.add(match.group(2).lower())
         else:
             understood = False
-    return ExpectedShape(
-        schemas=shape.schemas,
-        tables=shape.tables,
-        columns=shape.columns,
-        indexes=shape.indexes,
-        understood=understood,
-    )
+    return ExpectedShape(schemas, tables, columns, indexes, understood)
 
 
 _SCHEMA_PRESENCE_SQL = "SELECT nspname AS name FROM pg_namespace WHERE nspname = ANY($1::text[])"
@@ -516,7 +543,15 @@ async def bootstrap_lml_cache_table(
         except Exception:
             # Never let the diagnostic mask the real error. The PG that just
             # refused the DDL is not necessarily healthy enough to answer a
-            # catalog query, and the DDL failure is the actionable one.
+            # catalog query, and the DDL failure is the actionable one. Say so
+            # anyway: without this line, a bootstrap-failed log where the shape
+            # was never checked is indistinguishable from one where it was
+            # checked and found fine.
+            logger.warning(
+                "lml_cache bootstrap shape verification could not run after a failed "
+                "DDL; the failure below is reported unverified",
+                exc_info=True,
+            )
             raise exc from None
         if missing:
             raise LmlCacheSchemaMismatchError(
@@ -526,21 +561,10 @@ async def bootstrap_lml_cache_table(
         logger.warning(
             "lml_cache bootstrap DDL failed but the deployed schema already satisfies "
             "it (%s); treating as a no-op so the remaining bootstraps still run",
-            _describe(expected),
+            expected.describe(),
             exc_info=True,
         )
         return
 
     if expected:
         await _verify_or_raise(pg, expected)
-
-
-def _describe(expected: ExpectedShape) -> str:
-    """One-line rendering of an expectation set, for the warning above."""
-    parts = [
-        *(f"schema {s}" for s in sorted(expected.schemas)),
-        *(f"lml_cache.{t}" for t in sorted(expected.tables)),
-        *(f"lml_cache.{t}.{c}" for t, c in sorted(expected.columns)),
-        *(f"index {i}" for i in sorted(expected.indexes)),
-    ]
-    return ", ".join(parts)

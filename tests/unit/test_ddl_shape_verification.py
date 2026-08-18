@@ -305,11 +305,17 @@ class TestOnlyProvablyHarmlessFailuresAreSwallowed:
 
     async def test_a_do_block_is_not_understood(self):
         """A DO block's effect is conditional by construction. Its body is not
-        parsed for expectations, and its presence blocks the swallow."""
+        parsed for expectations, and its presence blocks the swallow.
+
+        Paired with a recognized statement on purpose. Passing the DO block
+        alone would leave the expectation empty, and the emptiness alone would
+        block the swallow -- so the test would still pass with the
+        ``understood`` half of the guard deleted.
+        """
         pg = _healthy_source(failing_statements={_DO_BLOCK})
 
         with pytest.raises(_BoomError):
-            await bootstrap_lml_cache_table(pg, _DO_BLOCK)
+            await bootstrap_lml_cache_table(pg, _ADD_COLUMN, _DO_BLOCK)
 
     async def test_a_do_blocks_inner_alter_is_not_read_as_an_expectation(self):
         """Guards the anchoring of the parser. ``_DO_BLOCK`` contains the text
@@ -323,10 +329,14 @@ class TestOnlyProvablyHarmlessFailuresAreSwallowed:
         assert pg.fetched == [], "a DO block must contribute no expectations"
 
     async def test_unrecognized_sql_blocks_the_swallow(self):
+        """Paired with a recognized statement for the reason above: an empty
+        expectation would block the swallow on its own."""
         pg = _healthy_source(failing_statements={"VACUUM lml_cache.artist_wikipedia_bio"})
 
         with pytest.raises(_BoomError):
-            await bootstrap_lml_cache_table(pg, "VACUUM lml_cache.artist_wikipedia_bio")
+            await bootstrap_lml_cache_table(
+                pg, _ADD_COLUMN, "VACUUM lml_cache.artist_wikipedia_bio"
+            )
 
     async def test_verification_failure_never_masks_the_original_error(self):
         """If the catalog query itself fails (the PG that just refused the DDL
@@ -395,3 +405,95 @@ class TestExpectationParsingAgainstTheRealDdl:
         assert shape.understood
         assert "compilation_track_location" in shape.tables
         assert "idx_compilation_track_location_reverse" in shape.indexes
+
+
+@pytest.mark.asyncio
+class TestStatementFormsThatUnderReportTheirOwnEffect:
+    """A statement whose parsed shape is SMALLER than what it actually does.
+
+    This is the one direction that is unsafe. An expectation that over-reports
+    costs a false alarm; one that UNDER-reports lets the failure path prove
+    "already satisfied" about a table that is genuinely short -- reinstating
+    exactly the silent degradation this module exists to prevent, now under a
+    reassuring log line.
+    """
+
+    async def test_a_multi_clause_alter_is_not_understood(self):
+        """``ADD COLUMN a, ADD COLUMN b`` matches the pattern on ``a`` alone.
+
+        PostgreSQL applies the clauses atomically, so a failure anywhere rolls
+        back ``b`` too. Reading only ``a`` and finding it present would swallow
+        a failure that left ``b`` missing.
+        """
+        ddl = (
+            "ALTER TABLE lml_cache.artist_wikipedia_bio "
+            "ADD COLUMN IF NOT EXISTS last_attempted_at TIMESTAMPTZ, "
+            "ADD COLUMN IF NOT EXISTS brand_new TEXT"
+        )
+        pg = _FakePgSource(
+            tables={"artist_wikipedia_bio"},
+            columns={("artist_wikipedia_bio", "last_attempted_at")},
+            failing_statements={ddl},
+        )
+
+        with pytest.raises(_BoomError):
+            await bootstrap_lml_cache_table(pg, ddl)
+
+    async def test_a_semicolon_joined_pair_is_not_understood(self):
+        """asyncpg's simple-query ``execute`` accepts several statements at once."""
+        ddl = (
+            "ALTER TABLE lml_cache.artist_wikipedia_bio "
+            "ADD COLUMN IF NOT EXISTS last_attempted_at TIMESTAMPTZ; "
+            "ALTER TABLE lml_cache.artist_wikipedia_bio "
+            "ADD COLUMN IF NOT EXISTS brand_new TEXT"
+        )
+        pg = _FakePgSource(
+            tables={"artist_wikipedia_bio"},
+            columns={("artist_wikipedia_bio", "last_attempted_at")},
+            failing_statements={ddl},
+        )
+
+        with pytest.raises(_BoomError):
+            await bootstrap_lml_cache_table(pg, ddl)
+
+    async def test_a_single_clause_alter_with_a_default_is_still_understood(self):
+        """The guard must not fire on the trailing type/default clauses that
+        every shipped ALTER carries -- that would silently disable the swallow
+        for the exact statement class LML#1210 was reported against."""
+        pg = _FakePgSource(
+            tables={"artist_wikipedia_bio"},
+            columns={("artist_wikipedia_bio", "last_attempted_at")},
+            failing_statements={_ADD_COLUMN},
+        )
+
+        await bootstrap_lml_cache_table(pg, _ADD_COLUMN)
+
+
+@pytest.mark.asyncio
+class TestIdentifierCaseFolding:
+    """PostgreSQL folds unquoted identifiers to lowercase; the catalog stores
+    them folded. Comparing an as-written capture against the catalog would
+    report a perfectly healthy object as absent -- and because that raise
+    happens on the SUCCESS path, it would escape the enclosing
+    ``set_up_*_schema`` helper and skip its remaining calls, causing this
+    module's own problem #2 on a boot where nothing was wrong.
+    """
+
+    async def test_a_mixed_case_table_matches_the_folded_catalog(self):
+        pg = _FakePgSource(tables={"mixedcase"})
+
+        await bootstrap_lml_cache_table(pg, "CREATE TABLE IF NOT EXISTS lml_cache.MixedCase (\n)")
+
+    async def test_a_mixed_case_index_and_its_table_match_the_folded_catalog(self):
+        pg = _FakePgSource(tables={"bio"}, indexes={"idx_bio_id"})
+
+        await bootstrap_lml_cache_table(
+            pg, "CREATE INDEX IF NOT EXISTS Idx_Bio_Id ON lml_cache.Bio (id)"
+        )
+
+    async def test_a_mixed_case_column_matches_the_folded_catalog(self):
+        pg = _FakePgSource(tables={"bio"}, columns={("bio", "lastseen")})
+
+        await bootstrap_lml_cache_table(
+            pg, "ALTER TABLE lml_cache.Bio ADD COLUMN IF NOT EXISTS LastSeen TIMESTAMPTZ"
+        )

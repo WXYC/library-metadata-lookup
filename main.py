@@ -188,14 +188,22 @@ async def _run_lml_cache_bootstraps(source: Any, bootstraps: tuple[tuple[str, An
                         except Exception:
                             # Degrade just this cache. Note what that actually
                             # means: nothing disables the consumer, so it keeps
-                            # issuing queries that error and are swallowed to a
-                            # miss (a write becomes a no-op) until the next boot
-                            # reruns this bootstrap.
+                            # issuing queries that error until the next boot
+                            # reruns this bootstrap. What that costs depends on
+                            # how the consumer handles the error, and two of
+                            # these labels do NOT swallow to a miss -- see the
+                            # exceptions named in the message.
                             logger.exception(
                                 "%s schema bootstrap failed — its consumers are NOT "
                                 "disabled; each read degrades to a cache miss and each "
                                 "write to a no-op until the next boot reruns this "
-                                "bootstrap; the other lml_cache.* bootstraps continue",
+                                "bootstrap, EXCEPT: the Discogs rate-bucket gate fails "
+                                "OPEN to the local limiter (so the shared budget stops "
+                                "being shared, and outbound Discogs traffic rises), and "
+                                "the API-key cache falls back to its last-known-good "
+                                "snapshot, which on a cold boot is empty and rejects "
+                                "every per-consumer key; the other lml_cache.* "
+                                "bootstraps continue",
                                 label,
                             )
             finally:
