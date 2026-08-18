@@ -14,14 +14,17 @@ on:
   pull_request:
     paths:
       - ".github/workflows/**"
+      - "scripts/install_actionlint.sh"
   push:
     branches: [main, prod]
     paths:
       - ".github/workflows/**"
+      - "scripts/install_actionlint.sh"
 
-# Workflow-level GITHUB_TOKEN scope. This job only checks out the repo and runs
-# a linter; it makes no authenticated GitHub API calls. contents:read is the
-# safe floor.
+# Workflow-level GITHUB_TOKEN scope. This job checks out the repo, downloads a
+# public file from raw.githubusercontent.com, and runs a linter. It writes
+# nothing back to GitHub, and the one authenticated request it makes is a read
+# of a public repo (#1214), so contents:read is both sufficient and the floor.
 permissions:
   contents: read
 
@@ -40,19 +43,21 @@ jobs:
       - uses: actions/checkout@v6
       # rhysd/actionlint publishes no root action.yml, so install the pinned
       # binary via the official download script (also pinned to the release
-      # tag). Fetch the script to a file first rather than `bash <(curl ...)`:
-      # process substitution discards curl's exit code, so a transient fetch
-      # failure would pass this step green and only surface as a confusing
-      # "command not found" at the run step. The script writes the binary path
-      # to the `executable` step output.
+      # tag). The fetch lives in scripts/install_actionlint.sh rather than
+      # inline here so its token-safety and retry properties can be pinned by
+      # tests (tests/unit/test_install_actionlint_auth.py) -- see that script's
+      # header for the rationale, including why the fetched installer must not
+      # inherit this job's token. GH_TOKEN authenticates the
+      # raw.githubusercontent.com fetch (#1214, generalizing #1205); the
+      # step-level env is only the delivery mechanism. The workflow's
+      # contents:read token is enough: rhysd/actionlint is public. The
+      # installer writes the binary path to the `executable` step output.
       - name: Download pinned actionlint
         id: get_actionlint
-        run: |
-          curl -sSfL \
-            "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash" \
-            -o "${RUNNER_TEMP}/download-actionlint.bash"
-          bash "${RUNNER_TEMP}/download-actionlint.bash" "$ACTIONLINT_VERSION"
+        run: bash scripts/install_actionlint.sh "$ACTIONLINT_VERSION"
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Run actionlint
         run: ${{ steps.get_actionlint.outputs.executable }} -color
         shell: bash

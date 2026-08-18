@@ -26,15 +26,21 @@ network), ``--ref`` forces the download branch past any sibling wxyc-shared
 checkout (one test instead copies the script under ``tmp_path`` to exercise the
 unpinned ``main`` arm), and ``--download-only`` stops the script before the
 codegen/ruff stages, which are out of scope here.
+
+The stub itself lives in ``tests/curl_stub.py``: LML#1214 gave this repo a
+second authenticated-download entry point (``scripts/install_actionlint.sh``)
+whose suite needs the identical recording harness.
 """
 
 import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import TypedDict
 
 import pytest
+
+from tests.curl_stub import curl_calls as _calls
+from tests.curl_stub import install_curl_stub as _install_curl_stub
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "generate_api_models.sh"
 
@@ -48,43 +54,6 @@ _CURL_COMMON = ["-sSfL", "--max-time", "30", "--retry", "3"]
 
 def _url(ref: str) -> str:
     return f"https://raw.githubusercontent.com/WXYC/wxyc-shared/{ref}/api.yaml"
-
-
-def _install_curl_stub(tmp_path: Path) -> None:
-    """Install a fake ``curl`` in ``tmp_path/bin`` that records every invocation.
-
-    Call *n* writes ``curl_calls/<n>.argv`` (one argv element per line -- a
-    header value like ``Authorization: Bearer x`` is a single element, spaces
-    and all), ``<n>.stdin`` (whatever was piped in), and ``<n>.env`` (any
-    ``GITHUB_TOKEN``/``GH_TOKEN`` lines in the child environment). Appending a
-    new numbered record per call, rather than truncating one file, is what
-    makes the auth-then-anonymous-fallback retry assertable as two distinct
-    calls.
-
-    Failure knob: if ``curl_fail_remaining`` exists, calls up to and including
-    the number it contains exit 22 (curl's HTTP-error code) after recording --
-    write ``1`` to fail only the first call, ``2`` to fail both. Compared
-    against the call ordinal the stub already computes, so the marker file is
-    read-only state rather than a decrementing counter.
-    """
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    stub = bin_dir / "curl"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f'calls_dir="{tmp_path / "curl_calls"}"\n'
-        f'fail_marker="{tmp_path / "curl_fail_remaining"}"\n'
-        'mkdir -p "$calls_dir"\n'
-        "n=$(find \"$calls_dir\" -name '*.argv' | wc -l | tr -d ' ')\n"
-        "n=$((n + 1))\n"
-        ': > "$calls_dir/$n.argv"\n'
-        'for arg in "$@"; do printf "%s\\n" "$arg" >> "$calls_dir/$n.argv"; done\n'
-        'cat > "$calls_dir/$n.stdin"\n'
-        "env | grep -E '^(GITHUB_TOKEN|GH_TOKEN)=' > \"$calls_dir/$n.env\" || true\n"
-        '[ -e "$fail_marker" ] && [ "$n" -le "$(cat "$fail_marker")" ] && exit 22\n'
-        "exit 0\n"
-    )
-    stub.chmod(0o755)
 
 
 def _install_env_recording_stub(tmp_path: Path, name: str) -> None:
@@ -121,29 +90,6 @@ def _set_up_sibling_checkout(tmp_path: Path) -> Path:
     sibling.mkdir()
     (sibling / "api.yaml").write_text("openapi: 3.0.0\n")
     return script_copy
-
-
-class _CurlCall(TypedDict):
-    argv: list[str]
-    stdin: str
-    env: str
-
-
-def _calls(tmp_path: Path) -> list[_CurlCall]:
-    """Read back the stub's per-invocation records, in call order."""
-    calls_dir = tmp_path / "curl_calls"
-    if not calls_dir.is_dir():
-        return []
-    records: list[_CurlCall] = []
-    for argv_file in sorted(calls_dir.glob("*.argv"), key=lambda p: int(p.stem)):
-        records.append(
-            _CurlCall(
-                argv=argv_file.read_text().splitlines(),
-                stdin=(calls_dir / f"{argv_file.stem}.stdin").read_text(),
-                env=(calls_dir / f"{argv_file.stem}.env").read_text(),
-            )
-        )
-    return records
 
 
 def _run_download(
