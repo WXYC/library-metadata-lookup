@@ -104,25 +104,6 @@ class ReadinessResponse(HealthCheckResponse):
     )
 
 
-class Genre(StrEnum):
-    Blues = "Blues"
-    Rock = "Rock"
-    Electronic = "Electronic"
-    Hiphop = "Hiphop"
-    Jazz = "Jazz"
-    Classical = "Classical"
-    Reggae = "Reggae"
-    Soundtracks = "Soundtracks"
-    OCS = "OCS"
-    Unknown = "Unknown"
-
-
-class Format(StrEnum):
-    Vinyl = "Vinyl"
-    CD = "CD"
-    Unknown = "Unknown"
-
-
 class RotationBin(StrEnum):
     """
     Rotation bin levels: H=Heavy, M=Medium, L=Light, S=Single
@@ -517,7 +498,10 @@ class Artist(BaseModel):
 
 
 class ArtistWithGenre(Artist):
-    genre_name: Genre
+    genre_name: str = Field(
+        ...,
+        description="Free-form: `genres.genre_name` is a `varchar(64)` in a lookup table `POST /library/genres` appends to. `GET /library/genres` is the authoritative enumeration (#367).\n",
+    )
 
 
 class Album(BaseModel):
@@ -715,28 +699,14 @@ class FormatEntry(BaseModel):
 
 
 class GenreEntry(BaseModel):
+    """
+    One row of `GET /library/genres` — the authoritative enumeration of the genres this station files under. Do not hardcode the set: it is a lookup table `POST /library/genres` appends to, and a closed enum here previously declared ten values while production held fifteen (#367). As of 2026-08 those fifteen are Africa, Asia, Blues, Classical, Comedy, Hiphop, Jazz, Latin, OCS, Reggae, Rock, Soundtracks, Spoken, Xmas, Electronic — listed to orient a reader, not as a contract.
+
+    """
+
     id: int
-    genre_name: Genre
+    genre_name: str
     code_letters: str
-
-
-class Rotation(BaseModel):
-    id: int | None = None
-    rotation_bin: RotationBin | None = None
-    add_date: date_aliased | None = None
-    kill_date: date_aliased | None = None
-
-
-class AlbumInfoResponse(Album):
-    artist_name: str
-    code_letters: str
-    format_name: str
-    genre_name: Genre
-    legacy_release_id: int | None = Field(
-        None,
-        description="The library row's surrogate key (BS#1963), NOT NULL in the database since migration 0137. Optional here (never required) so the live openapi-compliance deploy gate stays green across the publish -> BS-deploy window, matching the CatalogExportRow and BulkResolveInput precedent.\n",
-    )
-    rotation: Rotation | None = None
 
 
 class Source(StrEnum):
@@ -868,7 +838,7 @@ class RotationWithAlbum(RotationEntry):
     code_number: int
 
 
-class Rotation1(BaseModel):
+class Rotation(BaseModel):
     id: int | None = None
     code_letters: str | None = None
     code_artist_number: int | None = None
@@ -3315,6 +3285,81 @@ class AlbumSearchResult(BaseModel):
         None,
         description="Populated by Backend's catalog search when an artist-alias match (from `artist_search_alias`) drove this release into the results, per artist-search-alias plan PR 5. Sibling field to `matched_via` (which is track-title provenance). Empty or absent on normal artist/album hits. Backward-compatible — existing consumers ignore the field.\n",
     )
+
+
+class AlbumDetail(BaseModel):
+    """
+    The album-detail response: one `wxyc_schema.library` row plus its artist / format / genre joins, as `getAlbumFromDB` projects it.
+    FOUR operations return exactly this shape — `GET /library/info` (both its `album_id` and its `legacy_release_id` branch), `PATCH /library/{id}`, `PATCH /library/{id}/missing`, and `PATCH /library/{id}/found`. The three PATCHes re-read through `getAlbumFromDB` after their write, so there is one shape here, not two. They previously pointed at `AlbumSearchResult` (#365), which declares seven search-only properties no album-detail handler emits (`album_dist`, `artist_dist`, `rotation_bin`, `rotation_id`, `artwork_url`, `matched_via`, `matched_via_alias`) — do not re-point a detail operation at it.
+    Named for the shape, not for one endpoint: this was `AlbumInfoResponse`, which read as "the `/library/info` response" while serving four.
+    Deliberately FLAT rather than `allOf: [Album, …]`, though it began that way and every property below `format_id` is also on `Album`. Two reasons. The differ compares `allOf` branches one at a time, so re-pointing the three PATCHes here from the flat `AlbumSearchResult` read as "removed ten required properties" three times over and reddened the breaking-change gate for a change that removes nothing. And the composition was only half true: `Album` is the RAW inserted row `POST /library` returns — snake_case `discogs_unavailable`, no joins, no `reconciled_identity` — while this is the serialized, joined read shape. Sharing a base implied an equivalence the two do not have (see WXYC/Backend-Service#2216).
+
+    """
+
+    id: int = Field(..., description="Backend's serial `wxyc_schema.library.id`.")
+    artist_id: int
+    album_title: str
+    code_number: int
+    genre_id: int
+    format_id: int
+    label: str | None = Field(
+        ...,
+        description="`library.label`. Nullable in the database; the key is always present because the projection always selects it.\n",
+    )
+    record_label: str | None = Field(
+        None,
+        description="The SAME column as `label` — `getAlbumFromDB` projects `library.label` twice, under both names, so both are always present and always equal. Prefer `label`; `record_label` is retained because consumers read it (#373).\n",
+    )
+    label_id: int | None = None
+    add_date: AwareDatetime
+    disc_quantity: int | None = None
+    alternate_artist_name: str | None = None
+    album_artist: str | None = Field(
+        None,
+        description='Credited album artist for compilations (e.g., "Kruder & Dorfmeister" on a DJ-Kicks release filed under Various Artists).',
+    )
+    artist_name: str = Field(..., description="Joined from `artists.artist_name`.")
+    alphabetical_name: str | None = Field(
+        None,
+        description='Joined from `artists.alphabetical_name` — the filing form ("Beatles, The"), used for shelf order.\n',
+    )
+    code_letters: str = Field(..., description="Joined from `artists.code_letters`.")
+    code_artist_number: int = Field(
+        ...,
+        description="Joined from `genre_artist_crossreference.artist_genre_code` — the artist's number *within* this release's genre, so the same artist has a different one per genre. Part of the call number, not an id.\n",
+    )
+    format_name: str = Field(..., description="Joined from `format.format_name`.")
+    genre_name: str = Field(
+        ...,
+        description="Joined from `genres.genre_name`, a `varchar(64)`. Free-form: `GET /library/genres` is the authoritative enumeration (#367).\n",
+    )
+    plays: int | None = Field(None, description="Station play count for this release.")
+    last_modified: AwareDatetime | None = None
+    date_lost: AwareDatetime | None = Field(
+        None,
+        description="Set when a DJ flags the release missing from the stacks (BS#393). A release is currently missing when `date_lost` is set and `date_found` is either absent or earlier than it.\n",
+    )
+    date_found: AwareDatetime | None = None
+    on_streaming: bool | None = Field(
+        None,
+        description="Whether the release resolved to a streaming service. `false` is meaningful (checked, absent — the WXYC EXCLUSIVE case); null means never checked.\n",
+    )
+    legacy_release_id: int | None = Field(
+        None,
+        description="The library row's surrogate key (BS#1963), NOT NULL in the database since migration 0137. Optional here, never required, matching the `CatalogExportRow` and `BulkResolveInput` precedent.\n",
+    )
+    discogsUnavailable: bool | None = Field(
+        None,
+        description="MD-set marker indicating this release is intentionally not on\nDiscogs (embargoed promo, audience-segment release, etc.). When\ntrue, the LML runtime-lookup chokepoint does not attempt Discogs\nresolution for this release. See WXYC/wiki plans/rotation-discogs-unavailable.md.\n",
+    )
+    discogsUnavailableNote: constr(max_length=500) | None = Field(
+        None, description="Optional free-text reason for `discogsUnavailable`."
+    )
+    lastDiscogsRecheckAt: AwareDatetime | None = Field(
+        None,
+        description="Stamped on every recheck attempt by the\n`library-discogs-unavailable-recheck` cron. Read-only from the\nclient side.\n",
+    )
+    reconciled_identity: ReconciledIdentity | None = None
 
 
 class LibraryMatch(BaseModel):
