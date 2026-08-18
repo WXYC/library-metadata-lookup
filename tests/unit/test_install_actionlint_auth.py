@@ -50,7 +50,7 @@ _VERSION = "1.7.12"
 # The org-pinned curl idiom for a raw.githubusercontent.com download, shared
 # with scripts/generate_api_models.sh: --retry also covers 429/5xx and honors
 # Retry-After, which is the whole point of #1214.
-_CURL_COMMON = ["-sSfL", "--max-time", "30", "--retry", "3"]
+_CURL_COMMON = ["-sSfL", "--max-time", "30", "--retry", "3", "--retry-max-time", "60"]
 
 
 def _url(version: str = _VERSION) -> str:
@@ -60,15 +60,22 @@ def _url(version: str = _VERSION) -> str:
     )
 
 
-def _install_payload(tmp_path: Path) -> None:
-    """Make the stub curl "download" a recording stand-in for the installer.
+def _install_stand_in_installer(tmp_path: Path) -> None:
+    """Park a recording stand-in where the script will look for the installer.
 
     ``install_actionlint.sh`` executes what it fetched, so unlike the codegen
     suite this one cannot stop before the download is consumed. The stand-in
     records its own argv and environment, which is how the version-pin and
     token-scrub properties become observable at the child process.
+
+    Parked up front rather than "downloaded" by the stub curl, so that a run
+    whose fetches all failed still leaves a runnable file here. Otherwise
+    test_failure_of_both_attempts_still_fails cannot fail: with nothing at this
+    path, a script that had lost its error handling would die on `bash: no such
+    file` and leave no installer.argv either, which is exactly what that test
+    reads as success.
     """
-    (tmp_path / "curl_payload").write_text(
+    (tmp_path / "download-actionlint.bash").write_text(
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$@" > "{tmp_path}/installer.argv"\n'
         f"env | grep -E '^(GITHUB_TOKEN|GH_TOKEN)=' > \"{tmp_path}/installer.env\" || true\n"
@@ -105,7 +112,9 @@ def _run_install(
     )
 
 
-def _assert_argv(argv: list[str], *, authenticated: bool, version: str = _VERSION) -> None:
+def _assert_argv(
+    tmp_path: Path, argv: list[str], *, authenticated: bool, version: str = _VERSION
+) -> None:
     """The full curl invocation, asserted as one expression.
 
     The anonymous form is the pre-#1214 command plus the org-pinned
@@ -116,7 +125,9 @@ def _assert_argv(argv: list[str], *, authenticated: bool, version: str = _VERSIO
     *head, o_flag, out_path = argv
     assert head == [*_CURL_COMMON, *(["-H", "@-"] if authenticated else []), _url(version)]
     assert o_flag == "-o"
-    assert out_path
+    # Not merely truthy: the RUNNER_TEMP default is why CI's checkout does not
+    # end up with the installer script dropped in it, and nothing else pins it.
+    assert out_path == str(tmp_path / "download-actionlint.bash")
 
 
 @pytest.mark.parametrize("token_var", ["GH_TOKEN", "GITHUB_TOKEN"])
@@ -125,14 +136,14 @@ def test_token_attaches_authorization_header_without_leaking(tmp_path, token_var
     stderr advisory -- and the token value appears nowhere: not argv, not
     stdout, not stderr."""
     install_curl_stub(tmp_path)
-    _install_payload(tmp_path)
+    _install_stand_in_installer(tmp_path)
 
     result = _run_install(tmp_path, {token_var: _TOKEN})
 
     assert result.returncode == 0, result.stderr
     calls = curl_calls(tmp_path)
     assert len(calls) == 1
-    _assert_argv(calls[0]["argv"], authenticated=True)
+    _assert_argv(tmp_path, calls[0]["argv"], authenticated=True)
     assert calls[0]["stdin"] == f"Authorization: Bearer {_TOKEN}\n"
     assert not any(_TOKEN in arg for arg in calls[0]["argv"])
     assert "Authenticated download" in result.stderr
@@ -144,7 +155,7 @@ def test_gh_token_takes_precedence_over_github_token(tmp_path):
     """When both are set, GH_TOKEN wins -- the precedence gh itself documents
     (``gh help environment``), matching scripts/generate_api_models.sh."""
     install_curl_stub(tmp_path)
-    _install_payload(tmp_path)
+    _install_stand_in_installer(tmp_path)
     other = "gho_lml1214_secondary_token"
 
     result = _run_install(tmp_path, {"GH_TOKEN": _TOKEN, "GITHUB_TOKEN": other})
@@ -167,14 +178,14 @@ def test_no_token_sends_no_authorization_header(tmp_path):
     mistake it is.
     """
     install_curl_stub(tmp_path)
-    _install_payload(tmp_path)
+    _install_stand_in_installer(tmp_path)
 
     result = _run_install(tmp_path, {})
 
     assert result.returncode == 0, result.stderr
     calls = curl_calls(tmp_path)
     assert len(calls) == 1
-    _assert_argv(calls[0]["argv"], authenticated=False)
+    _assert_argv(tmp_path, calls[0]["argv"], authenticated=False)
     assert "Authorization" not in calls[0]["stdin"]
     assert not any("Authorization" in arg for arg in calls[0]["argv"])
     assert "Authenticated download" not in result.stdout + result.stderr
@@ -185,7 +196,7 @@ def test_failed_authenticated_download_falls_back_to_anonymous(tmp_path):
     """A stale ambient token must not break a previously-working install: the
     script retries once anonymously and says so on stderr."""
     install_curl_stub(tmp_path)
-    _install_payload(tmp_path)
+    _install_stand_in_installer(tmp_path)
     (tmp_path / "curl_fail_remaining").write_text("1")
 
     result = _run_install(tmp_path, {"GH_TOKEN": _TOKEN})
@@ -193,9 +204,13 @@ def test_failed_authenticated_download_falls_back_to_anonymous(tmp_path):
     assert result.returncode == 0, result.stderr
     calls = curl_calls(tmp_path)
     assert len(calls) == 2
-    _assert_argv(calls[0]["argv"], authenticated=True)
-    _assert_argv(calls[1]["argv"], authenticated=False)
-    assert "retrying anonymously" in result.stderr
+    _assert_argv(tmp_path, calls[0]["argv"], authenticated=True)
+    _assert_argv(tmp_path, calls[1]["argv"], authenticated=False)
+    assert "::warning::" in result.stderr, (
+        "the fallback must reach the run summary; a stderr-only note in a "
+        "sub-second advisory job is how a permanently-broken token stays green"
+    )
+    assert "falling back to the shared anonymous rate budget" in result.stderr
     assert _TOKEN not in result.stdout
     assert _TOKEN not in result.stderr
 
@@ -205,7 +220,7 @@ def test_failure_of_both_attempts_still_fails(tmp_path):
     fails -- after exactly one fallback, no retry loop -- rather than running the
     lint step against a missing binary."""
     install_curl_stub(tmp_path)
-    _install_payload(tmp_path)
+    _install_stand_in_installer(tmp_path)
     (tmp_path / "curl_fail_remaining").write_text("2")
 
     result = _run_install(tmp_path, {"GH_TOKEN": _TOKEN})
@@ -224,7 +239,7 @@ def test_token_is_dropped_before_the_downloaded_installer_runs(tmp_path):
     compromise from "lints our workflows" to "holds our token".
     """
     install_curl_stub(tmp_path)
-    _install_payload(tmp_path)
+    _install_stand_in_installer(tmp_path)
 
     result = _run_install(tmp_path, {"GH_TOKEN": _TOKEN, "GITHUB_TOKEN": _TOKEN})
 
@@ -238,27 +253,54 @@ def test_version_pin_reaches_both_the_url_and_the_installer(tmp_path):
     two cannot drift apart -- the property the workflow's ACTIONLINT_VERSION
     comment promises."""
     install_curl_stub(tmp_path)
-    _install_payload(tmp_path)
+    _install_stand_in_installer(tmp_path)
     pinned = "1.7.9"
 
     result = _run_install(tmp_path, {}, args=[pinned])
 
     assert result.returncode == 0, result.stderr
-    _assert_argv(curl_calls(tmp_path)[0]["argv"], authenticated=False, version=pinned)
+    _assert_argv(tmp_path, curl_calls(tmp_path)[0]["argv"], authenticated=False, version=pinned)
     assert _installer_argv(tmp_path) == [pinned]
 
 
-def test_missing_version_is_an_error_not_a_silent_latest(tmp_path):
-    """rhysd's installer treats an omitted version as "latest". Defaulting to
-    that would quietly unpin CI, so the wrapper refuses instead."""
-    install_curl_stub(tmp_path)
-    _install_payload(tmp_path)
+@pytest.mark.parametrize(
+    "bad_version",
+    ["", "v1.7.12", "1.7", "latest", "1.7.12-beta"],
+    ids=["empty", "leading_v", "two_part", "latest", "prerelease"],
+)
+def test_a_version_that_is_not_exact_major_minor_patch_is_refused(tmp_path, bad_version):
+    """Refuse before spending a request, rather than 404ing four retries deep.
 
-    result = _run_install(tmp_path, {}, args=[])
+    An omitted or malformed version does NOT reach rhysd's "latest" -- that
+    script has no network resolution at all; its v1.7.12 copy hardcodes
+    version="1.7.11" as a manually-maintained default, and "latest" is a synonym
+    for it. So the real hazard is quieter than an unpin: the workflow would
+    declare one tag while a differently-pinned binary got installed. `v1.7.12`
+    is the shape most likely to be typed, since that is how the release page
+    displays it.
+    """
+    install_curl_stub(tmp_path)
+    _install_stand_in_installer(tmp_path)
+
+    result = _run_install(tmp_path, {}, args=[bad_version] if bad_version else [])
 
     assert result.returncode != 0
-    assert curl_calls(tmp_path) == []
+    assert curl_calls(tmp_path) == [], "a malformed version must not spend a request"
     assert "version" in result.stderr.lower()
+
+
+def test_an_empty_download_does_not_pass_as_a_successful_install(tmp_path):
+    """curl reports a 200 carrying an empty body as success. Executing that is a
+    no-op that never writes the `executable` step output, so the failure lands
+    at the lint step as `command not found` -- exactly the confusing symptom the
+    fetch-to-file design exists to avoid."""
+    install_curl_stub(tmp_path)
+    (tmp_path / "download-actionlint.bash").write_text("")
+
+    result = _run_install(tmp_path, {})
+
+    assert result.returncode != 0
+    assert "empty" in result.stderr.lower()
 
 
 def test_workflow_invokes_the_script():
@@ -279,6 +321,44 @@ def test_workflow_invokes_the_script():
     assert "curl" not in executable, (
         "the raw.githubusercontent.com fetch belongs in the script, where it is tested"
     )
-    assert "GH_TOKEN: ${{ github.token }}" in executable, (
-        "the step must still deliver a token, or the fix silently reverts to anonymous"
+
+
+def test_the_installing_step_itself_receives_a_token():
+    """Scoped to the step that runs the script, and accepting either token name.
+
+    A whole-file substring match is both too loose and too brittle to pin this:
+    it stays green when the `env:` block migrates to a neighbouring step (the
+    exact silent revert to anonymous that #1214 exists to prevent), and it goes
+    red on a rename to GITHUB_TOKEN, which the script accepts and which is the
+    name the sibling codegen job already uses.
+
+    Scraped rather than YAML-parsed because PyYAML is not a declared dependency
+    of this repo -- it is importable only as a transitive one, so a parse here
+    would rest on someone else's dependency tree.
+    """
+    lines = _WORKFLOW.read_text().splitlines()
+    # The `run:` line specifically -- the two `paths:` entries and the block
+    # comment above the step also name the script.
+    starts = [
+        i
+        for i, line in enumerate(lines)
+        if "install_actionlint.sh" in line and line.lstrip().startswith("run:")
+    ]
+    assert len(starts) == 1, f"expected exactly one step running the script, found {len(starts)}"
+
+    indent = len(lines[starts[0]]) - len(lines[starts[0]].lstrip())
+    step: list[str] = []
+    for line in lines[starts[0] + 1 :]:
+        stripped = line.strip()
+        # A sibling step begins at the same indent with a list marker; the
+        # step's own keys are indented at least as far.
+        if stripped.startswith("- ") and len(line) - len(line.lstrip()) < indent:
+            break
+        step.append(line)
+
+    assert re.search(
+        r"^\s*(GH_TOKEN|GITHUB_TOKEN):\s*\$\{\{\s*github\.token\s*\}\}\s*$", "\n".join(step), re.M
+    ), (
+        "the step that installs actionlint no longer receives a token; CI is "
+        "back on the shared anonymous rate budget (#1214)"
     )
