@@ -35,6 +35,7 @@ from core.logging import setup_logging
 from core.observability import drop_fast_pool_reset_spans
 from core.server_timing_middleware import LmlWallTimingMiddleware
 from discogs.router import router as discogs_router
+from entity.ddl import LmlCacheSchemaMismatchError, verifying_lml_cache_shape
 from generated.api_models import ApiErrorResponse
 from identity.dependencies import close_entity_store
 from identity.router import api_v1_router as identity_api_v1_router
@@ -159,19 +160,44 @@ async def _run_lml_cache_bootstraps(source: Any, bootstraps: tuple[tuple[str, An
                     )
                     return
                 locked_source = _ConnectionPgSource(conn)
-                for label, bootstrap in bootstraps:
-                    try:
-                        await bootstrap(locked_source)
-                        logger.info("%s schema ready", label)
-                    except Exception:
-                        # Degrade just this cache: it no-ops to miss (the
-                        # rate-bucket gate fails open) until the next boot reruns
-                        # its bootstrap.
-                        logger.exception(
-                            "%s schema bootstrap failed — this cache is disabled until "
-                            "the next boot; the other lml_cache.* bootstraps continue",
-                            label,
-                        )
+                # Verify each bootstrap's claimed shape against the live catalog
+                # before calling it "ready" (LML#1210). Scoped to this loop: it
+                # is a boot-time question about what this process is going to
+                # serve against, not a cost every script-invoked bootstrap
+                # should pay. See entity.ddl.verifying_lml_cache_shape.
+                with verifying_lml_cache_shape():
+                    for label, bootstrap in bootstraps:
+                        try:
+                            await bootstrap(locked_source)
+                            logger.info("%s schema ready", label)
+                        except LmlCacheSchemaMismatchError:
+                            # Distinct from a plain bootstrap failure: the table
+                            # this cache reads is the WRONG SHAPE, and its reads
+                            # and writes go through swallowing_fetch /
+                            # swallowing_execute, so every subsequent query
+                            # degrades to a silent "miss". This log line is the
+                            # only loud signal that will exist.
+                            logger.exception(
+                                "%s schema is the WRONG SHAPE after bootstrap — queries "
+                                "touching the missing objects will be swallowed to a "
+                                "cache miss with no further signal, so treat this as a "
+                                "live degradation, not a boot warning; the other "
+                                "lml_cache.* bootstraps continue",
+                                label,
+                            )
+                        except Exception:
+                            # Degrade just this cache. Note what that actually
+                            # means: nothing disables the consumer, so it keeps
+                            # issuing queries that error and are swallowed to a
+                            # miss (a write becomes a no-op) until the next boot
+                            # reruns this bootstrap.
+                            logger.exception(
+                                "%s schema bootstrap failed — its consumers are NOT "
+                                "disabled; each read degrades to a cache miss and each "
+                                "write to a no-op until the next boot reruns this "
+                                "bootstrap; the other lml_cache.* bootstraps continue",
+                                label,
+                            )
             finally:
                 if locked:
                     try:

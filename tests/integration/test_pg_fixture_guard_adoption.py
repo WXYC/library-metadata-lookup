@@ -86,6 +86,9 @@ _LML_CACHE_FIXTURE_FILES = (
     # LML#1192 review round 5: the full validated-warm round-trip test also
     # drops its own scratch lml_cache.artist_wikipedia_bio rows.
     "test_wikipedia_bio_warm_round_trip.py",
+    # LML#1210: the shape-verification catalog queries run against a scratch
+    # lml_cache table the suite creates and drops itself.
+    "test_ddl_shape_verification_pg.py",
 )
 
 # Any DROP SCHEMA aimed at lml_cache, however spelled (with/without IF
