@@ -7,8 +7,10 @@ same shape — bounded outer semaphore, client-disconnect sentinel race, and
 
 The pieces:
 
-- ``max_concurrency_from_env(default)`` — resolves ``LML_BULK_MAX_CONCURRENT``,
-  floored at 1 so a misconfigured ``0`` can't hang the gather.
+- ``max_concurrency_from_env(default)`` — resolves ``LML_BULK_MAX_CONCURRENT``
+  through the shared ``core.search.resolve_positive_int_env``, so a
+  misconfigured ``0`` warns and falls back to the caller's default rather than
+  silently hanging (or silently serializing) the gather (LML#1215).
 - ``acquire_bulk_global_permit()`` — the LML#716 cross-request budget. The
   per-request semaphore above multiplies across concurrent requests (N
   batches admit N × ``LML_BULK_MAX_CONCURRENT`` items against the one event
@@ -68,7 +70,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
@@ -85,31 +86,36 @@ _BULK_MAX_CONCURRENT_ENV = "LML_BULK_MAX_CONCURRENT"
 
 
 def max_concurrency_from_env(default: int) -> int:
-    """Resolve ``LML_BULK_MAX_CONCURRENT``, floored at 1.
+    """Resolve ``LML_BULK_MAX_CONCURRENT`` through the shared positive-int reader.
 
     Read at request time (not via ``Settings``) to mirror
     ``LML_SEARCH_BUDGET_MS`` in ``core/search.py:resolve_search_budget_ms`` —
     both are runtime knobs.
 
+    This used to hand-roll the read as ``max(1, int(raw))`` (LML#1215), which
+    clamped ``0`` and negatives to 1 **silently** while every sibling knob
+    warned and fell back to its default. The clamp existed so a misconfigured
+    ``0`` couldn't hang the gather, and that guarantee is intact — the shared
+    reader's fallback is the caller's ``default``, which is always positive —
+    but a silent ``=0`` presented as a mysteriously serialized batch instead of
+    as the typo it is.
+
     Args:
-        default: Fallback used when the env var is unset or unparseable.
+        default: Fallback used when the env var is unset, unparseable, zero, or
+            negative. Must be positive: it is what keeps the semaphore bound
+            positive now that nothing clamps.
 
     Returns:
-        The resolved concurrency cap, clamped to ``>= 1``.
+        The resolved concurrency cap, always ``>= 1`` for a positive ``default``.
     """
-    raw = os.getenv(_BULK_MAX_CONCURRENT_ENV)
-    if not raw:
-        return default
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r, falling back to %d",
-            _BULK_MAX_CONCURRENT_ENV,
-            raw,
-            default,
-        )
-        return default
+    # Imported here, not at module top: core.search pulls in discogs.service
+    # (and thence the Discogs stack), which this leaf module must not load as
+    # an import-time side effect — the same deferral _get_bulk_global_semaphore
+    # below does for the sibling knob, and the reason core/env.py exists for
+    # the bool reader.
+    from core.search import resolve_positive_int_env
+
+    return resolve_positive_int_env(_BULK_MAX_CONCURRENT_ENV, default)
 
 
 async def watch_disconnect(request: Request) -> None:

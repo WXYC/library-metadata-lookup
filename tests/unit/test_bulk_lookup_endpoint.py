@@ -978,8 +978,17 @@ class TestBulkLookupEndpoint:
         ), "Expected a fallback warning for malformed LML_BULK_MAX_CONCURRENT"
 
     @pytest.mark.asyncio
-    async def test_zero_concurrency_env_floored_to_one(self, app_client, monkeypatch):
-        """`LML_BULK_MAX_CONCURRENT=0` must floor to 1, not hang the batch."""
+    async def test_zero_concurrency_env_falls_back_to_the_default(self, app_client, monkeypatch):
+        """`LML_BULK_MAX_CONCURRENT=0` must not hang the batch.
+
+        Until LML#1215 this route floored `0` to 1 — serializing the batch,
+        silently. It now goes through `resolve_positive_int_env` like every
+        sibling knob: WARN, and fall back to the route's default. What this
+        test guards either way is the route-level property, that a misconfigured
+        `0` never reaches `asyncio.Semaphore(0)` and deadlocks the gather; the
+        resolver-level contract is pinned in
+        `tests/unit/test_bulk_max_concurrency_env.py`.
+        """
         monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "0")
 
         with patch(
