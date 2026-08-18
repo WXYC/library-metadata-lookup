@@ -22,6 +22,25 @@ is the single home for both:
   and a warn-instead-of-clobber policy for a foreign-form constraint), not a
   behavior-preserving rename -- see LML#1038's PR body for the callout.
 
+LML#1210 adds the fourth piece: post-bootstrap shape verification. Statement
+success was the only evidence a bootstrap had worked, and it is not sufficient
+evidence in either direction. A staging boot on 2026-08-17 hit a 10s lock
+timeout on ``ADD COLUMN IF NOT EXISTS last_attempted_at`` and then logged
+"schema ready" for the next label and served -- harmless only because the
+column already existed. Had it not, the process would have served against a
+wrong-shape table whose reads and writes go through
+``entity/cache_toolkit.py``'s ``swallowing_fetch``/``swallowing_execute``, so
+the sole symptom would have been queries quietly returning "miss".
+
+:func:`parse_expected_shape` reads what a call's statements claim to ensure --
+derived from the statements themselves, never a hand-maintained registry that
+could drift away from the DDL it guards -- and :func:`bootstrap_lml_cache_table`
+checks it against ``pg_catalog`` on both the success and the failure path,
+raising :class:`LmlCacheSchemaMismatchError` on a genuine mismatch and
+downgrading a provably-harmless failure to a warning. Verification is entered
+by ``main.py``'s lifespan loop via :func:`verifying_lml_cache_shape` and is off
+elsewhere; see that function for why it is scoped rather than unconditional.
+
 PR-2 adds the third piece, :func:`bootstrap_lml_cache_table`: the shared
 transactional + ``lock_timeout`` posture only 2 of the 8 bootstraps had
 before it (``streaming_url_cache.py``, ``streaming_catalog.py``) -- the other
@@ -36,11 +55,18 @@ orchestrates DDL, never a row read/write.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+import logging
+import re
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from entity.sources import PgSource
+
+logger = logging.getLogger(__name__)
 
 #: Issued first by every ``lml_cache.*`` bootstrap. ``lml_cache`` is
 #: LML-owned (discogs-etl#288, Option 3) -- no alembic, no discogs-cache
@@ -179,6 +205,236 @@ LmlCacheBootstrapStatement = str | Callable[[Any], Awaitable[None]]
 _BOOTSTRAP_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '10s'"
 
 
+_verifying_shape: ContextVar[bool] = ContextVar("lml_cache_verifying_shape", default=False)
+
+
+@contextmanager
+def verifying_lml_cache_shape() -> Iterator[None]:
+    """Enable post-bootstrap shape verification for the enclosed block (LML#1210).
+
+    Off by default, and entered in exactly one place: ``main.py``'s
+    ``_run_lml_cache_bootstraps``, around the lifespan's bootstrap loop. Two
+    reasons it is scoped rather than unconditional:
+
+    * **It is a boot concern.** The point is to decide whether the process is
+      about to serve against a wrong-shape table. A script calling a
+      ``set_up_*_schema`` helper directly (e.g.
+      ``scripts/streaming_availability/catalog_dao.py``) is not that, and
+      should not pay a catalog round trip per bootstrap.
+    * **It keeps the statement-recording unit tests honest.** The ten
+      ``test_*_schema.py`` suites drive the real bootstraps through fakes that
+      record SQL and return no rows -- indistinguishable, from inside
+      verification, from a live PG that genuinely lacks every object. Rather
+      than teach ten near-duplicate doubles to model a catalog they exist to
+      not model, verification stays off unless a caller asks for it.
+
+    A ContextVar rather than a module global so a test can enable it without
+    leaking into the next one, and so concurrent tasks can't see each other's
+    setting.
+    """
+    token = _verifying_shape.set(True)
+    try:
+        yield
+    finally:
+        _verifying_shape.reset(token)
+
+
+class LmlCacheSchemaMismatchError(RuntimeError):
+    """A bootstrap finished but the live catalog does not have the shape it ensures.
+
+    Distinct from the underlying DDL error on purpose (LML#1210): a raw
+    ``LockNotAvailableError`` says "a statement did not run", which may be
+    harmless, while this says "the deployed table is the wrong shape and the
+    cache that reads it is about to degrade silently". ``main.py``'s bootstrap
+    loop logs the two differently for exactly that reason.
+    """
+
+
+# --- Post-bootstrap shape verification (LML#1210) ---------------------------
+#
+# Each pattern is matched with ``re.match`` against the whole stripped
+# statement, so it is ANCHORED at the start. That is load-bearing, not
+# incidental: ``entity/artist_wikipedia_bio.py``'s conditional-rename statement
+# is a ``DO`` block whose body CONTAINS ``ALTER TABLE lml_cache.
+# artist_wikipedia_bio``, and a substring search would mine an expectation out
+# of a statement whose entire purpose is to apply only under a runtime
+# condition. Anchoring makes an unrecognized wrapper stay unrecognized.
+
+_CREATE_SCHEMA_RE = re.compile(r"CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+(\w+)\s*$", re.I)
+_CREATE_TABLE_RE = re.compile(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+lml_cache\.(\w+)\s*\(", re.I)
+_ADD_COLUMN_RE = re.compile(
+    r"ALTER\s+TABLE\s+lml_cache\.(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)\b", re.I
+)
+_CREATE_INDEX_RE = re.compile(
+    r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)\s+ON\s+lml_cache\.(\w+)\b", re.I
+)
+
+
+@dataclass(frozen=True)
+class ExpectedShape:
+    """What a bootstrap's statements claim the catalog will contain afterwards.
+
+    Derived from the statements themselves rather than from a hand-maintained
+    per-table registry, so it cannot drift away from the DDL it guards -- the
+    failure mode a registry would have (LML#1204's lesson about hand-synced
+    rosters growing a net-shaped hole).
+
+    ``understood`` is False when ANY statement in the call was a form this
+    parser does not recognize -- a callable, a ``DO`` block, a ``CREATE
+    FUNCTION``, an index on a non-``lml_cache`` table. It gates the one place
+    the verification is allowed to *suppress* an error, because a statement
+    whose effect is invisible here can never be shown to have been a no-op.
+    """
+
+    schemas: set[str] = field(default_factory=set)
+    tables: set[str] = field(default_factory=set)
+    columns: set[tuple[str, str]] = field(default_factory=set)
+    indexes: set[str] = field(default_factory=set)
+    understood: bool = True
+
+    def __bool__(self) -> bool:
+        """True when there is anything at all to verify."""
+        return bool(self.schemas or self.tables or self.columns or self.indexes)
+
+
+def parse_expected_shape(statements: Iterable[LmlCacheBootstrapStatement]) -> ExpectedShape:
+    """Read the catalog objects ``statements`` ensure, one statement at a time.
+
+    Recognizes the four idempotent forms the ``lml_cache.*`` bootstraps
+    actually ship: ``CREATE SCHEMA IF NOT EXISTS``, ``CREATE TABLE IF NOT
+    EXISTS lml_cache.x (``, ``ALTER TABLE lml_cache.x ADD COLUMN IF NOT
+    EXISTS y``, and ``CREATE [UNIQUE] INDEX IF NOT EXISTS i ON lml_cache.x``.
+    Anything else leaves :attr:`ExpectedShape.understood` False.
+
+    Deliberately does NOT parse a ``CREATE TABLE``'s column list. Verifying the
+    table exists is enough for that form -- if the CREATE ran, its columns came
+    with it -- and a parser for the full body (nested parens, inline
+    constraints, defaults) would be fragile in exchange for nothing. The column
+    check exists for the ALTER form, which is the one that can leave a live
+    table one column short: the silent-degradation case ``entity/
+    artist_wikipedia_bio.py``'s P0-1 comment describes.
+    """
+    shape = ExpectedShape()
+    understood = True
+    for statement in statements:
+        if callable(statement):
+            understood = False
+            continue
+        text = statement.strip()
+        if match := _CREATE_SCHEMA_RE.match(text):
+            shape.schemas.add(match.group(1))
+        elif match := _CREATE_TABLE_RE.match(text):
+            shape.tables.add(match.group(1))
+        elif match := _ADD_COLUMN_RE.match(text):
+            shape.columns.add((match.group(1), match.group(2)))
+        elif match := _CREATE_INDEX_RE.match(text):
+            shape.indexes.add(match.group(1))
+            shape.tables.add(match.group(2))
+        else:
+            understood = False
+    return ExpectedShape(
+        schemas=shape.schemas,
+        tables=shape.tables,
+        columns=shape.columns,
+        indexes=shape.indexes,
+        understood=understood,
+    )
+
+
+_SCHEMA_PRESENCE_SQL = "SELECT nspname AS name FROM pg_namespace WHERE nspname = ANY($1::text[])"
+
+_TABLE_PRESENCE_SQL = """
+SELECT c.relname AS name
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'lml_cache'
+  AND c.relkind IN ('r', 'p')
+  AND c.relname = ANY($1::text[])
+"""
+
+_TABLE_COLUMN_SQL = """
+SELECT c.relname AS table_name, a.attname AS column_name
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE n.nspname = 'lml_cache'
+  AND c.relkind IN ('r', 'p')
+  AND c.relname = ANY($1::text[])
+"""
+
+_INDEX_PRESENCE_SQL = (
+    "SELECT indexname AS name FROM pg_indexes "
+    "WHERE schemaname = 'lml_cache' AND indexname = ANY($1::text[])"
+)
+
+
+async def _missing_objects(pg: PgSource, expected: ExpectedShape) -> list[str]:
+    """Return human-readable descriptions of everything ``expected`` lacks.
+
+    Reads ``pg_catalog`` directly rather than introducing a migration
+    framework: ``lml_cache.*`` is LML-owned and lifespan-bootstrapped by design
+    (discogs-etl#288 Option 3).
+    """
+    missing: list[str] = []
+    async with pg.acquire() as conn:
+        if expected.schemas:
+            rows = await conn.fetch(_SCHEMA_PRESENCE_SQL, sorted(expected.schemas))
+            present = {row["name"] for row in rows}
+            missing += [f"schema {s}" for s in sorted(expected.schemas - present)]
+
+        # Table presence is queried directly rather than inferred from the
+        # column rows. An ALTER-only call (the bio cache's three separate
+        # column bootstraps) expects no tables of its own, so inferring
+        # presence would let a missing table pass as "no columns to check".
+        present_tables: set[str] = set()
+        tables_of_interest = expected.tables | {table for table, _ in expected.columns}
+        if tables_of_interest:
+            rows = await conn.fetch(_TABLE_PRESENCE_SQL, sorted(tables_of_interest))
+            present_tables = {row["name"] for row in rows}
+            missing += [f"table lml_cache.{t}" for t in sorted(tables_of_interest - present_tables)]
+
+        if present_columns_needed := {c for c in expected.columns if c[0] in present_tables}:
+            rows = await conn.fetch(
+                _TABLE_COLUMN_SQL, sorted({table for table, _ in present_columns_needed})
+            )
+            present_columns = {(row["table_name"], row["column_name"]) for row in rows}
+            # Only columns on a table that exists -- a missing table is already
+            # reported above, and listing each of its columns would bury it.
+            missing += [
+                f"column lml_cache.{t}.{c}"
+                for t, c in sorted(present_columns_needed - present_columns)
+            ]
+
+        if expected.indexes:
+            rows = await conn.fetch(_INDEX_PRESENCE_SQL, sorted(expected.indexes))
+            present = {row["name"] for row in rows}
+            missing += [f"index lml_cache.{i}" for i in sorted(expected.indexes - present)]
+    return missing
+
+
+async def _verify_or_raise(pg: PgSource, expected: ExpectedShape) -> None:
+    """Raise :class:`LmlCacheSchemaMismatchError` if the catalog is short anything.
+
+    A failure of the verification query itself is logged and swallowed: the DDL
+    already applied cleanly on this path, so a broken diagnostic must not turn a
+    healthy boot into a failed one.
+    """
+    try:
+        missing = await _missing_objects(pg, expected)
+    except Exception:
+        logger.warning(
+            "lml_cache bootstrap shape verification could not run; the DDL itself "
+            "succeeded, so this boot proceeds unverified",
+            exc_info=True,
+        )
+        return
+    if missing:
+        raise LmlCacheSchemaMismatchError(
+            "lml_cache bootstrap reported success but the deployed schema is missing: "
+            + ", ".join(missing)
+        )
+
+
 async def bootstrap_lml_cache_table(
     pg: PgSource, *statements: LmlCacheBootstrapStatement, advisory_key: int | None = None
 ) -> None:
@@ -212,14 +468,79 @@ async def bootstrap_lml_cache_table(
     ``scripts/streaming_availability/catalog_dao.py``); the session lock
     alone suffices for every other table -- see the LML#1038 PR-2 body for
     the per-table decision and its rationale.
+
+    **Shape verification (LML#1210).** Statement success used to be the only
+    evidence that a bootstrap worked. It is not enough in either direction, and
+    both directions were observed or one column away from being observed on
+    2026-08-17:
+
+    * On success, the deployed catalog is checked against what the statements
+      claim to ensure (:func:`parse_expected_shape`). A mismatch raises
+      :class:`LmlCacheSchemaMismatchError` rather than letting the process serve
+      against a wrong-shape table, whose only symptom would be
+      ``entity/cache_toolkit.py``'s ``swallowing_fetch``/``swallowing_execute``
+      quietly returning "miss".
+    * On failure, the same check decides whether the failure MATTERED. The
+      staging boot that prompted this ran ``ADD COLUMN IF NOT EXISTS
+      last_attempted_at`` into a 10s lock timeout against a table that already
+      had the column: nothing was degraded, but the exception still propagated
+      out of ``set_up_artist_wikipedia_bio_schema`` and skipped its fourth call,
+      an unrelated ALTER that was still needed. When every expectation is
+      already satisfied, the failure is logged as a warning and swallowed, so
+      the caller's remaining bootstrap calls still run.
+
+    The swallow is deliberately narrow: it applies only when EVERY statement in
+    the call was a form the parser recognizes. One callable, ``DO`` block, or
+    unrecognized statement and the original exception propagates untouched --
+    an invisible statement cannot be shown to have been a no-op, and silently
+    skipping a CHECK widening or a guard trigger is not a trade worth making
+    for a nicer log line.
     """
-    async with pg.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(_BOOTSTRAP_LOCK_TIMEOUT)
-            if advisory_key is not None:
-                await conn.execute(f"SELECT pg_advisory_xact_lock({advisory_key})")
-            for statement in statements:
-                if callable(statement):
-                    await statement(conn)
-                else:
-                    await conn.execute(statement)
+    expected = parse_expected_shape(statements) if _verifying_shape.get() else ExpectedShape()
+    try:
+        async with pg.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(_BOOTSTRAP_LOCK_TIMEOUT)
+                if advisory_key is not None:
+                    await conn.execute(f"SELECT pg_advisory_xact_lock({advisory_key})")
+                for statement in statements:
+                    if callable(statement):
+                        await statement(conn)
+                    else:
+                        await conn.execute(statement)
+    except Exception as exc:
+        if not (expected and expected.understood):
+            raise
+        try:
+            missing = await _missing_objects(pg, expected)
+        except Exception:
+            # Never let the diagnostic mask the real error. The PG that just
+            # refused the DDL is not necessarily healthy enough to answer a
+            # catalog query, and the DDL failure is the actionable one.
+            raise exc from None
+        if missing:
+            raise LmlCacheSchemaMismatchError(
+                "lml_cache bootstrap DDL failed and the deployed schema is missing: "
+                + ", ".join(missing)
+            ) from exc
+        logger.warning(
+            "lml_cache bootstrap DDL failed but the deployed schema already satisfies "
+            "it (%s); treating as a no-op so the remaining bootstraps still run",
+            _describe(expected),
+            exc_info=True,
+        )
+        return
+
+    if expected:
+        await _verify_or_raise(pg, expected)
+
+
+def _describe(expected: ExpectedShape) -> str:
+    """One-line rendering of an expectation set, for the warning above."""
+    parts = [
+        *(f"schema {s}" for s in sorted(expected.schemas)),
+        *(f"lml_cache.{t}" for t in sorted(expected.tables)),
+        *(f"lml_cache.{t}.{c}" for t, c in sorted(expected.columns)),
+        *(f"index {i}" for i in sorted(expected.indexes)),
+    ]
+    return ", ".join(parts)
