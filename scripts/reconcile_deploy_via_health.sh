@@ -12,6 +12,17 @@
 # a few minutes later. Observed 2026-08-18: staging was serving the new commit ~4 minutes after
 # a `railway up` step failed with "operation timed out".
 #
+# Why /health is not a second, weaker gate than the deployment API. Railway gates traffic-
+# switching on `healthcheckPath`, which railway.toml sets to /health. The public domain therefore
+# only routes to a revision that has ALREADY passed Railway's healthcheck -- which is exactly
+# wait_for_railway_deployment.sh's SUCCESS predicate. Observing the expected SHA at the public
+# /health thus implies that predicate held; the two paths converge on the same underlying gate
+# rather than substituting a softer one for it. (It is also why accepting a 503 is sound: a public
+# 503 carrying the NEW sha is a revision that passed its healthcheck and degraded afterwards --
+# still a landed deploy.) That chain depends on railway.toml keeping healthcheckPath = "/health",
+# so a test pins it; repoint it and this gate silently weakens to "something answered with our
+# SHA", with nothing else failing.
+#
 # This script is the reconciliation path for exactly that case: it runs only when `railway up`
 # failed without producing a deployment id, and it decides whether the deploy actually landed by
 # polling GET /health for a transition to the expected commit_sha.
@@ -46,10 +57,15 @@
 # Environment:
 #   RECONCILE_HEALTH_TIMEOUT_SECONDS        total poll budget in seconds (default 900, matching
 #                                           wait_for_railway_deployment.sh -- see below)
-#   RECONCILE_HEALTH_POLL_INTERVAL_SECONDS  gap between polls in seconds (default 10)
+#   RECONCILE_HEALTH_POLL_INTERVAL_SECONDS  gap between polls in seconds (default 30 -- each
+#                                           poll costs a live Discogs call, see below)
 #   RECONCILE_HEALTH_CURL_TIMEOUT_SECONDS   curl --max-time per poll, in seconds (default 10)
 
 set -uo pipefail
+
+# Resolve siblings relative to this script, not the caller's cwd: CI invokes it as
+# ./scripts/reconcile_deploy_via_health.sh from the repo root, tests by absolute path.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 HEALTH_URL="${1:-}"
 EXPECTED_SHA="${2:-}"
@@ -76,7 +92,13 @@ fi
 # queued yet. Under-budgeting here doesn't fail safe, it just relocates the bug: the timeout would
 # be reported as "the upload never landed" on a deploy that landed a minute later.
 TIMEOUT_SECONDS="${RECONCILE_HEALTH_TIMEOUT_SECONDS:-900}"
-POLL_INTERVAL_SECONDS="${RECONCILE_HEALTH_POLL_INTERVAL_SECONDS:-10}"
+# 30, not the wait script's 10. That script polls Railway's API, which is free to us; every hit
+# HERE lands on our own /health, and routers/health.py's discogs_api probe makes a live
+# GET /oauth/identity per request on the raw client, outside LML's own rate gate. At 10s a full
+# 900s window would spend ~90 live Discogs calls out of a 60/min budget that staging and
+# production share -- during an incident, which is the worst moment to spend it. 30s costs at
+# most 20s of extra detection latency on a 900s budget and cuts that to ~30 calls.
+POLL_INTERVAL_SECONDS="${RECONCILE_HEALTH_POLL_INTERVAL_SECONDS:-30}"
 CURL_TIMEOUT_SECONDS="${RECONCILE_HEALTH_CURL_TIMEOUT_SECONDS:-10}"
 
 log() {
@@ -101,28 +123,21 @@ if [[ "$PRE_UPLOAD_SHA" == "$EXPECTED_SHA" ]]; then
   exit 1
 fi
 
-# Reads /health once. Echoes the commit_sha on success; returns non-zero (and echoes nothing) on
-# any failure -- network error, an unexpected HTTP status, unparsable body, or a missing/null
-# commit_sha field. Mirrors sample_health_commit_sha.sh's own handling, including its reason for
-# not using `curl -f` (a 503 from a degraded service still carries the real deploy identity, and
-# what is being read here is identity, not health -- see that script's comment). Kept separate
-# because the contracts differ: that script must never fail and prints a sentinel instead, while
-# this loop needs to distinguish a failed poll (retryable) from a successful one, which a sentinel
-# string would blur.
+# Reads /health once by delegating to sample_health_commit_sha.sh -- the SAME reader the pre-upload
+# baseline came from, deliberately, so the two readings this script compares can never be produced
+# by two subtly different rules. That matters more than the line count: the "accept 200 and 503,
+# never `curl -f`" policy and the whitespace/null rejection are a contract *between* the baseline
+# and the poll, and a second copy of it here would be a contract with itself. An earlier revision
+# did keep a copy, and it had already drifted -- the copy was missing the whitespace rejection.
+#
+# The two callers want different things from a failed read, which is the only reason a wrapper is
+# needed at all: the sampler's contract is "never fail, print the sentinel", while this loop needs
+# a retryable non-zero. Converting one to the other is the two lines below.
 read_health_commit_sha() {
-  local response http_code body sha
-  response="$(curl -s -w '\n%{http_code}' --max-time "$CURL_TIMEOUT_SECONDS" "$HEALTH_URL" \
-    2>/dev/null)" || return 1
-  http_code="${response##*$'\n'}"
-  body="${response%$'\n'*}"
-  case "$http_code" in
-    200 | 503) ;;
-    *) return 1 ;;
-  esac
-  sha="$(printf '%s' "$body" | jq -r '.commit_sha // empty' 2>/dev/null)" || return 1
-  if [[ -z "$sha" || "$sha" == "null" ]]; then
-    return 1
-  fi
+  local sha
+  sha="$(HEALTH_SAMPLE_CURL_TIMEOUT_SECONDS="$CURL_TIMEOUT_SECONDS" \
+    bash "$SCRIPT_DIR/sample_health_commit_sha.sh" "$HEALTH_URL")" || return 1
+  [[ -n "$sha" && "$sha" != "$UNREACHABLE_SENTINEL" ]] || return 1
   printf '%s' "$sha"
 }
 

