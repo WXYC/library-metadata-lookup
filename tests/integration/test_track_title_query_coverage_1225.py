@@ -20,6 +20,7 @@ import os
 
 import pytest
 
+from discogs.memory_cache import clear_all_caches
 from discogs.service import DiscogsService
 
 DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN")
@@ -30,6 +31,26 @@ pytestmark = [
 ]
 
 _POPULATION_ONE_RELEASE_ID = 6194406
+
+
+@pytest.fixture(autouse=True)
+def _isolate_validation_cache():
+    """Keep these live verdicts out of the shared in-process caches.
+
+    ``VALIDATION_CACHE`` is keyed on ``(release_id, track, artist)`` with
+    ``self`` stripped (``discogs/memory_cache.py``), so it is process-global.
+    The unit-side LML#1225 regressions in
+    ``tests/unit/test_orchestrator_helpers.py`` use the SAME release id and
+    query strings against a mocked ``get_release`` -- and ``tests/integration``
+    has no cache-clearing conftest fixture while ``tests/unit`` only clears
+    *after* each test. Collection order puts integration first, so in a
+    combined run (``pytest tests -m ''`` with a token set) these live verdicts
+    would be sitting in the cache when the unit tests start. CI only dodges
+    that because ``-m external_api`` deselects the unit tests; nothing pins it.
+    """
+    clear_all_caches()
+    yield
+    clear_all_caches()
 
 
 @pytest.mark.asyncio

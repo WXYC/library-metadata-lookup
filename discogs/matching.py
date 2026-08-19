@@ -174,10 +174,14 @@ TRACK_TITLE_FUZZY_MATCH_THRESHOLD = 85
 # title and the query as two whole strings. This one scores individual
 # token *pairs*, so coverage can ask "did each of the query's own words land
 # somewhere in the title" independent of how the strings compare as wholes.
-# 80 tolerates the same singular/plural and diacritic noise the whole-string
-# fuzzy floor does (e.g. "tower" vs "towers" scores ~91) without being loose
-# enough to let two short, unrelated words accidentally pair up.
-TRACK_TITLE_TOKEN_MATCH_THRESHOLD = 80
+# 85 tolerates the singular/plural and diacritic noise the whole-string fuzzy
+# floor does ("tower" vs "towers" scores ~91) while staying clear of
+# ``fuzz.ratio``'s 2-char-vs-3-char boundary, which sits at exactly 80.0
+# (2*2/(2+3)*100) and would otherwise "cover" a padded query token with an
+# unrelated short title word: he~the, to~two, at~cat, no~now, la~law and
+# iii~ii all score exactly 80. Covering noise is the one direction this gate
+# must not fail in, since coverage exists to *detect* uncovered noise.
+TRACK_TITLE_TOKEN_MATCH_THRESHOLD = 85
 
 # Fraction (0-1) of the QUERY's tokens that must each be covered by some
 # token in the matched title, gating both title-match arms above (LML#1225).
@@ -196,57 +200,169 @@ TRACK_TITLE_TOKEN_MATCH_THRESHOLD = 80
 # both holes by requiring that most of what the DJ actually typed shows up
 # in the title, independent of which arm opened the gate.
 #
-# Calibrated against LML#1225's measured table (fuzz.ratio >=
-# TRACK_TITLE_TOKEN_MATCH_THRESHOLD per token pair): every pinned accept
-# (LML#334's "tower of dub" / "smells teen spirit" / "de la soul - radio
-# edit", and #1035's "call name" -> "Call Your Name") scores 100% coverage;
-# every reject (the LML#334 adversarial anchor "towers of dub" vs "towers of
-# london" at 67%, and this issue's two repros at 33% and 60%) scores <= 67%.
-# 0.8 sits in the open gap between those two clusters with slack on both
-# sides -- not a knife's-edge tuning against either boundary -- so a single
-# stray token in an otherwise well-covered query (an OCR'd word, a dropped
-# plural) doesn't zero out an accept, while every measured reject still
-# clears the gate by a comfortable margin. Any floor in (0.67, 1.0] survives
-# the same calibration set; 0.8 was chosen for that headroom, not because
-# the boundary itself is load-bearing -- treat it as a starting point, not a
-# tuned constant, if a new calibration case narrows the gap.
+# Calibrated against LML#1225's measured table: every pinned accept (LML#334's
+# "tower of dub" / "smells teen spirit" / "de la soul - radio edit", and
+# #1035's "call name" -> "Call Your Name") scores 100% coverage; every reject
+# (the LML#334 adversarial anchor "towers of dub" vs "towers of london" at
+# 67%, and this issue's two repros at 33% and 60%) scores <= 67%. 0.8 sits in
+# the open gap between those two clusters. Any floor in (0.67, 1.0] survives
+# that calibration set.
+#
+# **The floor is coarser than it looks.** Coverage is a ratio of small
+# integers, so at 0.8 the tolerated number of uncovered CONTENT tokens is a
+# step function: 0 for queries of 1-4 content tokens, 1 for 5-9, 2 for 10+.
+# Track-title queries are overwhelmingly 2-4 tokens, so for the dominant
+# population 0.8 is *exactly* a 100%-coverage requirement, and 0.68 / 0.8 /
+# 1.0 are the same rule there. That is why the three normalizations below
+# (annotation segments, non-content tokens, merge/split absorption) do the
+# real work: with no tolerance budget to spend at typical query lengths, the
+# gate can only avoid false rejects by not counting a token as uncovered in
+# the first place. Retuning this float is NOT a lever on that behavior.
 #
 # Composition with the two title-match arms (design note, LML#1225): this
 # gate applies AFTER either arm already said "match" -- it never lets an arm
 # that rejected still pass, it only lets this second, independent condition
-# veto an arm's accept. The substring arm's own legitimate use (an exact or
-# near-exact short title, in a query that IS mostly that title) is
-# unaffected: a title that's wholly contained in the query and a title that
-# wholly matches the query score the same 100% coverage either way, because
-# coverage counts the QUERY's tokens, not the title's -- it doesn't
-# distinguish "short title, short query" from "short title, long query," it
-# only requires that whatever the query DOES say, the title backs up.
+# veto an arm's accept. Note the veto lands BEFORE the per-track and
+# release-level artist steps, so a correct artist credit cannot rescue a
+# query this gate rejects; the gate is title-side only, by construction.
 TRACK_TITLE_QUERY_COVERAGE_THRESHOLD = 0.8
 
+# Query tokens that carry no title-identifying content, so they are excluded
+# from coverage's denominator rather than counted as "uncovered" when the
+# Discogs title omits them (LML#1225). Without this, a leading article or a
+# request-shaped filler word is enough to fail an otherwise perfect query at
+# typical lengths: "the battle for space" vs "Battle For Space" scores 0.75,
+# below the floor.
+#
+# Deliberately a local copy of ``library/db.py``'s STOPWORDS vocabulary
+# rather than an import: this module is the pure, dependency-light matching
+# kernel (see ``scan_tracklist_for_match``'s purity contract) and must not
+# reach into the SQLite-backed library layer. The vocabulary is kept
+# identical on purpose -- three sibling strategies (`track_release_matching`,
+# `track_on_compilation`, `artist_plus_album`) already filter exactly these
+# words when extracting significant query keywords, so the gate agrees with
+# the candidate generators feeding it.
+_NON_CONTENT_QUERY_TOKENS = frozenset(
+    {
+        # Articles
+        "the",
+        "a",
+        "an",
+        # Conjunctions / prepositions
+        "and",
+        "with",
+        "from",
+        # Demonstratives
+        "that",
+        "this",
+        # Request-shaped noise
+        "play",
+        "song",
+        "remix",
+        # Label / format noise
+        "story",
+        "records",
+    }
+)
 
-def _query_token_coverage(query_lower: str, title_lower: str) -> float:
-    """Fraction of ``query_lower``'s tokens matched by some token in ``title_lower``.
+# A parenthesized or bracketed segment in the RAW query, stripped to form a
+# second coverage candidate (LML#1225). A DJ-typed version annotation --
+# "(Radio Edit)", "[Live at Newport]", "(feat. Sun Ra)" -- names a pressing,
+# not the track title Discogs lists, so counting its words as uncovered
+# rejects a genuine match. This is not hypothetical: LML *manufactures*
+# exactly this shape. ``track_on_compilation.py`` widens the Discogs query to
+# ``f"{song} ({remix_tag})"`` whenever the raw request typed a
+# remix/mix/version/edit parenthetical, then passes that widened string
+# straight into ``validate_release_for_track`` -- so without this carve-out
+# every remix request through the compilation tier validates against nothing.
+#
+# Only an explicit bracket counts. A bare trailing suffix ("Battle For Space
+# 12 inch mix") is indistinguishable from title content and stays subject to
+# the full-query coverage rule; brackets are the DJ's own signal that the
+# segment is an annotation rather than part of the name.
+_ANNOTATION_SEGMENT_RE = re.compile(r"[(\[][^)\]]*[)\]]")
 
-    Both inputs are expected already run through :func:`normalize_for_track_comparison`
-    (whitespace-collapsed, punctuation-stripped) -- this just splits on whitespace
-    and does an all-pairs per-token fuzzy match. A query token "covers" if
-    ``fuzz.ratio`` against ANY title token clears
-    :data:`TRACK_TITLE_TOKEN_MATCH_THRESHOLD`. An empty query is vacuously fully
-    covered (nothing to fail); a non-empty query against an empty title is
-    zero-covered (nothing to cover it).
+
+def _content_tokens(query_lower: str) -> list[str]:
+    """Split a normalized query into the tokens coverage is allowed to judge.
+
+    Drops :data:`_NON_CONTENT_QUERY_TOKENS`. A query made up *entirely* of
+    non-content words keeps all of them rather than collapsing to an empty
+    list, so "the a and" is still measured against the title instead of
+    passing vacuously.
     """
-    query_tokens = query_lower.split()
-    if not query_tokens:
-        return 1.0
+    tokens = query_lower.split()
+    content = [t for t in tokens if t not in _NON_CONTENT_QUERY_TOKENS]
+    return content or tokens
+
+
+def _token_is_covered(token: str, title_tokens: list[str], title_lower: str) -> bool:
+    """Whether one query token is accounted for by the title.
+
+    Two ways to cover, checked in order:
+
+    1. A whole-token fuzzy pair against any title token at
+       :data:`TRACK_TITLE_TOKEN_MATCH_THRESHOLD` ("tower" covers "towers").
+    2. Plain containment in the title *string*, which absorbs the token
+       merge/split family that per-token pairing is structurally blind to:
+       "moon"/"pix" both appear inside "moonpix", though neither pairs with
+       it (``fuzz.ratio("moon", "moonpix")`` is only 72.7). Without this,
+       "Moon Pix" vs "Moonpix" scores **0%** coverage on a pair
+       ``token_set_ratio`` scores 93 -- a false reject on exactly the
+       typographic-noise class LML#334's fuzzy fallback exists to absorb.
+       Hyphen and spacing disagreements ("Non-Stop", "Doo-Wop", "E-Bow The
+       Letter") are the same shape, since
+       :func:`normalize_for_track_comparison` deletes punctuation rather
+       than replacing it with a space.
+    """
+    if any(fuzz.ratio(token, t) >= TRACK_TITLE_TOKEN_MATCH_THRESHOLD for t in title_tokens):
+        return True
+    return token in title_lower
+
+
+def query_content_token_variants(track: str) -> list[list[str]]:
+    """Content-token readings of a raw query, most literal first (LML#1225).
+
+    Computed once per scan and reused for every tracklist entry -- the walk is
+    hot (a 99-track box set is scanned entry by entry), and re-normalizing and
+    re-splitting the query per entry is pure waste.
+
+    Returns one list for the whole query, plus -- when the raw text carries a
+    bracketed annotation that isn't the entire query -- a second list with
+    that segment removed (see :data:`_ANNOTATION_SEGMENT_RE`). Coverage
+    passes if *any* variant clears the floor. Taking the best reading is safe
+    because this gate only ever vetoes: a variant can restore a match one of
+    the title arms already accepted, never manufacture one they rejected.
+    """
+    variants = [_content_tokens(normalize_for_track_comparison(track))]
+    without_annotation = _ANNOTATION_SEGMENT_RE.sub(" ", track)
+    if without_annotation.strip() and without_annotation != track:
+        head = _content_tokens(normalize_for_track_comparison(without_annotation))
+        if head and head != variants[0]:
+            variants.append(head)
+    return variants
+
+
+def query_is_covered_by_title(query_variants: list[list[str]], title_lower: str) -> bool:
+    """Whether some reading of the query is accounted for by ``title_lower``.
+
+    ``title_lower`` must already be normalized by
+    :func:`normalize_for_track_comparison`. An empty query covers nothing:
+    a song string that normalizes away entirely ("!!!", "...", whitespace)
+    would otherwise substring-match every tracklist entry AND sail through
+    this gate, which is the opposite of what it exists to do. The sibling
+    ``find_track_position`` carries the same empty-needle guard.
+    """
     title_tokens = title_lower.split()
     if not title_tokens:
-        return 0.0
-    covered = sum(
-        1
-        for q in query_tokens
-        if any(fuzz.ratio(q, t) >= TRACK_TITLE_TOKEN_MATCH_THRESHOLD for t in title_tokens)
-    )
-    return covered / len(query_tokens)
+        return False
+    for tokens in query_variants:
+        if not tokens:
+            continue
+        covered = sum(1 for t in tokens if _token_is_covered(t, title_tokens, title_lower))
+        if covered / len(tokens) >= TRACK_TITLE_QUERY_COVERAGE_THRESHOLD:
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,18 +399,30 @@ def scan_tracklist_for_match(
        query tokens the title lacks. Neither requires the reverse. LML#1225
        adds a query-coverage requirement gating BOTH arms equally: even
        after substring or fuzzy matching says "match," at least
-       :data:`TRACK_TITLE_QUERY_COVERAGE_THRESHOLD` of the query's own
-       tokens must each fuzzy-match some title token (see
-       :func:`_query_token_coverage`). This rejects a real, short track
+       :data:`TRACK_TITLE_QUERY_COVERAGE_THRESHOLD` of the query's *content*
+       tokens must each be accounted for by the title (see
+       :func:`query_is_covered_by_title`). This rejects a real, short track
        title padded with arbitrary extra query words (this issue's "Battle
        For Space" vs "Space Lizzard Battle Star hell cat," and "Symphony
-       No. 9" vs "Purple Refrigerator Symphony No 9") without narrowing
-       recall on a short title that legitimately IS most of the query --
-       coverage counts the query's tokens, not the title's, so it can't
-       distinguish "short title, short query" from "short title, long
-       query non-noise"; it only requires that whatever the query says, the
-       title backs up. See that constant's docstring for the full
-       composition rule and calibration.
+       No. 9" vs "Purple Refrigerator Symphony No 9").
+
+       Three normalizations keep that from over-rejecting, and they are
+       load-bearing rather than polish -- at typical 2-4-token query
+       lengths the floor tolerates *zero* uncovered tokens, so anything the
+       gate miscounts as uncovered is an outright false reject:
+       bracketed annotation segments get a second, annotation-free reading
+       of the query; non-content words (articles, request filler) leave the
+       denominator; and containment in the title string absorbs token
+       merge/split ("Moon Pix" vs "Moonpix"). See
+       :data:`TRACK_TITLE_QUERY_COVERAGE_THRESHOLD` for the calibration and
+       the step-function arithmetic behind that "zero tolerance" claim.
+
+       Note what coverage does **not** do: it divides by the query's length,
+       so it is weakest exactly where the query is least specific. A
+       single-token query is vacuously covered, and "Space" still matches
+       "Battle For Space" through the substring arm. Under-specified queries
+       are a different failure mode from LML#1225's noise-padding one and
+       are not addressed here.
     2. Per-track artist credits (if any): bidirectional substring per
        credited name, then a joined-credit ``token_set_ratio`` fuzzy
        fallback (LML#210) for collaborations credited as separate names.
@@ -326,6 +454,8 @@ def scan_tracklist_for_match(
     track_lower = normalize_for_track_comparison(track)
     artist_lower = normalize_artist_for_validation(artist)
     release_artist_lower = normalize_artist_for_validation(release_artist)
+    # Hoisted out of the entry loop: the query's readings don't vary per entry.
+    query_variants = query_content_token_variants(track)
 
     for entry in tracklist:
         item_title = normalize_for_track_comparison(entry.title)
@@ -342,7 +472,7 @@ def scan_tracklist_for_match(
         # rationale. Applies uniformly to both arms (an entry that matched
         # via substring is held to the same coverage floor as one that
         # matched via token_set_ratio).
-        if _query_token_coverage(track_lower, item_title) < TRACK_TITLE_QUERY_COVERAGE_THRESHOLD:
+        if not query_is_covered_by_title(query_variants, item_title):
             continue
 
         if entry.artists:

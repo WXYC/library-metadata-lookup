@@ -242,24 +242,25 @@ class TestScanTracklistForMatchQueryCoverage:
             is False
         )
 
-    def test_typed_suffix_case_rejected_by_design(self):
-        """Design decision (LML#1225): a DJ-typed suffix like '12 inch mix'
-        against the real title 'Battle For Space' scores 50% query-token
-        coverage (3 of 6 tokens: 'battle', 'for', 'space' land; '12', 'inch',
-        'mix' don't) -- below the 80% floor, so this is REJECTED.
+    def test_bare_typed_suffix_rejected_by_design(self):
+        """Design decision (LML#1225): a DJ-typed suffix with NO brackets --
+        '12 inch mix' appended to the real title 'Battle For Space' -- scores
+        50% coverage and is REJECTED.
 
-        This case is not a production repro and isn't known to be reachable:
-        a typed suffix on a real track title overwhelmingly arrives together
-        with an artist (SWAPPED_INTERPRETATION or TRACK_ON_COMPILATION), not
-        as a bare SONG_AS_TRACK song string, and those paths have a real
-        artist leg backing up the title gate. Before this fix, the substring
-        arm already accepted this case unconditionally (the title is a
-        literal prefix of the query) -- unpinned, so not a documented
-        regression to preserve. The same coverage rule that closes the two
-        real repros closes this one too, and there is no evidence a DJ
-        titled-suffix query reaches this kernel without an artist to lean
-        on, so this is accepted as the correct trade rather than special-
-        cased. Pinned here so a future change to the floor makes a
+        The seam is the bracket, not the words. A bracketed annotation
+        ('Battle For Space (12 inch mix)') is the DJ explicitly marking a
+        segment as pressing metadata rather than part of the name, and the
+        annotation-stripped reading of the query accepts it (see
+        ``test_bracketed_annotation_accepted``). A bare trailing suffix
+        carries no such signal and is indistinguishable from title content,
+        so it stays subject to the full-query rule.
+
+        Do NOT justify this by claiming a real artist leg backs up the title
+        gate on the strategies where a typed suffix arrives -- it does not.
+        The coverage veto sits ABOVE the per-track and release-level artist
+        steps in ``scan_tracklist_for_match``, so a perfectly matching artist
+        credit cannot rescue a query this gate rejects. The trade is accepted
+        on the bracket distinction alone. Pinned so a future change makes a
         deliberate choice about this case instead of drifting into it."""
         tracklist = [TracklistEntry(title="Battle For Space", artists=None)]
         assert (
@@ -268,6 +269,132 @@ class TestScanTracklistForMatchQueryCoverage:
                 "Battle For Space 12 inch mix",
                 "Population One",
                 release_artist="Population One",
+            )
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        "query, title",
+        [
+            pytest.param("Moon Pix", "Moonpix", id="split_vs_merged"),
+            pytest.param("Non Stop", "Non-Stop", id="space_vs_hyphen"),
+            pytest.param("Doo Wop", "Doo-Wop", id="hyphen_short_tokens"),
+            pytest.param("E Bow the Letter", "E-Bow The Letter", id="hyphen_leading_initial"),
+        ],
+    )
+    def test_token_merge_split_still_accepts(self, query, title):
+        """Per-token pairing is structurally blind to token merge/split, and
+        ``normalize_for_track_comparison`` DELETES punctuation rather than
+        replacing it with a space -- so 'Moon Pix' and 'Moonpix' share no
+        token at all, though ``token_set_ratio`` scores them 93.
+
+        Whole-token fuzzy matching alone scored these 0-75% coverage and
+        rejected every one of them: a false reject on exactly the
+        typographic-noise class LML#334's fuzzy fallback exists to absorb
+        (Cat Power's *Moon Pix* is a CLAUDE.md canonical fixture). Title-string
+        containment in :func:`_token_is_covered` is what keeps them accepted."""
+        tracklist = [TracklistEntry(title=title, artists=None)]
+        assert (
+            scan_tracklist_for_match(tracklist, query, "Cat Power", release_artist="Cat Power")
+            is True
+        )
+
+    @pytest.mark.parametrize(
+        "query, title",
+        [
+            pytest.param("la paradoja (Extended Mix)", "la paradoja", id="paren_version"),
+            pytest.param("Back, Baby (Radio Edit)", "Back, Baby", id="paren_radio_edit"),
+            pytest.param(
+                "In a Sentimental Mood [Live at Newport]",
+                "In A Sentimental Mood",
+                id="bracket_live",
+            ),
+            pytest.param("Aluminum Tunes (feat. Sessa)", "Aluminum Tunes", id="paren_feature"),
+        ],
+    )
+    def test_bracketed_annotation_accepted(self, query, title):
+        """A DJ-typed bracketed annotation names a pressing, not the track
+        title Discogs lists, so its words must not count as uncovered.
+
+        This is not hypothetical: ``track_on_compilation.py`` *manufactures*
+        this exact shape, widening the Discogs query to ``f"{song}
+        ({remix_tag})"`` whenever the raw request typed a
+        remix/mix/version/edit parenthetical and then passing that widened
+        string straight into ``validate_release_for_track``. Without the
+        annotation-stripped reading of the query, every remix request through
+        the compilation tier validates against nothing."""
+        tracklist = [TracklistEntry(title=title, artists=None)]
+        assert (
+            scan_tracklist_for_match(tracklist, query, "Stereolab", release_artist="Stereolab")
+            is True
+        )
+
+    def test_manufactured_remix_widening_still_validates(self):
+        """The literal string ``track_on_compilation.py`` builds, end to end.
+
+        Its widening regex turns a raw request carrying '(Timo Maas Remix)'
+        into 'Enjoy the Silence (Timo Maas Remix)' and validates that against
+        a comp that lists the base title. The remixer's NAME is why an
+        annotation-word vocabulary alone is not enough here -- 'timo' and
+        'maas' are covered by nothing -- and why the whole bracketed segment
+        has to come out."""
+        tracklist = [TracklistEntry(title="Enjoy The Silence", artists=None)]
+        assert (
+            scan_tracklist_for_match(
+                tracklist,
+                "Enjoy the Silence (Timo Maas Remix)",
+                "Stereolab",
+                release_artist="Stereolab",
+            )
+            is True
+        )
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            pytest.param("the battle for space", id="leading_article"),
+            pytest.param("battle for space remix", id="trailing_request_noise"),
+            pytest.param("play the song battle for space", id="request_filler"),
+        ],
+    )
+    def test_non_content_tokens_do_not_count_as_uncovered(self, query):
+        """Articles and request-shaped filler leave the denominator.
+
+        At typical 2-4-token query lengths the 0.8 floor tolerates ZERO
+        uncovered tokens, so a single leading 'the' is otherwise enough to
+        fail an otherwise perfect query ('the battle for space' scores 0.75).
+        The vocabulary mirrors ``library/db.py``'s STOPWORDS, which three
+        sibling strategies already apply to this same job."""
+        tracklist = [TracklistEntry(title="Battle For Space", artists=None)]
+        assert (
+            scan_tracklist_for_match(
+                tracklist, query, "Population One", release_artist="Population One"
+            )
+            is True
+        )
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            pytest.param("!!!", id="punctuation_only"),
+            pytest.param("...", id="ellipsis"),
+            pytest.param("   ", id="whitespace_only"),
+        ],
+    )
+    def test_query_that_normalizes_away_matches_nothing(self, query):
+        """A song string that normalizes to empty must not validate.
+
+        ``normalize_for_track_comparison`` maps punctuation-only input to '',
+        and '' is a substring of every title -- so the substring arm accepts
+        every tracklist entry. Treating an empty query as vacuously covered
+        would let that straight through, which is the exact opposite of what
+        this gate exists to do. WXYC plays !!! (chk chk chk), and only
+        ``track_release_matching`` guards ``not track.strip()`` upstream; the
+        sibling ``find_track_position`` carries the same empty-needle guard."""
+        tracklist = [TracklistEntry(title="Battle For Space", artists=None)]
+        assert (
+            scan_tracklist_for_match(
+                tracklist, query, "Population One", release_artist="Population One"
             )
             is False
         )
