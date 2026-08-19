@@ -58,6 +58,30 @@ That last row matters: the CLI `Debug`-formats the status enum, so a status Rail
 
 Tunables, all with defaults that suit CI: `RAILWAY_DEPLOY_TIMEOUT_SECONDS` (900), `RAILWAY_DEPLOY_POLL_INTERVAL_SECONDS` (10), `RAILWAY_DEPLOY_MAX_POLL_ERRORS` (10), `RAILWAY_DEPLOY_BUILD_LOG_LINES` (100). The error tolerance is the point of the exercise: a single Railway API blip — including a zero-exit response that fails to parse — must not fail a good deploy, so it counts toward the tolerance instead of aborting.
 
+### Reconciling a `railway up` upload that never returned an id (LML#1231)
+
+The wait script above needs a `deploymentId`, and there is one failure mode upstream of where it can reach: if the `railway up` **HTTP request itself** fails — a client-side network timeout on the upload, not a build failure — the CLI never prints a `deploymentId` at all. `Deploy to Railway` exits non-zero, `Wait for deployment to go live` has nothing to poll, and (pre-LML#1231) the job went red even when Railway had already accepted the upload and the revision went live minutes later. Observed 2026-08-18: staging served the new commit ~4 minutes after a `railway up` step failed with `operation timed out`.
+
+Both deploy jobs now carry a reconciliation path for exactly that case:
+
+1. **`Sample /health before upload`** runs [`scripts/sample_health_commit_sha.sh`](../scripts/sample_health_commit_sha.sh) *before* `railway up`, reading `/health`'s current `commit_sha` as a step output. It never fails the step — an unreachable or malformed `/health` prints the sentinel `unreachable` and still exits 0, because "no baseline available" is itself meaningful input to the next step, not an error.
+2. **`Deploy to Railway`** now carries `continue-on-error: true`. This is load-bearing, not cosmetic: once a step fails outright, GitHub Actions marks the job failed permanently — no later step's success can undo it, only branch around it. `continue-on-error` is the only mechanism that lets a later step become the actual arbiter of red/green for this one case. `steps.deploy.outputs.deployment_id` is still empty exactly when the upload failed before producing one, so the two steps below gate on it directly rather than on the step's (now-masked) conclusion.
+3. **`Wait for deployment to go live`** gained `if: steps.deploy.outputs.deployment_id != ''` — unchanged otherwise, it simply no longer runs with an empty id (which used to be moot, since the job was already dead by that point; with `continue-on-error` in play it would otherwise run and hit the script's own usage-error exit).
+4. **`Reconcile deploy with no deployment id`** runs [`scripts/reconcile_deploy_via_health.sh`](../scripts/reconcile_deploy_via_health.sh) when `steps.deploy.outputs.deployment_id == ''`, passing the `/health` URL, `github.sha`, and the step-1 baseline. Its exit code is the job's real outcome for this branch.
+
+**The trap this design exists to close.** The naive check — "is `github.sha` live at `/health`?" — passes trivially on any re-run where that SHA is *already* serving from an earlier, unrelated successful deploy, which would turn a genuinely failed upload green. `reconcile_deploy_via_health.sh` instead requires a **transition**: it only reports recovery when the pre-upload baseline (step 1) differed from `github.sha` *and* a later poll observes `/health` become `github.sha`. Two cases are rejected immediately, before any polling, because no transition can be proven either way:
+
+| Pre-upload baseline | Verdict |
+|---|---|
+| Already equal to `github.sha` | **Fail — inconclusive.** A same-SHA re-run must never pass. |
+| `unreachable` (step 1 itself failed) | **Fail — inconclusive.** No starting point, no provable transition. |
+| A different SHA, and polling later observes `github.sha` | **Pass — recovered.** |
+| A different SHA, and polling times out without observing `github.sha` | **Fail.** The upload genuinely never landed (or `/health` was unreachable throughout the window — both fail the same way). |
+
+Tunables, analogous to the wait script's: `RECONCILE_HEALTH_TIMEOUT_SECONDS` (300), `RECONCILE_HEALTH_POLL_INTERVAL_SECONDS` (10), `RECONCILE_HEALTH_CURL_TIMEOUT_SECONDS` (10 — per-poll `curl --max-time`), plus `sample_health_commit_sha.sh`'s own `HEALTH_SAMPLE_CURL_TIMEOUT_SECONDS` (10). A single dropped poll during the reconciliation window is tolerated (mirrors the wait script's transient-error handling) — only never observing the expected SHA before the deadline is a failure.
+
+Because `Deploy to Railway`'s conclusion is masked by `continue-on-error`, a passing reconciliation step leaves the whole job's conclusion at `success`, so `smoke-test-staging`/`smoke-test-production` (which `needs:` the deploy job) run normally — no separate wiring was needed for that.
+
 ## Standalone `paths:`-filtered guard workflows
 
 Two workflows outside `ci.yml` run narrow, `paths:`-filtered checks on both `pull_request` and `push: branches: [main, prod]`, each with `permissions: contents: read` and no Python setup (pure bash):
