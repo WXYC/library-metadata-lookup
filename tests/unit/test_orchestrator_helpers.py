@@ -21,8 +21,10 @@ from discogs.models import (
     DiscogsSearchResponse,
     ReleaseInfo,
     ReleaseMetadataResponse,
+    TrackItem,
     TrackReleasesResponse,
 )
+from discogs.service import DiscogsService
 from generated.api_models import (
     DiscogsReleaseInfo,
     DiscogsTrackReleasesResponse,
@@ -3430,6 +3432,163 @@ class TestSearchSongAsTrack:
             f"Expected early-exit after at most {MAX_SEARCH_RESULTS} validate calls, "
             f"got {n_validate_calls} (LML#536: gather conversion lost early exit)."
         )
+
+
+class TestSearchSongAsTrackQueryCoverage1225:
+    """End-to-end LML#1225 regression: a REAL ``DiscogsService`` with only its
+    network-touching ``get_release``/``search_releases_by_track`` methods
+    mocked, so ``validate_track_on_release`` runs for real and exercises the
+    actual ``scan_tracklist_for_match`` kernel (not an ``AsyncMock`` stand-in
+    for the whole validation step, the way most of ``TestSearchSongAsTrack``
+    above does). This is the shape of the real production bug: a SONG_AS_TRACK
+    library HIT that should never have validated.
+
+    ``allow_release_resolution_fallback=False`` on every call below turns off
+    the unrelated LML#628 row-less carry-through, which would otherwise retry
+    resolution through a separate path and entangle this test with that
+    feature's own coverage.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rejects_noise_padded_query_fuzzy_arm_repro(self):
+        """Production repro 1 (2026-08-18): song="Space Lizzard Battle Star
+        hell cat" surfaced Population One's "Theater Of A Confused Mind" via
+        track "Battle For Space" -- token_set_ratio scores 85.71, clearing the
+        85 fuzzy floor, because it structurally ignores the four query tokens
+        that match nothing. Must now return no results."""
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search.return_value = [
+            make_library_item(artist="Population One", title="Theater Of A Confused Mind")
+        ]
+
+        release = ReleaseMetadataResponse(
+            release_id=6194406,
+            title="Theater Of A Confused Mind",
+            artist="Population One",
+            release_url="https://discogs.com/release/6194406",
+            tracklist=[TrackItem(position="B2", title="Battle For Space")],
+        )
+        svc = DiscogsService(token="unused-get_release-is-mocked")
+        svc.search_releases_by_track = AsyncMock(
+            return_value=DiscogsTrackReleasesResponse(
+                track="Space Lizzard Battle Star hell cat",
+                releases=[
+                    DiscogsReleaseInfo(
+                        album="Theater Of A Confused Mind",
+                        artist="Population One",
+                        release_id=6194406,
+                        release_url="https://discogs.com/release/6194406",
+                        is_compilation=False,
+                    )
+                ],
+                total=1,
+            )
+        )
+        with patch.object(svc, "get_release", new_callable=AsyncMock, return_value=release):
+            results, matched_via, _ = await search_song_as_track(
+                db,
+                "Space Lizzard Battle Star hell cat",
+                discogs_service=svc,
+                allow_release_resolution_fallback=False,
+            )
+
+        assert results == []
+        assert matched_via == {}
+
+    @pytest.mark.asyncio
+    async def test_rejects_noise_padded_query_substring_arm_repro(self):
+        """Production repro 2: song="Purple Refrigerator Symphony No 9" against
+        a release whose track is "Symphony No. 9" -- the normalized title is a
+        literal substring of the normalized query, so this enters via the
+        bidirectional-substring arm and never even reaches the fuzzy fallback.
+        Must now return no results."""
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search.return_value = [
+            make_library_item(artist="Ludwig van Beethoven", title="Nine Symphonies")
+        ]
+
+        release = ReleaseMetadataResponse(
+            release_id=1234567,
+            title="Nine Symphonies",
+            artist="Ludwig van Beethoven",
+            release_url="https://discogs.com/release/1234567",
+            tracklist=[TrackItem(position="9", title="Symphony No. 9")],
+        )
+        svc = DiscogsService(token="unused-get_release-is-mocked")
+        svc.search_releases_by_track = AsyncMock(
+            return_value=DiscogsTrackReleasesResponse(
+                track="Purple Refrigerator Symphony No 9",
+                releases=[
+                    DiscogsReleaseInfo(
+                        album="Nine Symphonies",
+                        artist="Ludwig van Beethoven",
+                        release_id=1234567,
+                        release_url="https://discogs.com/release/1234567",
+                        is_compilation=False,
+                    )
+                ],
+                total=1,
+            )
+        )
+        with patch.object(svc, "get_release", new_callable=AsyncMock, return_value=release):
+            results, matched_via, _ = await search_song_as_track(
+                db,
+                "Purple Refrigerator Symphony No 9",
+                discogs_service=svc,
+                allow_release_resolution_fallback=False,
+            )
+
+        assert results == []
+        assert matched_via == {}
+
+    @pytest.mark.asyncio
+    async def test_recall_preserved_for_clean_query_same_release(self):
+        """No-regression control: the SAME release from repro 1, queried with
+        the track's real (un-padded) title, must still validate and surface
+        the library row -- the fix narrows precision without costing recall
+        on a genuine match."""
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search.return_value = [
+            make_library_item(artist="Population One", title="Theater Of A Confused Mind")
+        ]
+
+        release = ReleaseMetadataResponse(
+            release_id=6194406,
+            title="Theater Of A Confused Mind",
+            artist="Population One",
+            release_url="https://discogs.com/release/6194406",
+            tracklist=[TrackItem(position="B2", title="Battle For Space")],
+        )
+        svc = DiscogsService(token="unused-get_release-is-mocked")
+        svc.search_releases_by_track = AsyncMock(
+            return_value=DiscogsTrackReleasesResponse(
+                track="Battle For Space",
+                releases=[
+                    DiscogsReleaseInfo(
+                        album="Theater Of A Confused Mind",
+                        artist="Population One",
+                        release_id=6194406,
+                        release_url="https://discogs.com/release/6194406",
+                        is_compilation=False,
+                    )
+                ],
+                total=1,
+            )
+        )
+        with patch.object(svc, "get_release", new_callable=AsyncMock, return_value=release):
+            results, matched_via, _ = await search_song_as_track(
+                db,
+                "Battle For Space",
+                discogs_service=svc,
+                allow_release_resolution_fallback=False,
+            )
+
+        assert len(results) == 1
+        assert results[0].artist == "Population One"
+        assert matched_via
 
 
 class TestLogReleaseResolutionBind:

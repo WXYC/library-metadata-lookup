@@ -6,8 +6,10 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from core.search import detect_ambiguous_format
 from discogs.matching import (
+    TracklistEntry,
     normalize_artist_for_validation,
     normalize_for_track_comparison,
+    scan_tracklist_for_match,
     strip_discogs_suffix,
 )
 from discogs.service import calculate_confidence
@@ -146,6 +148,129 @@ class TestNormalizeForTrackComparison:
     )
     def test_normalize_for_track_comparison(self, input_text, expected):
         assert normalize_for_track_comparison(input_text) == expected
+
+
+# ---------------------------------------------------------------------------
+# scan_tracklist_for_match -- query-coverage gate (LML#1225)
+# ---------------------------------------------------------------------------
+#
+# Direct, pure-function reproductions of the two production repros from
+# LML#1225: a real, short track title padded with unrelated query noise
+# validated a wrong library row because the title gate only ever checked
+# that the TITLE was accounted for (containment, or token_set_ratio's
+# shared-token score) -- never that the QUERY was accounted for by the
+# title. Same artist on both sides of each case (mirroring the real
+# `_validate_one` call, which always passes `release.artist` regardless of
+# strategy -- see `lookup/strategies/track_release_matching.py`), so a
+# regression that reopens either title-gate arm surfaces as an artist-gate
+# pass-through and this isolates it to the title/coverage logic alone.
+
+
+class TestScanTracklistForMatchQueryCoverage:
+    """Calibration set from LML#1225: every pinned accept clears query-token
+    coverage at 100%; every reject sits at or below 67%."""
+
+    def test_fuzzy_arm_rejects_noise_padded_query(self):
+        """Repro 1: 'battle for space' scores 85.71 on token_set_ratio (>= the
+        85 fuzzy floor) against the noisy query -- the fuzzy arm alone would
+        accept it. Query-token coverage is 2/6 (33%): only 'battle' and
+        'space' land in the title; 'lizzard', 'star', 'hell', 'cat' match
+        nothing. Must reject."""
+        tracklist = [TracklistEntry(title="Battle For Space", artists=None)]
+        assert (
+            scan_tracklist_for_match(
+                tracklist,
+                "Space Lizzard Battle Star hell cat",
+                "Population One",
+                release_artist="Population One",
+            )
+            is False
+        )
+
+    def test_substring_arm_rejects_noise_padded_query(self):
+        """Repro 2: the normalized title 'symphony no 9' is a literal
+        substring of the normalized query, so the bidirectional-substring
+        arm alone would accept it without ever reaching the fuzzy fallback.
+        Query-token coverage is 3/5 (60%): 'purple' and 'refrigerator' match
+        nothing in the title. Must reject."""
+        tracklist = [TracklistEntry(title="Symphony No. 9", artists=None)]
+        assert (
+            scan_tracklist_for_match(
+                tracklist,
+                "Purple Refrigerator Symphony No 9",
+                "Ludwig van Beethoven",
+                release_artist="Ludwig van Beethoven",
+            )
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        "query, title",
+        [
+            pytest.param("tower of dub", "Towers Of Dub", id="lml334_singular_plural_typo"),
+            pytest.param(
+                "smells teen spirit", "Smells Like Teen Spirit", id="lml334_dropped_interior_word"
+            ),
+            pytest.param(
+                "de la soul - radio edit",
+                "de la soul (radio edit)",
+                id="lml334_dash_vs_paren_suffix",
+            ),
+            pytest.param("call name", "Call Your Name", id="lml1035_dropped_interior_word"),
+        ],
+    )
+    def test_recall_anchors_still_accept(self, query, title):
+        """LML#334's recall anchors: typographic noise that leaves query
+        content intact must still clear the (now-additional) coverage gate --
+        every one of these scores 100% query-token coverage."""
+        tracklist = [TracklistEntry(title=title, artists=None)]
+        assert (
+            scan_tracklist_for_match(tracklist, query, "Stereolab", release_artist="Stereolab")
+            is True
+        )
+
+    def test_reject_anchor_one_shared_token_stays_rejected(self):
+        """LML#334's adversarial reject anchor: 'towers of dub' vs 'towers of
+        london' scores ~82 on token_set_ratio, already below the existing 85
+        fuzzy floor (unchanged by this fix) -- and separately sits at 67%
+        query-token coverage, below the new gate too. Belt and suspenders."""
+        tracklist = [TracklistEntry(title="Towers Of London", artists=None)]
+        assert (
+            scan_tracklist_for_match(
+                tracklist, "towers of dub", "Stereolab", release_artist="Stereolab"
+            )
+            is False
+        )
+
+    def test_typed_suffix_case_rejected_by_design(self):
+        """Design decision (LML#1225): a DJ-typed suffix like '12 inch mix'
+        against the real title 'Battle For Space' scores 50% query-token
+        coverage (3 of 6 tokens: 'battle', 'for', 'space' land; '12', 'inch',
+        'mix' don't) -- below the 80% floor, so this is REJECTED.
+
+        This case is not a production repro and isn't known to be reachable:
+        a typed suffix on a real track title overwhelmingly arrives together
+        with an artist (SWAPPED_INTERPRETATION or TRACK_ON_COMPILATION), not
+        as a bare SONG_AS_TRACK song string, and those paths have a real
+        artist leg backing up the title gate. Before this fix, the substring
+        arm already accepted this case unconditionally (the title is a
+        literal prefix of the query) -- unpinned, so not a documented
+        regression to preserve. The same coverage rule that closes the two
+        real repros closes this one too, and there is no evidence a DJ
+        titled-suffix query reaches this kernel without an artist to lean
+        on, so this is accepted as the correct trade rather than special-
+        cased. Pinned here so a future change to the floor makes a
+        deliberate choice about this case instead of drifting into it."""
+        tracklist = [TracklistEntry(title="Battle For Space", artists=None)]
+        assert (
+            scan_tracklist_for_match(
+                tracklist,
+                "Battle For Space 12 inch mix",
+                "Population One",
+                release_artist="Population One",
+            )
+            is False
+        )
 
 
 # ---------------------------------------------------------------------------
