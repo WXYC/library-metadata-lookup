@@ -53,34 +53,36 @@ def _isolate_validation_cache():
     clear_all_caches()
 
 
+@pytest.fixture
+async def service():
+    """A live-token ``DiscogsService``, closed on the way out."""
+    svc = DiscogsService(token=DISCOGS_TOKEN)
+    try:
+        yield svc
+    finally:
+        await svc.close()
+
+
 @pytest.mark.asyncio
-async def test_noise_padded_query_no_longer_validates():
+async def test_noise_padded_query_no_longer_validates(service):
     """LML#1225's production repro, replayed against the real Discogs release.
 
-    Query-token coverage is 2/6 (33%, well below the 0.8 floor): only
+    Query-content-token coverage is 2/6 (33%, well below the 0.8 floor): only
     'battle' and 'space' land in the title; 'lizzard', 'star', 'hell', 'cat'
     match nothing. Must now return False.
     """
-    service = DiscogsService(token=DISCOGS_TOKEN)
-    try:
-        result = await service.validate_track_on_release(
-            _POPULATION_ONE_RELEASE_ID, "Space Lizzard Battle Star hell cat", "Population One"
-        )
-    finally:
-        await service.close()
+    result = await service.validate_track_on_release(
+        _POPULATION_ONE_RELEASE_ID, "Space Lizzard Battle Star hell cat", "Population One"
+    )
     assert result is False
 
 
 @pytest.mark.asyncio
-async def test_clean_query_still_validates_no_recall_regression():
+async def test_clean_query_still_validates_no_recall_regression(service):
     """No-regression control: the track's real title, un-padded, must still
     validate against the same real release -- the fix narrows precision
     without costing recall on a genuine match."""
-    service = DiscogsService(token=DISCOGS_TOKEN)
-    try:
-        result = await service.validate_track_on_release(
-            _POPULATION_ONE_RELEASE_ID, "Battle For Space", "Population One"
-        )
-    finally:
-        await service.close()
+    result = await service.validate_track_on_release(
+        _POPULATION_ONE_RELEASE_ID, "Battle For Space", "Population One"
+    )
     assert result is True
