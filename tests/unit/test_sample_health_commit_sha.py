@@ -74,6 +74,28 @@ def test_missing_commit_sha_field_prints_the_sentinel(tmp_path):
     assert result.stdout.strip() == "unreachable"
 
 
+def test_a_commit_sha_containing_whitespace_prints_the_sentinel(tmp_path):
+    """The caller writes this script's stdout into ``$GITHUB_OUTPUT`` as
+    ``commit_sha=<value>``, and that file's format is line-oriented: a value
+    carrying an embedded newline either breaks the step outright or smuggles a
+    second, attacker-chosen ``name=value`` line into the step's outputs. The
+    value comes from a remote HTTP response body, so "it's our own /health, it
+    would never" is not a guarantee this script gets to rely on -- especially
+    since it only runs when the deploy path is already misbehaving.
+
+    A real commit SHA has no whitespace in it, so refusing any value that does
+    costs nothing and makes the single-line guarantee the script's own property
+    rather than the call site's assumption. It fails to the same sentinel as
+    every other unusable reading: no baseline, decided downstream."""
+    install_health_curl_stub(tmp_path, ['{"commit_sha": "abc123\\nmalicious=1"}'])
+
+    result = _run(tmp_path, [_URL])
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "unreachable"
+    assert "\n" not in result.stdout.rstrip("\n"), "stdout must be exactly one line"
+
+
 def test_malformed_json_prints_the_sentinel(tmp_path):
     install_health_curl_stub(tmp_path, ["not json at all"])
 
