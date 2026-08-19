@@ -151,11 +151,12 @@ async def _match_track_releases_to_library(
         The ``validate_release_for_track`` call below passes ``release.artist``
         as the artist argument regardless of strategy (SONG_AS_TRACK or
         SWAPPED_INTERPRETATION) -- see the comment at that call site
-        (LML#1225): on THIS call site the artist leg does no discriminating
-        work, so what actually gates a release here is the title match inside
-        ``scan_tracklist_for_match``. SWAPPED's real artist check already
-        happened above, against ``require_artist``, via the ``eligible``
-        filter -- it does not happen a second time inside validation.
+        (LML#1225): on THIS call site the artist leg compares the release
+        against itself and so does almost no discriminating work, which leaves
+        the title match inside ``scan_tracklist_for_match`` as what actually
+        gates a release here. SWAPPED's real artist check already happened
+        above, against ``require_artist``, via the ``eligible`` filter -- it
+        does not happen a second time inside validation.
         """
         if not release.album or len(release.album.strip()) < 3:
             return None
@@ -181,19 +182,33 @@ async def _match_track_releases_to_library(
         # actually return, mirroring search_compilations_for_track.
         #
         # LML#1225: the artist argument here is `release.artist` — the
-        # release's OWN credit — for BOTH SONG_AS_TRACK (`artist=None` on
-        # this kernel call) and SWAPPED_INTERPRETATION (`artist=<identified>`;
-        # this call ignores it and passes `release.artist` too). Inside the
-        # shared kernel (`discogs/matching.py::scan_tracklist_for_match`), the
-        # release-level artist step compares `artist_lower` against
-        # `release_artist_lower` — both derived from this same string — so it
-        # is always true and does no discriminating work. Validation at this
-        # call site therefore reduces to the title gate alone. SONG_AS_TRACK
-        # has no artist to pass in the first place (it is song-only by
-        # definition, inherent to the strategy, not a bug to fix here); SWAPPED
-        # already got its real artist check above via `require_artist`
-        # filtering `eligible`. Do not read this call as a second, independent
-        # validation factor — see `_validate_one`'s docstring.
+        # release's OWN credit — for BOTH SONG_AS_TRACK (which has no typed
+        # artist to pass; it is song-only by definition) and
+        # SWAPPED_INTERPRETATION (which HAS an identified artist, but this
+        # call passes `release.artist` anyway). So the kernel's release-level
+        # artist step compares this release's search-index credit against the
+        # same release's detail credit, and in the overwhelming majority of
+        # cases those agree — the step is very nearly always true and does
+        # almost no discriminating work here. Validation at this call site is
+        # therefore carried by the title gate; SWAPPED's real artist check
+        # already happened above, via `require_artist` filtering `eligible`.
+        #
+        # Nearly-always-true is NOT tautological, and the difference matters
+        # before anyone "simplifies" this away: the two strings come from two
+        # different Discogs endpoints. `release.artist` is parsed out of the
+        # search index's "Artist - Album" display string
+        # (`discogs/service.py::_parse_title`), while `release_artist` inside
+        # the kernel is the detail endpoint's first artist credit on the API
+        # path, or an unordered `SELECT artist_name ... LIMIT 1` on the cache
+        # path. For a multi-credit release the display string is the joined
+        # credit while the detail/cache string is one member, so they can and
+        # do diverge — and diverge *differently* between the two paths.
+        # Dropping the step or passing a constant would remove a real (if
+        # weak) check and reintroduce the API-vs-cache verdict divergence the
+        # LML#1035 kernel extraction exists to prevent.
+        #
+        # Do not read this call as a strong second validation factor — see
+        # `_validate_one`'s docstring.
         if release.release_id:
             is_valid = await validate_release_for_track(
                 discogs_service,

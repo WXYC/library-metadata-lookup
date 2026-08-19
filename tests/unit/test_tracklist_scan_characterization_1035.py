@@ -22,8 +22,12 @@ before the extraction in the same PR. No reconciliation was required; see the
 PR body for the full diff writeup.
 
 WXYC-representative fixtures throughout (Stereolab, Chuquimamani-Condori,
-Juana Molina, Duke Ellington & John Coltrane, Sessa, Large Professor) per
-CLAUDE.md's fixture guidance. Never Beatles/Radiohead/Queen.
+Juana Molina, Cat Power, Duke Ellington & John Coltrane, Sessa, Large
+Professor) per CLAUDE.md's fixture guidance. Never Beatles/Radiohead/Queen.
+The two LML#1225 reject cases are the exception, and deliberately so: they
+carry the real artist and title strings from the production incident
+(Population One, and the Beethoven row the same query surfaced) so the
+repro stays traceable to the log line it came from.
 """
 
 from dataclasses import dataclass
@@ -256,6 +260,82 @@ CASES: list[ScanCase] = [
             "the coverage gate rejects it even though the substring arm "
             "alone would have accepted it. Proves the gate covers BOTH arms, "
             "not just the fuzzy one."
+        ),
+    ),
+    # -----------------------------------------------------------------
+    # LML#1225 review: the three normalizations that keep the coverage
+    # gate from over-rejecting. At typical 2-4-token query lengths the
+    # 0.8 floor tolerates ZERO uncovered tokens, so each of these was a
+    # measured false reject before its normalization landed -- and each
+    # has to hold on BOTH adapters, which is why they live in this table
+    # rather than only in test_matching.py.
+    # -----------------------------------------------------------------
+    ScanCase(
+        id="lml1225_accept_token_merge_split",
+        release_artist="Cat Power",
+        release_track_title="Moonpix",
+        release_track_artists=[],
+        query_track="Moon Pix",
+        query_artist="Cat Power",
+        expected=True,
+        note=(
+            "Per-token pairing is blind to token merge/split, and "
+            "normalize_for_track_comparison DELETES punctuation instead of "
+            "replacing it with a space, so 'moon pix' and 'moonpix' share no "
+            "token -- fuzz.ratio('moon', 'moonpix') is 72.7, under the 85 "
+            "per-token floor. Whole-token coverage alone scored this 0% on a "
+            "pair token_set_ratio scores 93. Title-string containment keeps "
+            "it accepted."
+        ),
+    ),
+    ScanCase(
+        id="lml1225_accept_bracketed_annotation",
+        release_artist="Juana Molina",
+        release_track_title="la paradoja",
+        release_track_artists=[],
+        query_track="la paradoja (Extended Mix)",
+        query_artist="Juana Molina",
+        expected=True,
+        note=(
+            "A DJ-typed bracketed annotation names a pressing, not the title "
+            "Discogs lists. LML manufactures this exact shape: "
+            "track_on_compilation.py widens the query to f'{song} "
+            "({remix_tag})' and passes it straight into "
+            "validate_release_for_track, so without the annotation-stripped "
+            "reading every remix request through the compilation tier "
+            "validates against nothing."
+        ),
+    ),
+    ScanCase(
+        id="lml1225_accept_leading_article",
+        release_artist="Population One",
+        release_track_title="Battle For Space",
+        release_track_artists=[],
+        query_track="the battle for space",
+        query_artist="Population One",
+        expected=True,
+        note=(
+            "A single leading article is enough to fail an otherwise perfect "
+            "query at typical lengths (0.75, under the 0.8 floor), so "
+            "non-content words leave the denominator. Vocabulary mirrors "
+            "library/db.py's STOPWORDS, which three sibling strategies "
+            "already apply to this same job."
+        ),
+    ),
+    ScanCase(
+        id="lml1225_reject_query_that_normalizes_away",
+        release_artist="Population One",
+        release_track_title="Battle For Space",
+        release_track_artists=[],
+        query_track="!!!",
+        query_artist="Population One",
+        expected=False,
+        note=(
+            "A punctuation-only song string normalizes to '', which is a "
+            "substring of every title -- so the substring arm accepts every "
+            "tracklist entry. An empty query must therefore cover NOTHING "
+            "rather than being vacuously fully covered, or the gate inverts "
+            "into a universal accept. WXYC plays !!! (chk chk chk)."
         ),
     ),
 ]

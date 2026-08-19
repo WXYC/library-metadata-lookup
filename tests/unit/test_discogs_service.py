@@ -2431,6 +2431,27 @@ class TestFindTrackPosition:
         release = self._release([TrackItem(position="A1", title="Something Else", artists=[])])
         assert find_track_position(release, "Pequena Vertigem") is None
 
+    def test_noise_padded_query_yields_no_position(self) -> None:
+        """LML#1225: the position scan must agree with validation.
+
+        These callers feed a BMI royalty payload, so a query that
+        ``scan_tracklist_for_match`` rejects must not still resolve a
+        track-precision position — otherwise LML publishes per-track composer
+        credits for a track it simultaneously reports is not on the release.
+        Pins the coverage veto into ``_iter_title_matched_items``, which
+        ``find_track_position`` and ``_scan_tracklist_for_credit`` share.
+        """
+        release = self._release([TrackItem(position="B2", title="Pequena Vertigem", artists=[])])
+        assert find_track_position(release, "Purple Refrigerator Pequena Vertigem") is None
+        # Control: the same release still resolves the un-padded query.
+        assert find_track_position(release, "Pequena Vertigem") == "B2"
+
+    def test_bracketed_annotation_still_resolves_position(self) -> None:
+        """The annotation carve-out rides along too, so a DJ-typed pressing
+        tag doesn't cost a royalty payload its track position."""
+        release = self._release([TrackItem(position="A2", title="Pequena Vertigem", artists=[])])
+        assert find_track_position(release, "Pequena Vertigem (Radio Edit)") == "A2"
+
     def test_returns_none_when_matched_position_empty(self) -> None:
         # A title-matched track with an empty position yields None so the
         # caller falls back to release-level credits.
