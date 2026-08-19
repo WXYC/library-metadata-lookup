@@ -140,6 +140,64 @@ def test_reconciliation_step_only_runs_when_no_deployment_id_exists(job_name, he
 
 
 @pytest.mark.parametrize("job_name,health_url", _JOBS)
+def test_the_two_gated_steps_are_exhaustive_so_a_failed_deploy_cannot_report_green(
+    job_name, health_url
+):
+    """The safety property that ``continue-on-error`` on the deploy step buys its keep with.
+
+    Masking that step's failure means it no longer fails the job by itself, so the job's whole
+    red/green verdict now rests on the two gated steps below it. They must be *exhaustive*:
+    if a path existed where ``railway up`` fails and neither the wait step nor the reconciliation
+    step runs, the job would report green on a deploy that never landed -- strictly worse than the
+    false red this change set out to remove.
+
+    Two independent properties make them exhaustive, and this test pins both:
+
+    1. **The conditions are exact complements over one expression.** ``!= ''`` and ``== ''`` on the
+       same ``steps.deploy.outputs.deployment_id``, evaluated with one semantics. Whatever that
+       output is -- a real id, the empty string, or ``null`` because the step died before writing
+       ``$GITHUB_OUTPUT`` at all -- exactly one condition is true. (GitHub casts mismatched operand
+       types to numbers, and both ``null`` and ``''`` cast to ``0``, so an unset output takes the
+       ``== ''`` branch; both conditions coerce identically, so they stay complements regardless.)
+    2. **Neither condition contains a status-check function**, so both carry the implicit
+       ``success()`` -- which is *true* here, because ``continue-on-error`` turns the failed deploy
+       step's ``conclusion`` into ``success`` even though its ``outcome`` stays ``failure``.
+
+    Property 2 is the subtle one, and the trap is live: the issue's own suggested approach was to
+    run the reconciliation ``if: failure()``. That reads correctly and is exactly wrong once
+    ``continue-on-error`` is in play -- ``failure()`` would never fire, the wait step would skip on
+    the empty id, and a failed upload would sail through green with no verification at all. Any
+    status-check function in either condition reintroduces that hole, so none is allowed.
+    """
+    job = _job_block(job_name)
+    conditions = {}
+    for step_name in ("Wait for deployment to go live", "Reconcile deploy with no deployment id"):
+        step = _step_block(job, step_name)
+        found = re.findall(r"^\s*if:\s*(.+?)\s*$", step, re.M)
+        assert len(found) == 1, (
+            f"{step_name!r} must carry exactly one single-line `if:`, got {found}"
+        )
+        conditions[step_name] = found[0]
+
+    wait_if = conditions["Wait for deployment to go live"]
+    reconcile_if = conditions["Reconcile deploy with no deployment id"]
+
+    for step_name, condition in conditions.items():
+        assert not re.search(r"\b(success|failure|always|cancelled)\s*\(", condition), (
+            f"{step_name!r} gates on {condition!r}, which contains a status-check function. That "
+            "replaces the implicit success() -- true here, since continue-on-error makes the "
+            "failed deploy step's conclusion `success` -- and can skip BOTH gated steps, "
+            "reporting green on a deploy that never landed."
+        )
+
+    assert wait_if == "steps.deploy.outputs.deployment_id != ''"
+    assert reconcile_if == "steps.deploy.outputs.deployment_id == ''"
+    # Belt and braces: the two differ in the operator alone, so they cannot drift onto different
+    # expressions (which would break exhaustiveness while both still looked individually correct).
+    assert wait_if.replace("!=", "==") == reconcile_if
+
+
+@pytest.mark.parametrize("job_name,health_url", _JOBS)
 def test_reconciliation_step_runs_after_the_wait_step(job_name, health_url):
     """Ordering doesn't change which one actually executes (their `if`s are mutually exclusive
     on deployment_id), but keeping the reconciliation path textually after the normal wait path
