@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import sentry_sdk
-from rapidfuzz import fuzz
 from wxyc_etl.text import is_compilation_artist, to_match_form
 from wxyc_fastapi.http import async_singleton
 from wxyc_fastapi.observability import (
@@ -41,12 +40,11 @@ from discogs.admission import admit_or_shed, retry_429
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.fallthrough import apply_request_ctx_tags, fallthrough, request_context
 from discogs.matching import (
-    TRACK_TITLE_FUZZY_MATCH_THRESHOLD,
     TracklistEntry,
     normalize_for_track_comparison,
     query_content_token_variants,
-    query_is_covered_by_title,
     scan_tracklist_for_match,
+    title_matches_query,
 )
 from discogs.memory_cache import (
     ARTIST_CACHE,
@@ -2252,48 +2250,31 @@ class DiscogsService:
         release = await self.get_release(release_id)
         if release is None:
             return None
-        track_lower = normalize_for_track_comparison(track)
-        return _scan_tracklist_for_credit(release, track_lower, track=track)
+        return _scan_tracklist_for_credit(release, track)
 
 
-def _iter_title_matched_items(
-    release: ReleaseMetadataResponse, track_lower: str, *, track: str | None = None
-) -> Iterator[TrackItem]:
-    """Yield tracklist items whose normalized title matches ``track_lower``.
+def _iter_title_matched_items(release: ReleaseMetadataResponse, track: str) -> Iterator[TrackItem]:
+    """Yield tracklist items whose normalized title matches ``track``.
 
     The title-match step behind the credit-recovery scans —
     :func:`_scan_tracklist_for_credit` (LML#660) and :func:`find_track_position`
-    (LML#699): a bidirectional substring on the normalized title, then a
-    ``token_set_ratio`` fuzzy fallback (LML#334) so typographic noise that leaves
-    token content intact — singular/plural, a dropped interior word,
-    dash-vs-paren suffixes — still matches, then LML#1225's query-coverage veto.
+    (LML#699). Delegates the rule itself to
+    :func:`discogs.matching.title_matches_query`, the same predicate
+    ``scan_tracklist_for_match`` validates with, so the two cannot drift apart —
+    which matters here because these callers feed a **BMI royalty payload**: a
+    forked rule would report a track-precision position and composer credit for
+    a track validation simultaneously says is not on the release.
 
-    That veto is the reason this takes a raw ``track`` alongside the normalized
-    ``track_lower``: coverage reads bracketed annotation segments, which
-    normalization has already destroyed. It must stay in lockstep with
-    :func:`discogs.matching.scan_tracklist_for_match`, because these callers feed
-    a **BMI royalty payload** — without it, a noise-padded query yields a
-    track-precision position and composer credit for a track that validation
-    simultaneously reports is not on the release. Callers that omit ``track``
-    get the pre-LML#1225 rule and are opting out of that agreement.
-
-    ``track_lower`` is pre-normalized by the caller.
+    ``track`` is raw. It is normalized once here rather than by the caller,
+    because the LML#1225 coverage veto reads bracketed annotation segments that
+    normalization destroys and so needs both forms.
     """
-    query_variants = query_content_token_variants(track) if track is not None else None
+    track_lower = normalize_for_track_comparison(track)
+    query_variants = query_content_token_variants(track, track_lower)
     for item in release.tracklist or []:
         item_title = normalize_for_track_comparison(item.title)
-        if track_lower in item_title or item_title in track_lower:
-            pass
-        elif (
-            item_title
-            and fuzz.token_set_ratio(track_lower, item_title) >= TRACK_TITLE_FUZZY_MATCH_THRESHOLD
-        ):
-            pass
-        else:
-            continue
-        if query_variants is not None and not query_is_covered_by_title(query_variants, item_title):
-            continue
-        yield item
+        if title_matches_query(track_lower, item_title, query_variants):
+            yield item
 
 
 def _scan_tracklist_for_match(
@@ -2323,9 +2304,7 @@ def _scan_tracklist_for_match(
     return matched
 
 
-def _scan_tracklist_for_credit(
-    release: ReleaseMetadataResponse, track_lower: str, *, track: str | None = None
-) -> str | None:
+def _scan_tracklist_for_credit(release: ReleaseMetadataResponse, track: str) -> str | None:
     """Return the per-track credit for the title-matched track, or ``None`` (LML#660).
 
     The credit-recovery counterpart to :func:`_scan_tracklist_for_match`: same
@@ -2339,13 +2318,9 @@ def _scan_tracklist_for_credit(
     is skipped; when none carries one, ``None`` is returned and the caller falls
     back to LML#649 suppression rather than anchor on the release-level "Various".
 
-    ``track_lower`` is pre-normalized by the caller (single
-    ``normalize_for_track_comparison`` call), mirroring ``_scan_tracklist_for_match``.
-    The raw ``track`` rides along so the LML#1225 coverage veto in
-    :func:`_iter_title_matched_items` can read bracketed annotation segments that
-    normalization has already destroyed.
+    ``track`` is raw; :func:`_iter_title_matched_items` normalizes it.
     """
-    for item in _iter_title_matched_items(release, track_lower, track=track):
+    for item in _iter_title_matched_items(release, track):
         if item.artists:
             joined = " ".join(a.strip() for a in item.artists if a and a.strip())
             if joined:
@@ -2372,12 +2347,11 @@ def find_track_position(release: ReleaseMetadataResponse, track: str) -> str | N
     Returns ``None`` when ``track`` normalizes empty (an empty needle would
     substring-match every track), no title matches, or no matched track carries
     a position — the caller then falls back to release-level credits. ``track``
-    is raw; it is normalized here.
+    is raw; :func:`_iter_title_matched_items` normalizes it.
     """
-    track_lower = normalize_for_track_comparison(track)
-    if not track_lower:
+    if not normalize_for_track_comparison(track):
         return None
-    for item in _iter_title_matched_items(release, track_lower, track=track):
+    for item in _iter_title_matched_items(release, track):
         if item.position:
             return item.position
     return None

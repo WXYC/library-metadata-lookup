@@ -219,12 +219,9 @@ TRACK_TITLE_TOKEN_MATCH_THRESHOLD = 85
 # gate can only avoid false rejects by not counting a token as uncovered in
 # the first place. Retuning this float is NOT a lever on that behavior.
 #
-# Composition with the two title-match arms (design note, LML#1225): this
-# gate applies AFTER either arm already said "match" -- it never lets an arm
-# that rejected still pass, it only lets this second, independent condition
-# veto an arm's accept. Note the veto lands BEFORE the per-track and
-# release-level artist steps, so a correct artist credit cannot rescue a
-# query this gate rejects; the gate is title-side only, by construction.
+# Composition (design note, LML#1225): the veto lands BEFORE the per-track and
+# release-level artist steps, so a correct artist credit cannot rescue a query
+# this gate rejects -- the gate is title-side only, by construction.
 TRACK_TITLE_QUERY_COVERAGE_THRESHOLD = 0.8
 
 # Query tokens that carry no title-identifying content, so they are excluded
@@ -299,33 +296,33 @@ def _content_tokens(query_lower: str) -> list[str]:
 def _token_is_covered(token: str, title_tokens: list[str], title_lower: str) -> bool:
     """Whether one query token is accounted for by the title.
 
-    Two ways to cover, checked in order:
-
-    1. A whole-token fuzzy pair against any title token at
-       :data:`TRACK_TITLE_TOKEN_MATCH_THRESHOLD` ("tower" covers "towers").
-    2. Plain containment in the title *string*, which absorbs the token
-       merge/split family that per-token pairing is structurally blind to:
-       "moon"/"pix" both appear inside "moonpix", though neither pairs with
-       it (``fuzz.ratio("moon", "moonpix")`` is only 72.7). Without this,
-       "Moon Pix" vs "Moonpix" scores **0%** coverage on a pair
-       ``token_set_ratio`` scores 93 -- a false reject on exactly the
-       typographic-noise class LML#334's fuzzy fallback exists to absorb.
-       Hyphen and spacing disagreements ("Non-Stop", "Doo-Wop", "E-Bow The
-       Letter") are the same shape, since
-       :func:`normalize_for_track_comparison` deletes punctuation rather
-       than replacing it with a space.
+    Containment in the title *string* first (cheap, and how most covered
+    tokens actually cover), then a whole-token fuzzy pair against any title
+    token at :data:`TRACK_TITLE_TOKEN_MATCH_THRESHOLD` ("tower" covers
+    "towers"). The containment arm is not just an optimization: it absorbs
+    the token merge/split family that per-token pairing is structurally
+    blind to. "moon" and "pix" both appear inside "moonpix" though neither
+    pairs with it (``fuzz.ratio("moon", "moonpix")`` is 72.7), so without it
+    "Moon Pix" vs "Moonpix" scores 0% coverage on a pair ``token_set_ratio``
+    scores 93 -- a false reject on exactly the typographic-noise class
+    LML#334's fuzzy fallback exists to absorb. Hyphen and spacing
+    disagreements ("Non-Stop", "E-Bow The Letter") are the same shape, since
+    :func:`normalize_for_track_comparison` deletes punctuation rather than
+    replacing it with a space.
     """
-    if any(fuzz.ratio(token, t) >= TRACK_TITLE_TOKEN_MATCH_THRESHOLD for t in title_tokens):
+    if token in title_lower:
         return True
-    return token in title_lower
+    return any(fuzz.ratio(token, t) >= TRACK_TITLE_TOKEN_MATCH_THRESHOLD for t in title_tokens)
 
 
-def query_content_token_variants(track: str) -> list[list[str]]:
+def query_content_token_variants(track: str, track_lower: str) -> list[list[str]]:
     """Content-token readings of a raw query, most literal first (LML#1225).
 
     Computed once per scan and reused for every tracklist entry -- the walk is
-    hot (a 99-track box set is scanned entry by entry), and re-normalizing and
-    re-splitting the query per entry is pure waste.
+    hot (a 99-track box set is scanned entry by entry), and re-splitting the
+    query per entry is pure waste. ``track_lower`` is ``track`` already run
+    through :func:`normalize_for_track_comparison`; every caller has it, and
+    re-deriving it here was ~87% of this function's cost.
 
     Returns one list for the whole query, plus -- when the raw text carries a
     bracketed annotation that isn't the entire query -- a second list with
@@ -334,11 +331,14 @@ def query_content_token_variants(track: str) -> list[list[str]]:
     because this gate only ever vetoes: a variant can restore a match one of
     the title arms already accepted, never manufacture one they rejected.
     """
-    variants = [_content_tokens(normalize_for_track_comparison(track))]
+    variants = [_content_tokens(track_lower)]
     without_annotation = _ANNOTATION_SEGMENT_RE.sub(" ", track)
     if without_annotation.strip() and without_annotation != track:
         head = _content_tokens(normalize_for_track_comparison(without_annotation))
-        if head and head != variants[0]:
+        # Raw inequality doesn't imply normalized inequality -- a bracket-only
+        # difference ("Foo ()") collapses to the same tokens, and a duplicate
+        # variant would double the coverage work on every tracklist entry.
+        if head != variants[0]:
             variants.append(head)
     return variants
 
@@ -357,12 +357,53 @@ def query_is_covered_by_title(query_variants: list[list[str]], title_lower: str)
     if not title_tokens:
         return False
     for tokens in query_variants:
-        if not tokens:
+        total = len(tokens)
+        if not total:
             continue
-        covered = sum(1 for t in tokens if _token_is_covered(t, title_tokens, title_lower))
-        if covered / len(tokens) >= TRACK_TITLE_QUERY_COVERAGE_THRESHOLD:
+        covered = 0
+        for index, token in enumerate(tokens):
+            if _token_is_covered(token, title_tokens, title_lower):
+                covered += 1
+            elif (covered + total - index - 1) / total < TRACK_TITLE_QUERY_COVERAGE_THRESHOLD:
+                # Even covering every remaining token can no longer reach the
+                # floor. Same comparison as the verdict below, so the early
+                # exit cannot disagree with it.
+                break
+        if covered / total >= TRACK_TITLE_QUERY_COVERAGE_THRESHOLD:
             return True
     return False
+
+
+def title_matches_query(
+    track_lower: str, title_lower: str, query_variants: list[list[str]]
+) -> bool:
+    """Whether one tracklist entry's title matches the query being searched for.
+
+    The single title rule behind every tracklist scan: bidirectional substring
+    on the normalized title, then a ``token_set_ratio`` fuzzy fallback
+    (LML#334) so typographic noise that leaves token content intact still
+    matches, then LML#1225's query-coverage veto over both arms.
+
+    Extracted so ``scan_tracklist_for_match`` (validation) and
+    ``discogs/service.py``'s ``_iter_title_matched_items`` (the LML#660 credit
+    and LML#699 position scans) cannot drift apart -- LML#1035 collapsed two
+    copies of this rule into one kernel, and a per-caller copy would reopen
+    exactly that gap. Enforcing the agreement structurally matters most for
+    the credit/position callers, which feed a BMI royalty payload: without it
+    they would report a track-precision position and composer credit for a
+    track validation simultaneously says is not on the release.
+
+    All three arguments are pre-computed by the caller -- ``track_lower`` and
+    ``title_lower`` via :func:`normalize_for_track_comparison`,
+    ``query_variants`` via :func:`query_content_token_variants` hoisted out of
+    the entry loop.
+    """
+    matched = track_lower in title_lower or title_lower in track_lower
+    if not matched and title_lower:
+        matched = (
+            fuzz.token_set_ratio(track_lower, title_lower) >= TRACK_TITLE_FUZZY_MATCH_THRESHOLD
+        )
+    return matched and query_is_covered_by_title(query_variants, title_lower)
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,32 +431,12 @@ def scan_tracklist_for_match(
 
     The shared, pure/sync core of tracklist-match validation (LML#1035):
 
-    1. Title gate per entry: bidirectional substring on the normalized
-       title, then a ``token_set_ratio`` fuzzy fallback (LML#334) so
-       typographic noise that leaves token content intact still matches.
-       **Either arm only checks that the TITLE is accounted for** --
-       containment checks the title's content against the query, and
-       ``token_set_ratio`` scores shared tokens and structurally ignores
-       query tokens the title lacks. Neither requires the reverse. LML#1225
-       adds a query-coverage requirement gating BOTH arms equally: even
-       after substring or fuzzy matching says "match," at least
-       :data:`TRACK_TITLE_QUERY_COVERAGE_THRESHOLD` of the query's *content*
-       tokens must each be accounted for by the title (see
-       :func:`query_is_covered_by_title`). This rejects a real, short track
-       title padded with arbitrary extra query words (this issue's "Battle
-       For Space" vs "Space Lizzard Battle Star hell cat," and "Symphony
-       No. 9" vs "Purple Refrigerator Symphony No 9").
-
-       Three normalizations keep that from over-rejecting, and they are
-       load-bearing rather than polish -- at typical 2-4-token query
-       lengths the floor tolerates *zero* uncovered tokens, so anything the
-       gate miscounts as uncovered is an outright false reject:
-       bracketed annotation segments get a second, annotation-free reading
-       of the query; non-content words (articles, request filler) leave the
-       denominator; and containment in the title string absorbs token
-       merge/split ("Moon Pix" vs "Moonpix"). See
-       :data:`TRACK_TITLE_QUERY_COVERAGE_THRESHOLD` for the calibration and
-       the step-function arithmetic behind that "zero tolerance" claim.
+    1. Title gate per entry: :func:`title_matches_query` -- bidirectional
+       substring, then a ``token_set_ratio`` fuzzy fallback (LML#334), then
+       LML#1225's query-coverage veto over both arms. See
+       :data:`TRACK_TITLE_QUERY_COVERAGE_THRESHOLD` for the root cause, the
+       calibration set, why the float is not a tuning lever, and why the
+       three normalizations under it are load-bearing rather than polish.
 
        Note what coverage does **not** do: it divides by the query's length,
        so it is weakest exactly where the query is least specific. A
@@ -455,24 +476,11 @@ def scan_tracklist_for_match(
     artist_lower = normalize_artist_for_validation(artist)
     release_artist_lower = normalize_artist_for_validation(release_artist)
     # Hoisted out of the entry loop: the query's readings don't vary per entry.
-    query_variants = query_content_token_variants(track)
+    query_variants = query_content_token_variants(track, track_lower)
 
     for entry in tracklist:
         item_title = normalize_for_track_comparison(entry.title)
-        title_matches = track_lower in item_title or item_title in track_lower
-        if not title_matches and item_title:
-            title_matches = (
-                fuzz.token_set_ratio(track_lower, item_title) >= TRACK_TITLE_FUZZY_MATCH_THRESHOLD
-            )
-        if not title_matches:
-            continue
-        # LML#1225: neither arm above checks that the QUERY is accounted
-        # for by the title -- see the docstring's step 1 and
-        # TRACK_TITLE_QUERY_COVERAGE_THRESHOLD's docstring for the full
-        # rationale. Applies uniformly to both arms (an entry that matched
-        # via substring is held to the same coverage floor as one that
-        # matched via token_set_ratio).
-        if not query_is_covered_by_title(query_variants, item_title):
+        if not title_matches_query(track_lower, item_title, query_variants):
             continue
 
         if entry.artists:

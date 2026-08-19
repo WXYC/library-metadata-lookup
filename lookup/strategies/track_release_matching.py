@@ -149,14 +149,10 @@ async def _match_track_releases_to_library(
         post-gather walk; this helper is order-agnostic.
 
         The ``validate_release_for_track`` call below passes ``release.artist``
-        as the artist argument regardless of strategy (SONG_AS_TRACK or
-        SWAPPED_INTERPRETATION) -- see the comment at that call site
-        (LML#1225): on THIS call site the artist leg compares the release
-        against itself and so does almost no discriminating work, which leaves
-        the title match inside ``scan_tracklist_for_match`` as what actually
-        gates a release here. SWAPPED's real artist check already happened
-        above, against ``require_artist``, via the ``eligible`` filter -- it
-        does not happen a second time inside validation.
+        for both strategies, which leaves the title match inside
+        ``scan_tracklist_for_match`` as what actually gates a release here; see
+        the comment at that call site for why the artist leg does almost no
+        discriminating work on this path.
         """
         if not release.album or len(release.album.strip()) < 3:
             return None
@@ -207,8 +203,7 @@ async def _match_track_releases_to_library(
         # weak) check and reintroduce the API-vs-cache verdict divergence the
         # LML#1035 kernel extraction exists to prevent.
         #
-        # Do not read this call as a strong second validation factor — see
-        # `_validate_one`'s docstring.
+        # Do not read this call as a strong second validation factor.
         if release.release_id:
             is_valid = await validate_release_for_track(
                 discogs_service,
