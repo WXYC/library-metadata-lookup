@@ -96,6 +96,38 @@ def test_a_commit_sha_containing_whitespace_prints_the_sentinel(tmp_path):
     assert "\n" not in result.stdout.rstrip("\n"), "stdout must be exactly one line"
 
 
+def test_a_503_from_a_degraded_service_is_still_a_usable_baseline(tmp_path):
+    """``/health`` answers **503 with a fully-populated body** whenever a core dependency is down
+    -- ``routers/health.py`` ends with ``status_code = 200 if status in ("healthy", "degraded")
+    else 503``, and ``CORE_SERVICES = {"database"}``, so a library.db that hasn't finished loading
+    from the bucket is enough to trip it. The ``commit_sha`` in that body is exactly as accurate as
+    the one in a 200.
+
+    Discarding it would make this whole feature inert precisely when it is needed: a Railway
+    incident that times out ``railway up`` is the same kind of event that leaves the live service
+    degraded, and a sampler that returns ``unreachable`` there sends the reconciliation script
+    straight down its unconditional fail-closed branch. The deploy identity is what is being read,
+    not the service's health -- and the smoke-test job downstream is what judges health."""
+    install_health_curl_stub(tmp_path, [(503, '{"status": "unhealthy", "commit_sha": "abc123"}')])
+
+    result = _run(tmp_path, [_URL])
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "abc123"
+
+
+def test_an_unexpected_http_status_prints_the_sentinel(tmp_path):
+    """502/504 from an edge proxy is genuinely "could not read /health" -- there is no application
+    body behind it, so unlike a 503 it carries no deploy identity. Only the two statuses the app
+    itself emits are trusted; everything else falls back to the sentinel."""
+    install_health_curl_stub(tmp_path, [(502, "<html>Bad Gateway</html>")])
+
+    result = _run(tmp_path, [_URL])
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "unreachable"
+
+
 def test_malformed_json_prints_the_sentinel(tmp_path):
     install_health_curl_stub(tmp_path, ["not json at all"])
 

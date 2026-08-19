@@ -38,11 +38,14 @@
 #
 # Exit codes:
 #   0  recovered -- /health transitioned from a different SHA to <expected-sha> during this run
-#   1  not recovered -- inconclusive baseline, timed out, or /health never became reachable
-#   2  bad usage
+#   1  not recovered -- inconclusive baseline (already-matching, `unreachable`, or empty), timed
+#      out, or /health never became readable
+#   2  bad usage -- fewer than three arguments, or an empty <health-url> / <expected-sha>. An
+#      empty <pre-upload-sha> is NOT usage: it is a runtime condition, and exits 1. See below.
 #
 # Environment:
-#   RECONCILE_HEALTH_TIMEOUT_SECONDS        total poll budget in seconds (default 300)
+#   RECONCILE_HEALTH_TIMEOUT_SECONDS        total poll budget in seconds (default 900, matching
+#                                           wait_for_railway_deployment.sh -- see below)
 #   RECONCILE_HEALTH_POLL_INTERVAL_SECONDS  gap between polls in seconds (default 10)
 #   RECONCILE_HEALTH_CURL_TIMEOUT_SECONDS   curl --max-time per poll, in seconds (default 10)
 
@@ -52,12 +55,27 @@ HEALTH_URL="${1:-}"
 EXPECTED_SHA="${2:-}"
 PRE_UPLOAD_SHA="${3:-}"
 
-if [[ -z "$HEALTH_URL" || -z "$EXPECTED_SHA" || -z "$PRE_UPLOAD_SHA" ]]; then
+# Note which operand is checked here and which is not. The URL and the expected SHA are literals
+# at the call site, so an empty one is a broken workflow -- a programming error, exit 2. The
+# pre-upload SHA is different: it is produced at run time by another step, and that step
+# (`echo "commit_sha=$(...)" >> "$GITHUB_OUTPUT"`) always exits 0, so it can legitimately hand us
+# an empty string -- the sampler missing from the checkout, or exiting on its own usage error.
+# That is a runtime condition meaning exactly what the `unreachable` sentinel means (no baseline,
+# so no provable transition), and it is handled as such below. Calling it a usage error would send
+# whoever reads the log hunting for a malformed workflow step instead of an unreadable /health.
+if [[ $# -lt 3 || -z "$HEALTH_URL" || -z "$EXPECTED_SHA" ]]; then
   echo "usage: $(basename "$0") <health-url> <expected-sha> <pre-upload-sha>" >&2
   exit 2
 fi
 
-TIMEOUT_SECONDS="${RECONCILE_HEALTH_TIMEOUT_SECONDS:-300}"
+# 900 to match RAILWAY_DEPLOY_TIMEOUT_SECONDS in wait_for_railway_deployment.sh: both are waiting
+# on the same physical event -- a revision finishing its build and starting to serve -- so they
+# should agree about how long that may legitimately take. If anything this one needs the budget
+# more: the wait script starts its clock once the upload has already been accepted, whereas this
+# one starts from a client-side upload failure and must still cover a build that had not been
+# queued yet. Under-budgeting here doesn't fail safe, it just relocates the bug: the timeout would
+# be reported as "the upload never landed" on a deploy that landed a minute later.
+TIMEOUT_SECONDS="${RECONCILE_HEALTH_TIMEOUT_SECONDS:-900}"
 POLL_INTERVAL_SECONDS="${RECONCILE_HEALTH_POLL_INTERVAL_SECONDS:-10}"
 CURL_TIMEOUT_SECONDS="${RECONCILE_HEALTH_CURL_TIMEOUT_SECONDS:-10}"
 
@@ -71,7 +89,9 @@ UNREACHABLE_SENTINEL="unreachable"
 log "Reconciling a railway-up failure that produced no deployment id (LML#1231)."
 log "Expected SHA ${EXPECTED_SHA}, pre-upload /health reading was '${PRE_UPLOAD_SHA}'."
 
-if [[ "$PRE_UPLOAD_SHA" == "$UNREACHABLE_SENTINEL" ]]; then
+# An empty baseline means the same thing as the sentinel and is handled identically -- see the
+# usage check above for why it reaches this branch rather than being rejected as a usage error.
+if [[ -z "$PRE_UPLOAD_SHA" || "$PRE_UPLOAD_SHA" == "$UNREACHABLE_SENTINEL" ]]; then
   log "INCONCLUSIVE: /health could not be sampled before the upload attempt; a transition cannot be proven, so this stays a failure."
   exit 1
 fi
@@ -82,13 +102,23 @@ if [[ "$PRE_UPLOAD_SHA" == "$EXPECTED_SHA" ]]; then
 fi
 
 # Reads /health once. Echoes the commit_sha on success; returns non-zero (and echoes nothing) on
-# any failure -- network error, non-2xx, unparsable body, or a missing/null commit_sha field.
-# Mirrors sample_health_commit_sha.sh's own handling, but kept separate: that script's contract
-# is "never fail, print a sentinel instead," while this loop needs to distinguish a failed poll
-# (retryable) from a successful one, which a sentinel string would blur.
+# any failure -- network error, an unexpected HTTP status, unparsable body, or a missing/null
+# commit_sha field. Mirrors sample_health_commit_sha.sh's own handling, including its reason for
+# not using `curl -f` (a 503 from a degraded service still carries the real deploy identity, and
+# what is being read here is identity, not health -- see that script's comment). Kept separate
+# because the contracts differ: that script must never fail and prints a sentinel instead, while
+# this loop needs to distinguish a failed poll (retryable) from a successful one, which a sentinel
+# string would blur.
 read_health_commit_sha() {
-  local body sha
-  body="$(curl -sf --max-time "$CURL_TIMEOUT_SECONDS" "$HEALTH_URL" 2>/dev/null)" || return 1
+  local response http_code body sha
+  response="$(curl -s -w '\n%{http_code}' --max-time "$CURL_TIMEOUT_SECONDS" "$HEALTH_URL" \
+    2>/dev/null)" || return 1
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  case "$http_code" in
+    200 | 503) ;;
+    *) return 1 ;;
+  esac
   sha="$(printf '%s' "$body" | jq -r '.commit_sha // empty' 2>/dev/null)" || return 1
   if [[ -z "$sha" || "$sha" == "null" ]]; then
     return 1

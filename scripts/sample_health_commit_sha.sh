@@ -16,6 +16,11 @@
 # path below prints the sentinel `unreachable` and exits 0; the sole exception is a missing URL
 # argument, which is a call-site programming error rather than a runtime condition.
 #
+# "Unreachable" here means the deploy identity could not be read -- NOT that the service is
+# unhealthy. A 503 (the status /health returns when a core dependency is down) carries a fully
+# populated body and is accepted; see the curl invocation below for why that distinction is
+# load-bearing rather than pedantic.
+#
 # Usage:
 #   sample_health_commit_sha.sh <health-url>
 #
@@ -46,7 +51,28 @@ unreachable() {
   exit 0
 }
 
-body="$(curl -sf --max-time "$TIMEOUT_SECONDS" "$URL" 2>/dev/null)" || unreachable
+# Not `curl -sf`: /health answers 503 with a *fully-populated* body whenever a core dependency is
+# down (routers/health.py -- `status_code = 200 if status in ("healthy", "degraded") else 503`,
+# with CORE_SERVICES = {"database"}). `-f` would discard that body, and the commit_sha inside it is
+# exactly as accurate as the one in a 200 -- what is being read here is the deploy's identity, not
+# its health. Discarding it would make this whole path inert in the situation it exists for: the
+# same Railway incident that times out `railway up` is one that plausibly leaves the live service
+# degraded, and an `unreachable` baseline sends the reconciliation script straight down its
+# unconditional fail-closed branch. So: keep the body, and decide on the status code instead.
+response="$(curl -s -w '\n%{http_code}' --max-time "$TIMEOUT_SECONDS" "$URL" 2>/dev/null)" ||
+  unreachable
+
+# -w appends "\n<code>", so the last line is the status and everything before it is the body.
+http_code="${response##*$'\n'}"
+body="${response%$'\n'*}"
+
+# 200 (healthy/degraded) and 503 (unhealthy) are the two statuses the application itself emits,
+# and both carry the real body. Anything else -- a 502/504 from an edge proxy, a 404 -- has no
+# application response behind it and therefore no deploy identity to read.
+case "$http_code" in
+  200 | 503) ;;
+  *) unreachable ;;
+esac
 
 sha="$(printf '%s' "$body" | jq -r '.commit_sha // empty' 2>/dev/null)" || unreachable
 

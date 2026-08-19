@@ -26,6 +26,7 @@ neither can prove a transition happened, so neither is allowed to pass.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -148,6 +149,46 @@ def test_transient_health_errors_during_polling_are_tolerated(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def test_a_degraded_service_returning_503_still_proves_the_transition(tmp_path):
+    """The polling half of the same point ``sample_health_commit_sha.sh`` makes: ``/health``
+    answers 503 with a fully-populated body when a core dependency is down, and the ``commit_sha``
+    in it is exactly as accurate as the one in a 200. A revision that has genuinely landed and is
+    serving its own SHA while its database check is still failing HAS transitioned -- the upload
+    landed, which is the only question this script is asked. Whether the service is healthy is the
+    smoke-test job's call, downstream, and it makes that call on its own."""
+    install_health_curl_stub(
+        tmp_path,
+        [
+            _health_body(_OLD_SHA),
+            (503, f'{{"status": "unhealthy", "commit_sha": "{_EXPECTED_SHA}"}}'),
+        ],
+    )
+
+    result = _run(tmp_path, [_URL, _EXPECTED_SHA, _OLD_SHA])
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_an_empty_baseline_is_inconclusive_rather_than_a_usage_error(tmp_path):
+    """The CI step that produces the baseline (`echo "commit_sha=$(...)" >> "$GITHUB_OUTPUT"`)
+    always exits 0, so it can hand this script an *empty* third argument -- if the sampler script
+    were missing from the checkout, say, or exited on its own usage error. That is a runtime
+    condition with the same meaning as the ``unreachable`` sentinel (no baseline, so no provable
+    transition), not a call-site programming error.
+
+    Reporting it as exit 2 "usage" would be a lie about which of the script's two documented
+    failure meanings applies, and would send whoever reads the log hunting for a malformed
+    workflow step instead of an unreadable /health. The job is red either way; this is about the
+    log telling the truth."""
+    install_health_curl_stub(tmp_path, [_health_body(_OLD_SHA)])
+
+    result = _run(tmp_path, [_URL, _EXPECTED_SHA, ""])
+
+    assert result.returncode == 1
+    assert "INCONCLUSIVE" in result.stderr or "inconclusive" in result.stderr.lower()
+    assert health_curl_call_count(tmp_path) == 0
+
+
 def test_missing_arguments_is_a_usage_error(tmp_path):
     install_health_curl_stub(tmp_path, ["irrelevant"])
 
@@ -171,3 +212,34 @@ def test_timeout_is_configurable(tmp_path):
 
     assert result.returncode == 1
     assert health_curl_call_count(tmp_path) >= 1
+
+
+def test_the_reconciliation_window_is_at_least_the_wait_scripts_deploy_budget():
+    """Both scripts are waiting for the same physical event -- a Railway revision finishing its
+    build and starting to serve -- so the reconciliation path must not give it a smaller budget
+    than ``wait_for_railway_deployment.sh`` does.
+
+    The reconciliation clock is in fact the *worse* positioned of the two. The wait script starts
+    counting once the upload has already been accepted; this script starts counting from an upload
+    that failed client-side, so its window has to cover the build and release that hadn't even been
+    queued yet. Giving the harder case the smaller budget is backwards, and the failure it produces
+    is a *timeout reported as "the upload never landed"* -- i.e. exactly the false red this whole
+    feature exists to remove, just relocated. The one measurement available (the 2026-08-18
+    incident) was ~240s from failure to the new SHA serving, which a 300s window clears by only 25%
+    -- one slower-than-usual Docker build away from re-introducing the bug.
+
+    Pinned as a static comparison of the two defaults rather than a timing test: the property that
+    matters is "these two budgets agree about how long a deploy may legitimately take," and
+    sleeping 900s in a unit test to prove it would be absurd.
+    """
+    reconcile = _SCRIPT.read_text()
+    wait = (_REPO_ROOT / "scripts" / "wait_for_railway_deployment.sh").read_text()
+
+    reconcile_default = re.search(r"RECONCILE_HEALTH_TIMEOUT_SECONDS:-(\d+)\}", reconcile)
+    wait_default = re.search(r"RAILWAY_DEPLOY_TIMEOUT_SECONDS:-(\d+)\}", wait)
+    assert reconcile_default and wait_default, "both scripts must declare a default timeout"
+
+    assert int(reconcile_default.group(1)) >= int(wait_default.group(1)), (
+        f"reconciliation budget {reconcile_default.group(1)}s is smaller than the wait script's "
+        f"{wait_default.group(1)}s for the same event, from a strictly earlier starting line"
+    )
