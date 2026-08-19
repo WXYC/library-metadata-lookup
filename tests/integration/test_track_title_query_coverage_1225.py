@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 
 import pytest
+import pytest_asyncio
 
 from discogs.memory_cache import clear_all_caches
 from discogs.service import DiscogsService
@@ -53,7 +54,7 @@ def _isolate_validation_cache():
     clear_all_caches()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def service():
     """A live-token ``DiscogsService``, closed on the way out."""
     svc = DiscogsService(token=DISCOGS_TOKEN)
