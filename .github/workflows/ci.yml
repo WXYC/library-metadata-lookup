@@ -273,13 +273,20 @@ jobs:
       # error that may not reflect what Railway actually did. This step's own exit code is the
       # real red/green decision for this case: see its header for why it refuses to pass on a
       # SHA that was already live before this attempt (the trap this whole path exists to avoid).
+      #
+      # Both SHAs go through env: rather than `${{ }}` inside the run body. PRE_UPLOAD_SHA is the
+      # reason: its value is whatever jq pulled out of a remote /health response, and `${{ }}` is
+      # textual substitution before the shell parses the script, so interpolating it would make a
+      # malicious or malformed commit_sha executable in a job holding RAILWAY_TOKEN_*. Via env: the
+      # shell reads it as data. EXPECTED_SHA is safe on its own but follows the same rule so the
+      # "no expressions in run bodies" property stays checkable at a glance.
       - name: Reconcile deploy with no deployment id
         if: steps.deploy.outputs.deployment_id == ''
-        run: >-
-          ./scripts/reconcile_deploy_via_health.sh "$HEALTH_URL" "${{ github.sha }}"
-          "${{ steps.pre_deploy_health.outputs.commit_sha }}"
+        run: ./scripts/reconcile_deploy_via_health.sh "$HEALTH_URL" "$EXPECTED_SHA" "$PRE_UPLOAD_SHA"
         env:
           HEALTH_URL: https://library-metadata-lookup-staging.up.railway.app/health
+          EXPECTED_SHA: ${{ github.sha }}
+          PRE_UPLOAD_SHA: ${{ steps.pre_deploy_health.outputs.commit_sha }}
 
   smoke-test-staging:
     name: Smoke Test (Staging)
@@ -365,13 +372,14 @@ jobs:
       # See deploy-staging for the full rationale (LML#1231). Production's blast radius is why
       # the underlying script takes the stricter reading of any ambiguity -- an unreadable or
       # already-matching pre-upload baseline stays a failure in both jobs, not just this one.
+      # See deploy-staging for why both SHAs go through env: instead of `${{ }}` in the run body.
       - name: Reconcile deploy with no deployment id
         if: steps.deploy.outputs.deployment_id == ''
-        run: >-
-          ./scripts/reconcile_deploy_via_health.sh "$HEALTH_URL" "${{ github.sha }}"
-          "${{ steps.pre_deploy_health.outputs.commit_sha }}"
+        run: ./scripts/reconcile_deploy_via_health.sh "$HEALTH_URL" "$EXPECTED_SHA" "$PRE_UPLOAD_SHA"
         env:
           HEALTH_URL: https://library-metadata-lookup-production.up.railway.app/health
+          EXPECTED_SHA: ${{ github.sha }}
+          PRE_UPLOAD_SHA: ${{ steps.pre_deploy_health.outputs.commit_sha }}
 
   smoke-test-production:
     name: Smoke Test (Production)

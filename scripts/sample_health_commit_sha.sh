@@ -50,7 +50,13 @@ body="$(curl -sf --max-time "$TIMEOUT_SECONDS" "$URL" 2>/dev/null)" || unreachab
 
 sha="$(printf '%s' "$body" | jq -r '.commit_sha // empty' 2>/dev/null)" || unreachable
 
-if [[ -z "$sha" || "$sha" == "null" ]]; then
+# Whitespace disqualifies a reading, and the reason is the call site: CI writes this stdout into
+# $GITHUB_OUTPUT as `commit_sha=<value>`, a line-oriented format. An embedded newline in a value
+# read from a remote HTTP response body would either break the step or append a second,
+# response-chosen `name=value` line to the step's outputs. A real commit SHA never contains
+# whitespace, so rejecting it costs nothing and makes "exactly one line of stdout" this script's
+# own guarantee rather than an assumption the caller is quietly making on its behalf.
+if [[ -z "$sha" || "$sha" == "null" || "$sha" == *[[:space:]]* ]]; then
   unreachable
 fi
 

