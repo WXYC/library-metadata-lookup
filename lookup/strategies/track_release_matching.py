@@ -147,6 +147,15 @@ async def _match_track_releases_to_library(
         (too-short album title, no library hits, no eligible rows, or
         validation rejected). Order-preserving dedup happens in the caller's
         post-gather walk; this helper is order-agnostic.
+
+        The ``validate_release_for_track`` call below passes ``release.artist``
+        as the artist argument regardless of strategy (SONG_AS_TRACK or
+        SWAPPED_INTERPRETATION) -- see the comment at that call site
+        (LML#1225): on THIS call site the artist leg does no discriminating
+        work, so what actually gates a release here is the title match inside
+        ``scan_tracklist_for_match``. SWAPPED's real artist check already
+        happened above, against ``require_artist``, via the ``eligible``
+        filter -- it does not happen a second time inside validation.
         """
         if not release.album or len(release.album.strip()) < 3:
             return None
@@ -170,6 +179,21 @@ async def _match_track_releases_to_library(
         # that don't always contain the track on the tracklist. Deferred until
         # after library matching so we only pay the API cost for releases we'd
         # actually return, mirroring search_compilations_for_track.
+        #
+        # LML#1225: the artist argument here is `release.artist` — the
+        # release's OWN credit — for BOTH SONG_AS_TRACK (`artist=None` on
+        # this kernel call) and SWAPPED_INTERPRETATION (`artist=<identified>`;
+        # this call ignores it and passes `release.artist` too). Inside the
+        # shared kernel (`discogs/matching.py::scan_tracklist_for_match`), the
+        # release-level artist step compares `artist_lower` against
+        # `release_artist_lower` — both derived from this same string — so it
+        # is always true and does no discriminating work. Validation at this
+        # call site therefore reduces to the title gate alone. SONG_AS_TRACK
+        # has no artist to pass in the first place (it is song-only by
+        # definition, inherent to the strategy, not a bug to fix here); SWAPPED
+        # already got its real artist check above via `require_artist`
+        # filtering `eligible`. Do not read this call as a second, independent
+        # validation factor — see `_validate_one`'s docstring.
         if release.release_id:
             is_valid = await validate_release_for_track(
                 discogs_service,

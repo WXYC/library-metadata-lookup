@@ -169,6 +169,85 @@ ARTIST_FUZZY_MATCH_THRESHOLD = 70
 # in both `discogs/service.py` and `discogs/cache_service.py`.
 TRACK_TITLE_FUZZY_MATCH_THRESHOLD = 85
 
+# Per-token fuzzy-match floor for the query-coverage gate below (LML#1225).
+# NOT the same knob as TRACK_TITLE_FUZZY_MATCH_THRESHOLD, which scores the
+# title and the query as two whole strings. This one scores individual
+# token *pairs*, so coverage can ask "did each of the query's own words land
+# somewhere in the title" independent of how the strings compare as wholes.
+# 80 tolerates the same singular/plural and diacritic noise the whole-string
+# fuzzy floor does (e.g. "tower" vs "towers" scores ~91) without being loose
+# enough to let two short, unrelated words accidentally pair up.
+TRACK_TITLE_TOKEN_MATCH_THRESHOLD = 80
+
+# Fraction (0-1) of the QUERY's tokens that must each be covered by some
+# token in the matched title, gating both title-match arms above (LML#1225).
+#
+# Root cause: bidirectional substring and token_set_ratio both only ask
+# whether the TITLE is accounted for by the query (substring), or how much
+# the two strings resemble each other on shared tokens (token_set_ratio,
+# which structurally ignores query tokens the title doesn't have -- that's
+# the point of a "set" ratio). Neither one asks the reverse: is the QUERY
+# accounted for by the title? A short, real track title padded with
+# arbitrary extra query words slips through both arms unchanged --
+# "Battle For Space" vs "Space Lizzard Battle Star hell cat" scores 85.71 on
+# token_set_ratio (clears the 85 fuzzy floor); "Symphony No. 9" is a literal
+# substring of "Purple Refrigerator Symphony No 9" (clears the substring arm
+# outright, never even reaching the fuzzy fallback). This constant closes
+# both holes by requiring that most of what the DJ actually typed shows up
+# in the title, independent of which arm opened the gate.
+#
+# Calibrated against LML#1225's measured table (fuzz.ratio >=
+# TRACK_TITLE_TOKEN_MATCH_THRESHOLD per token pair): every pinned accept
+# (LML#334's "tower of dub" / "smells teen spirit" / "de la soul - radio
+# edit", and #1035's "call name" -> "Call Your Name") scores 100% coverage;
+# every reject (the LML#334 adversarial anchor "towers of dub" vs "towers of
+# london" at 67%, and this issue's two repros at 33% and 60%) scores <= 67%.
+# 0.8 sits in the open gap between those two clusters with slack on both
+# sides -- not a knife's-edge tuning against either boundary -- so a single
+# stray token in an otherwise well-covered query (an OCR'd word, a dropped
+# plural) doesn't zero out an accept, while every measured reject still
+# clears the gate by a comfortable margin. Any floor in (0.67, 1.0] survives
+# the same calibration set; 0.8 was chosen for that headroom, not because
+# the boundary itself is load-bearing -- treat it as a starting point, not a
+# tuned constant, if a new calibration case narrows the gap.
+#
+# Composition with the two title-match arms (design note, LML#1225): this
+# gate applies AFTER either arm already said "match" -- it never lets an arm
+# that rejected still pass, it only lets this second, independent condition
+# veto an arm's accept. The substring arm's own legitimate use (an exact or
+# near-exact short title, in a query that IS mostly that title) is
+# unaffected: a title that's wholly contained in the query and a title that
+# wholly matches the query score the same 100% coverage either way, because
+# coverage counts the QUERY's tokens, not the title's -- it doesn't
+# distinguish "short title, short query" from "short title, long query," it
+# only requires that whatever the query DOES say, the title backs up.
+TRACK_TITLE_QUERY_COVERAGE_THRESHOLD = 0.8
+
+
+def _query_token_coverage(query_lower: str, title_lower: str) -> float:
+    """Fraction of ``query_lower``'s tokens matched by some token in ``title_lower``.
+
+    Both inputs are expected already run through :func:`normalize_for_track_comparison`
+    (whitespace-collapsed, punctuation-stripped) -- this just splits on whitespace
+    and does an all-pairs per-token fuzzy match. A query token "covers" if
+    ``fuzz.ratio`` against ANY title token clears
+    :data:`TRACK_TITLE_TOKEN_MATCH_THRESHOLD`. An empty query is vacuously fully
+    covered (nothing to fail); a non-empty query against an empty title is
+    zero-covered (nothing to cover it).
+    """
+    query_tokens = query_lower.split()
+    if not query_tokens:
+        return 1.0
+    title_tokens = title_lower.split()
+    if not title_tokens:
+        return 0.0
+    covered = sum(
+        1
+        for q in query_tokens
+        if any(fuzz.ratio(q, t) >= TRACK_TITLE_TOKEN_MATCH_THRESHOLD for t in title_tokens)
+    )
+    return covered / len(query_tokens)
+
 
 @dataclass(frozen=True, slots=True)
 class TracklistEntry:
@@ -198,6 +277,24 @@ def scan_tracklist_for_match(
     1. Title gate per entry: bidirectional substring on the normalized
        title, then a ``token_set_ratio`` fuzzy fallback (LML#334) so
        typographic noise that leaves token content intact still matches.
+       **Either arm only checks that the TITLE is accounted for** --
+       containment checks the title's content against the query, and
+       ``token_set_ratio`` scores shared tokens and structurally ignores
+       query tokens the title lacks. Neither requires the reverse. LML#1225
+       adds a query-coverage requirement gating BOTH arms equally: even
+       after substring or fuzzy matching says "match," at least
+       :data:`TRACK_TITLE_QUERY_COVERAGE_THRESHOLD` of the query's own
+       tokens must each fuzzy-match some title token (see
+       :func:`_query_token_coverage`). This rejects a real, short track
+       title padded with arbitrary extra query words (this issue's "Battle
+       For Space" vs "Space Lizzard Battle Star hell cat," and "Symphony
+       No. 9" vs "Purple Refrigerator Symphony No 9") without narrowing
+       recall on a short title that legitimately IS most of the query --
+       coverage counts the query's tokens, not the title's, so it can't
+       distinguish "short title, short query" from "short title, long
+       query non-noise"; it only requires that whatever the query says, the
+       title backs up. See that constant's docstring for the full
+       composition rule and calibration.
     2. Per-track artist credits (if any): bidirectional substring per
        credited name, then a joined-credit ``token_set_ratio`` fuzzy
        fallback (LML#210) for collaborations credited as separate names.
@@ -238,6 +335,14 @@ def scan_tracklist_for_match(
                 fuzz.token_set_ratio(track_lower, item_title) >= TRACK_TITLE_FUZZY_MATCH_THRESHOLD
             )
         if not title_matches:
+            continue
+        # LML#1225: neither arm above checks that the QUERY is accounted
+        # for by the title -- see the docstring's step 1 and
+        # TRACK_TITLE_QUERY_COVERAGE_THRESHOLD's docstring for the full
+        # rationale. Applies uniformly to both arms (an entry that matched
+        # via substring is held to the same coverage floor as one that
+        # matched via token_set_ratio).
+        if _query_token_coverage(track_lower, item_title) < TRACK_TITLE_QUERY_COVERAGE_THRESHOLD:
             continue
 
         if entry.artists:

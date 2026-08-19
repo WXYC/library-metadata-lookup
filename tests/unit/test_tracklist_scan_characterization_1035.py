@@ -168,6 +168,96 @@ CASES: list[ScanCase] = [
         expected=True,
         note="Same ANV-asterisk tolerance, exercised on the release-level credit.",
     ),
+    # -----------------------------------------------------------------
+    # LML#1225: query-token coverage gate. A title-matched entry (either
+    # arm) must also have the QUERY substantially accounted for by the
+    # matched title, not just the reverse. The three recall anchors below
+    # are LML#334's original fuzzy-fallback motivating cases (added here
+    # per LML#1225's acceptance criteria, not previously present in this
+    # shared table); the two reject cases are LML#1225's production
+    # repros, each entering through a different title-gate arm.
+    # -----------------------------------------------------------------
+    ScanCase(
+        id="lml334_recall_singular_plural_typo",
+        release_artist="Stereolab",
+        release_track_title="Towers Of Dub",
+        release_track_artists=[],
+        query_track="tower of dub",
+        query_artist="Stereolab",
+        expected=True,
+        note=(
+            "LML#334 recall anchor. 'tower' vs 'towers' breaks the substring "
+            "gate; token_set_ratio ~96 clears the fuzzy floor and query-token "
+            "coverage is 100% (every query token fuzzy-matches a title token)."
+        ),
+    ),
+    ScanCase(
+        id="lml334_recall_dropped_interior_word",
+        release_artist="Stereolab",
+        release_track_title="Smells Like Teen Spirit",
+        release_track_artists=[],
+        query_track="smells teen spirit",
+        query_artist="Stereolab",
+        expected=True,
+        note=(
+            "LML#334 recall anchor. Dropping the interior word 'like' scores "
+            "100 on token_set_ratio and 100% query-token coverage -- every "
+            "remaining query token is a title token verbatim."
+        ),
+    ),
+    ScanCase(
+        id="lml334_recall_dash_vs_paren_suffix",
+        release_artist="Stereolab",
+        release_track_title="de la soul (radio edit)",
+        release_track_artists=[],
+        query_track="de la soul - radio edit",
+        query_artist="Stereolab",
+        expected=True,
+        note=(
+            "LML#334 recall anchor. Both sides normalize to the identical "
+            "string 'de la soul radio edit' (punctuation-stripped), so this "
+            "clears the substring arm outright at 100% query-token coverage."
+        ),
+    ),
+    ScanCase(
+        id="lml1225_reject_fuzzy_arm_noise_padded_query",
+        release_artist="Population One",
+        release_track_title="Battle For Space",
+        release_track_artists=[],
+        query_track="Space Lizzard Battle Star hell cat",
+        query_artist="Population One",
+        expected=False,
+        note=(
+            "LML#1225 production repro 1. token_set_ratio scores 85.71 (>= "
+            "the 85 fuzzy floor) because it structurally ignores the four "
+            "query tokens that match nothing ('lizzard', 'star', 'hell', "
+            "'cat'). Query-token coverage is 2/6 (33%) -- below the "
+            "TRACK_TITLE_QUERY_COVERAGE_THRESHOLD floor, so the fuzzy arm's "
+            "accept is overridden and the entry is rejected. Same artist on "
+            "both sides mirrors the real _validate_one call, which always "
+            "passes release.artist regardless of strategy -- see "
+            "lookup/strategies/track_release_matching.py."
+        ),
+    ),
+    ScanCase(
+        id="lml1225_reject_substring_arm_noise_padded_query",
+        release_artist="Ludwig van Beethoven",
+        release_track_title="Symphony No. 9",
+        release_track_artists=[],
+        query_track="Purple Refrigerator Symphony No 9",
+        query_artist="Ludwig van Beethoven",
+        expected=False,
+        note=(
+            "LML#1225 production repro 2. The normalized title 'symphony no "
+            "9' is a literal substring of the normalized query, so this "
+            "enters via the bidirectional-substring arm and never reaches "
+            "the fuzzy fallback at all. Query-token coverage is 3/5 (60%) -- "
+            "'purple' and 'refrigerator' match nothing in the title -- so "
+            "the coverage gate rejects it even though the substring arm "
+            "alone would have accepted it. Proves the gate covers BOTH arms, "
+            "not just the fuzzy one."
+        ),
+    ),
 ]
 
 
