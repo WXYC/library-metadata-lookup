@@ -76,11 +76,9 @@ def install_health_curl_stub(tmp_path: Path, responses: list) -> None:
         f'calls_dir="{calls_dir}"\n'
         f'responses_dir="{responses_dir}"\n'
         f"total={len(responses)}\n"
-        'n=$(find "$calls_dir" -maxdepth 1 -name "*.marker" | wc -l | tr -d " ")\n'
+        'n=$(find "$calls_dir" -maxdepth 1 -name "*.argv" | wc -l | tr -d " ")\n'
         "n=$((n + 1))\n"
-        'touch "$calls_dir/$n.marker"\n'
-        ': > "$calls_dir/$n.argv"\n'
-        'for arg in "$@"; do printf "%s\\n" "$arg" >> "$calls_dir/$n.argv"; done\n'
+        'printf "%s\\n" "$@" > "$calls_dir/$n.argv"\n'
         "idx=$n\n"
         'if [ "$idx" -gt "$total" ]; then idx=$total; fi\n'
         'if [ -e "$responses_dir/$idx.fail" ]; then\n'
@@ -91,12 +89,10 @@ def install_health_curl_stub(tmp_path: Path, responses: list) -> None:
         # so `-sf` and `-fs` are both `-f` -- checking for a bare "-f" argument would miss the
         # exact spelling the scripts actually use.
         "write_out=0\n"
-        "want_value=0\n"
         "fail_on_error=0\n"
         'for arg in "$@"; do\n'
-        '  if [ "$want_value" = "1" ]; then want_value=0; continue; fi\n'
         '  case "$arg" in\n'
-        "    -w|--write-out) write_out=1; want_value=1 ;;\n"
+        "    -w|--write-out) write_out=1 ;;\n"
         "    --fail) fail_on_error=1 ;;\n"
         "    --*) ;;\n"
         '    -*) case "$arg" in *f*) fail_on_error=1 ;; esac ;;\n'
@@ -121,7 +117,7 @@ def health_curl_call_count(tmp_path: Path) -> int:
     calls_dir = tmp_path / "health_calls"
     if not calls_dir.is_dir():
         return 0
-    return len(list(calls_dir.glob("*.marker")))
+    return len(list(calls_dir.glob("*.argv")))
 
 
 def health_curl_call_argv(tmp_path: Path, call_number: int) -> list[str]:

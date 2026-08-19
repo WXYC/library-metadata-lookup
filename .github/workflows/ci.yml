@@ -205,6 +205,11 @@ jobs:
     # still runs and reports per-PR; a red status is visible without blocking the
     # deploy chain. See WXYC/library-metadata-lookup#208.
     needs: [lint, typecheck, test, pg]
+    # LML#1231: one definition per job. Both the pre-upload sample and the reconciliation
+    # step read this, and if they ever disagreed the failure would be silent and bad --
+    # reconciling a production deploy against staging's /health.
+    env:
+      HEALTH_URL: https://library-metadata-lookup-staging.up.railway.app/health
     steps:
       - uses: actions/checkout@v6
       - name: Install Railway CLI
@@ -213,7 +218,9 @@ jobs:
       # RAILWAY_GIT_COMMIT_SHA is absent on the live deploy. Bake the SHA into
       # the uploaded working directory so /health can report it. See LML#509.
       - name: Record deployed commit SHA for /health
-        run: echo "${{ github.sha }}" > COMMIT_SHA
+        run: echo "$COMMIT_SHA_VALUE" > COMMIT_SHA
+        env:
+          COMMIT_SHA_VALUE: ${{ github.sha }}
       # LML#1231: the reconciliation path below (Reconcile deploy with no deployment id) must be
       # able to prove a genuine TRANSITION, not just a match -- see that step's comment. Proving
       # a transition needs a reading of /health from strictly before `railway up` runs, so this
@@ -222,8 +229,6 @@ jobs:
       - name: Sample /health before upload
         id: pre_deploy_health
         run: echo "commit_sha=$(bash scripts/sample_health_commit_sha.sh "$HEALTH_URL")" >> "$GITHUB_OUTPUT"
-        env:
-          HEALTH_URL: https://library-metadata-lookup-staging.up.railway.app/health
       # `--detach --json` returns as soon as the upload is accepted, prints
       # {"deploymentId": ..., "logsUrl": ...} and nothing else on stdout, and never opens a log
       # stream. Plain `railway up` streams build logs and hard-exits 1 if that stream drops --
@@ -274,7 +279,8 @@ jobs:
       # real red/green decision for this case: see its header for why it refuses to pass on a
       # SHA that was already live before this attempt (the trap this whole path exists to avoid).
       #
-      # Both SHAs go through env: rather than `${{ }}` inside the run body. PRE_UPLOAD_SHA is the
+      # Both SHAs go through env: rather than `${{ }}` inside the run body (HEALTH_URL comes from
+      # the job-level env above). PRE_UPLOAD_SHA is the
       # reason: its value is whatever jq pulled out of a remote /health response, and `${{ }}` is
       # textual substitution before the shell parses the script, so interpolating it would make a
       # malicious or malformed commit_sha executable in a job holding RAILWAY_TOKEN_*. Via env: the
@@ -284,7 +290,6 @@ jobs:
         if: steps.deploy.outputs.deployment_id == ''
         run: ./scripts/reconcile_deploy_via_health.sh "$HEALTH_URL" "$EXPECTED_SHA" "$PRE_UPLOAD_SHA"
         env:
-          HEALTH_URL: https://library-metadata-lookup-staging.up.railway.app/health
           EXPECTED_SHA: ${{ github.sha }}
           PRE_UPLOAD_SHA: ${{ steps.pre_deploy_health.outputs.commit_sha }}
 
@@ -327,6 +332,11 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/prod'
     # external_api is intentionally NOT a deploy gate — see deploy-staging for the rationale.
     needs: [lint, typecheck, test, pg]
+    # LML#1231: one definition per job. Both the pre-upload sample and the reconciliation
+    # step read this, and if they ever disagreed the failure would be silent and bad --
+    # reconciling a production deploy against staging's /health.
+    env:
+      HEALTH_URL: https://library-metadata-lookup-production.up.railway.app/health
     steps:
       - uses: actions/checkout@v6
       - name: Install Railway CLI
@@ -335,13 +345,13 @@ jobs:
       # RAILWAY_GIT_COMMIT_SHA is absent on the live deploy. Bake the SHA into
       # the uploaded working directory so /health can report it. See LML#509.
       - name: Record deployed commit SHA for /health
-        run: echo "${{ github.sha }}" > COMMIT_SHA
+        run: echo "$COMMIT_SHA_VALUE" > COMMIT_SHA
+        env:
+          COMMIT_SHA_VALUE: ${{ github.sha }}
       # See deploy-staging for why this is sampled before `railway up` runs (LML#1231).
       - name: Sample /health before upload
         id: pre_deploy_health
         run: echo "commit_sha=$(bash scripts/sample_health_commit_sha.sh "$HEALTH_URL")" >> "$GITHUB_OUTPUT"
-        env:
-          HEALTH_URL: https://library-metadata-lookup-production.up.railway.app/health
       # See deploy-staging for why this is `--detach --json` plus an explicit wait, and for why
       # continue-on-error is required for the LML#1231 reconciliation path below to be able to
       # decide red/green at all.
@@ -377,7 +387,6 @@ jobs:
         if: steps.deploy.outputs.deployment_id == ''
         run: ./scripts/reconcile_deploy_via_health.sh "$HEALTH_URL" "$EXPECTED_SHA" "$PRE_UPLOAD_SHA"
         env:
-          HEALTH_URL: https://library-metadata-lookup-production.up.railway.app/health
           EXPECTED_SHA: ${{ github.sha }}
           PRE_UPLOAD_SHA: ${{ steps.pre_deploy_health.outputs.commit_sha }}
 

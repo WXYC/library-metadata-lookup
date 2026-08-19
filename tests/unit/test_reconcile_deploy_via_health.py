@@ -30,7 +30,11 @@ import re
 import subprocess
 from pathlib import Path
 
-from tests.health_curl_stub import health_curl_call_count, install_health_curl_stub
+from tests.health_curl_stub import (
+    health_curl_call_argv,
+    health_curl_call_count,
+    install_health_curl_stub,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = _REPO_ROOT / "scripts" / "reconcile_deploy_via_health.sh"
@@ -44,6 +48,11 @@ _OLD_SHA = "e67049c1a5e4c2d3b1a09876fedcba9876543210"
 # wall-clock timing -- see health_curl_stub's docstring for why a short list of
 # canned responses is enough to express "recovers on the Nth poll" or "never
 # recovers" without a test needing to know the exact number of polls that occur.
+# Interval 0 deliberately. Raising it to 1 to stop the two *timeout-path* tests spinning (they are
+# deadline-bound at 2s either way) was measured and rejected: it slows every *recovery*-path test
+# instead, because those finish as soon as the scripted transition arrives and a 1s gap makes them
+# wait for it. Whole-file wall clock went 7.8s -> 14.1s. The spin is confined to two tests that are
+# not on the suite's critical path.
 _FAST_ENV = {
     "RECONCILE_HEALTH_TIMEOUT_SECONDS": "2",
     "RECONCILE_HEALTH_POLL_INTERVAL_SECONDS": "0",
@@ -139,9 +148,15 @@ def test_health_unreachable_throughout_the_window_reports_failure(tmp_path):
 
 
 def test_transient_health_errors_during_polling_are_tolerated(tmp_path):
-    """A single dropped poll must not be fatal on its own -- only failing to
-    ever observe the expected SHA within the timeout is. Mirrors
-    wait_for_railway_deployment.sh's tolerance of transient polling blips."""
+    """A single dropped poll must not be fatal on its own -- only failing to ever observe the
+    expected SHA within the timeout is.
+
+    Note this is deliberately *more* tolerant than wait_for_railway_deployment.sh, which bails
+    after RAILWAY_DEPLOY_MAX_POLL_ERRORS consecutive failures. That bound is right for the script
+    it lives in, because it polls Railway's API -- an API being down is a real signal. It would be
+    wrong here: this polls the application itself, which is *expected* to stop answering while the
+    revision it is waiting for restarts. Porting the bound across would turn the normal shape of a
+    successful deploy into an early red."""
     install_health_curl_stub(tmp_path, [_health_body(_OLD_SHA), None, _health_body(_EXPECTED_SHA)])
 
     result = _run(tmp_path, [_URL, _EXPECTED_SHA, _OLD_SHA])
@@ -187,6 +202,42 @@ def test_an_empty_baseline_is_inconclusive_rather_than_a_usage_error(tmp_path):
     assert result.returncode == 1
     assert "INCONCLUSIVE" in result.stderr or "inconclusive" in result.stderr.lower()
     assert health_curl_call_count(tmp_path) == 0
+
+
+def test_the_poller_and_the_sampler_cannot_diverge_on_what_a_usable_reading_is(tmp_path):
+    """The baseline and every poll must be produced by one reader, not two that agree today.
+
+    This script compares a reading taken before the upload against readings taken after, so the
+    rules for "is this a usable commit_sha" are a contract *between* those two readings -- accept
+    200 and 503, never ``curl -f``, reject null and whitespace. A second copy of those rules here
+    would be a contract with itself, and an earlier revision proved the point: the copy had already
+    drifted, missing the whitespace rejection the sampler has.
+
+    Whitespace is the probe because it is the rule the copy actually lost. A reading carrying an
+    embedded newline must be a *failed* poll (retried, logged as a warning), never a successful
+    read of a nonsense SHA."""
+    install_health_curl_stub(tmp_path, ['{"commit_sha": "abc123\\nmalicious=1"}'])
+
+    result = _run(tmp_path, [_URL, _EXPECTED_SHA, _OLD_SHA])
+
+    assert result.returncode == 1
+    assert "WARN" in result.stderr
+    assert "malicious" not in result.stderr, (
+        "a whitespace-bearing reading was accepted as a real commit_sha, so the poller is no "
+        "longer using the same reader as the pre-upload sampler"
+    )
+
+
+def test_the_poll_curl_timeout_knob_reaches_the_underlying_request(tmp_path):
+    """RECONCILE_HEALTH_CURL_TIMEOUT_SECONDS is forwarded into the shared reader rather than
+    applied by a second curl invocation here; pin that it actually arrives at --max-time, since a
+    forward that silently stopped forwarding would look identical from the outside."""
+    install_health_curl_stub(tmp_path, [_health_body(_OLD_SHA)])
+
+    _run(tmp_path, [_URL, _EXPECTED_SHA, _OLD_SHA], {"RECONCILE_HEALTH_CURL_TIMEOUT_SECONDS": "3"})
+
+    argv = health_curl_call_argv(tmp_path, 1)
+    assert argv[argv.index("--max-time") + 1] == "3"
 
 
 def test_missing_arguments_is_a_usage_error(tmp_path):
@@ -242,4 +293,25 @@ def test_the_reconciliation_window_is_at_least_the_wait_scripts_deploy_budget():
     assert int(reconcile_default.group(1)) >= int(wait_default.group(1)), (
         f"reconciliation budget {reconcile_default.group(1)}s is smaller than the wait script's "
         f"{wait_default.group(1)}s for the same event, from a strictly earlier starting line"
+    )
+
+
+def test_the_health_route_is_still_what_railway_gates_traffic_on():
+    """The reconciliation gate's strength rests on a fact in railway.toml, not in this script.
+
+    Railway only switches traffic to a revision once ``healthcheckPath`` passes. Because that path
+    is ``/health``, observing the expected SHA there implies the revision passed the same check
+    ``wait_for_railway_deployment.sh`` waits for -- so the two verification paths converge on one
+    underlying gate instead of this one being a softer substitute.
+
+    Repoint or drop ``healthcheckPath`` and that stops being true: the reconciliation silently
+    degrades to "some process answered with our SHA" while every other test here still passes.
+    This is the only place that assumption can be caught, so it is pinned here rather than left as
+    prose in the script header."""
+    railway_toml = (_REPO_ROOT / "railway.toml").read_text()
+
+    assert re.search(r'^\s*healthcheckPath\s*=\s*"/health"\s*$', railway_toml, re.M), (
+        "railway.toml no longer gates traffic on /health, so a /health SHA reading no longer "
+        "implies the revision passed Railway's healthcheck -- reconcile_deploy_via_health.sh's "
+        "header argument for why it is not a weaker gate has been invalidated"
     )
