@@ -214,14 +214,32 @@ jobs:
       # the uploaded working directory so /health can report it. See LML#509.
       - name: Record deployed commit SHA for /health
         run: echo "${{ github.sha }}" > COMMIT_SHA
+      # LML#1231: the reconciliation path below (Reconcile deploy with no deployment id) must be
+      # able to prove a genuine TRANSITION, not just a match -- see that step's comment. Proving
+      # a transition needs a reading of /health from strictly before `railway up` runs, so this
+      # has to happen here rather than after a failure is already known. Best-effort: the script
+      # never fails this step, it prints the sentinel `unreachable` when /health can't be read.
+      - name: Sample /health before upload
+        id: pre_deploy_health
+        run: echo "commit_sha=$(bash scripts/sample_health_commit_sha.sh "$HEALTH_URL")" >> "$GITHUB_OUTPUT"
+        env:
+          HEALTH_URL: https://library-metadata-lookup-staging.up.railway.app/health
       # `--detach --json` returns as soon as the upload is accepted, prints
       # {"deploymentId": ..., "logsUrl": ...} and nothing else on stdout, and never opens a log
       # stream. Plain `railway up` streams build logs and hard-exits 1 if that stream drops --
       # and only in "CI mode", which $CI auto-enables on every Actions runner. That turned
       # transient log-transport hiccups into a red deploy while the deployment went live
       # (railwayapp/cli v4.58.0 src/commands/up.rs:240, :275-279). The wait step is the real gate.
+      #
+      # continue-on-error (LML#1231): if the `railway up` HTTP request itself fails (a
+      # client-side timeout on the upload), this step exits non-zero before ever writing
+      # deployment_id/logs_url. Without continue-on-error, GitHub Actions marks the job failed
+      # right there -- permanently; no later step can undo it, only mask/skip around it. Setting
+      # it here is what lets "Reconcile deploy with no deployment id" become the real arbiter of
+      # red/green for that one case, instead of the job going red before it even runs.
       - name: Deploy to Railway
         id: deploy
+        continue-on-error: true
         run: |
           railway up --detach --json --service library-metadata-lookup > "$RUNNER_TEMP/deploy.json"
           jq -e . "$RUNNER_TEMP/deploy.json"
@@ -240,12 +258,28 @@ jobs:
       # gate and usually stronger: `railway up` raced a build-log stream against a deploy-status
       # subscription and normally returned once the *build* finished, whereas SUCCESS here means
       # Railway's healthcheck passed (railway.toml sets healthcheckPath) and the revision serves.
+      # Only runs when the deploy step actually produced an id -- see the reconciliation step
+      # below for the complementary case.
       - name: Wait for deployment to go live
+        if: steps.deploy.outputs.deployment_id != ''
         run: ./scripts/wait_for_railway_deployment.sh library-metadata-lookup "$DEPLOYMENT_ID" "$LOGS_URL"
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_STAGING }}
           DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment_id }}
           LOGS_URL: ${{ steps.deploy.outputs.logs_url }}
+      # LML#1231: the deploy step above failed to produce a deployment id -- the one case
+      # scripts/wait_for_railway_deployment.sh can never see, because it needs that id to poll
+      # against. Reconcile against reality instead of leaving the job red on a client-side upload
+      # error that may not reflect what Railway actually did. This step's own exit code is the
+      # real red/green decision for this case: see its header for why it refuses to pass on a
+      # SHA that was already live before this attempt (the trap this whole path exists to avoid).
+      - name: Reconcile deploy with no deployment id
+        if: steps.deploy.outputs.deployment_id == ''
+        run: >-
+          ./scripts/reconcile_deploy_via_health.sh "$HEALTH_URL" "${{ github.sha }}"
+          "${{ steps.pre_deploy_health.outputs.commit_sha }}"
+        env:
+          HEALTH_URL: https://library-metadata-lookup-staging.up.railway.app/health
 
   smoke-test-staging:
     name: Smoke Test (Staging)
@@ -295,9 +329,18 @@ jobs:
       # the uploaded working directory so /health can report it. See LML#509.
       - name: Record deployed commit SHA for /health
         run: echo "${{ github.sha }}" > COMMIT_SHA
-      # See deploy-staging for why this is `--detach --json` plus an explicit wait.
+      # See deploy-staging for why this is sampled before `railway up` runs (LML#1231).
+      - name: Sample /health before upload
+        id: pre_deploy_health
+        run: echo "commit_sha=$(bash scripts/sample_health_commit_sha.sh "$HEALTH_URL")" >> "$GITHUB_OUTPUT"
+        env:
+          HEALTH_URL: https://library-metadata-lookup-production.up.railway.app/health
+      # See deploy-staging for why this is `--detach --json` plus an explicit wait, and for why
+      # continue-on-error is required for the LML#1231 reconciliation path below to be able to
+      # decide red/green at all.
       - name: Deploy to Railway
         id: deploy
+        continue-on-error: true
         run: |
           railway up --detach --json --service library-metadata-lookup > "$RUNNER_TEMP/deploy.json"
           jq -e . "$RUNNER_TEMP/deploy.json"
@@ -313,11 +356,22 @@ jobs:
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
       - name: Wait for deployment to go live
+        if: steps.deploy.outputs.deployment_id != ''
         run: ./scripts/wait_for_railway_deployment.sh library-metadata-lookup "$DEPLOYMENT_ID" "$LOGS_URL"
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
           DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment_id }}
           LOGS_URL: ${{ steps.deploy.outputs.logs_url }}
+      # See deploy-staging for the full rationale (LML#1231). Production's blast radius is why
+      # the underlying script takes the stricter reading of any ambiguity -- an unreadable or
+      # already-matching pre-upload baseline stays a failure in both jobs, not just this one.
+      - name: Reconcile deploy with no deployment id
+        if: steps.deploy.outputs.deployment_id == ''
+        run: >-
+          ./scripts/reconcile_deploy_via_health.sh "$HEALTH_URL" "${{ github.sha }}"
+          "${{ steps.pre_deploy_health.outputs.commit_sha }}"
+        env:
+          HEALTH_URL: https://library-metadata-lookup-production.up.railway.app/health
 
   smoke-test-production:
     name: Smoke Test (Production)
