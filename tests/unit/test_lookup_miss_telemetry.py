@@ -1,7 +1,7 @@
 """Emit-site coverage for the LML#1233 miss-attribution properties.
 
 `tests/unit/test_miss_kind.py` covers the taxonomy in isolation; this module
-covers the wiring -- that the six new properties actually reach the
+covers the wiring -- that the seven new properties actually reach the
 `lookup_completed` payload, carrying values read off the real response rather
 than defaults.
 

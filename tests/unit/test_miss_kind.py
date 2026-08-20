@@ -124,14 +124,19 @@ class TestPrecedence:
         [(True, False), (False, True), (True, True)],
         ids=["timeout", "degraded", "both"],
     )
-    def test_no_infrastructure_outcome_is_ever_miss_clean(
+    def test_a_signalled_infrastructure_outcome_is_never_miss_clean(
         self, timeout: bool, degraded: bool
     ) -> None:
-        """The invariant the Layer 2 alert depends on.
+        """Whenever a flag IS set, the outcome leaves the attributable bucket.
 
-        If any infrastructure-caused empty response could land in
-        ``miss_clean``, the alert would page for upstream outages instead of
-        recall regressions.
+        Scope note, so this is not misread as stronger than it is: this varies
+        the two flags, not the upstream failures that ought to set them. It
+        cannot prove "no infrastructure-caused empty response is ever
+        ``miss_clean``" -- and that stronger claim is currently FALSE, because
+        a non-breaker Discogs failure sets neither flag (LML#1236; see the
+        module docstring's "Known gap"). Closing that gap is a change to the
+        response, not to this function, so the test that proves it belongs
+        with that fix.
         """
         assert (
             derive_miss_kind(_resp(results_count=0, timeout=timeout, degraded=degraded))
@@ -178,7 +183,7 @@ class TestTelemetryProperties:
     PostHog insights filter on.
     """
 
-    def test_returns_exactly_the_six_documented_keys(self) -> None:
+    def test_returns_exactly_the_seven_documented_keys(self) -> None:
         props = miss_telemetry_properties(_resp(results_count=0), commit_sha="abc")
         assert set(props) == {
             "miss_kind",
