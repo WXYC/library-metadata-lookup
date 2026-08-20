@@ -16,10 +16,34 @@ actually responsible for.
 
 `miss_clean` is the only algorithm-attributable outcome and the only series
 the LML#1233 Layer 2 alert fires on. Precedence is
-`hit` -> `timeout` -> `degraded` -> `clean`: an infrastructure cause must
-always outrank the residual bucket, because the alternative is `miss_clean`
-quietly absorbing sheds and the alert paging for upstream outages instead of
-recall regressions -- the exact inversion it exists to prevent.
+`hit` -> `timeout` -> `degraded` -> `clean`: whenever an infrastructure cause
+IS signalled it outranks the residual bucket, because the alternative is
+`miss_clean` absorbing sheds and the alert paging for upstream outages
+instead of recall regressions.
+
+**Known gap -- `miss_clean` is not yet a pure signal (LML#1236).** This
+function can only classify what the response tells it, and `degraded` /
+`timeout` are narrower than "something upstream failed". They are set by
+exactly two producers:
+
+- `timeout` -- the LML#370 hard cap / spine-deadline trip.
+- `degraded` -- `state.upstream_shed`, which `core/search.py`'s single
+  catch boundary sets on `BreakerOpenError` only.
+
+An ordinary Discogs failure -- 5xx, reset connection, read timeout below the
+breaker's trip threshold -- sets neither. `discogs/service.py` swallows it and
+returns `None`/empty, and `lookup/orchestrator.py`'s step-2 track lookup
+catches bare `Exception` into `return [], True`, which additionally means a
+`BreakerOpenError` raised in step 2 never reaches step 3's boundary. All of
+those land here as `miss_clean`.
+
+The saturation breaker limits the blast radius -- a sustained outage trips it,
+and from then on the sheds *are* marked -- but the pre-trip window and
+sub-threshold failures are misattributed. Propagating `degraded=True` at those
+swallow sites changes the wire response, so it is tracked separately in
+LML#1236 rather than smuggled in here. Until it lands, read a `miss_clean`
+spike alongside the Discogs health signals (`cache.api_calls`, the LML#683
+alerts) rather than as proof of a recall regression.
 
 `search_type` is deliberately not read here. It is a lane-derived label:
 `core.search.get_search_type_from_state` returns the *last strategy
@@ -40,7 +64,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from generated.api_models import LookupResponse
+    from lookup.models import LookupResponse
 
 OUTCOME_HIT = "hit"
 """At least one result was returned. Not a miss, whatever else degraded."""

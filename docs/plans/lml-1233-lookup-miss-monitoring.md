@@ -150,6 +150,12 @@ Add `commit_sha` there for deploy attribution and stop. Per-item bulk outcome ag
 
 ## Phase 2 — production alert (PR 2, gated on a baseline wait)
 
+**`miss_clean` is not yet a pure signal — read this before fitting a threshold (LML#1236).**
+
+PR 1's `miss_kind` classifies from `timeout` / `degraded`, and those are narrower than "something upstream failed": `degraded` comes only from `BreakerOpenError` via `state.upstream_shed`, while an ordinary Discogs 5xx is swallowed in `discogs/service.py` and in `lookup/orchestrator.py`'s step-2 track lookup (which catches bare `Exception`, so a step-2 `BreakerOpenError` never reaches step 3's catch boundary either). Those land in `miss_clean`.
+
+Two consequences for this phase. First, the baseline window will contain some contamination, so a threshold fitted to it is fitted to a slightly dirty series — prefer a threshold with headroom over a tight one, and re-check it after LML#1236 lands. Second, the response runbook must direct the reader to cross-check the Discogs health signals (`cache.api_calls`, the LML#683 alerts) before concluding a `miss_clean` spike is a recall regression. Ideally LML#1236 ships before the alert is enabled; if it does not, both points above are mandatory rather than advisory.
+
 **Baseline first.** After PR 1 reaches production, accumulate **at least 7 days** of `miss_kind` data before choosing any threshold. Two days is not a baseline, and the observed 5.5% → 13.1% day-over-day swing is mostly the mix effect of Finding 3, not signal. This mirrors how LML#683's thresholds were set from a 3-day window with per-window ranges reported, not from a single point.
 
 **Insight** (house pattern: single-row HogQL, trailing window, hourly check, email delivery):
