@@ -1355,6 +1355,48 @@ class TestGetRelease:
         assert written.artwork_url == "https://img.discogs.com/confield-cover.jpg"
 
     @pytest.mark.asyncio
+    async def test_require_artwork_answer_failed_live_ask_does_not_write_back(
+        self, service_with_cache
+    ):
+        """LML#1237 follow-up. The "pays this cost at most once" claim in
+        ``require_artwork_answer``'s docstring only holds for a SUCCESSFUL
+        live ask -- ``write_release`` only fires when the API leg actually
+        returns a value (``discogs/fallthrough.py``: write-back is gated on
+        ``api_result is not None``). A failed ask (exhausted retries, breaker
+        shed, network error) writes nothing back, so the row stays
+        never-asked and a LATER call with ``require_artwork_answer=True``
+        will re-ask again. The breaker and the shared rate gate (#879) bound
+        how often that retry can happen; this flag does not bound it to
+        exactly once.
+        """
+        never_asked = ReleaseMetadataResponse(
+            release_id=1573111,
+            title="Some Comp",
+            artist="Various",
+            release_url="https://discogs.com/release/1573111",
+            artwork_url=None,
+            artwork_checked_at=None,
+            tracklist=[
+                TrackItem(position="1", title="Track One", duration="3:00", artists=[]),
+            ],
+            cached=True,
+        )
+        service_with_cache.cache_service.get_release = AsyncMock(return_value=never_asked)
+        service_with_cache.cache_service.write_release = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=None,  # exhausted retries / rate limited -- a failed ask
+        ) as mock_request:
+            result = await service_with_cache.get_release(1573111, require_artwork_answer=True)
+
+        mock_request.assert_called_once()
+        assert result is None
+        service_with_cache.cache_service.write_release.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_require_artwork_answer_does_not_reask_once_checked(self, service_with_cache):
         """LML#1237 / #423 invariant: once a row carries a non-NULL
         ``artwork_checked_at`` -- Discogs was asked, whatever the answer --
