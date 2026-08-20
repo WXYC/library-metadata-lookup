@@ -47,6 +47,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from wxyc_etl.schema import library_columns
+
 logger = logging.getLogger("build_golden_corpus")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -117,18 +119,72 @@ ABSENT_ARTIST_QUERIES: tuple[tuple[str, str], ...] = (
 
 #: Seeded artists queried with an album they do not have. The shape is a real
 #: production one (a DJ types an album WXYC does not shelve for an artist it
-#: does) and the interesting half is that it does NOT miss -- the artist-only
-#: leg returns the shelf with `song_not_found=True`. Pinning that keeps a
-#: change that turns the fallback off from reading as a recall improvement.
-ABSENT_ALBUM_QUERIES: tuple[tuple[str, str], ...] = (
-    ("Cat Power", "Sun Rays Over Nothing"),
-    ("Broadcast", "Spell Blanket"),
-    ("Burial", "Antidawn"),
-    ("Big Thief", "Double Infinity"),
-    ("Aphex Twin", "Syro Deluxe Edition"),
-    ("Brian Eno", "Reflection"),
-    ("Colleen", "Le jour et la nuit"),
+#: does), and it does not uniformly land in one place: the third element says
+#: which of three things this particular query actually reaches, verified
+#: against the built corpus rather than assumed (LML#1233 review corrected a
+#: prior note here that claimed the whole stratum pinned the artist-only
+#: fallback, when five of the original seven cleanly missed and the other two
+#: hit through a different, narrower mechanism -- see each category below).
+#:
+#: - `"clean_miss"` -- the floor case. `search_library_with_fallback`'s
+#:   album-match rapidfuzz floor (`_ALBUM_MATCH_FLOOR`, `lookup/matching.py`,
+#:   80.0) correctly rejects the typed album against every real title on the
+#:   shelf, so the query misses.
+#: - `"fuzzy_collision"` -- NOT the artist-only fallback, despite looking
+#:   similar. A short real album title (e.g. "Syro") is a near-substring of
+#:   the typed one ("Syro Deluxe Edition") and gets caught by the LOOSER
+#:   per-album word-overlap filter inside `search_library_with_fallback`'s own
+#:   per-album loop (`search_one_album`, `lookup/strategies/artist_plus_album.py`)
+#:   -- before the artist-only leg is ever reached. The response is a hit on
+#:   that one unrelated album, with `song_not_found=True`.
+#: - `"artist_fallback"` -- the genuine artist-only fallback
+#:   (`search_library_with_fallback`'s `if not all_results and lib_artist:`
+#:   branch): the typed album shares too few whole words with any real title
+#:   to be caught by the per-album loop, but clears the rapidfuzz floor once
+#:   every shelved title is checked unfiltered, so the shelf rows carrying the
+#:   matched word come back with `song_not_found=True`. Only one query here is
+#:   built to land here on purpose -- Brian Eno / "Airports" matches both
+#:   "Ambient 1 - Music for Airports" and "Bang on a Can Does Music for
+#:   Airports" (each token_set_ratio 100.0 against "airports") but shares only
+#:   one significant word with either, below the per-album loop's two-word
+#:   floor.
+ABSENT_ALBUM_QUERIES: tuple[tuple[str, str, str], ...] = (
+    ("Cat Power", "Sun Rays Over Nothing", "fuzzy_collision"),
+    ("Broadcast", "Spell Blanket", "clean_miss"),
+    ("Burial", "Antidawn", "clean_miss"),
+    ("Big Thief", "Double Infinity", "clean_miss"),
+    ("Aphex Twin", "Syro Deluxe Edition", "fuzzy_collision"),
+    ("Brian Eno", "Reflection", "clean_miss"),
+    ("Colleen", "Le jour et la nuit", "clean_miss"),
+    ("Brian Eno", "Airports", "artist_fallback"),
 )
+
+_ABSENT_ALBUM_NOTES: dict[str, str] = {
+    "clean_miss": (
+        "Seeded artist, album WXYC does not shelve. The album-match rapidfuzz "
+        "floor (_ALBUM_MATCH_FLOOR, lookup/matching.py) correctly rejects every "
+        "real title on the shelf against the typed album, so this cleanly misses."
+    ),
+    "fuzzy_collision": (
+        "Seeded artist, album WXYC does not shelve -- but this one does NOT "
+        "miss. A short real album title fuzz-collides as a near-substring of "
+        "the typed one and is caught by the looser per-album word-overlap "
+        "filter inside search_library_with_fallback's own per-album loop, "
+        "before the artist-only fallback is ever reached. The response is a "
+        "hit on that one unrelated album, with song_not_found=True -- a "
+        "narrower and more surprising hazard than the artist-only fallback, "
+        "and not the same mechanism."
+    ),
+    "artist_fallback": (
+        "Seeded artist, album WXYC does not shelve, built specifically to "
+        "reach the genuine artist-only fallback (search_library_with_fallback's "
+        "`if not all_results and lib_artist:` branch): the typed album shares "
+        "too few whole words with any real title to be caught by the earlier "
+        "per-album loop, but clears the album-match floor once the whole shelf "
+        "is checked unfiltered. song_not_found=True is the load-bearing half "
+        "-- the shelf rows carrying the matched word come back, not a miss."
+    ),
+}
 
 #: Tracks that exist nowhere -- not on the shelf, not in the Discogs fixture.
 #: The miss direction for the track-bearing lanes, which the sampled cases
@@ -277,8 +333,37 @@ class Fixture:
     album_searches: dict[str, list[int]] = field(default_factory=dict)
     album_title_searches: dict[str, list[int]] = field(default_factory=dict)
 
-    def route(self, table: dict[str, list[int]], key: str, keys: tuple[str, ...]) -> None:
-        table[key] = [self.releases[k]["release_id"] for k in keys]
+    def route(
+        self,
+        table: dict[str, list[int]],
+        key: str,
+        keys: tuple[str, ...],
+        *,
+        override: bool = False,
+    ) -> None:
+        """Record one route, refusing to silently clobber a conflicting one.
+
+        Two different releases can resolve to the same route key -- a bare
+        track title shared across pressings, or a frozen route deliberately
+        reusing a key sampling also produced. The first is a fixture bug
+        (LML#1233 review): the loser's case would silently be answered by the
+        winner's release, with nothing in the diff to say so (already latent:
+        four track titles in the sampled fixture are shared across releases,
+        and `route_key("untitled", None)` resolves to whichever of two
+        releases wrote it last). The second is intentional -- callers building
+        `FROZEN_*_ROUTES` pass `override=True` to say so explicitly, in the
+        reviewed diff rather than in silence. A same-value re-route (the two
+        specs happen to resolve to the identical release id) is never a
+        conflict, override or not.
+        """
+        value = [self.releases[k]["release_id"] for k in keys]
+        if not override and key in table and table[key] != value:
+            raise SystemExit(
+                f"route {key!r} already maps to release id(s) {table[key]!r}; refusing to "
+                f"silently overwrite with {value!r}. If this replacement is deliberate "
+                "(e.g. a FROZEN_*_ROUTES entry), route it with override=True."
+            )
+        table[key] = value
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -298,17 +383,11 @@ def route_key(*parts: str | None) -> str:
 # library.db
 # ---------------------------------------------------------------------------
 
-LIBRARY_FIELDS = (
-    "id",
-    "title",
-    "artist",
-    "call_letters",
-    "artist_call_number",
-    "release_call_number",
-    "genre",
-    "format",
-    "alternate_artist_name",
-)
+#: The code under test's own column list (`library/db.py` imports the same
+#: name to validate `library.db`'s schema; `tests/e2e/golden/corpus.py`'s
+#: `LIBRARY_COLUMNS` imports it too), not a hand-copied second tuple that can
+#: drift from it silently (LML#1233 review).
+LIBRARY_FIELDS = tuple(library_columns())
 
 
 def fetch_library_rows(db_path: Path) -> list[dict[str, Any]]:
@@ -661,22 +740,21 @@ def build_sampled_cases(
     shelved = {(row["artist"].lower(), row["title"].lower()) for row in rows}
     mis_declared = [
         (artist, album)
-        for artist, album in ABSENT_ALBUM_QUERIES
+        for artist, album, _category in ABSENT_ALBUM_QUERIES
         if (artist.lower(), album.lower()) in shelved
     ]
     if mis_declared:
         raise SystemExit(
             f"{mis_declared} are declared as albums WXYC does not shelve, but they are "
             "seeded. Those cases would pin an ordinary direct hit while claiming to pin "
-            "the artist-only fallback."
+            "an absent-album lane."
         )
-    for artist, album in ABSENT_ALBUM_QUERIES:
+    for artist, album, category in ABSENT_ALBUM_QUERIES:
         cases.append(
             _case(
                 f"ab-nofallback-{slugify(artist)}-{slugify(album)}",
                 "artist_album",
-                "Seeded artist, album WXYC does not shelve. Pins the artist-only "
-                "fallback: the answer is the shelf with song_not_found set, not a miss.",
+                _ABSENT_ALBUM_NOTES[category],
                 {"artist": artist, "album": album},
             )
         )
@@ -1027,12 +1105,15 @@ def main(argv: list[str] | None = None) -> int:
     for spec, _resolved in shelf_releases:
         assert spec.library_row is not None
         fixture.route(fixture.album_searches, route_key(*spec.library_row), (spec.key,))
+    # These three tables are the deliberate exception the `route()` conflict
+    # guard exists to name: a frozen regression case's route is authoritative
+    # over anything sampling independently derived for the same key.
     for track, artist, keys in FROZEN_TRACK_ROUTES:
-        fixture.route(fixture.track_searches, route_key(track, artist), keys)
+        fixture.route(fixture.track_searches, route_key(track, artist), keys, override=True)
     for album, keys in FROZEN_ALBUM_TITLE_ROUTES:
-        fixture.route(fixture.album_title_searches, route_key(album), keys)
+        fixture.route(fixture.album_title_searches, route_key(album), keys, override=True)
     for artist, album, keys in FROZEN_ALBUM_ROUTES:
-        fixture.route(fixture.album_searches, route_key(artist, album), keys)
+        fixture.route(fixture.album_searches, route_key(artist, album), keys, override=True)
 
     cases = build_sampled_cases(rows, track_releases, rng) + frozen_cases()
     cases.sort(key=lambda case: (not case["frozen"], case["id"]))

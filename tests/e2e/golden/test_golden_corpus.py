@@ -204,14 +204,21 @@ def test_expectations_are_well_formed():
             f"{case.id} expects miss_kind {case.expect.miss_kind!r}, "
             f"not one of {sorted(corpus.KNOWN_MISS_KINDS)}"
         )
-        if case.expect.miss_kind == corpus.MISS_CLEAN:
-            assert not case.expect.results, (
-                f"{case.id} expects a miss but also lists results -- contradictory"
-            )
-        else:
+        # Hit-vs-any-miss, not clean-vs-not-clean: `verdict_from_payload` derives
+        # `miss_timeout` and `miss_degraded` from an empty `results` list too
+        # (corpus.py), so a case expecting either of those with no results is
+        # well-formed, not a contradiction (LML#1233 review).
+        if case.expect.miss_kind == corpus.OUTCOME_HIT:
             assert case.expect.results, (
                 f"{case.id} expects a hit but lists no results -- contradictory"
             )
+        else:
+            assert not case.expect.results, (
+                f"{case.id} expects a miss but also lists results -- contradictory"
+            )
+        assert corpus.verdict_shape_is_consistent(case.expect), (
+            f"{case.id}: verdict_shape_is_consistent disagrees with the check above"
+        )
         assert len(case.expect.results) <= corpus.MAX_RECORDED_RESULTS, (
             f"{case.id} records {len(case.expect.results)} results, above the "
             f"{corpus.MAX_RECORDED_RESULTS} cap. The response cap moved, or the "
@@ -230,6 +237,120 @@ def test_cases_file_is_canonically_formatted():
         "tests/e2e/golden/cases.json is not canonically formatted. Run "
         "`uv run python -m scripts.rebaseline_golden_corpus --format-only`."
     )
+
+
+def test_max_recorded_results_is_the_production_cap():
+    """`MAX_RECORDED_RESULTS` must track the real cap, not a hand-copied literal.
+
+    The two had already drifted -- `MAX_RECORDED_RESULTS` was 8, the real
+    `/lookup` cap (`lookup.matching.MAX_SEARCH_RESULTS`) was 5 -- which means
+    raising the real cap by up to 3 would have passed this corpus silently,
+    the exact regression the guard exists to catch (LML#1233 review).
+    """
+    from lookup.matching import MAX_SEARCH_RESULTS
+
+    assert corpus.MAX_RECORDED_RESULTS == MAX_SEARCH_RESULTS
+
+
+@pytest.mark.parametrize(
+    "miss_kind, results, expected",
+    [
+        pytest.param(corpus.OUTCOME_HIT, ("#1 A — B",), True, id="hit-with-results"),
+        pytest.param(corpus.OUTCOME_HIT, (), False, id="hit-with-no-results-is-inconsistent"),
+        pytest.param(corpus.MISS_CLEAN, (), True, id="clean-miss"),
+        pytest.param(corpus.MISS_TIMEOUT, (), True, id="timeout-miss"),
+        pytest.param(corpus.MISS_DEGRADED, (), True, id="degraded-miss"),
+        pytest.param(
+            corpus.MISS_TIMEOUT, ("#1 A — B",), False, id="timeout-with-results-is-inconsistent"
+        ),
+    ],
+)
+def test_verdict_shape_is_consistent_for_every_miss_kind(miss_kind, results, expected):
+    """`results` is non-empty iff `miss_kind` is a hit -- for EVERY miss kind.
+
+    A prior version of this invariant special-cased `miss_clean` only, so a
+    `miss_timeout` or `miss_degraded` verdict with (correctly) no results read
+    as contradictory -- the opposite of the truth, and the exact shape
+    `verdict_from_payload` always produces for those two kinds (LML#1233
+    review).
+    """
+    verdict = corpus.Verdict(
+        miss_kind=miss_kind, song_not_found=False, found_on_compilation=False, results=results
+    )
+    assert corpus.verdict_shape_is_consistent(verdict) is expected
+
+
+def test_pinned_environment_covers_non_settings_search_knobs():
+    """The pipeline's non-`Settings` env knobs must be pinned, not inherited.
+
+    `Settings` fields are pinned automatically; these are read straight off
+    `os.environ` by `core.search.resolve_positive_int_env` and cousins, so
+    they need an explicit entry in `corpus._PINNED_ENV`. Reproduction for the
+    one that is provably verdict-relevant: `LML_SEARCH_BUDGET_MS=1` starves
+    the strategy cascade and flips `lml1184-arabian-prince-strange-life` from
+    a hit to a clean miss (LML#1233 review) -- run
+    `LML_SEARCH_BUDGET_MS=1 uv run pytest tests/e2e/golden` to see it fail
+    without this pin.
+    """
+    from lookup.admission import ADMISSION_LOOP_LAG_SHED_ENV_VAR, ADMISSION_SHED_ENFORCE_ENV_VAR
+    from lookup.timeouts import (
+        APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
+        BANDCAMP_LIVE_PROBE_TIMEOUT_ENV_VAR,
+    )
+
+    env = corpus.pinned_environment()
+    for name in (
+        "LML_SEARCH_BUDGET_MS",
+        "LML_SEARCH_HARD_TIMEOUT_MS",
+        ADMISSION_LOOP_LAG_SHED_ENV_VAR,
+        ADMISSION_SHED_ENFORCE_ENV_VAR,
+        "LML_DISCOGS_POOL_MAX_SIZE",
+        APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
+        BANDCAMP_LIVE_PROBE_TIMEOUT_ENV_VAR,
+    ):
+        assert name in env, f"{name} is read at request time but not pinned by corpus.py"
+
+
+@pytest.mark.asyncio
+async def test_fake_discogs_service_search_respects_limit():
+    """`FakeDiscogsService.search` must truncate to `limit`, like its siblings.
+
+    Previously ignored the argument entirely and returned every routed
+    candidate regardless of what the caller asked for -- inconsistent with
+    `search_releases_by_track` and `search_releases_by_album_title`, which
+    both apply `ids[:limit]`, and a silent divergence from the production
+    `DiscogsService.search`, which truncates (LML#1233 review). Latent
+    against the checked-in fixture (every route carries at most one id
+    today), so this constructs its own multi-id route rather than relying on
+    `discogs.json`.
+    """
+    from discogs.models import DiscogsSearchRequest
+
+    fixture = corpus.load_discogs_fixture()
+    releases = list(fixture["releases"])
+    assert len(releases) >= 3, "fixture needs at least 3 releases to prove truncation"
+    ids = [r["release_id"] for r in releases[:3]]
+    fixture = {**fixture, "album_searches": {"multi|route": ids}}
+    fake = corpus.FakeDiscogsService(fixture)
+
+    response = await fake.search(DiscogsSearchRequest(artist="multi", album="route"), limit=2)
+
+    assert len(response.results) == 2
+    assert response.total == 3
+
+
+def test_build_library_db_raises_on_a_row_missing_a_column(tmp_path):
+    """A row missing an expected column must raise, not silently insert NULL.
+
+    `row.get(col)` previously swallowed a missing key into a NULL cell, which
+    would let a stale `library.json` (or a `LIBRARY_COLUMNS` widened without
+    regenerating the fixture) record a corpus verdict against silently
+    truncated catalog rows (LML#1233 review).
+    """
+    incomplete_row = {"id": 1, "title": "T", "artist": "A"}
+    assert set(corpus.LIBRARY_COLUMNS) - set(incomplete_row), "fixture row must be incomplete"
+    with pytest.raises(KeyError):
+        corpus.build_library_db(tmp_path / "library.db", [incomplete_row])
 
 
 # ---------------------------------------------------------------------------

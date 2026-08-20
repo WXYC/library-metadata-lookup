@@ -1827,7 +1827,7 @@
     "id": "ab-nofallback-aphex-twin-syro-deluxe-edition",
     "shape": "artist_album",
     "frozen": false,
-    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "note": "Seeded artist, album WXYC does not shelve -- but this one does NOT miss. A short real album title fuzz-collides as a near-substring of the typed one and is caught by the looser per-album word-overlap filter inside search_library_with_fallback's own per-album loop, before the artist-only fallback is ever reached. The response is a hit on that one unrelated album, with song_not_found=True -- a narrower and more surprising hazard than the artist-only fallback, and not the same mechanism.",
     "query": {
       "artist": "Aphex Twin",
       "album": "Syro Deluxe Edition"
@@ -1845,7 +1845,7 @@
     "id": "ab-nofallback-big-thief-double-infinity",
     "shape": "artist_album",
     "frozen": false,
-    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "note": "Seeded artist, album WXYC does not shelve. The album-match rapidfuzz floor (_ALBUM_MATCH_FLOOR, lookup/matching.py) correctly rejects every real title on the shelf against the typed album, so this cleanly misses.",
     "query": {
       "artist": "Big Thief",
       "album": "Double Infinity"
@@ -1858,10 +1858,29 @@
     }
   },
   {
+    "id": "ab-nofallback-brian-eno-airports",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Seeded artist, album WXYC does not shelve, built specifically to reach the genuine artist-only fallback (search_library_with_fallback's `if not all_results and lib_artist:` branch): the typed album shares too few whole words with any real title to be caught by the earlier per-album loop, but clears the album-match floor once the whole shelf is checked unfiltered. song_not_found=True is the load-bearing half -- the shelf rows carrying the matched word come back, not a miss.",
+    "query": {
+      "artist": "Brian Eno",
+      "album": "Airports"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#24376 Brian Eno — Ambient 1 - Music for Airports",
+        "#24901 Brian Eno — Bang on a Can Does Music for Airports"
+      ]
+    }
+  },
+  {
     "id": "ab-nofallback-brian-eno-reflection",
     "shape": "artist_album",
     "frozen": false,
-    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "note": "Seeded artist, album WXYC does not shelve. The album-match rapidfuzz floor (_ALBUM_MATCH_FLOOR, lookup/matching.py) correctly rejects every real title on the shelf against the typed album, so this cleanly misses.",
     "query": {
       "artist": "Brian Eno",
       "album": "Reflection"
@@ -1877,7 +1896,7 @@
     "id": "ab-nofallback-broadcast-spell-blanket",
     "shape": "artist_album",
     "frozen": false,
-    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "note": "Seeded artist, album WXYC does not shelve. The album-match rapidfuzz floor (_ALBUM_MATCH_FLOOR, lookup/matching.py) correctly rejects every real title on the shelf against the typed album, so this cleanly misses.",
     "query": {
       "artist": "Broadcast",
       "album": "Spell Blanket"
@@ -1893,7 +1912,7 @@
     "id": "ab-nofallback-burial-antidawn",
     "shape": "artist_album",
     "frozen": false,
-    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "note": "Seeded artist, album WXYC does not shelve. The album-match rapidfuzz floor (_ALBUM_MATCH_FLOOR, lookup/matching.py) correctly rejects every real title on the shelf against the typed album, so this cleanly misses.",
     "query": {
       "artist": "Burial",
       "album": "Antidawn"
@@ -1909,7 +1928,7 @@
     "id": "ab-nofallback-cat-power-sun-rays-over-nothing",
     "shape": "artist_album",
     "frozen": false,
-    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "note": "Seeded artist, album WXYC does not shelve -- but this one does NOT miss. A short real album title fuzz-collides as a near-substring of the typed one and is caught by the looser per-album word-overlap filter inside search_library_with_fallback's own per-album loop, before the artist-only fallback is ever reached. The response is a hit on that one unrelated album, with song_not_found=True -- a narrower and more surprising hazard than the artist-only fallback, and not the same mechanism.",
     "query": {
       "artist": "Cat Power",
       "album": "Sun Rays Over Nothing"
@@ -1927,7 +1946,7 @@
     "id": "ab-nofallback-colleen-le-jour-et-la-nuit",
     "shape": "artist_album",
     "frozen": false,
-    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "note": "Seeded artist, album WXYC does not shelve. The album-match rapidfuzz floor (_ALBUM_MATCH_FLOOR, lookup/matching.py) correctly rejects every real title on the shelf against the typed album, so this cleanly misses.",
     "query": {
       "artist": "Colleen",
       "album": "Le jour et la nuit"
