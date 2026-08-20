@@ -747,6 +747,50 @@ class DiscogsCacheService:
         except Exception as e:
             _classify_cache_error("get_release_artist_variations", e)
 
+    async def get_sibling_release_artwork(
+        self, master_id: int, *, exclude_release_id: int
+    ) -> str | None:
+        """Find another cached pressing under ``master_id`` that already has a cover.
+
+        Discogs carries many pressings per album and only some have an
+        uploaded image (LML#1237); a release bound to one imageless pressing
+        does not mean the album has no cover -- a sibling pressing under the
+        same master may already carry one in this cache, at no extra Discogs
+        round-trip. Deterministic pick (lowest release id) so a repeated
+        lookup for the same master is stable.
+
+        Only ever answers from ``artwork_url IS NOT NULL`` rows. A sibling
+        that has never been live-checked for artwork (``artwork_checked_at
+        IS NULL``, the "never asked" state -- WXYC/discogs-etl#239,
+        LML#423) or one that was checked and confirmed imageless is simply
+        not a candidate here; neither is ever read as proof the album lacks
+        a cover, which stays a decision only a live check of the master's
+        canonical release can make.
+
+        Returns:
+            The sibling's ``artwork_url``, or ``None`` when no cached
+            sibling under this master has one.
+
+        Raises:
+            CacheUnavailableError: if the database is unreachable.
+        """
+        try:
+            query = """
+                SELECT artwork_url
+                FROM release
+                WHERE master_id = $1 AND id != $2 AND artwork_url IS NOT NULL
+                ORDER BY id
+                LIMIT 1
+            """
+            rows = await self._bounded_fetch(
+                query, master_id, exclude_release_id, op="get_sibling_release_artwork"
+            )
+            return rows[0]["artwork_url"] if rows else None
+        except CacheUnavailableError:
+            raise
+        except Exception as e:
+            _classify_cache_error("get_sibling_release_artwork", e)
+
     @async_cached(_ARTIST_SEARCH_CACHE)
     async def search_artists_by_name(self, name: str, *, limit: int = 5) -> list[dict]:
         """Fuzzy-match an artist name against ``artist`` and ``artist_name_variation``.

@@ -16,9 +16,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from discogs.cache_service import CacheSchemaSkewError, CacheUnavailableError
 from discogs.models import (
     DiscogsSearchRequest,
     DiscogsSearchResponse,
+    MasterRelease,
     ReleaseInfo,
     ReleaseMetadataResponse,
     TrackItem,
@@ -2763,6 +2765,318 @@ class TestFetchArtworkFallback:
         assert results[0][1].artwork_url == "https://i.discogs.com/release-cover.jpg"
         mock_discogs_service.get_artist_image.assert_not_called()
         mock_discogs_service.get_label_image.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: sibling-pressing artwork recovery (LML#1237)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveFallbackArtworkSiblingPressing:
+    """A bound release with no ``images[0]`` cover is not "the album has no
+    cover" -- Discogs carries many pressings per album and only some have an
+    uploaded image (#687 reopened; #1237). Before falling to the artist
+    image, ``_resolve_fallback_artwork`` must try a sibling pressing under
+    the same ``master_id``: the cache first, then (bounded to one extra
+    round-trip) the master's own canonical release."""
+
+    @pytest.mark.asyncio
+    async def test_cache_sibling_resolves_without_a_live_master_call(self, mock_discogs_service):
+        """A cached sibling with a cover wins outright -- no Discogs round-trip
+        at all beyond the original get_release (LML#1237's "cache first")."""
+        items = [make_library_item(id=1, artist="Autechre", title="Confield")]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=28138, album="Confield", artist="Autechre", artwork_url=None
+                )
+            ]
+        )
+        mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=28138,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            release_url="https://www.discogs.com/release/28138",
+        )
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.get_sibling_release_artwork = AsyncMock(
+            return_value="https://i.discogs.com/R-1573110.jpeg"
+        )
+
+        results = await fetch_artwork_for_items(items, mock_discogs_service)
+
+        assert results[0][1].artwork_url == "https://i.discogs.com/R-1573110.jpeg"
+        mock_discogs_service.cache_service.get_sibling_release_artwork.assert_awaited_once_with(
+            15678, exclude_release_id=28138
+        )
+        mock_discogs_service.get_master.assert_not_called()
+        mock_discogs_service.get_artist_image.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pins_autechre_confield_to_a_release_cover(self, mock_discogs_service):
+        """Regression pin (#1237): Autechre -- Confield resolves to an R- cover
+        via a sibling pressing, never to the artist image and never to None."""
+        items = [make_library_item(id=1, artist="Autechre", title="Confield")]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=28138, album="Confield", artist="Autechre", artwork_url=None
+                )
+            ]
+        )
+        mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=28138,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            release_url="https://www.discogs.com/release/28138",
+        )
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.get_sibling_release_artwork = AsyncMock(
+            return_value="https://i.discogs.com/R-1573110-1204549204.jpeg"
+        )
+
+        results = await fetch_artwork_for_items(items, mock_discogs_service)
+
+        assert results[0][1].artwork_url == "https://i.discogs.com/R-1573110-1204549204.jpeg"
+        mock_discogs_service.get_artist_image.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pins_autechre_chiastic_slide_to_a_release_cover(self, mock_discogs_service):
+        """Regression pin (#1237): Autechre -- Chiastic Slide resolves to an
+        R- cover via a sibling pressing (the ticket's second motivating
+        album), never to the artist image and never to None."""
+        items = [make_library_item(id=1, artist="Autechre", title="Chiastic Slide")]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=45321,
+                    album="Chiastic Slide",
+                    artist="Autechre",
+                    artwork_url=None,
+                )
+            ]
+        )
+        mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=45321,
+            master_id=15682,
+            title="Chiastic Slide",
+            artist="Autechre",
+            artist_id=77,
+            release_url="https://www.discogs.com/release/45321",
+        )
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.get_sibling_release_artwork = AsyncMock(
+            return_value="https://i.discogs.com/R-2496-1616266865-6947.jpeg"
+        )
+
+        results = await fetch_artwork_for_items(items, mock_discogs_service)
+
+        assert results[0][1].artwork_url == "https://i.discogs.com/R-2496-1616266865-6947.jpeg"
+        mock_discogs_service.get_artist_image.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_cache_service_falls_through_to_live_master_lookup(self, mock_discogs_service):
+        """With no PG cache configured, the master's canonical release is
+        consulted live -- still bounded (one get_master + one get_release),
+        never an unbounded pressing crawl."""
+        mock_discogs_service.cache_service = None
+        release = ReleaseMetadataResponse(
+            release_id=28138,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            release_url="https://www.discogs.com/release/28138",
+        )
+        main_release = ReleaseMetadataResponse(
+            release_id=1573110,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            artwork_url="https://i.discogs.com/R-1573110.jpeg",
+            release_url="https://www.discogs.com/release/1573110",
+        )
+        mock_discogs_service.get_release.side_effect = lambda rid: (
+            release if rid == 28138 else main_release
+        )
+        mock_discogs_service.get_master.return_value = MasterRelease(
+            master_id=15678, title="Confield", main_release_id=1573110
+        )
+
+        result = await _resolve_fallback_artwork(mock_discogs_service, 28138)
+
+        assert result == "https://i.discogs.com/R-1573110.jpeg"
+        mock_discogs_service.get_master.assert_awaited_once_with(15678)
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_falls_through_to_live_master_lookup(self, mock_discogs_service):
+        """No cached sibling has a cover -- consult the master's canonical
+        release before giving up on the album entirely."""
+        release = ReleaseMetadataResponse(
+            release_id=28138,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            release_url="https://www.discogs.com/release/28138",
+        )
+        main_release = ReleaseMetadataResponse(
+            release_id=1573110,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            artwork_url="https://i.discogs.com/R-1573110.jpeg",
+            release_url="https://www.discogs.com/release/1573110",
+        )
+        mock_discogs_service.get_release.side_effect = lambda rid: (
+            release if rid == 28138 else main_release
+        )
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.get_sibling_release_artwork = AsyncMock(
+            return_value=None
+        )
+        mock_discogs_service.get_master.return_value = MasterRelease(
+            master_id=15678, title="Confield", main_release_id=1573110
+        )
+
+        result = await _resolve_fallback_artwork(mock_discogs_service, 28138)
+
+        assert result == "https://i.discogs.com/R-1573110.jpeg"
+
+    @pytest.mark.asyncio
+    async def test_master_has_no_cover_anywhere_falls_to_artist_rung(self, mock_discogs_service):
+        """No cached sibling and the master's canonical release also has no
+        cover -- only now does the artist-image rung fire."""
+        release = ReleaseMetadataResponse(
+            release_id=28138,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            release_url="https://www.discogs.com/release/28138",
+        )
+        main_release = ReleaseMetadataResponse(
+            release_id=1573110,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            release_url="https://www.discogs.com/release/1573110",
+        )
+        mock_discogs_service.get_release.side_effect = lambda rid: (
+            release if rid == 28138 else main_release
+        )
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.get_sibling_release_artwork = AsyncMock(
+            return_value=None
+        )
+        mock_discogs_service.get_master.return_value = MasterRelease(
+            master_id=15678, title="Confield", main_release_id=1573110
+        )
+        mock_discogs_service.get_artist_image.return_value = (
+            "https://i.discogs.com/artist-photo.jpg"
+        )
+
+        result = await _resolve_fallback_artwork(mock_discogs_service, 28138)
+
+        assert result == "https://i.discogs.com/artist-photo.jpg"
+
+    @pytest.mark.asyncio
+    async def test_main_release_is_the_bound_release_skips_redundant_fetch(
+        self, mock_discogs_service
+    ):
+        """When the bound release already IS the master's canonical pressing,
+        re-fetching it would just re-confirm the same coverless row -- skip
+        straight to the artist rung instead of a wasted round-trip."""
+        release = ReleaseMetadataResponse(
+            release_id=1573110,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            release_url="https://www.discogs.com/release/1573110",
+        )
+        mock_discogs_service.get_release.return_value = release
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.get_sibling_release_artwork = AsyncMock(
+            return_value=None
+        )
+        mock_discogs_service.get_master.return_value = MasterRelease(
+            master_id=15678, title="Confield", main_release_id=1573110
+        )
+        mock_discogs_service.get_artist_image.return_value = (
+            "https://i.discogs.com/artist-photo.jpg"
+        )
+
+        result = await _resolve_fallback_artwork(mock_discogs_service, 1573110)
+
+        assert result == "https://i.discogs.com/artist-photo.jpg"
+        mock_discogs_service.get_release.assert_awaited_once_with(1573110)
+
+    @pytest.mark.asyncio
+    async def test_no_master_id_skips_sibling_resolution_entirely(self, mock_discogs_service):
+        """A release with no master_id (one-off, self-released) keeps the
+        pre-#1237 behavior exactly: straight to the artist rung, no cache
+        query and no live master lookup."""
+        mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=28138,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            release_url="https://www.discogs.com/release/28138",
+        )
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.get_artist_image.return_value = (
+            "https://i.discogs.com/artist-photo.jpg"
+        )
+
+        result = await _resolve_fallback_artwork(mock_discogs_service, 28138)
+
+        assert result == "https://i.discogs.com/artist-photo.jpg"
+        mock_discogs_service.cache_service.get_sibling_release_artwork.assert_not_called()
+        mock_discogs_service.get_master.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_cls", [CacheUnavailableError, CacheSchemaSkewError])
+    async def test_cache_error_degrades_to_live_master_lookup(
+        self, mock_discogs_service, error_cls
+    ):
+        """A cache failure on the sibling query must not abort resolution --
+        it degrades to the bounded live master check, same as every other
+        cache-read boundary in this service."""
+        release = ReleaseMetadataResponse(
+            release_id=28138,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            release_url="https://www.discogs.com/release/28138",
+        )
+        main_release = ReleaseMetadataResponse(
+            release_id=1573110,
+            master_id=15678,
+            title="Confield",
+            artist="Autechre",
+            artwork_url="https://i.discogs.com/R-1573110.jpeg",
+            release_url="https://www.discogs.com/release/1573110",
+        )
+        mock_discogs_service.get_release.side_effect = lambda rid: (
+            release if rid == 28138 else main_release
+        )
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.get_sibling_release_artwork = AsyncMock(
+            side_effect=error_cls("cache down")
+        )
+        mock_discogs_service.get_master.return_value = MasterRelease(
+            master_id=15678, title="Confield", main_release_id=1573110
+        )
+
+        result = await _resolve_fallback_artwork(mock_discogs_service, 28138)
+
+        assert result == "https://i.discogs.com/R-1573110.jpeg"
 
 
 # ---------------------------------------------------------------------------

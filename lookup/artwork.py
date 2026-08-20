@@ -15,7 +15,8 @@ from wxyc_etl.text import is_compilation_artist
 
 from clients.streaming.matching import find_best_typed_match
 from config.settings import get_settings
-from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
+from discogs.cache_service import CacheSchemaSkewError, CacheUnavailableError
+from discogs.models import DiscogsSearchRequest, DiscogsSearchResult, ReleaseMetadataResponse
 from discogs.service import DiscogsService
 from library.models import LibraryItem
 from lookup.artist_resolution import (
@@ -43,14 +44,76 @@ can import the same constants the runtime path uses — keeping the
 measurement's compilation handling provably-aligned with production."""
 
 
-async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id: int) -> str | None:
-    """Try the release's own cover (images[0]), then artist image.
+async def _resolve_sibling_artwork(
+    discogs_service: DiscogsService, release: ReleaseMetadataResponse
+) -> str | None:
+    """Recover a cover from another pressing of the same album (LML#1237).
 
-    LML#687: the label-image rung was removed -- a label logo is essentially
-    never correct album art (the motivating case: Autechre's *Confield* had no
-    cover and returned the Warp Records logo as its artwork). A missing cover
-    now resolves to ``None`` after the artist-image rung rather than falling
-    all the way through to the release's label.
+    Discogs carries many pressings per album and only some have an uploaded
+    image -- a bound release with no ``images[0]`` does not mean the album
+    has no cover, it means *this pressing's* row has none. ``None`` when
+    ``release`` carries no ``master_id`` (a one-off / self-released title
+    Discogs never grouped), which keeps this a no-op for every release the
+    cascade already handled correctly.
+
+    Cache first: a sibling pressing under the same master may already be in
+    the PG cache with a cover, at no extra Discogs round-trip
+    (``DiscogsCacheService.get_sibling_release_artwork``, ``artwork_url IS
+    NOT NULL`` only -- a sibling that was never live-checked for artwork is
+    not treated as proof the album lacks a cover). A cache failure degrades
+    to the live leg rather than aborting resolution, same as every other
+    cache-read boundary in this service.
+
+    Only when the cache can't answer does this consult the master live
+    (``get_master``) and check its own designated canonical release
+    (``main_release_id``) — Discogs's own "best representative" pressing.
+    That is at most one ``get_master`` plus one ``get_release`` (itself
+    cache-first), never an unbounded crawl of every pressing under the
+    master. Skipped entirely when the canonical release IS the release
+    already just checked, so a coverless master never pays a redundant
+    round-trip for the same row.
+    """
+    if not release.master_id:
+        return None
+
+    cache = discogs_service.cache_service
+    if cache is not None:
+        try:
+            sibling_artwork = await cache.get_sibling_release_artwork(
+                release.master_id, exclude_release_id=release.release_id
+            )
+        except (CacheUnavailableError, CacheSchemaSkewError) as e:
+            logger.warning(
+                f"Sibling artwork cache lookup failed for master {release.master_id}: {e}"
+            )
+            sibling_artwork = None
+        if sibling_artwork:
+            return sibling_artwork
+
+    master = await discogs_service.get_master(release.master_id)
+    if master is None or not master.main_release_id:
+        return None
+    if master.main_release_id == release.release_id:
+        return None
+
+    main_release = await discogs_service.get_release(master.main_release_id)
+    return main_release.artwork_url if main_release else None
+
+
+async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id: int) -> str | None:
+    """Try the release's own cover, then a sibling pressing, then artist image.
+
+    LML#687 removed the label-image rung on the mistaken premise that the
+    motivating release (Autechre's *Confield*) had no cover anywhere -- a
+    label logo is essentially never correct album art, and that conclusion
+    stands. But #687 was reopened: *Confield* has a cover in the cache all
+    along, under a different (sibling) release id than the one LML bound.
+    LML#1237 adds that recovery step -- a missing ``images[0]`` on the bound
+    release now tries a sibling pressing of the same album
+    (``_resolve_sibling_artwork``) before degrading to the artist-image rung.
+    Only when no pressing of the album carries an image (as far as the cache
+    and one bounded live master check can tell) does resolution fall through
+    to the artist image and then ``None`` -- never to the release's label.
 
     Structurally invalid ids (``release_id <= 0``) short-circuit before the
     Discogs round-trip — the LML#401 synthesis pattern produces a
@@ -71,6 +134,10 @@ async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id:
     # two-call path produces via populateReleaseMetadata.
     if release.artwork_url:
         return release.artwork_url
+
+    sibling_artwork = await _resolve_sibling_artwork(discogs_service, release)
+    if sibling_artwork:
+        return sibling_artwork
 
     if release.artist_id:
         image = await discogs_service.get_artist_image(release.artist_id)

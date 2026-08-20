@@ -867,6 +867,61 @@ class TestGetRelease:
 
 
 # ---------------------------------------------------------------------------
+# get_sibling_release_artwork (LML#1237)
+# ---------------------------------------------------------------------------
+
+
+class TestGetSiblingReleaseArtwork:
+    """A release bound with no ``images[0]`` cover does not mean the album has
+    no cover -- Discogs carries many pressings per master, and a sibling
+    pressing may already have an image in this cache. Runs inside the
+    LML#804 ``_bounded_fetch`` transaction, same as ``search_releases_by_track``
+    -- assertions target ``mock_asyncpg_pool._mock_conn.fetch``."""
+
+    @pytest.mark.asyncio
+    async def test_returns_sibling_artwork(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
+            return_value=[{"artwork_url": "https://i.discogs.com/sibling-cover.jpg"}]
+        )
+
+        result = await cache_service.get_sibling_release_artwork(9999, exclude_release_id=28138)
+
+        assert result == "https://i.discogs.com/sibling-cover.jpg"
+
+    @pytest.mark.asyncio
+    async def test_no_sibling_returns_none(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
+
+        result = await cache_service.get_sibling_release_artwork(9999, exclude_release_id=28138)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_excludes_the_bound_release_and_requires_artwork(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """The SQL must never return the release being resolved as its own
+        sibling, and must only ever answer from rows that actually carry a
+        cover -- a sibling that was never live-checked for artwork
+        (``artwork_checked_at IS NULL``, the "never asked" state, LML#1237) is
+        not proof the album lacks one, so it must not be selectable here."""
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
+
+        await cache_service.get_sibling_release_artwork(9999, exclude_release_id=28138)
+
+        sql = mock_asyncpg_pool._mock_conn.fetch.call_args[0][0]
+        assert "master_id" in sql
+        assert "artwork_url IS NOT NULL" in sql
+        assert "id != $2" in sql or "id <> $2" in sql
+
+    @pytest.mark.asyncio
+    async def test_error_raises(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(side_effect=Exception("db error"))
+        with pytest.raises(CacheUnavailableError):
+            await cache_service.get_sibling_release_artwork(9999, exclude_release_id=28138)
+
+
+# ---------------------------------------------------------------------------
 # write_release
 # ---------------------------------------------------------------------------
 
