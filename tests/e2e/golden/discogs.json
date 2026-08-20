@@ -1,0 +1,5417 @@
+{
+  "releases": [
+    {
+      "release_id": 43694,
+      "title": "Richard D. James Album",
+      "artist": "Aphex Twin",
+      "year": 1997,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "4",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Cornish Acid",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Peek 824545201",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Fingerbib",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Carn Marth",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "To Cure A Weakling Child",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Goon Gumpas",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "Yellow Calx",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Girl/Boy Song",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Logan Rock Witch",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "Milkman",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "Inkey$",
+          "artists": []
+        },
+        {
+          "position": "13",
+          "title": "Girl/Boy (£18 Snare Rush Mix)",
+          "artists": []
+        },
+        {
+          "position": "14",
+          "title": "Beetles",
+          "artists": []
+        },
+        {
+          "position": "15",
+          "title": "Girl/Boy (Redruth Mix)",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 86619,
+      "title": "Aikea-Guinea",
+      "artist": "Cocteau Twins",
+      "year": 1985,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Aikea-Guinea",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "Kookaburra",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Quisquose",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "Rococo",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 126602,
+      "title": "Music Has The Right To Children",
+      "artist": "Boards Of Canada",
+      "year": 2002,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1-01",
+          "title": "Wildlife Analysis",
+          "artists": []
+        },
+        {
+          "position": "1-02",
+          "title": "An Eagle In Your Mind",
+          "artists": []
+        },
+        {
+          "position": "1-03",
+          "title": "The Color Of The Fire",
+          "artists": []
+        },
+        {
+          "position": "1-04",
+          "title": "Telephasic Workshop",
+          "artists": []
+        },
+        {
+          "position": "1-05",
+          "title": "Triangles & Rhombuses",
+          "artists": []
+        },
+        {
+          "position": "1-06",
+          "title": "Sixtyten",
+          "artists": []
+        },
+        {
+          "position": "1-07",
+          "title": "Turquoise Hexagon Sun",
+          "artists": []
+        },
+        {
+          "position": "1-08",
+          "title": "Kaini Industries",
+          "artists": []
+        },
+        {
+          "position": "1-09",
+          "title": "Bocuma",
+          "artists": []
+        },
+        {
+          "position": "1-10",
+          "title": "Roygbiv",
+          "artists": []
+        },
+        {
+          "position": "1-11",
+          "title": "Rue The Whirl",
+          "artists": []
+        },
+        {
+          "position": "1-12",
+          "title": "Aquarius",
+          "artists": []
+        },
+        {
+          "position": "1-13",
+          "title": "Olson",
+          "artists": []
+        },
+        {
+          "position": "1-14",
+          "title": "Pete Standing Alone",
+          "artists": []
+        },
+        {
+          "position": "1-15",
+          "title": "Smokes Quantity",
+          "artists": []
+        },
+        {
+          "position": "1-16",
+          "title": "Open The Light",
+          "artists": []
+        },
+        {
+          "position": "1-17",
+          "title": "One Very Important Thought",
+          "artists": []
+        },
+        {
+          "position": "2-01",
+          "title": "Aquarius (Version 3)",
+          "artists": []
+        },
+        {
+          "position": "2-02",
+          "title": "Happy Cycling",
+          "artists": []
+        },
+        {
+          "position": "2-03",
+          "title": "Olson (Version 3)",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 127710,
+      "title": "26 Mixes For Cash",
+      "artist": "Aphex Twin",
+      "year": 2003,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1-01",
+          "title": "Time To Find Me (AFX Fast Mix)",
+          "artists": [
+            "Seefeel"
+          ]
+        },
+        {
+          "position": "1-02",
+          "title": "Raising The Titanic (Big Drum Mix)",
+          "artists": [
+            "Gavin Bryars Ensemble"
+          ]
+        },
+        {
+          "position": "1-03",
+          "title": "Journey (Aphex Twin Care Mix)",
+          "artists": [
+            "The Gentle People"
+          ]
+        },
+        {
+          "position": "1-04",
+          "title": "Triachus (Mix By Aphex Twin)",
+          "artists": [
+            "Kinesthesia"
+          ]
+        },
+        {
+          "position": "1-05",
+          "title": "Heroes (Aphex Twin Remix)",
+          "artists": [
+            "Philip Glass"
+          ]
+        },
+        {
+          "position": "1-06",
+          "title": "In The Glitter Part 2 (Aphex Twin Mix)",
+          "artists": [
+            "Buck-Tick"
+          ]
+        },
+        {
+          "position": "1-07",
+          "title": "Zeros And Ones (Aphex Twin Reconstruction #2)",
+          "artists": [
+            "Jesus Jones"
+          ]
+        },
+        {
+          "position": "1-08",
+          "title": "Ziggy (Aphex Twin Mix #1)",
+          "artists": [
+            "Nav Katze"
+          ]
+        },
+        {
+          "position": "1-09",
+          "title": "Your Head My Voice (Voix Revirement)",
+          "artists": [
+            "Saint Etienne"
+          ]
+        },
+        {
+          "position": "1-10",
+          "title": "Change (Aphex Twin Mix #2)",
+          "artists": [
+            "Nav Katze"
+          ]
+        },
+        {
+          "position": "1-11",
+          "title": "Une Femme N’est Pas Un Homme (Aphex Twin Mix)",
+          "artists": [
+            "The Beatniks"
+          ]
+        },
+        {
+          "position": "1-12",
+          "title": "The Beauty Of Being Numb Section B (Created By Aphex Twin)",
+          "artists": [
+            "Nine Inch Nails"
+          ]
+        },
+        {
+          "position": "1-13",
+          "title": "Let My Fish Loose (Aphex Twin Remix)",
+          "artists": [
+            "Nobukazu Takemura"
+          ]
+        },
+        {
+          "position": "2-01",
+          "title": "Krieger (Aphex Twin Baldhu Mix)",
+          "artists": [
+            "Die Fantastischen Vier"
+          ]
+        },
+        {
+          "position": "2-02",
+          "title": "Deep In Velvet (Aphex Twin Turnips Mix)",
+          "artists": [
+            "Phillip Boa & The Voodooclub"
+          ]
+        },
+        {
+          "position": "2-03",
+          "title": "Falling Free (Aphex Twin Remix)",
+          "artists": [
+            "Curve"
+          ]
+        },
+        {
+          "position": "2-04",
+          "title": "We Have Arrived (Aphex Twin QQT Mix)",
+          "artists": [
+            "Mescalinum United"
+          ]
+        },
+        {
+          "position": "2-05",
+          "title": "At The Heart Of It All (Created By Aphex Twin)",
+          "artists": [
+            "Nine Inch Nails"
+          ]
+        },
+        {
+          "position": "2-06",
+          "title": "Flow Coma (Remix By AFX)",
+          "artists": [
+            "808 State"
+          ]
+        },
+        {
+          "position": "2-07",
+          "title": "Windowlicker (Acid Edit)",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "2-08",
+          "title": "Normal (Helston Flora Remix By AFX)",
+          "artists": [
+            "Baby Ford"
+          ]
+        },
+        {
+          "position": "2-09",
+          "title": "SAW2 CD1 TRK2 (Original Mix)",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "2-10",
+          "title": "Mindstream (The Aphex Twin Remix)",
+          "artists": [
+            "Meat Beat Manifesto"
+          ]
+        },
+        {
+          "position": "2-11",
+          "title": "You Can't Hide Your Love (Hidden Love Mix)",
+          "artists": [
+            "DMX Krew"
+          ]
+        },
+        {
+          "position": "2-12",
+          "title": "Spotlight (Aphex Twin Mix)",
+          "artists": [
+            "Wagon Christ"
+          ]
+        },
+        {
+          "position": "2-13",
+          "title": "Debase (Soft Palate)",
+          "artists": [
+            "The Mike Flowers Pops"
+          ]
+        }
+      ]
+    },
+    {
+      "release_id": 202433,
+      "title": "Raising The Titanic",
+      "artist": "Aphex Twin",
+      "year": 1995,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A",
+          "title": "Raising The Titanic (Mix)",
+          "artists": []
+        },
+        {
+          "position": "B",
+          "title": "Raising The Titanic (Big Drum Mix)",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 325741,
+      "title": "Tres Cosas",
+      "artist": "Juana Molina",
+      "year": 2004,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "No Es Tan Cierto",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "El Cristal",
+          "artists": []
+        },
+        {
+          "position": "A3",
+          "title": "Sálvese Quién Pueda",
+          "artists": []
+        },
+        {
+          "position": "A4",
+          "title": "¡Uh!",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Tres Cosas",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "Yo Sé Que",
+          "artists": []
+        },
+        {
+          "position": "B3",
+          "title": "Isabel",
+          "artists": []
+        },
+        {
+          "position": "C1",
+          "title": "Zamba Corta",
+          "artists": []
+        },
+        {
+          "position": "C2",
+          "title": "Sólo Su Voz",
+          "artists": []
+        },
+        {
+          "position": "C3",
+          "title": "Cúrame",
+          "artists": []
+        },
+        {
+          "position": "D1",
+          "title": "Filter Taps",
+          "artists": []
+        },
+        {
+          "position": "D2",
+          "title": "El Progreso",
+          "artists": []
+        },
+        {
+          "position": "D3",
+          "title": "Yo Sé Que...(Salve Argentina)",
+          "artists": []
+        },
+        {
+          "position": "D4",
+          "title": "Insensible",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 354741,
+      "title": "I Care Because You Do",
+      "artist": "Aphex Twin",
+      "year": 1995,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Acrid Avid Jam Shred",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "The Waxen Pith",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Wax The Nip",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Icct Hedral (Edit)",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Ventolin (Video Version)",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Come On You Slags!",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Start As You Mean To Go On",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "Wet Tip Hen Ax",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Mookid",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Alberto Balsalm",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "Cow Cud Is A Twin",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "Next Heap With",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 894252,
+      "title": "Chrome Children Vol. 2",
+      "artist": "Various",
+      "year": 2007,
+      "is_compilation": true,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Chrome Dreams",
+          "artists": [
+            "Beat Konducta"
+          ]
+        },
+        {
+          "position": "2",
+          "title": "Rhymes With An L",
+          "artists": [
+            "M.E.D. (2)"
+          ]
+        },
+        {
+          "position": "3",
+          "title": "Living For The City",
+          "artists": [
+            "Roc 'C'"
+          ]
+        },
+        {
+          "position": "4",
+          "title": "Stay With Me",
+          "artists": [
+            "MC Chocolate Star"
+          ]
+        },
+        {
+          "position": "5",
+          "title": "Reverse Part 2",
+          "artists": [
+            "Percee P"
+          ]
+        },
+        {
+          "position": "6",
+          "title": "Gitback",
+          "artists": [
+            "Oh No"
+          ]
+        },
+        {
+          "position": "7",
+          "title": "Money Motivated Movements",
+          "artists": [
+            "Guilty Simpson"
+          ]
+        },
+        {
+          "position": "8",
+          "title": "Selah's Children",
+          "artists": [
+            "Beat Konducta"
+          ]
+        },
+        {
+          "position": "9",
+          "title": "BZ Theme (Danny Breaks Remix)",
+          "artists": [
+            "Baron Zen"
+          ]
+        },
+        {
+          "position": "10",
+          "title": "Happy Now?",
+          "artists": [
+            "Aloe Blacc"
+          ]
+        },
+        {
+          "position": "11",
+          "title": "Bubbha's Dance",
+          "artists": [
+            "J Rocc"
+          ]
+        },
+        {
+          "position": "12",
+          "title": "Soul Traveling",
+          "artists": [
+            "Gary Wilson"
+          ]
+        },
+        {
+          "position": "13",
+          "title": "Keep Running Away (Egon's Edit)",
+          "artists": [
+            "Clifford Nyren"
+          ]
+        },
+        {
+          "position": "14",
+          "title": "Marcus, Martin & Malcolm",
+          "artists": [
+            "The Jazzistics"
+          ]
+        },
+        {
+          "position": "15",
+          "title": "Murder",
+          "artists": [
+            "James Pants"
+          ]
+        },
+        {
+          "position": "16",
+          "title": "Strange Life",
+          "artists": [
+            "The Arabian Prince"
+          ]
+        }
+      ]
+    },
+    {
+      "release_id": 1024408,
+      "title": "Les Ondes Silencieuses",
+      "artist": "Colleen",
+      "year": 2007,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "This Place In Time",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Le Labyrinthe",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Sun Against My Eyes",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Les Ondes Silencieuses",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Blue Sands",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Echoes And Coral",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Sea Of Tranquillity",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "Past The Long Black Land",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Le Bateau",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Unfold Out",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "Serpentine",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "I'll Read You A Story",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 1110631,
+      "title": "Haha Sound",
+      "artist": "Broadcast",
+      "year": 2003,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Colour Me In",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Pendulum",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Before We Begin",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Valerie",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Man Is Not A Bird",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Minim",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Lunch Hour Pops",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "Black Umbrellas",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Ominous Cloud",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Distorsion",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "Oh How I Miss You",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "The Little Bell",
+          "artists": []
+        },
+        {
+          "position": "13",
+          "title": "Winter Now",
+          "artists": []
+        },
+        {
+          "position": "14",
+          "title": "Hawk",
+          "artists": []
+        },
+        {
+          "position": "15",
+          "title": "Stupido",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 1485425,
+      "title": "More Blank Than Frank",
+      "artist": "Brian Eno",
+      "year": 1986,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Here He Comes",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "Everything Merges With The Night",
+          "artists": []
+        },
+        {
+          "position": "A3",
+          "title": "On Some Faraway Beach",
+          "artists": []
+        },
+        {
+          "position": "A4",
+          "title": "I'll Come Running (To Tie Your Shoe)",
+          "artists": []
+        },
+        {
+          "position": "A5",
+          "title": "Julie With",
+          "artists": []
+        },
+        {
+          "position": "A6",
+          "title": "Taking Tiger Mountain",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Backwater",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "St. Elmo's Fire",
+          "artists": []
+        },
+        {
+          "position": "B3",
+          "title": "No One Receiving",
+          "artists": []
+        },
+        {
+          "position": "B4",
+          "title": "The Great Pretender",
+          "artists": []
+        },
+        {
+          "position": "B5",
+          "title": "Back In Judy's Jungle",
+          "artists": []
+        },
+        {
+          "position": "B6",
+          "title": "King's Lead Hat",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 1677023,
+      "title": "The Sleeping Bag Sessions",
+      "artist": "Arthur Russell",
+      "year": 2009,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "5 Minutes (B-B-B Bombing Mix)",
+          "artists": [
+            "Bonzo Goes To Washington"
+          ]
+        },
+        {
+          "position": "A2",
+          "title": "Tiger Stripes (Extended Version)",
+          "artists": [
+            "Felix (2)"
+          ]
+        },
+        {
+          "position": "A3",
+          "title": "Chill Pill (Underwater Mix)",
+          "artists": [
+            "Sounds Of JHS 126 Brooklyn"
+          ]
+        },
+        {
+          "position": "B1",
+          "title": "Radio Rhythm (S-I-G-N-A-L S-M-A-R-T) (Extra Cheese Mix)",
+          "artists": [
+            "Clandestine",
+            "Ned Sublette"
+          ]
+        },
+        {
+          "position": "B2",
+          "title": "Go Bang (Walter Gibbons Mix)",
+          "artists": [
+            "Dinosaur L"
+          ]
+        },
+        {
+          "position": "C1",
+          "title": "School Bell / Tree House",
+          "artists": [
+            "Indian Ocean"
+          ]
+        },
+        {
+          "position": "C2",
+          "title": "Tree House (Extended Bootleg Edit)",
+          "artists": [
+            "Indian Ocean"
+          ]
+        },
+        {
+          "position": "D1",
+          "title": "You Can't Hold Me Down (Extended Version)",
+          "artists": [
+            "Felix (2)"
+          ]
+        },
+        {
+          "position": "D2",
+          "title": "5 Minutes (R-R-R Radio Mix)",
+          "artists": [
+            "Bonzo Goes To Washington"
+          ]
+        },
+        {
+          "position": "D3",
+          "title": "Radio Rhythm (S-I-G-N-A-L S-M-A-R-T) (Dub Mix) (Killer Whale)",
+          "artists": [
+            "Clandestine",
+            "Ned Sublette"
+          ]
+        }
+      ]
+    },
+    {
+      "release_id": 1847792,
+      "title": "Moon Pix",
+      "artist": "Cat Power",
+      "year": 1999,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "American Flag",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "He Turns Down",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "No Sense",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Say",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Metal Heart",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Back Of Your Head",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Moonshiner",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "You May Know Him",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Colors And The Kids",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Cross Bones Style",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "Peking Saint",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "Sea Of Love",
+          "artists": []
+        },
+        {
+          "position": "13",
+          "title": "Schizophrenia Weighted Me Down",
+          "artists": []
+        },
+        {
+          "position": "14",
+          "title": "Kingsport Town (Live)",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 2172437,
+      "title": "Oversteps",
+      "artist": "Autechre",
+      "year": 2010,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "r ess",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Ilanders",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "known(1)",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "pt2ph8",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "qplay",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "see on see",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Treale",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "os veix3",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "O=0",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "d-sho qub",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "st epreo",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "redfall",
+          "artists": []
+        },
+        {
+          "position": "13",
+          "title": "krYlon",
+          "artists": []
+        },
+        {
+          "position": "14",
+          "title": "Yuop",
+          "artists": []
+        },
+        {
+          "position": "15",
+          "title": "Xektses sql",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 2254565,
+      "title": "Livro",
+      "artist": "Caetano Veloso",
+      "year": 1997,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Os Passistas",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Livros",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Onde O Rio É Mais Baiano",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Manhatã",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Doideca",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Você É Minha",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Um Tom",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "How Beautiful Could A Being Be",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "O Navio Negreiro (Excerto)",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Não Enche",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "Minha Voz, Minha Vida",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "Alexandre",
+          "artists": []
+        },
+        {
+          "position": "13",
+          "title": "Na Baixa Do Sapateiro",
+          "artists": []
+        },
+        {
+          "position": "14",
+          "title": "Pra Ninguém",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 2292273,
+      "title": "Saint Bartlett",
+      "artist": "Damien Jurado",
+      "year": 2010,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Cloudy Shoes",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "Arkansas",
+          "artists": []
+        },
+        {
+          "position": "A3",
+          "title": "Rachel & Cali",
+          "artists": []
+        },
+        {
+          "position": "A4",
+          "title": "Throwing Your Voice",
+          "artists": []
+        },
+        {
+          "position": "A5",
+          "title": "Wallingford",
+          "artists": []
+        },
+        {
+          "position": "A6",
+          "title": "Pear",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Kansas City",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "Harborview",
+          "artists": []
+        },
+        {
+          "position": "B3",
+          "title": "Kalama",
+          "artists": []
+        },
+        {
+          "position": "B4",
+          "title": "The Falling Snow",
+          "artists": []
+        },
+        {
+          "position": "B5",
+          "title": "Beacon Hill",
+          "artists": []
+        },
+        {
+          "position": "B6",
+          "title": "With Lightning In Your Hands",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 2807409,
+      "title": "Hangable Auto Bulb",
+      "artist": "Aphex Twin",
+      "year": 2005,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Children Talking",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Hangable Auto Bulb",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Laughable Butane Bob",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Bit",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Custodian Discount",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Wabby Legs",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Every Day",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "Arched Maid Via RDJ",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Steppingfilter 101",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Canticle Drawl",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "MC-4 Acid",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "Untitled",
+          "artists": []
+        },
+        {
+          "position": "13",
+          "title": "Where's Your Girlfriend?",
+          "artists": []
+        },
+        {
+          "position": "14",
+          "title": "Grumpy Acid",
+          "artists": []
+        },
+        {
+          "position": "15",
+          "title": "Analord 158b",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 2807409,
+      "title": "Hangable Auto Bulb",
+      "artist": "Aphex Twin",
+      "year": 2005,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Children Talking",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Hangable Auto Bulb",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Laughable Butane Bob",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Bit",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Custodian Discount",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Wabby Legs",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Every Day",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "Arched Maid Via RDJ",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Steppingfilter 101",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Canticle Drawl",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "MC-4 Acid",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "Untitled",
+          "artists": []
+        },
+        {
+          "position": "13",
+          "title": "Where's Your Girlfriend?",
+          "artists": []
+        },
+        {
+          "position": "14",
+          "title": "Grumpy Acid",
+          "artists": []
+        },
+        {
+          "position": "15",
+          "title": "Analord 158b",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 3573363,
+      "title": "Galaxy Garden",
+      "artist": "Lone (2)",
+      "year": 2012,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "New Colour",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "The Animal Pattern",
+          "artists": []
+        },
+        {
+          "position": "A3",
+          "title": "As A Child",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Lying In The Reeds",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "Dragon Blues Eyes",
+          "artists": []
+        },
+        {
+          "position": "B3",
+          "title": "Crystal Caverns 1991",
+          "artists": []
+        },
+        {
+          "position": "C1",
+          "title": "Raindance",
+          "artists": []
+        },
+        {
+          "position": "C2",
+          "title": "Dream Girl / Sky Surfer",
+          "artists": []
+        },
+        {
+          "position": "C3",
+          "title": "Earth's Lungs",
+          "artists": []
+        },
+        {
+          "position": "D1",
+          "title": "Cthulhu",
+          "artists": []
+        },
+        {
+          "position": "D2",
+          "title": "Stands Tidal Waves",
+          "artists": []
+        },
+        {
+          "position": "D3",
+          "title": "Spirals",
+          "artists": []
+        },
+        {
+          "position": "CD-1",
+          "title": "New Colour",
+          "artists": []
+        },
+        {
+          "position": "CD-2",
+          "title": "The Animal Pattern",
+          "artists": []
+        },
+        {
+          "position": "CD-3",
+          "title": "As A Child",
+          "artists": []
+        },
+        {
+          "position": "CD-4",
+          "title": "Lying In The Reeds",
+          "artists": []
+        },
+        {
+          "position": "CD-5",
+          "title": "Dragon Blues Eyes",
+          "artists": []
+        },
+        {
+          "position": "CD-6",
+          "title": "Crystal Caverns 1991",
+          "artists": []
+        },
+        {
+          "position": "CD-7",
+          "title": "Raindance",
+          "artists": []
+        },
+        {
+          "position": "CD-8",
+          "title": "Dream Girl / Sky Surfer",
+          "artists": []
+        },
+        {
+          "position": "CD-9",
+          "title": "Earth's Lungs",
+          "artists": []
+        },
+        {
+          "position": "CD-10",
+          "title": "Cthulhu",
+          "artists": []
+        },
+        {
+          "position": "CD-11",
+          "title": "Stands Tidal Waves",
+          "artists": []
+        },
+        {
+          "position": "CD-12",
+          "title": "Spirals",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 3618272,
+      "title": "Burial",
+      "artist": "Burial",
+      "year": 2012,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Untitled",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Distant Lights",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Spaceape",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Wounder",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Night Bus",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Southern Comfort",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "U Hurt Me",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "Gutted",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Forgive",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Broken Home",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "Prayer",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "Pirates",
+          "artists": []
+        },
+        {
+          "position": "13",
+          "title": "Untitled",
+          "artists": []
+        },
+        {
+          "position": "14",
+          "title": "South London Boroughs",
+          "artists": []
+        },
+        {
+          "position": "15",
+          "title": "Nite Train",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 6101566,
+      "title": "Syro",
+      "artist": "Aphex Twin",
+      "year": 2014,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "minipops 67 [120.2][source field mix]",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "XMAS_EVET10 [120][thanaton3 mix]",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "produk 29 [101]",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "4 bit 9d api+e+6 [126.26]",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "180db_ [130]",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "CIRCLONT6A [141.98][syrobonkus mix]",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "fz pseudotimestretch+e+3 [138.85]",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "CIRCLONT14 [152.97][shrymoming mix]",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "syro u473t8+e [141.98][piezoluminescence mix]",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "PAPAT4 [155][pineal mix]",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "s950tx16wasr10 [163.97][earth portal mix]",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "aisatsana [102]",
+          "artists": []
+        },
+        {
+          "position": "13",
+          "title": "MARCHROMT30A edit 2b 96 [104.98]",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 6194406,
+      "title": "Theater Of A Confused Mind",
+      "artist": "Population One",
+      "year": 2014,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Out Of Control",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "Code Urgent",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "For Only You ",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "Battle For Space",
+          "artists": []
+        },
+        {
+          "position": "C1",
+          "title": "Inner City Circus",
+          "artists": []
+        },
+        {
+          "position": "C2",
+          "title": "All Together",
+          "artists": []
+        },
+        {
+          "position": "D1",
+          "title": "My Own Shadow",
+          "artists": []
+        },
+        {
+          "position": "D2",
+          "title": "All Of A Sudden ",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 6219913,
+      "title": "Strawberry Jam",
+      "artist": "Animal Collective",
+      "year": 2007,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Animal Collective",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Strawberry Jam",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Peacebone",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Unsolved Mysteries",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Chores",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "For Reverend Green",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Fireworks",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "#1",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Winter Wonder Land",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Cuckoo Cuckoo",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "Derek",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 6376973,
+      "title": "Burn Your Fire For No Witness",
+      "artist": "Angel Olsen",
+      "year": 2014,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1-1",
+          "title": "Unfucktheworld",
+          "artists": []
+        },
+        {
+          "position": "1-2",
+          "title": "Forgiven / Forgotten",
+          "artists": []
+        },
+        {
+          "position": "1-3",
+          "title": "Hi-Five",
+          "artists": []
+        },
+        {
+          "position": "1-4",
+          "title": "White Fire",
+          "artists": []
+        },
+        {
+          "position": "1-5",
+          "title": "High & Wild",
+          "artists": []
+        },
+        {
+          "position": "1-6",
+          "title": "Lights Out",
+          "artists": []
+        },
+        {
+          "position": "1-7",
+          "title": "Stars",
+          "artists": []
+        },
+        {
+          "position": "1-8",
+          "title": "Iota",
+          "artists": []
+        },
+        {
+          "position": "1-9",
+          "title": "Dance Slow Decades",
+          "artists": []
+        },
+        {
+          "position": "1-10",
+          "title": "Enemy",
+          "artists": []
+        },
+        {
+          "position": "1-11",
+          "title": "Windows",
+          "artists": []
+        },
+        {
+          "position": "2-1",
+          "title": "White Water",
+          "artists": []
+        },
+        {
+          "position": "2-2",
+          "title": "All Right Now",
+          "artists": []
+        },
+        {
+          "position": "2-3",
+          "title": "Only With You",
+          "artists": []
+        },
+        {
+          "position": "2-4",
+          "title": "May As Well",
+          "artists": []
+        },
+        {
+          "position": "2-5",
+          "title": "Endless Road",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 6566463,
+      "title": "On Your Own Love Again",
+      "artist": "Jessica Pratt",
+      "year": 2015,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Wrong Hand",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "Game That I Play",
+          "artists": []
+        },
+        {
+          "position": "A3",
+          "title": "Strange Melody",
+          "artists": []
+        },
+        {
+          "position": "A4",
+          "title": "Greycedes",
+          "artists": []
+        },
+        {
+          "position": "A5",
+          "title": "Moon Dude",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Jacquelyn In The Background",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "I've Got A Feeling",
+          "artists": []
+        },
+        {
+          "position": "B3",
+          "title": "Back, Baby",
+          "artists": []
+        },
+        {
+          "position": "B4",
+          "title": "On Your Own Love Again",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 7408054,
+      "title": "Invite The Light",
+      "artist": "Dam-Funk",
+      "year": 2015,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Junie's Transmission",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "We Continue",
+          "artists": []
+        },
+        {
+          "position": "A3",
+          "title": "Somewhere, Someday",
+          "artists": []
+        },
+        {
+          "position": "A4",
+          "title": "I'm Just Tryna' Survive (In The Big City)",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Surveillance Escape",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "Floating On Air",
+          "artists": []
+        },
+        {
+          "position": "C1",
+          "title": "HowUGon'Fu*kAroundAndChooseABusta?",
+          "artists": []
+        },
+        {
+          "position": "C2",
+          "title": "The Hunt & Murder Of Lucifer",
+          "artists": []
+        },
+        {
+          "position": "C3",
+          "title": "It Didn't Have 2 End This Way",
+          "artists": []
+        },
+        {
+          "position": "C4",
+          "title": "Acting",
+          "artists": []
+        },
+        {
+          "position": "D1",
+          "title": "Missing U",
+          "artists": []
+        },
+        {
+          "position": "D2",
+          "title": "O.B.E",
+          "artists": []
+        },
+        {
+          "position": "D3",
+          "title": "Glyde 2nyte",
+          "artists": []
+        },
+        {
+          "position": "E1",
+          "title": "Just Ease Your Mind From All Negativity",
+          "artists": []
+        },
+        {
+          "position": "E2",
+          "title": "Virtuous Progression",
+          "artists": []
+        },
+        {
+          "position": "E3",
+          "title": "Scatin' (Toward The Light)",
+          "artists": []
+        },
+        {
+          "position": "E4",
+          "title": "Junie's Re-Transmission",
+          "artists": []
+        },
+        {
+          "position": "F1",
+          "title": "I'm Just Tryna' Survive (In The Big City) (Party Version)",
+          "artists": []
+        },
+        {
+          "position": "F2",
+          "title": "Kaint Let 'Em Change Me",
+          "artists": []
+        },
+        {
+          "position": "F3",
+          "title": "The Acceptance",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 10199709,
+      "title": "All This I Do For Glory",
+      "artist": "Colin Stetson",
+      "year": 2017,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "All This I Do For Glory",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "Like Wolves On The Fold",
+          "artists": []
+        },
+        {
+          "position": "A3",
+          "title": "Between Water And Wind",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Spindrift",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "In The Clinches",
+          "artists": []
+        },
+        {
+          "position": "B3",
+          "title": "The Lure Of The Mine",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 11176198,
+      "title": "Hippnotic Culture Remixed",
+      "artist": "Population One",
+      "year": 2018,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Rush Hour (20th Anniversary Mix)",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "Warped (Remixed)",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Cosmic Drill (Remixed)",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "Lovechild (Remixed)",
+          "artists": []
+        },
+        {
+          "position": "B3",
+          "title": "Lost In Space (Remixed)",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 11945334,
+      "title": "7",
+      "artist": "Beach House",
+      "year": 2018,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Dark Spring",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "Pay No Mind",
+          "artists": []
+        },
+        {
+          "position": "A3",
+          "title": "Lemon Glow",
+          "artists": []
+        },
+        {
+          "position": "A4",
+          "title": "L'Inconnue",
+          "artists": []
+        },
+        {
+          "position": "A5",
+          "title": "Drunk In LA",
+          "artists": []
+        },
+        {
+          "position": "A6",
+          "title": "Dive",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Black Car",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "Lose Your Smile",
+          "artists": []
+        },
+        {
+          "position": "B3",
+          "title": "Woo",
+          "artists": []
+        },
+        {
+          "position": "B4",
+          "title": "Girl Of The Year",
+          "artists": []
+        },
+        {
+          "position": "B5",
+          "title": "Last Ride",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 12521963,
+      "title": "Collapse EP",
+      "artist": "Aphex Twin",
+      "year": 2018,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "T69 Collapse",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "1st 44",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "MT1 t29r2",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Abundance10Edit [2 R8's, FZ20M & A 909] ",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Pthex",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "T69 Collapse [Durichroma]",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 13567396,
+      "title": "Classics",
+      "artist": "Aphex Twin",
+      "year": 2018,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Digeridoo",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "2",
+          "title": "Flaphead",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "3",
+          "title": "Phloam",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "4",
+          "title": "Isopropanol",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "5",
+          "title": "Polynomial-C",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "6",
+          "title": "Tamphex (Hedphuq Mix)",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "7",
+          "title": "Phlange Phace",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "8",
+          "title": "Dodeccaheedron",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "9",
+          "title": "Analogue Bubblebath 1",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "10",
+          "title": "Metapharstic",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "11",
+          "title": "We Have Arrived (Aphex Twin QQT Mix)",
+          "artists": [
+            "Mescalinum United"
+          ]
+        },
+        {
+          "position": "12",
+          "title": "We Have Arrived (Aphex Twin TTQ Mix)",
+          "artists": [
+            "Mescalinum United"
+          ]
+        },
+        {
+          "position": "13",
+          "title": "Come On You Slags!",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "14",
+          "title": "We Are The Music Makers (Hardcore Mix)",
+          "artists": [
+            "Aphex Twin"
+          ]
+        }
+      ]
+    },
+    {
+      "release_id": 14130561,
+      "title": "Dots And Loops",
+      "artist": "Stereolab",
+      "year": 2019,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1-1",
+          "title": "Brakhage",
+          "artists": []
+        },
+        {
+          "position": "1-2",
+          "title": "Miss Modular",
+          "artists": []
+        },
+        {
+          "position": "1-3",
+          "title": "The Flower Called Nowhere",
+          "artists": []
+        },
+        {
+          "position": "1-4",
+          "title": "Diagonals",
+          "artists": []
+        },
+        {
+          "position": "1-5",
+          "title": "Prisoner Of Mars",
+          "artists": []
+        },
+        {
+          "position": "1-6",
+          "title": "Rainbo Conversation",
+          "artists": []
+        },
+        {
+          "position": "1-7",
+          "title": "Refractions In The Plastic Pulse",
+          "artists": []
+        },
+        {
+          "position": "1-8",
+          "title": "Parsec",
+          "artists": []
+        },
+        {
+          "position": "1-9",
+          "title": "Ticker-Tape Of The Unconscious",
+          "artists": []
+        },
+        {
+          "position": "1-10",
+          "title": "Contronatura",
+          "artists": []
+        },
+        {
+          "position": "2-1",
+          "title": "Diagonals Bode Drums",
+          "artists": []
+        },
+        {
+          "position": "2-2",
+          "title": "Contranatura (Pt 2 - Instrumental)",
+          "artists": []
+        },
+        {
+          "position": "2-3",
+          "title": "Brakhage (Instrumental)",
+          "artists": []
+        },
+        {
+          "position": "2-4",
+          "title": "The Flower Called Nowhere (Instrumental)",
+          "artists": []
+        },
+        {
+          "position": "2-5",
+          "title": "Bonus Beats",
+          "artists": []
+        },
+        {
+          "position": "2-6",
+          "title": "Diagonals (Instrumental)",
+          "artists": []
+        },
+        {
+          "position": "2-7",
+          "title": "Contranatura (Demo)",
+          "artists": []
+        },
+        {
+          "position": "2-8",
+          "title": "Allures (Demo)",
+          "artists": []
+        },
+        {
+          "position": "2-9",
+          "title": "Refractions In The Plastic Pulse (Demo)",
+          "artists": []
+        },
+        {
+          "position": "2-10",
+          "title": "I Feel The Air (Demo)",
+          "artists": []
+        },
+        {
+          "position": "2-11",
+          "title": "Off On (Demo)",
+          "artists": []
+        },
+        {
+          "position": "2-12",
+          "title": "Incredible He Woman (Demo)",
+          "artists": []
+        },
+        {
+          "position": "2-13",
+          "title": "Miss Modular (Demo)",
+          "artists": []
+        },
+        {
+          "position": "2-14",
+          "title": "Untitled In Dusseldorf (Demo)",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 14251460,
+      "title": "Two Hands",
+      "artist": "Big Thief",
+      "year": 2019,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Rock And Sing",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Forgotten Eyes",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "The Toy",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Two Hands",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Those Girls",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Shoulders",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Not",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "Wolf",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Replaced",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Cut My Hair",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "Love In Mine",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 14901659,
+      "title": "Come To Daddy",
+      "artist": "Aphex Twin",
+      "year": null,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Come To Daddy, Pappy Mix",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "2",
+          "title": "Flim",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "3",
+          "title": "Come To Daddy, Little Lord Faulteroy Mix",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "4",
+          "title": "Bucephalus Bouncing Ball",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "5",
+          "title": "To Cure A Weakling Child, Contour Regard",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "6",
+          "title": "Funny Little Man",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "7",
+          "title": "Come To Daddy, Mummy Mix",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "8",
+          "title": "IZ-US",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "9",
+          "title": "Windowlicker",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "10",
+          "title": "∆Mᵢ⁻¹=−α ∑ Dᵢ[η][ ∑ Fjᵢ[η−1]+Fextᵢ [η⁻¹]]",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "11",
+          "title": "Nannou",
+          "artists": [
+            "Aphex Twin"
+          ]
+        },
+        {
+          "position": "12",
+          "title": "Time To Find Me, AFX Fast Mix",
+          "artists": [
+            "Seefeel"
+          ]
+        },
+        {
+          "position": "13",
+          "title": "Raising The Titanic, Big Drum Mix",
+          "artists": [
+            "Gavin Bryars"
+          ]
+        },
+        {
+          "position": "14",
+          "title": "Triachus, Mix By Aphex Twin",
+          "artists": [
+            "Kinesthesia"
+          ]
+        },
+        {
+          "position": "15",
+          "title": "Your Head My Voice, Voix Revirement",
+          "artists": [
+            "Saint Etienne"
+          ]
+        }
+      ]
+    },
+    {
+      "release_id": 19702915,
+      "title": "Fine And Mellow",
+      "artist": "Billie Holiday",
+      "year": 2009,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1-1",
+          "title": "That Old Devil Called Love",
+          "artists": []
+        },
+        {
+          "position": "1-2",
+          "title": "Fine And Mellow",
+          "artists": []
+        },
+        {
+          "position": "1-3",
+          "title": "My Man",
+          "artists": []
+        },
+        {
+          "position": "1-4",
+          "title": "Stormy Weather",
+          "artists": []
+        },
+        {
+          "position": "1-5",
+          "title": "A Fine Romance",
+          "artists": []
+        },
+        {
+          "position": "1-6",
+          "title": "I Love You Porgy",
+          "artists": []
+        },
+        {
+          "position": "1-7",
+          "title": "I Cover The Waterfront",
+          "artists": []
+        },
+        {
+          "position": "1-8",
+          "title": "Loverman",
+          "artists": []
+        },
+        {
+          "position": "1-9",
+          "title": "Love Me Or Leave Me",
+          "artists": []
+        },
+        {
+          "position": "1-10",
+          "title": "Night And Day",
+          "artists": []
+        },
+        {
+          "position": "1-11",
+          "title": "Can't Help Lovin That Man",
+          "artists": []
+        },
+        {
+          "position": "1-12",
+          "title": "God Bless The Child",
+          "artists": []
+        },
+        {
+          "position": "1-13",
+          "title": "Blue Moon",
+          "artists": []
+        },
+        {
+          "position": "1-14",
+          "title": "Theese Fooling Things",
+          "artists": []
+        },
+        {
+          "position": "1-15",
+          "title": "East Of The Sun (West Of The Moon)",
+          "artists": []
+        },
+        {
+          "position": "1-16",
+          "title": "Solitude",
+          "artists": []
+        },
+        {
+          "position": "2-1",
+          "title": "They Can't Take It Away From Me",
+          "artists": []
+        },
+        {
+          "position": "2-2",
+          "title": "Georgia On My Mind",
+          "artists": []
+        },
+        {
+          "position": "2-3",
+          "title": "I Can't Give You Anything But Love",
+          "artists": []
+        },
+        {
+          "position": "2-4",
+          "title": "Love For Sale",
+          "artists": []
+        },
+        {
+          "position": "2-5",
+          "title": "Lover Come Back To Me",
+          "artists": []
+        },
+        {
+          "position": "2-6",
+          "title": "Body And Soul",
+          "artists": []
+        },
+        {
+          "position": "2-7",
+          "title": "Embraceable You",
+          "artists": []
+        },
+        {
+          "position": "2-8",
+          "title": "Summertime",
+          "artists": []
+        },
+        {
+          "position": "2-9",
+          "title": "Pennies From Heaven",
+          "artists": []
+        },
+        {
+          "position": "2-10",
+          "title": "Willow Weep For Me",
+          "artists": []
+        },
+        {
+          "position": "2-11",
+          "title": "All Of Me",
+          "artists": []
+        },
+        {
+          "position": "2-12",
+          "title": "Careless",
+          "artists": []
+        },
+        {
+          "position": "2-13",
+          "title": "You Go To My Head",
+          "artists": []
+        },
+        {
+          "position": "2-14",
+          "title": "Easy To Love",
+          "artists": []
+        },
+        {
+          "position": "2-15",
+          "title": "I Only Have Eyes For You",
+          "artists": []
+        },
+        {
+          "position": "2-16",
+          "title": "You Tuned The Tables On Me",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 22264552,
+      "title": "Only Love From Now On",
+      "artist": "Carmen Villain",
+      "year": 2022,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Gestures",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "Future Memory",
+          "artists": []
+        },
+        {
+          "position": "A3",
+          "title": "Liminal Space",
+          "artists": []
+        },
+        {
+          "position": "A4",
+          "title": "Only Love From Now On",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Subtle Bodies",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "Silueta",
+          "artists": []
+        },
+        {
+          "position": "B3",
+          "title": "Portals",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 29574202,
+      "title": "Vhoysee",
+      "artist": "Anne Gillis",
+      "year": 2023,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Carriole Fantôme",
+          "artists": []
+        },
+        {
+          "position": "A2",
+          "title": "Bangkok La Nuit",
+          "artists": []
+        },
+        {
+          "position": "A3",
+          "title": "Ect",
+          "artists": []
+        },
+        {
+          "position": "A4",
+          "title": "Soupir",
+          "artists": []
+        },
+        {
+          "position": "A5",
+          "title": "Cheveux D'Angebiguë",
+          "artists": []
+        },
+        {
+          "position": "B1",
+          "title": "Mes Voix",
+          "artists": []
+        },
+        {
+          "position": "B2",
+          "title": "Brumes Renversées",
+          "artists": []
+        },
+        {
+          "position": "B3",
+          "title": "Harpe À Poussière",
+          "artists": []
+        },
+        {
+          "position": "B4",
+          "title": "Cinolm",
+          "artists": []
+        },
+        {
+          "position": "B5",
+          "title": "Il Vous Reste",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 31160183,
+      "title": "Mingus Ah Um (Remastered)",
+      "artist": "Charles Mingus",
+      "year": 2019,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Better Git It In Your Soul ",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Goodbye Pork Pie Hat",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Boogie Stop Shuffle",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Self-Portrait In Three Colors",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Open Letter To Duke",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Bird Calls",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Fables Of Faubus",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "Pussy Cat Dues",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Jelly Roll",
+          "artists": []
+        }
+      ]
+    },
+    {
+      "release_id": 38001429,
+      "title": "Drukqs",
+      "artist": "Aphex Twin",
+      "year": 2026,
+      "is_compilation": false,
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "Jynweythek",
+          "artists": []
+        },
+        {
+          "position": "2",
+          "title": "Vordhosbn",
+          "artists": []
+        },
+        {
+          "position": "3",
+          "title": "Kladfvgbung Mischk",
+          "artists": []
+        },
+        {
+          "position": "4",
+          "title": "Omgyjya-Switch7",
+          "artists": []
+        },
+        {
+          "position": "5",
+          "title": "Strotha Tynhe",
+          "artists": []
+        },
+        {
+          "position": "6",
+          "title": "Gwety Mernans",
+          "artists": []
+        },
+        {
+          "position": "7",
+          "title": "Bbydhyonchord",
+          "artists": []
+        },
+        {
+          "position": "8",
+          "title": "Cock/ver10",
+          "artists": []
+        },
+        {
+          "position": "9",
+          "title": "Avril 14th",
+          "artists": []
+        },
+        {
+          "position": "10",
+          "title": "Mt Saint Michel + Saint Michaels Mount",
+          "artists": []
+        },
+        {
+          "position": "11",
+          "title": "Gwarek2",
+          "artists": []
+        },
+        {
+          "position": "12",
+          "title": "Orban Eq Trx 4",
+          "artists": []
+        },
+        {
+          "position": "13",
+          "title": "Aussois",
+          "artists": []
+        },
+        {
+          "position": "14",
+          "title": "Hy A Scullyas Lyf Adhagrow",
+          "artists": []
+        },
+        {
+          "position": "15",
+          "title": "Kesson Dalek",
+          "artists": []
+        },
+        {
+          "position": "16",
+          "title": "54 Cymru Beats",
+          "artists": []
+        },
+        {
+          "position": "17",
+          "title": "Btoum-Roumada",
+          "artists": []
+        },
+        {
+          "position": "18",
+          "title": "Lornaderek",
+          "artists": []
+        },
+        {
+          "position": "19",
+          "title": "QKThr",
+          "artists": []
+        },
+        {
+          "position": "20",
+          "title": "Meltphace 6",
+          "artists": []
+        },
+        {
+          "position": "21",
+          "title": "Bit 4",
+          "artists": []
+        },
+        {
+          "position": "22",
+          "title": "Prep Gwarek 36",
+          "artists": []
+        },
+        {
+          "position": "23",
+          "title": "Father",
+          "artists": []
+        },
+        {
+          "position": "24",
+          "title": "Taking Control",
+          "artists": []
+        },
+        {
+          "position": "25",
+          "title": "Petiatil Cx Htdui",
+          "artists": []
+        },
+        {
+          "position": "26",
+          "title": "Ruglen Holon",
+          "artists": []
+        },
+        {
+          "position": "27",
+          "title": "Afx237 v.7",
+          "artists": []
+        },
+        {
+          "position": "28",
+          "title": "Ziggomatic 17",
+          "artists": []
+        },
+        {
+          "position": "29",
+          "title": "Beskhu3epnm",
+          "artists": []
+        },
+        {
+          "position": "30",
+          "title": "Nanou2",
+          "artists": []
+        },
+        {
+          "position": "31",
+          "title": "dRuQks Prepared uN 1",
+          "artists": []
+        },
+        {
+          "position": "32",
+          "title": "Avril 14th Half Speed Alternative Version [Re-Recorded 2009 Nagra]",
+          "artists": []
+        },
+        {
+          "position": "33",
+          "title": "Avril 14th Reversed Music Not Audio [Re-Recorded 2009 Nagra]",
+          "artists": []
+        },
+        {
+          "position": "34",
+          "title": "Avril 14th Doubletempo,Half Speed",
+          "artists": []
+        },
+        {
+          "position": "35",
+          "title": "Mangle 11",
+          "artists": []
+        }
+      ]
+    }
+  ],
+  "track_searches": {
+    "#1|": [
+      6219913
+    ],
+    "#1|animal collective": [
+      6219913
+    ],
+    "5 minutes (b-b-b bombing mix)|": [
+      1677023
+    ],
+    "5 minutes (b-b-b bombing mix)|arthur russell": [
+      1677023
+    ],
+    "5 minutes (r-r-r radio mix)|": [
+      1677023
+    ],
+    "5 minutes (r-r-r radio mix)|arthur russell": [
+      1677023
+    ],
+    "a fine romance|": [
+      19702915
+    ],
+    "a fine romance|billie holiday": [
+      19702915
+    ],
+    "acting|": [
+      7408054
+    ],
+    "acting|dam-funk": [
+      7408054
+    ],
+    "aikea-guinea|": [
+      86619
+    ],
+    "aikea-guinea|cocteau twins": [
+      86619
+    ],
+    "alexandre|": [
+      2254565
+    ],
+    "alexandre|caetano veloso": [
+      2254565
+    ],
+    "all of me|": [
+      19702915
+    ],
+    "all of me|billie holiday": [
+      19702915
+    ],
+    "all right now|": [
+      6376973
+    ],
+    "all right now|angel olsen": [
+      6376973
+    ],
+    "all this i do for glory|": [
+      10199709
+    ],
+    "all this i do for glory|colin stetson": [
+      10199709
+    ],
+    "allures (demo)|": [
+      14130561
+    ],
+    "allures (demo)|stereolab": [
+      14130561
+    ],
+    "american flag|": [
+      1847792
+    ],
+    "american flag|cat power": [
+      1847792
+    ],
+    "an eagle in your mind|": [
+      126602
+    ],
+    "an eagle in your mind|boards of canada": [
+      126602
+    ],
+    "analord 158b|": [
+      2807409
+    ],
+    "analord 158b|aphex twin": [
+      2807409
+    ],
+    "animal collective|": [
+      6219913
+    ],
+    "animal collective|animal collective": [
+      6219913
+    ],
+    "aquarius (version 3)|": [
+      126602
+    ],
+    "aquarius (version 3)|boards of canada": [
+      126602
+    ],
+    "aquarius|": [
+      126602
+    ],
+    "aquarius|boards of canada": [
+      126602
+    ],
+    "arched maid via rdj|": [
+      2807409
+    ],
+    "arched maid via rdj|aphex twin": [
+      2807409
+    ],
+    "arkansas|": [
+      2292273
+    ],
+    "arkansas|damien jurado": [
+      2292273
+    ],
+    "back in judy's jungle|": [
+      1485425
+    ],
+    "back in judy's jungle|brian eno": [
+      1485425
+    ],
+    "back of your head|": [
+      1847792
+    ],
+    "back of your head|cat power": [
+      1847792
+    ],
+    "back, baby|": [
+      6566463
+    ],
+    "back, baby|jessica pratt": [
+      6566463
+    ],
+    "backwater|": [
+      1485425
+    ],
+    "backwater|brian eno": [
+      1485425
+    ],
+    "bangkok la nuit|": [
+      29574202
+    ],
+    "bangkok la nuit|anne gillis": [
+      29574202
+    ],
+    "beacon hill|": [
+      2292273
+    ],
+    "beacon hill|damien jurado": [
+      2292273
+    ],
+    "before we begin|": [
+      1110631
+    ],
+    "before we begin|broadcast": [
+      1110631
+    ],
+    "better git it in your soul|": [
+      31160183
+    ],
+    "better git it in your soul|charles mingus": [
+      31160183
+    ],
+    "between water and wind|": [
+      10199709
+    ],
+    "between water and wind|colin stetson": [
+      10199709
+    ],
+    "bird calls|": [
+      31160183
+    ],
+    "bird calls|charles mingus": [
+      31160183
+    ],
+    "bit|": [
+      2807409
+    ],
+    "bit|aphex twin": [
+      2807409
+    ],
+    "black car|": [
+      11945334
+    ],
+    "black car|beach house": [
+      11945334
+    ],
+    "black umbrellas|": [
+      1110631
+    ],
+    "black umbrellas|broadcast": [
+      1110631
+    ],
+    "blue moon|": [
+      19702915
+    ],
+    "blue moon|billie holiday": [
+      19702915
+    ],
+    "blue sands|": [
+      1024408
+    ],
+    "blue sands|colleen": [
+      1024408
+    ],
+    "bocuma|": [
+      126602
+    ],
+    "bocuma|boards of canada": [
+      126602
+    ],
+    "body and soul|": [
+      19702915
+    ],
+    "body and soul|billie holiday": [
+      19702915
+    ],
+    "bonus beats|": [
+      14130561
+    ],
+    "bonus beats|stereolab": [
+      14130561
+    ],
+    "boogie stop shuffle|": [
+      31160183
+    ],
+    "boogie stop shuffle|charles mingus": [
+      31160183
+    ],
+    "brakhage (instrumental)|": [
+      14130561
+    ],
+    "brakhage (instrumental)|stereolab": [
+      14130561
+    ],
+    "brakhage|": [
+      14130561
+    ],
+    "brakhage|stereolab": [
+      14130561
+    ],
+    "broken home|": [
+      3618272
+    ],
+    "broken home|burial": [
+      3618272
+    ],
+    "brumes renversées|": [
+      29574202
+    ],
+    "brumes renversées|anne gillis": [
+      29574202
+    ],
+    "can't help lovin that man|": [
+      19702915
+    ],
+    "can't help lovin that man|billie holiday": [
+      19702915
+    ],
+    "canticle drawl|": [
+      2807409
+    ],
+    "canticle drawl|aphex twin": [
+      2807409
+    ],
+    "careless|": [
+      19702915
+    ],
+    "careless|billie holiday": [
+      19702915
+    ],
+    "carriole fantôme|": [
+      29574202
+    ],
+    "carriole fantôme|anne gillis": [
+      29574202
+    ],
+    "cheveux d'angebiguë|": [
+      29574202
+    ],
+    "cheveux d'angebiguë|anne gillis": [
+      29574202
+    ],
+    "children talking|": [
+      2807409
+    ],
+    "children talking|aphex twin": [
+      2807409
+    ],
+    "chill pill (underwater mix)|": [
+      1677023
+    ],
+    "chill pill (underwater mix)|arthur russell": [
+      1677023
+    ],
+    "chores|": [
+      6219913
+    ],
+    "chores|animal collective": [
+      6219913
+    ],
+    "cinolm|": [
+      29574202
+    ],
+    "cinolm|anne gillis": [
+      29574202
+    ],
+    "cloudy shoes|": [
+      2292273
+    ],
+    "cloudy shoes|damien jurado": [
+      2292273
+    ],
+    "colors and the kids|": [
+      1847792
+    ],
+    "colors and the kids|cat power": [
+      1847792
+    ],
+    "colour me in|": [
+      1110631
+    ],
+    "colour me in|broadcast": [
+      1110631
+    ],
+    "contranatura (demo)|": [
+      14130561
+    ],
+    "contranatura (demo)|stereolab": [
+      14130561
+    ],
+    "contranatura (pt 2 - instrumental)|": [
+      14130561
+    ],
+    "contranatura (pt 2 - instrumental)|stereolab": [
+      14130561
+    ],
+    "contronatura|": [
+      14130561
+    ],
+    "contronatura|stereolab": [
+      14130561
+    ],
+    "cosmic drill (remixed)|": [
+      11176198
+    ],
+    "cosmic drill (remixed)|population one": [
+      11176198
+    ],
+    "cross bones style|": [
+      1847792
+    ],
+    "cross bones style|cat power": [
+      1847792
+    ],
+    "crystal caverns 1991|lone": [
+      3573363
+    ],
+    "cuckoo cuckoo|": [
+      6219913
+    ],
+    "cuckoo cuckoo|animal collective": [
+      6219913
+    ],
+    "custodian discount|": [
+      2807409
+    ],
+    "custodian discount|aphex twin": [
+      2807409
+    ],
+    "cut my hair|": [
+      14251460
+    ],
+    "cut my hair|big thief": [
+      14251460
+    ],
+    "cúrame|": [
+      325741
+    ],
+    "cúrame|juana molina": [
+      325741
+    ],
+    "d-sho qub|": [
+      2172437
+    ],
+    "d-sho qub|autechre": [
+      2172437
+    ],
+    "dance slow decades|": [
+      6376973
+    ],
+    "dance slow decades|angel olsen": [
+      6376973
+    ],
+    "dark spring|": [
+      11945334
+    ],
+    "dark spring|beach house": [
+      11945334
+    ],
+    "derek|": [
+      6219913
+    ],
+    "derek|animal collective": [
+      6219913
+    ],
+    "diagonals (instrumental)|": [
+      14130561
+    ],
+    "diagonals (instrumental)|stereolab": [
+      14130561
+    ],
+    "diagonals bode drums|": [
+      14130561
+    ],
+    "diagonals bode drums|stereolab": [
+      14130561
+    ],
+    "diagonals|": [
+      14130561
+    ],
+    "diagonals|stereolab": [
+      14130561
+    ],
+    "distant lights|": [
+      3618272
+    ],
+    "distant lights|burial": [
+      3618272
+    ],
+    "distorsion|": [
+      1110631
+    ],
+    "distorsion|broadcast": [
+      1110631
+    ],
+    "dive|": [
+      11945334
+    ],
+    "dive|beach house": [
+      11945334
+    ],
+    "doideca|": [
+      2254565
+    ],
+    "doideca|caetano veloso": [
+      2254565
+    ],
+    "drunk in la|": [
+      11945334
+    ],
+    "drunk in la|beach house": [
+      11945334
+    ],
+    "east of the sun (west of the moon)|": [
+      19702915
+    ],
+    "east of the sun (west of the moon)|billie holiday": [
+      19702915
+    ],
+    "easy to love|": [
+      19702915
+    ],
+    "easy to love|billie holiday": [
+      19702915
+    ],
+    "echoes and coral|": [
+      1024408
+    ],
+    "echoes and coral|colleen": [
+      1024408
+    ],
+    "ect|": [
+      29574202
+    ],
+    "ect|anne gillis": [
+      29574202
+    ],
+    "el cristal|": [
+      325741
+    ],
+    "el cristal|juana molina": [
+      325741
+    ],
+    "el progreso|": [
+      325741
+    ],
+    "el progreso|juana molina": [
+      325741
+    ],
+    "embraceable you|": [
+      19702915
+    ],
+    "embraceable you|billie holiday": [
+      19702915
+    ],
+    "endless road|": [
+      6376973
+    ],
+    "endless road|angel olsen": [
+      6376973
+    ],
+    "enemy|": [
+      6376973
+    ],
+    "enemy|angel olsen": [
+      6376973
+    ],
+    "every day|": [
+      2807409
+    ],
+    "every day|aphex twin": [
+      2807409
+    ],
+    "everything merges with the night|": [
+      1485425
+    ],
+    "everything merges with the night|brian eno": [
+      1485425
+    ],
+    "fables of faubus|": [
+      31160183
+    ],
+    "fables of faubus|charles mingus": [
+      31160183
+    ],
+    "filter taps|": [
+      325741
+    ],
+    "filter taps|juana molina": [
+      325741
+    ],
+    "fine and mellow|": [
+      19702915
+    ],
+    "fine and mellow|billie holiday": [
+      19702915
+    ],
+    "fireworks|": [
+      6219913
+    ],
+    "fireworks|animal collective": [
+      6219913
+    ],
+    "floating on air|": [
+      7408054
+    ],
+    "floating on air|dam-funk": [
+      7408054
+    ],
+    "for reverend green|": [
+      6219913
+    ],
+    "for reverend green|animal collective": [
+      6219913
+    ],
+    "forgiven / forgotten|": [
+      6376973
+    ],
+    "forgiven / forgotten|angel olsen": [
+      6376973
+    ],
+    "forgive|": [
+      3618272
+    ],
+    "forgive|burial": [
+      3618272
+    ],
+    "forgotten eyes|": [
+      14251460
+    ],
+    "forgotten eyes|big thief": [
+      14251460
+    ],
+    "future memory|": [
+      22264552
+    ],
+    "future memory|carmen villain": [
+      22264552
+    ],
+    "game that i play|": [
+      6566463
+    ],
+    "game that i play|jessica pratt": [
+      6566463
+    ],
+    "georgia on my mind|": [
+      19702915
+    ],
+    "georgia on my mind|billie holiday": [
+      19702915
+    ],
+    "gestures|": [
+      22264552
+    ],
+    "gestures|carmen villain": [
+      22264552
+    ],
+    "girl of the year|": [
+      11945334
+    ],
+    "girl of the year|beach house": [
+      11945334
+    ],
+    "glyde 2nyte|": [
+      7408054
+    ],
+    "glyde 2nyte|dam-funk": [
+      7408054
+    ],
+    "go bang (walter gibbons mix)|": [
+      1677023
+    ],
+    "go bang (walter gibbons mix)|arthur russell": [
+      1677023
+    ],
+    "god bless the child|": [
+      19702915
+    ],
+    "god bless the child|billie holiday": [
+      19702915
+    ],
+    "goodbye pork pie hat|": [
+      31160183
+    ],
+    "goodbye pork pie hat|charles mingus": [
+      31160183
+    ],
+    "greycedes|": [
+      6566463
+    ],
+    "greycedes|jessica pratt": [
+      6566463
+    ],
+    "grumpy acid|": [
+      2807409
+    ],
+    "grumpy acid|aphex twin": [
+      2807409
+    ],
+    "gutted|": [
+      3618272
+    ],
+    "gutted|burial": [
+      3618272
+    ],
+    "hangable auto bulb|": [
+      2807409
+    ],
+    "hangable auto bulb|aphex twin": [
+      2807409
+    ],
+    "happy cycling|": [
+      126602
+    ],
+    "happy cycling|boards of canada": [
+      126602
+    ],
+    "harborview|": [
+      2292273
+    ],
+    "harborview|damien jurado": [
+      2292273
+    ],
+    "harpe à poussière|": [
+      29574202
+    ],
+    "harpe à poussière|anne gillis": [
+      29574202
+    ],
+    "hawk|": [
+      1110631
+    ],
+    "hawk|broadcast": [
+      1110631
+    ],
+    "he turns down|": [
+      1847792
+    ],
+    "he turns down|cat power": [
+      1847792
+    ],
+    "here he comes|": [
+      1485425
+    ],
+    "here he comes|brian eno": [
+      1485425
+    ],
+    "hi-five|": [
+      6376973
+    ],
+    "hi-five|angel olsen": [
+      6376973
+    ],
+    "high & wild|": [
+      6376973
+    ],
+    "high & wild|angel olsen": [
+      6376973
+    ],
+    "how beautiful could a being be|": [
+      2254565
+    ],
+    "how beautiful could a being be|caetano veloso": [
+      2254565
+    ],
+    "howugon'fu*karoundandchooseabusta?|": [
+      7408054
+    ],
+    "howugon'fu*karoundandchooseabusta?|dam-funk": [
+      7408054
+    ],
+    "i can't give you anything but love|": [
+      19702915
+    ],
+    "i can't give you anything but love|billie holiday": [
+      19702915
+    ],
+    "i cover the waterfront|": [
+      19702915
+    ],
+    "i cover the waterfront|billie holiday": [
+      19702915
+    ],
+    "i feel the air (demo)|": [
+      14130561
+    ],
+    "i feel the air (demo)|stereolab": [
+      14130561
+    ],
+    "i love you porgy|": [
+      19702915
+    ],
+    "i love you porgy|billie holiday": [
+      19702915
+    ],
+    "i only have eyes for you|": [
+      19702915
+    ],
+    "i only have eyes for you|billie holiday": [
+      19702915
+    ],
+    "i'll come running (to tie your shoe)|": [
+      1485425
+    ],
+    "i'll come running (to tie your shoe)|brian eno": [
+      1485425
+    ],
+    "i'll read you a story|": [
+      1024408
+    ],
+    "i'll read you a story|colleen": [
+      1024408
+    ],
+    "i'm just tryna' survive (in the big city) (party version)|": [
+      7408054
+    ],
+    "i'm just tryna' survive (in the big city) (party version)|dam-funk": [
+      7408054
+    ],
+    "i'm just tryna' survive (in the big city)|": [
+      7408054
+    ],
+    "i'm just tryna' survive (in the big city)|dam-funk": [
+      7408054
+    ],
+    "i've got a feeling|": [
+      6566463
+    ],
+    "i've got a feeling|jessica pratt": [
+      6566463
+    ],
+    "il vous reste|": [
+      29574202
+    ],
+    "il vous reste|anne gillis": [
+      29574202
+    ],
+    "ilanders|": [
+      2172437
+    ],
+    "ilanders|autechre": [
+      2172437
+    ],
+    "in the clinches|": [
+      10199709
+    ],
+    "in the clinches|colin stetson": [
+      10199709
+    ],
+    "incredible he woman (demo)|": [
+      14130561
+    ],
+    "incredible he woman (demo)|stereolab": [
+      14130561
+    ],
+    "insensible|": [
+      325741
+    ],
+    "insensible|juana molina": [
+      325741
+    ],
+    "iota|": [
+      6376973
+    ],
+    "iota|angel olsen": [
+      6376973
+    ],
+    "isabel|": [
+      325741
+    ],
+    "isabel|juana molina": [
+      325741
+    ],
+    "it didn't have 2 end this way|": [
+      7408054
+    ],
+    "it didn't have 2 end this way|dam-funk": [
+      7408054
+    ],
+    "jacquelyn in the background|": [
+      6566463
+    ],
+    "jacquelyn in the background|jessica pratt": [
+      6566463
+    ],
+    "jelly roll|": [
+      31160183
+    ],
+    "jelly roll|charles mingus": [
+      31160183
+    ],
+    "julie with|": [
+      1485425
+    ],
+    "julie with|brian eno": [
+      1485425
+    ],
+    "junie's re-transmission|": [
+      7408054
+    ],
+    "junie's re-transmission|dam-funk": [
+      7408054
+    ],
+    "junie's transmission|": [
+      7408054
+    ],
+    "junie's transmission|dam-funk": [
+      7408054
+    ],
+    "just ease your mind from all negativity|": [
+      7408054
+    ],
+    "just ease your mind from all negativity|dam-funk": [
+      7408054
+    ],
+    "kaini industries|": [
+      126602
+    ],
+    "kaini industries|boards of canada": [
+      126602
+    ],
+    "kaint let 'em change me|": [
+      7408054
+    ],
+    "kaint let 'em change me|dam-funk": [
+      7408054
+    ],
+    "kalama|": [
+      2292273
+    ],
+    "kalama|damien jurado": [
+      2292273
+    ],
+    "kansas city|": [
+      2292273
+    ],
+    "kansas city|damien jurado": [
+      2292273
+    ],
+    "king's lead hat|": [
+      1485425
+    ],
+    "king's lead hat|brian eno": [
+      1485425
+    ],
+    "kingsport town (live)|": [
+      1847792
+    ],
+    "kingsport town (live)|cat power": [
+      1847792
+    ],
+    "known(1)|": [
+      2172437
+    ],
+    "known(1)|autechre": [
+      2172437
+    ],
+    "kookaburra|": [
+      86619
+    ],
+    "kookaburra|cocteau twins": [
+      86619
+    ],
+    "krylon|": [
+      2172437
+    ],
+    "krylon|autechre": [
+      2172437
+    ],
+    "l'inconnue|": [
+      11945334
+    ],
+    "l'inconnue|beach house": [
+      11945334
+    ],
+    "last ride|": [
+      11945334
+    ],
+    "last ride|beach house": [
+      11945334
+    ],
+    "laughable butane bob|": [
+      2807409
+    ],
+    "laughable butane bob|aphex twin": [
+      2807409
+    ],
+    "le bateau|": [
+      1024408
+    ],
+    "le bateau|colleen": [
+      1024408
+    ],
+    "le labyrinthe|": [
+      1024408
+    ],
+    "le labyrinthe|colleen": [
+      1024408
+    ],
+    "lemon glow|": [
+      11945334
+    ],
+    "lemon glow|beach house": [
+      11945334
+    ],
+    "les ondes silencieuses|": [
+      1024408
+    ],
+    "les ondes silencieuses|colleen": [
+      1024408
+    ],
+    "lights out|": [
+      6376973
+    ],
+    "lights out|angel olsen": [
+      6376973
+    ],
+    "like wolves on the fold|": [
+      10199709
+    ],
+    "like wolves on the fold|colin stetson": [
+      10199709
+    ],
+    "liminal space|": [
+      22264552
+    ],
+    "liminal space|carmen villain": [
+      22264552
+    ],
+    "livros|": [
+      2254565
+    ],
+    "livros|caetano veloso": [
+      2254565
+    ],
+    "lose your smile|": [
+      11945334
+    ],
+    "lose your smile|beach house": [
+      11945334
+    ],
+    "lost in space (remixed)|": [
+      11176198
+    ],
+    "lost in space (remixed)|population one": [
+      11176198
+    ],
+    "love for sale|": [
+      19702915
+    ],
+    "love for sale|billie holiday": [
+      19702915
+    ],
+    "love in mine|": [
+      14251460
+    ],
+    "love in mine|big thief": [
+      14251460
+    ],
+    "love me or leave me|": [
+      19702915
+    ],
+    "love me or leave me|billie holiday": [
+      19702915
+    ],
+    "lovechild (remixed)|": [
+      11176198
+    ],
+    "lovechild (remixed)|population one": [
+      11176198
+    ],
+    "lover come back to me|": [
+      19702915
+    ],
+    "lover come back to me|billie holiday": [
+      19702915
+    ],
+    "loverman|": [
+      19702915
+    ],
+    "loverman|billie holiday": [
+      19702915
+    ],
+    "lunch hour pops|": [
+      1110631
+    ],
+    "lunch hour pops|broadcast": [
+      1110631
+    ],
+    "man is not a bird|": [
+      1110631
+    ],
+    "man is not a bird|broadcast": [
+      1110631
+    ],
+    "manhatã|": [
+      2254565
+    ],
+    "manhatã|caetano veloso": [
+      2254565
+    ],
+    "may as well|": [
+      6376973
+    ],
+    "may as well|angel olsen": [
+      6376973
+    ],
+    "mc-4 acid|": [
+      2807409
+    ],
+    "mc-4 acid|aphex twin": [
+      2807409
+    ],
+    "mes voix|": [
+      29574202
+    ],
+    "mes voix|anne gillis": [
+      29574202
+    ],
+    "metal heart|": [
+      1847792
+    ],
+    "metal heart|cat power": [
+      1847792
+    ],
+    "milkman|aphex twin": [
+      43694
+    ],
+    "minha voz, minha vida|": [
+      2254565
+    ],
+    "minha voz, minha vida|caetano veloso": [
+      2254565
+    ],
+    "minim|": [
+      1110631
+    ],
+    "minim|broadcast": [
+      1110631
+    ],
+    "miss modular (demo)|": [
+      14130561
+    ],
+    "miss modular (demo)|stereolab": [
+      14130561
+    ],
+    "miss modular|": [
+      14130561
+    ],
+    "miss modular|stereolab": [
+      14130561
+    ],
+    "missing u|": [
+      7408054
+    ],
+    "missing u|dam-funk": [
+      7408054
+    ],
+    "moon dude|": [
+      6566463
+    ],
+    "moon dude|jessica pratt": [
+      6566463
+    ],
+    "moonshiner|": [
+      1847792
+    ],
+    "moonshiner|cat power": [
+      1847792
+    ],
+    "my man|": [
+      19702915
+    ],
+    "my man|billie holiday": [
+      19702915
+    ],
+    "na baixa do sapateiro|": [
+      2254565
+    ],
+    "na baixa do sapateiro|caetano veloso": [
+      2254565
+    ],
+    "night and day|": [
+      19702915
+    ],
+    "night and day|billie holiday": [
+      19702915
+    ],
+    "night bus|": [
+      3618272
+    ],
+    "night bus|burial": [
+      3618272
+    ],
+    "nite train|": [
+      3618272
+    ],
+    "nite train|burial": [
+      3618272
+    ],
+    "no es tan cierto|": [
+      325741
+    ],
+    "no es tan cierto|juana molina": [
+      325741
+    ],
+    "no one receiving|": [
+      1485425
+    ],
+    "no one receiving|brian eno": [
+      1485425
+    ],
+    "no sense|": [
+      1847792
+    ],
+    "no sense|cat power": [
+      1847792
+    ],
+    "not|": [
+      14251460
+    ],
+    "not|big thief": [
+      14251460
+    ],
+    "não enche|": [
+      2254565
+    ],
+    "não enche|caetano veloso": [
+      2254565
+    ],
+    "o navio negreiro (excerto)|": [
+      2254565
+    ],
+    "o navio negreiro (excerto)|caetano veloso": [
+      2254565
+    ],
+    "o.b.e|": [
+      7408054
+    ],
+    "o.b.e|dam-funk": [
+      7408054
+    ],
+    "o=0|": [
+      2172437
+    ],
+    "o=0|autechre": [
+      2172437
+    ],
+    "off on (demo)|": [
+      14130561
+    ],
+    "off on (demo)|stereolab": [
+      14130561
+    ],
+    "oh how i miss you|": [
+      1110631
+    ],
+    "oh how i miss you|broadcast": [
+      1110631
+    ],
+    "olson (version 3)|": [
+      126602
+    ],
+    "olson (version 3)|boards of canada": [
+      126602
+    ],
+    "olson|": [
+      126602
+    ],
+    "olson|boards of canada": [
+      126602
+    ],
+    "ominous cloud|": [
+      1110631
+    ],
+    "ominous cloud|broadcast": [
+      1110631
+    ],
+    "on some faraway beach|": [
+      1485425
+    ],
+    "on some faraway beach|brian eno": [
+      1485425
+    ],
+    "on your own love again|": [
+      6566463
+    ],
+    "on your own love again|jessica pratt": [
+      6566463
+    ],
+    "onde o rio é mais baiano|": [
+      2254565
+    ],
+    "onde o rio é mais baiano|caetano veloso": [
+      2254565
+    ],
+    "one very important thought|": [
+      126602
+    ],
+    "one very important thought|boards of canada": [
+      126602
+    ],
+    "only love from now on|": [
+      22264552
+    ],
+    "only love from now on|carmen villain": [
+      22264552
+    ],
+    "only with you|": [
+      6376973
+    ],
+    "only with you|angel olsen": [
+      6376973
+    ],
+    "open letter to duke|": [
+      31160183
+    ],
+    "open letter to duke|charles mingus": [
+      31160183
+    ],
+    "open the light|": [
+      126602
+    ],
+    "open the light|boards of canada": [
+      126602
+    ],
+    "os passistas|": [
+      2254565
+    ],
+    "os passistas|caetano veloso": [
+      2254565
+    ],
+    "os veix3|": [
+      2172437
+    ],
+    "os veix3|autechre": [
+      2172437
+    ],
+    "parsec|": [
+      14130561
+    ],
+    "parsec|stereolab": [
+      14130561
+    ],
+    "past the long black land|": [
+      1024408
+    ],
+    "past the long black land|colleen": [
+      1024408
+    ],
+    "pay no mind|": [
+      11945334
+    ],
+    "pay no mind|beach house": [
+      11945334
+    ],
+    "peacebone|": [
+      6219913
+    ],
+    "peacebone|animal collective": [
+      6219913
+    ],
+    "pear|": [
+      2292273
+    ],
+    "pear|damien jurado": [
+      2292273
+    ],
+    "peking saint|": [
+      1847792
+    ],
+    "peking saint|cat power": [
+      1847792
+    ],
+    "pendulum|": [
+      1110631
+    ],
+    "pendulum|broadcast": [
+      1110631
+    ],
+    "pennies from heaven|": [
+      19702915
+    ],
+    "pennies from heaven|billie holiday": [
+      19702915
+    ],
+    "pete standing alone|": [
+      126602
+    ],
+    "pete standing alone|boards of canada": [
+      126602
+    ],
+    "pirates|": [
+      3618272
+    ],
+    "pirates|burial": [
+      3618272
+    ],
+    "portals|": [
+      22264552
+    ],
+    "portals|carmen villain": [
+      22264552
+    ],
+    "pra ninguém|": [
+      2254565
+    ],
+    "pra ninguém|caetano veloso": [
+      2254565
+    ],
+    "prayer|": [
+      3618272
+    ],
+    "prayer|burial": [
+      3618272
+    ],
+    "prisoner of mars|": [
+      14130561
+    ],
+    "prisoner of mars|stereolab": [
+      14130561
+    ],
+    "pt2ph8|": [
+      2172437
+    ],
+    "pt2ph8|autechre": [
+      2172437
+    ],
+    "pussy cat dues|": [
+      31160183
+    ],
+    "pussy cat dues|charles mingus": [
+      31160183
+    ],
+    "qplay|": [
+      2172437
+    ],
+    "qplay|autechre": [
+      2172437
+    ],
+    "quisquose|": [
+      86619
+    ],
+    "quisquose|cocteau twins": [
+      86619
+    ],
+    "r ess|": [
+      2172437
+    ],
+    "r ess|autechre": [
+      2172437
+    ],
+    "rachel & cali|": [
+      2292273
+    ],
+    "rachel & cali|damien jurado": [
+      2292273
+    ],
+    "radio rhythm (s-i-g-n-a-l s-m-a-r-t) (dub mix) (killer whale)|": [
+      1677023
+    ],
+    "radio rhythm (s-i-g-n-a-l s-m-a-r-t) (dub mix) (killer whale)|arthur russell": [
+      1677023
+    ],
+    "radio rhythm (s-i-g-n-a-l s-m-a-r-t) (extra cheese mix)|": [
+      1677023
+    ],
+    "radio rhythm (s-i-g-n-a-l s-m-a-r-t) (extra cheese mix)|arthur russell": [
+      1677023
+    ],
+    "rainbo conversation|": [
+      14130561
+    ],
+    "rainbo conversation|stereolab": [
+      14130561
+    ],
+    "redfall|": [
+      2172437
+    ],
+    "redfall|autechre": [
+      2172437
+    ],
+    "refractions in the plastic pulse (demo)|": [
+      14130561
+    ],
+    "refractions in the plastic pulse (demo)|stereolab": [
+      14130561
+    ],
+    "refractions in the plastic pulse|": [
+      14130561
+    ],
+    "refractions in the plastic pulse|stereolab": [
+      14130561
+    ],
+    "replaced|": [
+      14251460
+    ],
+    "replaced|big thief": [
+      14251460
+    ],
+    "rock and sing|": [
+      14251460
+    ],
+    "rock and sing|big thief": [
+      14251460
+    ],
+    "rococo|": [
+      86619
+    ],
+    "rococo|cocteau twins": [
+      86619
+    ],
+    "roygbiv|": [
+      126602
+    ],
+    "roygbiv|boards of canada": [
+      126602
+    ],
+    "rue the whirl|": [
+      126602
+    ],
+    "rue the whirl|boards of canada": [
+      126602
+    ],
+    "rush hour (20th anniversary mix)|": [
+      11176198
+    ],
+    "rush hour (20th anniversary mix)|population one": [
+      11176198
+    ],
+    "say|": [
+      1847792
+    ],
+    "say|cat power": [
+      1847792
+    ],
+    "scatin' (toward the light)|": [
+      7408054
+    ],
+    "scatin' (toward the light)|dam-funk": [
+      7408054
+    ],
+    "schizophrenia weighted me down|": [
+      1847792
+    ],
+    "schizophrenia weighted me down|cat power": [
+      1847792
+    ],
+    "school bell / tree house|": [
+      1677023
+    ],
+    "school bell / tree house|arthur russell": [
+      1677023
+    ],
+    "sea of love|": [
+      1847792
+    ],
+    "sea of love|cat power": [
+      1847792
+    ],
+    "sea of tranquillity|": [
+      1024408
+    ],
+    "sea of tranquillity|colleen": [
+      1024408
+    ],
+    "see on see|": [
+      2172437
+    ],
+    "see on see|autechre": [
+      2172437
+    ],
+    "self-portrait in three colors|": [
+      31160183
+    ],
+    "self-portrait in three colors|charles mingus": [
+      31160183
+    ],
+    "serpentine|": [
+      1024408
+    ],
+    "serpentine|colleen": [
+      1024408
+    ],
+    "shoulders|": [
+      14251460
+    ],
+    "shoulders|big thief": [
+      14251460
+    ],
+    "silueta|": [
+      22264552
+    ],
+    "silueta|carmen villain": [
+      22264552
+    ],
+    "sixtyten|": [
+      126602
+    ],
+    "sixtyten|boards of canada": [
+      126602
+    ],
+    "smokes quantity|": [
+      126602
+    ],
+    "smokes quantity|boards of canada": [
+      126602
+    ],
+    "solitude|": [
+      19702915
+    ],
+    "solitude|billie holiday": [
+      19702915
+    ],
+    "somewhere, someday|": [
+      7408054
+    ],
+    "somewhere, someday|dam-funk": [
+      7408054
+    ],
+    "soupir|": [
+      29574202
+    ],
+    "soupir|anne gillis": [
+      29574202
+    ],
+    "south london boroughs|": [
+      3618272
+    ],
+    "south london boroughs|burial": [
+      3618272
+    ],
+    "southern comfort|": [
+      3618272
+    ],
+    "southern comfort|burial": [
+      3618272
+    ],
+    "space lizzard battle star|": [
+      6194406
+    ],
+    "spaceape|": [
+      3618272
+    ],
+    "spaceape|burial": [
+      3618272
+    ],
+    "spindrift|": [
+      10199709
+    ],
+    "spindrift|colin stetson": [
+      10199709
+    ],
+    "st epreo|": [
+      2172437
+    ],
+    "st epreo|autechre": [
+      2172437
+    ],
+    "st. elmo's fire|": [
+      1485425
+    ],
+    "st. elmo's fire|brian eno": [
+      1485425
+    ],
+    "stars|": [
+      6376973
+    ],
+    "stars|angel olsen": [
+      6376973
+    ],
+    "steppingfilter 101|": [
+      2807409
+    ],
+    "steppingfilter 101|aphex twin": [
+      2807409
+    ],
+    "stormy weather|": [
+      19702915
+    ],
+    "stormy weather|billie holiday": [
+      19702915
+    ],
+    "strange life|arabian prince": [
+      894252
+    ],
+    "strange melody|": [
+      6566463
+    ],
+    "strange melody|jessica pratt": [
+      6566463
+    ],
+    "strawberry jam|": [
+      6219913
+    ],
+    "strawberry jam|animal collective": [
+      6219913
+    ],
+    "stupido|": [
+      1110631
+    ],
+    "stupido|broadcast": [
+      1110631
+    ],
+    "subtle bodies|": [
+      22264552
+    ],
+    "subtle bodies|carmen villain": [
+      22264552
+    ],
+    "summertime|": [
+      19702915
+    ],
+    "summertime|billie holiday": [
+      19702915
+    ],
+    "sun against my eyes|": [
+      1024408
+    ],
+    "sun against my eyes|colleen": [
+      1024408
+    ],
+    "surveillance escape|": [
+      7408054
+    ],
+    "surveillance escape|dam-funk": [
+      7408054
+    ],
+    "sálvese quién pueda|": [
+      325741
+    ],
+    "sálvese quién pueda|juana molina": [
+      325741
+    ],
+    "sólo su voz|": [
+      325741
+    ],
+    "sólo su voz|juana molina": [
+      325741
+    ],
+    "taking tiger mountain|": [
+      1485425
+    ],
+    "taking tiger mountain|brian eno": [
+      1485425
+    ],
+    "telephasic workshop|": [
+      126602
+    ],
+    "telephasic workshop|boards of canada": [
+      126602
+    ],
+    "that old devil called love|": [
+      19702915
+    ],
+    "that old devil called love|billie holiday": [
+      19702915
+    ],
+    "the acceptance|": [
+      7408054
+    ],
+    "the acceptance|dam-funk": [
+      7408054
+    ],
+    "the color of the fire|": [
+      126602
+    ],
+    "the color of the fire|boards of canada": [
+      126602
+    ],
+    "the falling snow|": [
+      2292273
+    ],
+    "the falling snow|damien jurado": [
+      2292273
+    ],
+    "the flower called nowhere (instrumental)|": [
+      14130561
+    ],
+    "the flower called nowhere (instrumental)|stereolab": [
+      14130561
+    ],
+    "the flower called nowhere|": [
+      14130561
+    ],
+    "the flower called nowhere|stereolab": [
+      14130561
+    ],
+    "the great pretender|": [
+      1485425
+    ],
+    "the great pretender|brian eno": [
+      1485425
+    ],
+    "the hunt & murder of lucifer|": [
+      7408054
+    ],
+    "the hunt & murder of lucifer|dam-funk": [
+      7408054
+    ],
+    "the little bell|": [
+      1110631
+    ],
+    "the little bell|broadcast": [
+      1110631
+    ],
+    "the lure of the mine|": [
+      10199709
+    ],
+    "the lure of the mine|colin stetson": [
+      10199709
+    ],
+    "the toy|": [
+      14251460
+    ],
+    "the toy|big thief": [
+      14251460
+    ],
+    "theese fooling things|": [
+      19702915
+    ],
+    "theese fooling things|billie holiday": [
+      19702915
+    ],
+    "they can't take it away from me|": [
+      19702915
+    ],
+    "they can't take it away from me|billie holiday": [
+      19702915
+    ],
+    "this place in time|": [
+      1024408
+    ],
+    "this place in time|colleen": [
+      1024408
+    ],
+    "those girls|": [
+      14251460
+    ],
+    "those girls|big thief": [
+      14251460
+    ],
+    "throwing your voice|": [
+      2292273
+    ],
+    "throwing your voice|damien jurado": [
+      2292273
+    ],
+    "ticker-tape of the unconscious|": [
+      14130561
+    ],
+    "ticker-tape of the unconscious|stereolab": [
+      14130561
+    ],
+    "tiger stripes (extended version)|": [
+      1677023
+    ],
+    "tiger stripes (extended version)|arthur russell": [
+      1677023
+    ],
+    "treale|": [
+      2172437
+    ],
+    "treale|autechre": [
+      2172437
+    ],
+    "tree house (extended bootleg edit)|": [
+      1677023
+    ],
+    "tree house (extended bootleg edit)|arthur russell": [
+      1677023
+    ],
+    "tres cosas|": [
+      325741
+    ],
+    "tres cosas|juana molina": [
+      325741
+    ],
+    "triangles & rhombuses|": [
+      126602
+    ],
+    "triangles & rhombuses|boards of canada": [
+      126602
+    ],
+    "turquoise hexagon sun|": [
+      126602
+    ],
+    "turquoise hexagon sun|boards of canada": [
+      126602
+    ],
+    "two hands|": [
+      14251460
+    ],
+    "two hands|big thief": [
+      14251460
+    ],
+    "u hurt me|": [
+      3618272
+    ],
+    "u hurt me|burial": [
+      3618272
+    ],
+    "um tom|": [
+      2254565
+    ],
+    "um tom|caetano veloso": [
+      2254565
+    ],
+    "unfold out|": [
+      1024408
+    ],
+    "unfold out|colleen": [
+      1024408
+    ],
+    "unfucktheworld|": [
+      6376973
+    ],
+    "unfucktheworld|angel olsen": [
+      6376973
+    ],
+    "unsolved mysteries|": [
+      6219913
+    ],
+    "unsolved mysteries|animal collective": [
+      6219913
+    ],
+    "untitled in dusseldorf (demo)|": [
+      14130561
+    ],
+    "untitled in dusseldorf (demo)|stereolab": [
+      14130561
+    ],
+    "untitled|": [
+      2807409
+    ],
+    "untitled|aphex twin": [
+      2807409
+    ],
+    "untitled|burial": [
+      3618272
+    ],
+    "valerie|": [
+      1110631
+    ],
+    "valerie|broadcast": [
+      1110631
+    ],
+    "virtuous progression|": [
+      7408054
+    ],
+    "virtuous progression|dam-funk": [
+      7408054
+    ],
+    "você é minha|": [
+      2254565
+    ],
+    "você é minha|caetano veloso": [
+      2254565
+    ],
+    "wabby legs|": [
+      2807409
+    ],
+    "wabby legs|aphex twin": [
+      2807409
+    ],
+    "wallingford|": [
+      2292273
+    ],
+    "wallingford|damien jurado": [
+      2292273
+    ],
+    "warped (remixed)|": [
+      11176198
+    ],
+    "warped (remixed)|population one": [
+      11176198
+    ],
+    "we continue|": [
+      7408054
+    ],
+    "we continue|dam-funk": [
+      7408054
+    ],
+    "where's your girlfriend?|": [
+      2807409
+    ],
+    "where's your girlfriend?|aphex twin": [
+      2807409
+    ],
+    "white fire|": [
+      6376973
+    ],
+    "white fire|angel olsen": [
+      6376973
+    ],
+    "white water|": [
+      6376973
+    ],
+    "white water|angel olsen": [
+      6376973
+    ],
+    "wildlife analysis|": [
+      126602
+    ],
+    "wildlife analysis|boards of canada": [
+      126602
+    ],
+    "willow weep for me|": [
+      19702915
+    ],
+    "willow weep for me|billie holiday": [
+      19702915
+    ],
+    "windows|": [
+      6376973
+    ],
+    "windows|angel olsen": [
+      6376973
+    ],
+    "winter now|": [
+      1110631
+    ],
+    "winter now|broadcast": [
+      1110631
+    ],
+    "winter wonder land|": [
+      6219913
+    ],
+    "winter wonder land|animal collective": [
+      6219913
+    ],
+    "with lightning in your hands|": [
+      2292273
+    ],
+    "with lightning in your hands|damien jurado": [
+      2292273
+    ],
+    "wolf|": [
+      14251460
+    ],
+    "wolf|big thief": [
+      14251460
+    ],
+    "woo|": [
+      11945334
+    ],
+    "woo|beach house": [
+      11945334
+    ],
+    "wounder|": [
+      3618272
+    ],
+    "wounder|burial": [
+      3618272
+    ],
+    "wrong hand|": [
+      6566463
+    ],
+    "wrong hand|jessica pratt": [
+      6566463
+    ],
+    "xektses sql|": [
+      2172437
+    ],
+    "xektses sql|autechre": [
+      2172437
+    ],
+    "yo sé que...(salve argentina)|": [
+      325741
+    ],
+    "yo sé que...(salve argentina)|juana molina": [
+      325741
+    ],
+    "yo sé que|": [
+      325741
+    ],
+    "yo sé que|juana molina": [
+      325741
+    ],
+    "you can't hold me down (extended version)|": [
+      1677023
+    ],
+    "you can't hold me down (extended version)|arthur russell": [
+      1677023
+    ],
+    "you go to my head|": [
+      19702915
+    ],
+    "you go to my head|billie holiday": [
+      19702915
+    ],
+    "you may know him|": [
+      1847792
+    ],
+    "you may know him|cat power": [
+      1847792
+    ],
+    "you tuned the tables on me|": [
+      19702915
+    ],
+    "you tuned the tables on me|billie holiday": [
+      19702915
+    ],
+    "yuop|": [
+      2172437
+    ],
+    "yuop|autechre": [
+      2172437
+    ],
+    "zamba corta|": [
+      325741
+    ],
+    "zamba corta|juana molina": [
+      325741
+    ],
+    "¡uh!|": [
+      325741
+    ],
+    "¡uh!|juana molina": [
+      325741
+    ]
+  },
+  "album_searches": {
+    "angel olsen|burn your fire for no witness": [
+      6376973
+    ],
+    "animal collective|strawberry jam": [
+      6219913
+    ],
+    "anne gillis|vhoysee": [
+      29574202
+    ],
+    "aphex twin|26 mixes for cash": [
+      127710
+    ],
+    "aphex twin|classics": [
+      13567396
+    ],
+    "aphex twin|collapse ep": [
+      12521963
+    ],
+    "aphex twin|come to daddy": [
+      14901659
+    ],
+    "aphex twin|drukqs": [
+      38001429
+    ],
+    "aphex twin|hangable auto bulb": [
+      2807409
+    ],
+    "aphex twin|i care because you do": [
+      354741
+    ],
+    "aphex twin|raising the titanic": [
+      202433
+    ],
+    "aphex twin|richard d. james album": [
+      43694
+    ],
+    "aphex twin|syro": [
+      6101566
+    ],
+    "arthur russell|the sleeping bag sessions": [
+      1677023
+    ],
+    "autechre|oversteps": [
+      2172437
+    ],
+    "beach house|7": [
+      11945334
+    ],
+    "big thief|two hands": [
+      14251460
+    ],
+    "billie holiday|fine and mellow": [
+      19702915
+    ],
+    "boards of canada|music has the right to children": [
+      126602
+    ],
+    "brian eno|more blank than frank": [
+      1485425
+    ],
+    "broadcast|haha sound": [
+      1110631
+    ],
+    "burial|burial": [
+      3618272
+    ],
+    "caetano veloso|livro": [
+      2254565
+    ],
+    "carmen villain|only love from now on": [
+      22264552
+    ],
+    "cat power|moon pix": [
+      1847792
+    ],
+    "charles mingus|mingus ah um (remastered)": [
+      31160183
+    ],
+    "cocteau twins|aikea-guinea": [
+      86619
+    ],
+    "colin stetson|all this i do for glory": [
+      10199709
+    ],
+    "colleen|les ondes silencieuses": [
+      1024408
+    ],
+    "dam-funk|invite the light": [
+      7408054
+    ],
+    "damien jurado|saint bartlett": [
+      2292273
+    ],
+    "jessica pratt|on your own love again": [
+      6566463
+    ],
+    "juana molina|tres cosas": [
+      325741
+    ],
+    "lone|galaxy garden": [
+      3573363
+    ],
+    "population one|hippnotic culture remixed": [
+      11176198
+    ],
+    "stereolab|dots and loops": [
+      14130561
+    ]
+  },
+  "album_title_searches": {
+    "galaxy garden": [
+      3573363
+    ]
+  }
+}

@@ -568,3 +568,31 @@ uv run python -m scripts.measure_track_recall_gap \
   --discogs-url postgresql://postgres@localhost:5432/discogs_full \
   --out /tmp/lml_1264_census.json
 ```
+## Golden Corpus Builder + Re-baseliner (`scripts/build_golden_corpus.py`, `scripts/rebaseline_golden_corpus.py`)
+
+Offline maintenance tools for the LML#1233 Layer 3 golden corpus in `tests/e2e/golden/`. Neither runs in CI, and the corpus itself reads only the three checked-in JSON files they write — see [`testing.md`](testing.md#golden-corpus-lml1233-layer-3) for what a case is, what it asserts, and the re-baselining rule.
+
+The split is deliberate: **regenerating data** and **recording behavior** are different acts, and only the second can move a baseline.
+
+`build_golden_corpus.py` writes `library.json`, `discogs.json` and case *skeletons*. It needs two local, read-only sources, neither available in CI: a production-shaped `library.db` (gitignored) and a full Discogs dump in PostgreSQL (the `release` / `release_artist` / `release_track` / `release_track_artist` shape discogs-cache builds — `discogs_full` on a local `:5432` is the usual one). Sampling is deterministic (`SAMPLE_SEED`), so a re-run against the same sources reproduces the same corpus; a catalog refresh moves rows, which is exactly the kind of change that should appear in a reviewed diff. It **never writes an expectation**: existing ones are carried forward verbatim by id and new cases come out `"expect": null`, so a regeneration cannot launder a regression into the baseline.
+
+The two `LIKE` predicates in `_RESOLVE_SQL` are redundant with the equalities beside them and are there only to hit the `gin_trgm` indexes — without them PostgreSQL sequential-scans a 179M-row `release_track` per lookup. Keep both halves.
+
+`rebaseline_golden_corpus.py` drives every case through the real app (same env pins as the test tier, via the shared `corpus.pinned_environment`) and records the verdicts. It refuses to rewrite a `"frozen": true` case — those pin failures that already reached production once — printing the drift and exiting non-zero instead; accepting the new behavior means hand-editing that case and saying why. It never runs implicitly: there is no pytest plugin and no environment variable CI could trip.
+
+```bash
+# regenerate fixtures (developer machine with both sources)
+uv run --with 'psycopg[binary]' python -m scripts.build_golden_corpus \
+  --library-db library.db --discogs-dsn 'postgresql://localhost:5432/discogs_full'
+
+# preview what would move, write nothing
+uv run python -m scripts.rebaseline_golden_corpus --dry-run
+
+# record; then commit tests/e2e/golden/cases.json on its own, with the reason
+uv run python -m scripts.rebaseline_golden_corpus
+
+# reformat a hand-edited cases.json through the canonical writer
+uv run python -m scripts.rebaseline_golden_corpus --format-only
+```
+
+`psycopg` is not a project dependency — the builder imports it lazily and tells you to `uv run --with 'psycopg[binary]'` if it is missing. The re-baseliner needs nothing beyond the dev extra.
