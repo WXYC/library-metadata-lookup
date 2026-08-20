@@ -1293,6 +1293,131 @@ class TestGetRelease:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_require_artwork_answer_forces_reask_on_never_asked_tracklist_row(
+        self, service_with_cache
+    ):
+        """LML#1237. The LML#542 widening (above) made a tracklist-bearing row a
+        cache HIT even with ``artwork_checked_at IS NULL`` -- correct for
+        ``get_release`` in general, but it means the artwork-resolution caller
+        (``lookup.artwork._resolve_fallback_artwork``) reads that row's NULL
+        ``artwork_url`` as "this release has no cover" without ever asking
+        Discogs. ``require_artwork_answer=True`` narrows the predicate back
+        down for exactly that caller: a row that has never been checked for
+        artwork is a MISS regardless of its tracklist, so it falls through to
+        the live API. The general (``require_artwork_answer=False``) behavior
+        is untouched -- see
+        ``test_cache_hit_with_tracklist_and_null_artwork_columns_does_not_call_api``
+        above for the pin that #537 is not regressed.
+        """
+        never_asked = ReleaseMetadataResponse(
+            release_id=1573110,
+            title="Confield",
+            artist="Autechre",
+            release_url="https://discogs.com/release/1573110",
+            artwork_url=None,
+            artwork_checked_at=None,
+            tracklist=[
+                TrackItem(position="1", title="Cipater", duration="4:11", artists=[]),
+            ],
+            cached=True,
+        )
+        service_with_cache.cache_service.get_release = AsyncMock(return_value=never_asked)
+        service_with_cache.cache_service.write_release = AsyncMock()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Confield",
+            "artists": [{"name": "Autechre"}],
+            "tracklist": [],
+            "images": [{"uri": "https://img.discogs.com/confield-cover.jpg"}],
+            "labels": [],
+            "genres": [],
+            "styles": [],
+        }
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ) as mock_request:
+            result = await service_with_cache.get_release(1573110, require_artwork_answer=True)
+
+        mock_request.assert_called_once()
+        assert result is not None
+        assert result.artwork_url == "https://img.discogs.com/confield-cover.jpg"
+        # The #423 invariant: the live ask must be written back so this
+        # release is never re-asked again, by any caller.
+        service_with_cache.cache_service.write_release.assert_called_once()
+        written = service_with_cache.cache_service.write_release.call_args.args[0]
+        assert written.artwork_url == "https://img.discogs.com/confield-cover.jpg"
+
+    @pytest.mark.asyncio
+    async def test_require_artwork_answer_does_not_reask_once_checked(self, service_with_cache):
+        """LML#1237 / #423 invariant: once a row carries a non-NULL
+        ``artwork_checked_at`` -- Discogs was asked, whatever the answer --
+        ``require_artwork_answer=True`` must NOT re-ask. Only the "never
+        asked" tail (tested above) falls through; a genuinely-imageless
+        release stays a hit forever, exactly as the unqualified predicate
+        already guarantees.
+        """
+        asked_no_cover = ReleaseMetadataResponse(
+            release_id=2496,
+            title="Chiastic Slide",
+            artist="Autechre",
+            release_url="https://discogs.com/release/2496",
+            artwork_url=None,
+            artwork_checked_at=datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC),
+            cached=True,
+        )
+        service_with_cache.cache_service.get_release = AsyncMock(return_value=asked_no_cover)
+        service_with_cache.cache_service.write_release = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+        ) as mock_request:
+            result = await service_with_cache.get_release(2496, require_artwork_answer=True)
+
+        mock_request.assert_not_called()
+        service_with_cache.cache_service.write_release.assert_not_called()
+        assert result is asked_no_cover
+
+    @pytest.mark.asyncio
+    async def test_require_artwork_answer_does_not_reask_tombstone(self, service_with_cache):
+        """LML#1237: a 404-tombstoned release genuinely does not exist, so
+        ``require_artwork_answer=True`` must not turn it into a live re-ask
+        either -- ``not_found`` wins regardless of the artwork columns,
+        matching ``test_cache_hit_tombstone_only_signal_does_not_call_api``."""
+        tombstone = ReleaseMetadataResponse(
+            release_id=33696619,
+            title="",
+            artist="",
+            release_url="https://www.discogs.com/release/33696619",
+            artwork_url=None,
+            artwork_checked_at=None,
+            tracklist=[],
+            not_found=True,
+            cached=True,
+        )
+        service_with_cache.cache_service.get_release = AsyncMock(return_value=tombstone)
+        service_with_cache.cache_service.write_release = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+        ) as mock_request:
+            result = await service_with_cache.get_release(33696619, require_artwork_answer=True)
+
+        mock_request.assert_not_called()
+        service_with_cache.cache_service.write_release.assert_not_called()
+        assert result is None
+
+    @pytest.mark.asyncio
     async def test_404_returns_none(self, service):
         with patch.object(
             service, "_request_with_retry", new_callable=AsyncMock, return_value=None

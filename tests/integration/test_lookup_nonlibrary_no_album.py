@@ -87,7 +87,7 @@ def _base_discogs_mock() -> AsyncMock:
     svc.validate_track_on_release = AsyncMock(return_value=True)
     svc.search_releases_by_album_title = AsyncMock(return_value=_empty_track_releases())
 
-    async def _get_release(release_id: int) -> ReleaseMetadataResponse:
+    async def _get_release(release_id: int, **_kwargs) -> ReleaseMetadataResponse:
         return ReleaseMetadataResponse(
             release_id=release_id,
             title=OWN_ALBUM if release_id == OWN_RELEASE_ID else COMP_ALBUM,

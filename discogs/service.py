@@ -1361,7 +1361,7 @@ class DiscogsService:
 
     @async_cached(RELEASE_CACHE)
     async def get_release(
-        self, release_id: int, *, lean: bool = False
+        self, release_id: int, *, lean: bool = False, require_artwork_answer: bool = False
     ) -> ReleaseMetadataResponse | None:
         """Get full release metadata by ID.
 
@@ -1382,6 +1382,25 @@ class DiscogsService:
                 ``@async_cached`` key includes ``lean``, so lean and full
                 results occupy disjoint L1 entries — a lean read can never be
                 served to (or poison) the ``/discogs/*`` full-object surface.
+            require_artwork_answer: LML#1237. When ``True``, narrows the
+                LML#542 widened cache-hit predicate back down for the one
+                caller whose entire question is the artwork
+                (``lookup.artwork._resolve_fallback_artwork``): a cache row
+                that carries a tracklist but has never been asked about
+                artwork (``artwork_checked_at IS NULL``) is treated as a
+                MISS instead of a hit, so it falls through to a live Discogs
+                fetch rather than returning a stale ``artwork_url=None``. A
+                ``not_found`` tombstone, or any row that has already been
+                asked (``artwork_checked_at IS NOT NULL``, whatever the
+                answer was), is still a hit either way — this only affects
+                the "bulk-loaded, never asked" tail. The live fetch's result
+                is written back via the normal ``pg_write`` leg, so a given
+                release pays this cost at most once, ever, regardless of
+                how many callers ask with this flag set. Defaults to
+                ``False`` so every other caller's cache-hit behavior
+                (LML#537) is unchanged. Included in the ``@async_cached``
+                key like ``lean``, so a ``True`` call can never be served
+                from (or poison) the default L1 entry.
 
         Returns:
             ReleaseMetadataResponse with full metadata, or None on error
@@ -1636,9 +1655,26 @@ class DiscogsService:
                 # decouples artwork availability from cache-hit eligibility;
                 # `extended=true` consumers still surface artwork when the
                 # row has it, but we no longer FETCH purely to populate it.
+                #
+                # LML#1237: that widening is correct for `get_release` in
+                # general, but it is wrong for the one caller whose entire
+                # question IS the artwork (`lookup.artwork.
+                # _resolve_fallback_artwork`) -- arm 2 alone let it read a
+                # never-asked row's NULL `artwork_url` as "no cover" without
+                # ever hitting the live API. `require_artwork_answer` scopes
+                # arm 2 to `not require_artwork_answer`: that caller opts out
+                # of the tracklist-only hit and falls through to a live
+                # fetch, while arms 1 and 3 (a tombstone, or a row that has
+                # already been asked either way) still short-circuit for it
+                # exactly as for every other caller — a never-asked row is
+                # the ONLY state this widens back down for.
                 is_pg_hit=lambda v: (
                     v is not None
-                    and (bool(v.not_found) or bool(v.tracklist) or v.artwork_checked_at is not None)
+                    and (
+                        bool(v.not_found)
+                        or v.artwork_checked_at is not None
+                        or (bool(v.tracklist) and not require_artwork_answer)
+                    )
                 ),
                 breadcrumb_data={"release_id": release_id},
             )

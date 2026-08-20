@@ -3100,6 +3100,71 @@ class TestFetchArtworkFallback:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _resolve_fallback_artwork never-asked re-ask (LML#1237)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveFallbackArtworkNeverAskedReask:
+    """LML#1237. ``get_release``'s LML#542 widened predicate treats a
+    tracklist-bearing cache row as a hit even when ``artwork_checked_at IS
+    NULL`` -- correct for `get_release` callers in general, but it means
+    ``_resolve_fallback_artwork`` read that row's NULL ``artwork_url`` as
+    "this release has no cover" without Discogs ever being asked. The fix is
+    at this call site: it asks ``get_release`` for an artwork-authoritative
+    answer via ``require_artwork_answer=True``, narrowing the predicate back
+    down for exactly this caller (see ``discogs/service.py``'s
+    ``TestGetRelease.test_require_artwork_answer_forces_reask_on_never_asked_tracklist_row``
+    for the cache-layer half of this fix).
+    """
+
+    @pytest.mark.asyncio
+    async def test_requests_artwork_authoritative_answer_by_default(self, mock_discogs_service):
+        """Default call (the normal /lookup path): _resolve_fallback_artwork
+        must ask get_release for an authoritative artwork answer rather than
+        accepting a stale 'never checked' None."""
+        mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1573110,
+            title="Confield",
+            artist="Autechre",
+            artwork_url="https://img.discogs.com/confield-cover.jpg",
+            release_url="https://www.discogs.com/release/1573110",
+        )
+
+        result = await _resolve_fallback_artwork(mock_discogs_service, 1573110)
+
+        assert result == "https://img.discogs.com/confield-cover.jpg"
+        mock_discogs_service.get_release.assert_called_once_with(
+            1573110, require_artwork_answer=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_bulk_kill_switch_suppresses_the_reask(self, mock_discogs_service):
+        """LML#671/#652 bulk kill switch: the /lookup/bulk 35k-album drain
+        passes allow_release_resolution_fallback=False so a never-asked slice
+        of the population can't turn into a single-run stampede against the
+        shared Discogs rate bucket (#879). With the switch off,
+        _resolve_fallback_artwork must NOT request the live-authoritative
+        answer -- it reads whatever PG already has, exactly as before this
+        fix."""
+        mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1573110,
+            title="Confield",
+            artist="Autechre",
+            artwork_url=None,
+            release_url="https://www.discogs.com/release/1573110",
+        )
+
+        result = await _resolve_fallback_artwork(
+            mock_discogs_service, 1573110, allow_release_resolution_fallback=False
+        )
+
+        assert result is None
+        mock_discogs_service.get_release.assert_called_once_with(
+            1573110, require_artwork_answer=False
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests: _resolve_fallback_artwork sentinel guard (LML#518)
 # ---------------------------------------------------------------------------
 
