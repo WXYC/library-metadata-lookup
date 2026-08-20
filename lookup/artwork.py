@@ -67,9 +67,16 @@ async def _resolve_fallback_artwork(
     artwork, so it asks for an artwork-authoritative answer via
     ``get_release(..., require_artwork_answer=True)`` -- narrows the
     predicate back down for this call only; every other ``get_release``
-    caller is unaffected (LML#537 not regressed). The live ask (when one
-    fires) is written back to PG unconditionally, so a given release pays
-    this cost at most once, ever -- not once per lookup.
+    caller is unaffected (LML#537 not regressed). A *successful* live ask is
+    written back to PG unconditionally, so a release that Discogs actually
+    answers for pays this cost at most once, ever -- not once per lookup. That
+    bound is conditional, not absolute: a failed ask (breaker shed, network
+    error, exhausted retries) writes nothing back, so the row stays
+    never-asked and can be re-attempted on a later lookup. The breaker and
+    the shared rate gate (#879) cap how often that retry can happen -- they
+    do not cap it at exactly once -- so treat this as "amortizes to at most
+    one live call per release once Discogs is reachable," not as a hard
+    per-release ceiling.
 
     ``allow_release_resolution_fallback`` (default ``True``, the normal
     ``/lookup`` path) is the SAME bulk kill switch ``fetch_artwork_for_items``
@@ -78,7 +85,16 @@ async def _resolve_fallback_artwork(
     12,364-release never-asked population can't turn into a single-run
     stampede against the shared Discogs rate bucket (#879). With the switch
     off, this falls back to the pre-#1237 behavior -- read whatever PG has,
-    never re-ask.
+    never re-ask. A caller that omits this keyword entirely (rather than
+    passing it explicitly either way) silently gets ``True`` -- i.e. silently
+    opts INTO live re-asking. That default is right for ``/lookup``, the
+    common case, but it is a trap for a new batch/background caller: the
+    LML#1020 compilation-artwork drain (``scripts/build_compilation_track_location.py``)
+    originally hit exactly this by not passing the flag at all, and had to be
+    fixed to pass ``False`` explicitly -- see that call site's comment. Any
+    new caller that walks more than a handful of releases against a live
+    ``DiscogsService`` outside of a single interactive ``/lookup`` request
+    MUST pass ``False`` explicitly; do not rely on the default.
 
     Structurally invalid ids (``release_id <= 0``) short-circuit before the
     Discogs round-trip — the LML#401 synthesis pattern produces a

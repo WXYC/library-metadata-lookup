@@ -382,6 +382,7 @@ class TestBuildCompilationTrackLocationOrchestration:
         credits_by_release,
         dry_run=False,
         limit=None,
+        discogs_service=None,
     ):
         conn = AsyncMock()
         conn.executemany = AsyncMock()
@@ -419,7 +420,7 @@ class TestBuildCompilationTrackLocationOrchestration:
         stats = await build_compilation_track_location(
             library_db_path="unused.db",
             discogs_conn=conn,
-            discogs_service=None,
+            discogs_service=discogs_service,
             full=full,
             limit=limit,
             dry_run=dry_run,
@@ -452,6 +453,48 @@ class TestBuildCompilationTrackLocationOrchestration:
         conn.executemany.assert_awaited_once()
         rows = conn.executemany.await_args.args[1]
         assert rows == [(3, "A1", "some artist", "some title", "primary", 555, None)]
+
+    async def test_artwork_precompute_never_forces_a_live_reask(self, monkeypatch, comps):
+        """LML#1237 follow-up. ``_resolve_fallback_artwork`` grew a never-asked
+        live re-ask (``allow_release_resolution_fallback``, default ``True`` to
+        match the ``/lookup`` path). This drain is not ``/lookup`` -- it's the
+        LML#1020 nightly cron walking 58k+ compilation credits against a
+        rate-gated live ``DiscogsService`` (00:15 PT), and the guard just above
+        the artwork-precompute call site (skip a comp with no cached tracklist)
+        means every release that reaches ``_resolve_fallback_artwork`` here is
+        exactly the tracklist-bearing arm the never-asked re-ask narrows -- the
+        overlap with the drain's population is total, not incidental. The call
+        site must pass ``allow_release_resolution_fallback=False`` explicitly
+        to restore the pre-#1237 behavior (read whatever the cache has, never
+        re-ask), the same carve-out ``/lookup/bulk`` already gets via its own
+        kill switch.
+        """
+        discogs_service = AsyncMock()
+        discogs_service.get_release = AsyncMock(return_value=None)
+
+        conn, stats = await self._run(
+            monkeypatch,
+            comps,
+            full=False,
+            processed_ids=set(),
+            matches={2: 111},
+            credits_by_release={
+                111: [
+                    {
+                        "position": "A1",
+                        "sequence": 1,
+                        "artist_name": "Some Artist",
+                        "track_title": "Some Title",
+                        "extra": 0,
+                        "role": None,
+                    }
+                ]
+            },
+            discogs_service=discogs_service,
+        )
+
+        assert stats["rows_inserted"] == 1
+        discogs_service.get_release.assert_awaited_once_with(111, require_artwork_answer=False)
 
     async def test_full_mode_includes_already_processed_library_ids(self, monkeypatch, comps):
         conn, stats = await self._run(

@@ -317,7 +317,23 @@ async def build_compilation_track_location(
             continue
         artwork_url = None
         if discogs_service is not None:
-            artwork_url = await _resolve_fallback_artwork(discogs_service, release_id)
+            # LML#1237 follow-up: _resolve_fallback_artwork's never-asked live
+            # re-ask defaults to allow_release_resolution_fallback=True, matching
+            # the /lookup path it was built for. This is the LML#1020 nightly
+            # cron, not /lookup -- it runs unattended against a rate-gated live
+            # DiscogsService over 58k+ compilation credits, and does NOT go
+            # through the /lookup/bulk kill switch that fix's rate-budget
+            # argument rests on. The "no cached tracklist" skip a few lines up
+            # means every release reaching this call is exactly the
+            # tracklist-bearing, possibly-never-asked arm that re-ask narrows,
+            # so leaving this at the default would turn a slice of the
+            # never-asked population into a live call on every drain run. Pass
+            # False explicitly -- a bulk/background caller must always opt out
+            # of the live re-ask, never rely on the default, which is tuned for
+            # a single interactive /lookup request instead.
+            artwork_url = await _resolve_fallback_artwork(
+                discogs_service, release_id, allow_release_resolution_fallback=False
+            )
         rows = build_rows(
             library_id=comp.library_id,
             discogs_release_id=release_id,

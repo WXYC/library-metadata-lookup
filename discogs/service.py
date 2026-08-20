@@ -1393,10 +1393,16 @@ class DiscogsService:
                 ``not_found`` tombstone, or any row that has already been
                 asked (``artwork_checked_at IS NOT NULL``, whatever the
                 answer was), is still a hit either way — this only affects
-                the "bulk-loaded, never asked" tail. The live fetch's result
-                is written back via the normal ``pg_write`` leg, so a given
-                release pays this cost at most once, ever, regardless of
-                how many callers ask with this flag set. Defaults to
+                the "bulk-loaded, never asked" tail. A *successful* live
+                fetch is written back via the normal ``pg_write`` leg, so a
+                release Discogs actually answers pays this cost at most
+                once, ever, regardless of how many callers ask with this
+                flag set. That is conditional on success, not absolute: a
+                failed fetch (breaker shed, network error, exhausted
+                retries) writes nothing back, leaving the row never-asked
+                and eligible to be re-attempted by a later call — bounded by
+                the breaker's and the shared rate gate's (#879) own retry
+                ceiling, not by this flag. Defaults to
                 ``False`` so every other caller's cache-hit behavior
                 (LML#537) is unchanged. Included in the ``@async_cached``
                 key like ``lean``, so a ``True`` call can never be served
