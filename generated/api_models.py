@@ -115,16 +115,6 @@ class RotationBin(StrEnum):
     S = "S"
 
 
-class DayOfWeek(StrEnum):
-    Sunday = "Sunday"
-    Monday = "Monday"
-    Tuesday = "Tuesday"
-    Wednesday = "Wednesday"
-    Thursday = "Thursday"
-    Friday = "Friday"
-    Saturday = "Saturday"
-
-
 class FlowsheetEntryBase(BaseModel):
     id: int
     play_order: int
@@ -859,19 +849,6 @@ class Rotation(BaseModel):
     )
 
 
-class DJ(BaseModel):
-    id: int
-    dj_name: str
-    real_name: str | None = None
-    email: str | None = None
-
-
-class NewDJ(BaseModel):
-    cognito_user_name: str | None = None
-    real_name: str | None = None
-    dj_name: str | None = None
-
-
 class BinEntry(BaseModel):
     id: int
     dj_id: int
@@ -931,7 +908,7 @@ class BinLibraryDetails(BaseModel):
     genre_name: str | None = None
     legacy_release_id: int | None = Field(
         None,
-        description="The library row's surrogate key (BS#1963), NOT NULL in the database since migration 0137. Optional here (never required) so the live openapi-compliance deploy gate stays green across the publish -> BS-deploy window, matching the CatalogExportRow and BulkResolveInput precedent.\n",
+        description="The library row's surrogate key (BS#1963), NOT NULL in the database since migration 0137. Optional here (never required) because the column is emitted per-projection, not globally: NOT NULL is a claim about the column, while `required` is a promise that the key appears on the wire, and WXYC/Backend-Service#2167 is open precisely because the LML search-proxy rows do not emit it explicitly yet. Promoting this to required once every projection returning the schema provably emits it is worth doing, and needs a per-projection audit rather than a text edit. Matches the CatalogExportRow and BulkResolveInput precedent.\n",
     )
 
 
@@ -939,7 +916,7 @@ class ScheduleShift(BaseModel):
     id: int
     dj_id: int
     dj_name: str
-    day: DayOfWeek
+    day: conint(ge=0, le=6) = Field(..., description="Day of the week 0 = Monday, 6 = Sunday")
     start_time: str = Field(..., description="Time in HH:MM format")
     end_time: str = Field(..., description="Time in HH:MM format")
     show_name: str | None = None
@@ -948,7 +925,7 @@ class ScheduleShift(BaseModel):
 
 class AddScheduleShiftRequest(BaseModel):
     dj_id: int
-    day: DayOfWeek
+    day: conint(ge=0, le=6) = Field(..., description="Day of the week 0 = Monday, 6 = Sunday")
     start_time: str
     end_time: str
     show_name: str | None = None
@@ -3242,7 +3219,7 @@ class AlbumSearchResult(BaseModel):
     label_id: int | None = None
     legacy_release_id: int | None = Field(
         None,
-        description="The library row's surrogate key (BS#1963), NOT NULL in the database since migration 0137. Optional here (never required) so the live openapi-compliance deploy gate stays green across the publish -> BS-deploy window, matching the CatalogExportRow and BulkResolveInput precedent.\n",
+        description="The library row's surrogate key (BS#1963), NOT NULL in the database since migration 0137. Optional here (never required) because the column is emitted per-projection, not globally: NOT NULL is a claim about the column, while `required` is a promise that the key appears on the wire, and WXYC/Backend-Service#2167 is open precisely because the LML search-proxy rows do not emit it explicitly yet. Promoting this to required once every projection returning the schema provably emits it is worth doing, and needs a per-projection audit rather than a text edit. Matches the CatalogExportRow and BulkResolveInput precedent.\n",
     )
     album_dist: float | None = None
     artist_dist: float | None = None
