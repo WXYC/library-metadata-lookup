@@ -1330,6 +1330,31 @@ class TestPerformLookupFallback:
 # ---------------------------------------------------------------------------
 
 
+def _confirm_wave_a_release(mock_discogs_service: AsyncMock, release: DiscogsReleaseInfo) -> None:
+    """Route TRACK_ON_COMPILATION's Wave A probe to a real, validated release.
+
+    LML#1239: ``mock_discogs_service`` leaves ``search_releases_by_track``
+    unconfigured by default, so it returns a bare ``AsyncMock`` rather than a
+    ``DiscogsTrackReleasesResponse``. ``_probes_fresh_gather``'s ``isinstance``
+    assert on that value then raises, the exception is swallowed by
+    ``search_compilations_for_track``'s outer try/except, and the scenario
+    silently falls through to TRACK_ON_COMPILATION's last-resort keyword-only
+    branch instead of the genuine, tracklist-validated match the test means to
+    exercise. Wave B (the ``artist_as_keyword=True`` probe) returns empty so
+    only Wave A supplies the candidate."""
+
+    async def _search_releases_by_track(
+        track: str, artist: str | None = None, *, artist_as_keyword: bool = False, **_: object
+    ) -> DiscogsTrackReleasesResponse:
+        releases = [] if artist_as_keyword else [release]
+        return DiscogsTrackReleasesResponse(
+            track=track, artist=artist, releases=releases, total=len(releases)
+        )
+
+    mock_discogs_service.search_releases_by_track = AsyncMock(side_effect=_search_releases_by_track)
+    mock_discogs_service.validate_track_on_release = AsyncMock(return_value=True)
+
+
 class TestPerformLookupCompilations:
     """Test compilation search when direct search fails."""
 
@@ -1352,8 +1377,8 @@ class TestPerformLookupCompilations:
         # 1. artist + song -> empty (no album match)
         # 2. artist only -> returns fallback (triggers song_not_found=True)
         # Then search_compilations_for_track is triggered:
-        # 3. keyword search -> returns compilation_item
-        # Then search_album_fuzzy is called for the Discogs album title:
+        # 3. keyword search -> returns compilation_item (unused; Wave A confirms first)
+        # Then search_album_fuzzy is called for Wave A's validated release:
         # 4. exact search for "Disco Not Disco" -> returns compilation_item
         mock_library_db.search.side_effect = [
             [],  # search_library_with_fallback: artist + song
@@ -1363,6 +1388,16 @@ class TestPerformLookupCompilations:
         ]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        _confirm_wave_a_release(
+            mock_discogs_service,
+            DiscogsReleaseInfo(
+                album="Disco Not Disco",
+                artist="Various Artists",
+                release_id=58610,
+                release_url="https://www.discogs.com/release/58610",
+                is_compilation=True,
+            ),
+        )
 
         request = LookupRequest(
             artist="Some Artist",
@@ -1406,8 +1441,8 @@ class TestPerformLookupCompilations:
         mock_library_db.find_similar_artist.return_value = None
 
         # search_library_with_fallback: artist+song -> empty, artist-only -> empty
-        # search_compilations_for_track: keyword search -> compilation,
-        #   search_album_fuzzy -> compilation
+        # search_compilations_for_track: keyword search -> compilation (unused;
+        #   Wave A confirms first), search_album_fuzzy -> compilation
         mock_library_db.search.side_effect = [
             [],  # search_library_with_fallback: artist + song
             [],  # search_library_with_fallback: artist only (Adonis not in library)
@@ -1416,6 +1451,16 @@ class TestPerformLookupCompilations:
         ]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        _confirm_wave_a_release(
+            mock_discogs_service,
+            DiscogsReleaseInfo(
+                album="Trax Records 20th Anniversary Collection",
+                artist="Various Artists",
+                release_id=46602,
+                release_url="https://www.discogs.com/release/46602",
+                is_compilation=True,
+            ),
+        )
 
         request = LookupRequest(
             artist="Adonis",
@@ -1466,21 +1511,27 @@ class TestPerformLookupCompilations:
         # 2. artist + song "Adonis No Way Back" -> empty
         # 3. artist only "Adonis" -> empty
         # Then search_compilations_for_track:
-        # 4. keyword search "adonis back" -> compilation
-        # 5. search_album_fuzzy("No Way Back") exact -> rejected by album_title_acceptable
-        # 6. search_album_fuzzy("No Way Back") fuzzy "back" -> rejected by similarity
-        # 7. search_album_fuzzy("Trax Records...") exact -> compilation (VA match)
+        # 4. keyword search "adonis back" -> compilation (unused; Wave A confirms first)
+        # 5. search_album_fuzzy("Trax Records...") exact -> compilation (VA match)
         mock_library_db.search.side_effect = [
             [],  # search_library_with_fallback: artist + album
             [],  # search_library_with_fallback: artist + song
             [],  # search_library_with_fallback: artist only
             [compilation_item],  # search_compilations_for_track: keyword search
-            [compilation_item],  # search_album_fuzzy: exact "No Way Back" (filtered)
-            [compilation_item],  # search_album_fuzzy: fuzzy "back" (rejected)
             [compilation_item],  # search_album_fuzzy: exact "Trax Records..." (match)
         ]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        _confirm_wave_a_release(
+            mock_discogs_service,
+            DiscogsReleaseInfo(
+                album="Trax Records 20th Anniversary Collection",
+                artist="Various Artists",
+                release_id=46602,
+                release_url="https://www.discogs.com/release/46602",
+                is_compilation=True,
+            ),
+        )
 
         request = LookupRequest(
             artist="Adonis",
@@ -1626,13 +1677,23 @@ class TestPerformLookupCompilations:
         mock_library_db.search.side_effect = [
             [],  # search_library_with_fallback: artist + song
             [fallback_item],  # search_library_with_fallback: artist only
-            [compilation_item],  # search_compilations_for_track: keyword search
+            [compilation_item],  # search_compilations_for_track: keyword search (unused)
             [compilation_item],  # search_album_fuzzy: exact search
         ]
 
         # If filter_results_by_track_validation runs, it calls discogs_service.search
         # for each result. We track whether this happens.
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        _confirm_wave_a_release(
+            mock_discogs_service,
+            DiscogsReleaseInfo(
+                album="Disco Not Disco",
+                artist="Various Artists",
+                release_id=58610,
+                release_url="https://www.discogs.com/release/58610",
+                is_compilation=True,
+            ),
+        )
 
         request = LookupRequest(
             artist="Some Artist",
@@ -1657,6 +1718,64 @@ class TestPerformLookupCompilations:
         # Without the artist fallback validation this would be 1 call.
         # If compilation results were ALSO re-validated, count would be 3+.
         assert mock_discogs_service.search.call_count <= 2
+
+    @pytest.mark.asyncio
+    async def test_last_resort_keyword_hit_is_not_a_confirmed_compilation_find(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#1239: TRACK_ON_COMPILATION's last-resort branch surfaces the best
+        library keyword hit whenever Discogs returns nothing at all, without ever
+        consulting a tracklist. That row must not be reported as a confirmed
+        compilation find.
+
+        Reproduction: artist="Stereolab", song="Zzyzx Marginal Fanfare" -- a
+        track that does not exist. Before the fix this returned
+        found_on_compilation=True / song_not_found=False with a context message
+        asserting the track had been located on a specific release.
+        """
+        stereolab_item = make_library_item(
+            id=501,
+            artist="Stereolab",
+            title="Peng!",
+            call_letters="S",
+        )
+
+        mock_library_db.find_similar_artist.return_value = None
+        mock_library_db.search.side_effect = [
+            [],  # search_library_with_fallback: artist + song
+            [],  # search_library_with_fallback: artist only -- nothing confirmed
+            [stereolab_item],  # search_compilations_for_track: keyword search
+        ]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Stereolab",
+            song="Zzyzx Marginal Fanfare",
+            raw_message="Zzyzx Marginal Fanfare by Stereolab",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.found_on_compilation is False, (
+            "A keyword-only hit was never validated against a tracklist -- it "
+            "must not be reported as a confirmed compilation find."
+        )
+        assert response.song_not_found is True
+        assert response.search_type != "compilation", (
+            "search_type must move with found_on_compilation -- Backend-Service's "
+            "isTrustedLmlTrackContextMatch gates on search_type alone."
+        )
+        assert response.context_message is not None
+        assert "Found" not in response.context_message, (
+            "The context message must not assert the track was located."
+        )
 
 
 # ---------------------------------------------------------------------------

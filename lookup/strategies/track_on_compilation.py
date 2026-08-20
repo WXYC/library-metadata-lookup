@@ -123,6 +123,26 @@ TrackOnCompilationExecute = Callable[
 ]
 
 
+def _lacks_tracklist_confirmation(
+    items: list[LibraryItem], discogs_titles: dict[int, ResolvedRelease]
+) -> bool:
+    """LML#1239: True when none of ``items`` was ever validated against a tracklist.
+
+    Every genuine compilation match -- the primary Discogs-probe pass
+    (``_collect_release_matches``), the album-title fallback, and the #628
+    row-less carry-through -- registers a :class:`ResolvedRelease` in
+    ``discogs_titles`` keyed by the surfaced item's id before the item ever
+    reaches ``results``. The L1018 last-resort branch is the *only* path
+    that appends a row without doing so: it fires precisely when Discogs
+    found nothing to validate against, and surfaces the top keyword-search
+    hit unchecked. The two branches are mutually exclusive by construction
+    -- the last-resort branch only runs when ``results`` is still empty --
+    so "none of the surfaced items carries an entry" reliably means "this
+    batch came from the last-resort branch," never a mix of the two.
+    """
+    return bool(items) and all(item.id not in discogs_titles for item in items)
+
+
 @dataclass(frozen=True)
 class TrackOnCompilation:
     """Match the song against compilation tracklists via Discogs cross-reference."""
@@ -141,6 +161,12 @@ class TrackOnCompilation:
         items, discogs_titles = await self.execute(self.db, parsed)
         if not items:
             return Outcome.empty()
+        if _lacks_tracklist_confirmation(items, discogs_titles):
+            # LML#1239: the L1018 last-resort branch surfaced the top
+            # keyword-search hit without ever consulting a tracklist. Return
+            # it demoted -- a plausible artist row, not a confirmed find --
+            # rather than asserting a match nothing has verified.
+            return Outcome.artist_fallback(items)
         return Outcome.compilation(items, discogs_titles=discogs_titles)
 
 

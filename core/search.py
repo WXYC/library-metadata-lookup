@@ -1065,7 +1065,11 @@ def get_search_type_from_state(state: SearchState) -> str:
     elif last_strategy == SearchStrategyType.SWAPPED_INTERPRETATION:
         return "alternative"
     elif last_strategy == SearchStrategyType.TRACK_ON_COMPILATION:
-        return "compilation"
+        # LML#1239: a demoted last-resort hit clears found_on_compilation but
+        # still leaves TRACK_ON_COMPILATION as the last-tried strategy -- mirror
+        # the ARTIST_PLUS_ALBUM branch above so search_type moves with the
+        # verdict instead of re-asserting "compilation" for an unconfirmed row.
+        return SEARCH_TYPE_FALLBACK if state.song_not_found else "compilation"
     elif last_strategy == SearchStrategyType.SONG_AS_ARTIST:
         return "song_as_artist"
     elif last_strategy == SearchStrategyType.SONG_AS_TRACK:
