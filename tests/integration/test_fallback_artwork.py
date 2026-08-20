@@ -56,3 +56,34 @@ async def test_resolves_to_release_images_uri_when_present():
         f"got {resolved!r}. The function must prefer release.images[0].uri over "
         "the artist/label image fallback."
     )
+
+
+@pytest.mark.parametrize(
+    ("release_id", "label"),
+    [
+        (1573110, "Autechre - Confield"),
+        (2496, "Autechre - Chiastic Slide"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resolves_own_cover_for_previously_misdiagnosed_releases(release_id, label):
+    """LML#1237 regression pin. #687 was reopened because it misdiagnosed
+    these two releases as coverless (arguing from a *different*, imageless
+    Autechre pressing, release 28138) when in fact both carry their own
+    Discogs cover -- LML just could not see it, because the cache row for
+    each was in the "bulk-loaded, never asked about artwork" state and the
+    LML#542 widened `get_release` predicate read that NULL as absence.
+    Pins that `_resolve_fallback_artwork` surfaces the release's own cover
+    for both, without degrading to the artist-image rung."""
+    service = DiscogsService(token=DISCOGS_TOKEN)
+
+    resolved = await _resolve_fallback_artwork(service, release_id)
+
+    assert resolved, f"{label} (release {release_id}) resolved to no artwork at all"
+    release = await service.get_release(release_id)
+    assert release is not None, f"get_release({release_id}) returned None for {label}"
+    assert resolved == release.artwork_url, (
+        f"{label} (release {release_id}): _resolve_fallback_artwork returned {resolved!r}, "
+        f"but the release's own cover is {release.artwork_url!r} -- expected the release-cover "
+        "rung to win, not a degraded artist-image fallback."
+    )

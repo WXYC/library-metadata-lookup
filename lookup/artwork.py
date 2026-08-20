@@ -43,14 +43,42 @@ can import the same constants the runtime path uses — keeping the
 measurement's compilation handling provably-aligned with production."""
 
 
-async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id: int) -> str | None:
+async def _resolve_fallback_artwork(
+    discogs_service: DiscogsService,
+    release_id: int,
+    *,
+    allow_release_resolution_fallback: bool = True,
+) -> str | None:
     """Try the release's own cover (images[0]), then artist image.
 
     LML#687: the label-image rung was removed -- a label logo is essentially
     never correct album art (the motivating case: Autechre's *Confield* had no
     cover and returned the Warp Records logo as its artwork). A missing cover
     now resolves to ``None`` after the artist-image rung rather than falling
-    all the way through to the release's label.
+    all the way through to the release's label. #687 was later reopened: that
+    "no cover" premise was itself wrong for both cases it was argued from --
+    see the LML#1237 fix below.
+
+    LML#1237: ``get_release``'s LML#542 widened predicate treats a
+    tracklist-bearing cache row as a hit even when it has never been asked
+    about artwork (``artwork_checked_at IS NULL``), so a bulk-loaded release
+    with no live Discogs check yet reads as coverless here without Discogs
+    ever being asked. This is the caller whose entire question IS the
+    artwork, so it asks for an artwork-authoritative answer via
+    ``get_release(..., require_artwork_answer=True)`` -- narrows the
+    predicate back down for this call only; every other ``get_release``
+    caller is unaffected (LML#537 not regressed). The live ask (when one
+    fires) is written back to PG unconditionally, so a given release pays
+    this cost at most once, ever -- not once per lookup.
+
+    ``allow_release_resolution_fallback`` (default ``True``, the normal
+    ``/lookup`` path) is the SAME bulk kill switch ``fetch_artwork_for_items``
+    already threads through for the resolution fan-out (LML#671/#652): the
+    ``/lookup/bulk`` 35k-album drain passes ``False`` so a slice of the
+    12,364-release never-asked population can't turn into a single-run
+    stampede against the shared Discogs rate bucket (#879). With the switch
+    off, this falls back to the pre-#1237 behavior -- read whatever PG has,
+    never re-ask.
 
     Structurally invalid ids (``release_id <= 0``) short-circuit before the
     Discogs round-trip — the LML#401 synthesis pattern produces a
@@ -60,7 +88,9 @@ async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id:
     """
     if release_id <= 0:
         return None
-    release = await discogs_service.get_release(release_id)
+    release = await discogs_service.get_release(
+        release_id, require_artwork_answer=allow_release_resolution_fallback
+    )
     if not release:
         return None
 
@@ -87,6 +117,7 @@ async def _bind_resolved_release(
     item: LibraryItem,
     *,
     album: str | None = None,
+    allow_release_resolution_fallback: bool = True,
 ) -> DiscogsSearchResult:
     """Trust-and-bind an already-validated ``ResolvedRelease`` (LML#604).
 
@@ -115,8 +146,17 @@ async def _bind_resolved_release(
       1.0, so a typed-album request keeps the full confidence there.
 
     An in-library bind (id != 0) is never softened.
+
+    ``allow_release_resolution_fallback`` (LML#1237) is forwarded to
+    ``_resolve_fallback_artwork`` unchanged -- it gates the never-asked live
+    re-ask, not the trust-bind itself. Trust-binding a release is unaffected
+    either way; only how its cover is resolved changes.
     """
-    artwork_url = await _resolve_fallback_artwork(discogs_service, release.release_id)
+    artwork_url = await _resolve_fallback_artwork(
+        discogs_service,
+        release.release_id,
+        allow_release_resolution_fallback=allow_release_resolution_fallback,
+    )
     confidence = release.confidence
     if item.id == ROWLESS_LIBRARY_ID and not (album or "").strip():
         confidence = min(confidence, ROWLESS_NO_ALBUM_CONFIDENCE)
@@ -150,7 +190,11 @@ async def fetch_artwork_for_items(
     validated release instead of leaving ``discogs_url`` unbound.
     ``allow_release_resolution_fallback`` is the bulk kill switch — the
     /lookup/bulk drain passes ``False`` so the 35k-album backfill never triggers
-    the per-row Discogs fan-out.
+    the per-row Discogs fan-out. LML#1237 reuses the same switch to gate the
+    never-asked-artwork live re-ask in ``_resolve_fallback_artwork`` /
+    ``_bind_resolved_release`` — a second, artwork-specific flag would let a
+    bulk sweep re-ask Discogs for a slice of the never-asked population even
+    with resolution fallback off, defeating the point of the switch.
 
     ``album`` (the request-level typed album, when present) only gates the A2
     soft-confidence on a row-less carried bind (LML#629): a no-album query's
@@ -216,7 +260,11 @@ async def fetch_artwork_for_items(
                     album_title=item.title or "",
                 )
                 return await _bind_resolved_release(
-                    discogs_service, override_release, item, album=request_album
+                    discogs_service,
+                    override_release,
+                    item,
+                    album=request_album,
+                    allow_release_resolution_fallback=allow_release_resolution_fallback,
                 )
 
             # The widened seam carries a ResolvedRelease; its album_title is the
@@ -248,7 +296,11 @@ async def fetch_artwork_for_items(
             )
             if bind_carried and resolved is not None:
                 return await _bind_resolved_release(
-                    discogs_service, resolved, item, album=request_album
+                    discogs_service,
+                    resolved,
+                    item,
+                    album=request_album,
+                    allow_release_resolution_fallback=allow_release_resolution_fallback,
                 )
 
             # Found-on-compilation trust-bind (LML#684, widened): an in-library
@@ -269,7 +321,11 @@ async def fetch_artwork_for_items(
             # bind_carried branch above, so it is excluded here.
             if found_on_compilation and resolved is not None and item.id != ROWLESS_LIBRARY_ID:
                 return await _bind_resolved_release(
-                    discogs_service, resolved, item, album=request_album
+                    discogs_service,
+                    resolved,
+                    item,
+                    album=request_album,
+                    allow_release_resolution_fallback=allow_release_resolution_fallback,
                 )
 
             album = resolved.album_title if resolved is not None else item.title
@@ -392,11 +448,19 @@ async def fetch_artwork_for_items(
                     )
                     if best is not None:
                         return await _bind_resolved_release(
-                            discogs_service, best, item, album=request_album
+                            discogs_service,
+                            best,
+                            item,
+                            album=request_album,
+                            allow_release_resolution_fallback=allow_release_resolution_fallback,
                         )
                 return None
             if not result.artwork_url:
-                fallback = await _resolve_fallback_artwork(discogs_service, result.release_id)
+                fallback = await _resolve_fallback_artwork(
+                    discogs_service,
+                    result.release_id,
+                    allow_release_resolution_fallback=allow_release_resolution_fallback,
+                )
                 if fallback:
                     result = result.model_copy(update={"artwork_url": fallback})
             return result
