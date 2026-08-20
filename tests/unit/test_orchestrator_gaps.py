@@ -4,13 +4,19 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from core.search import SearchState
 from lookup.artwork import fetch_artwork_for_items
 from lookup.matching import _va_series_title_match, album_title_acceptable
 from lookup.orchestrator import resolve_albums_for_track
+from lookup.release_resolution import ResolvedRelease
 from lookup.strategies.artist_plus_album import search_library_with_fallback
 from lookup.strategies.song_as_artist import search_song_as_artist
 from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
-from lookup.strategies.track_on_compilation import search_compilations_for_track
+from lookup.strategies.track_on_compilation import (
+    TrackOnCompilation,
+    _lacks_tracklist_confirmation,
+    search_compilations_for_track,
+)
 from lookup.strategies.track_release_matching import search_album_fuzzy
 from lookup.validation import filter_results_by_track_validation
 from services.parser import ParsedRequest
@@ -1408,3 +1414,90 @@ class TestFetchArtworkException:
         assert results[0][1] is None
         # Second one should have artwork
         assert results[1][1] is not None
+
+
+# ---------------------------------------------------------------------------
+# TrackOnCompilation.attempt() -- last-resort demotion (LML#1239)
+# ---------------------------------------------------------------------------
+
+
+def _resolved_release(item_id: int) -> ResolvedRelease:
+    return ResolvedRelease(
+        release_id=item_id,
+        release_url=f"https://www.discogs.com/release/{item_id}",
+        is_compilation=True,
+        album_title="Some Compilation",
+    )
+
+
+class TestLacksTracklistConfirmation:
+    """Unit coverage of the LML#1239 admission test in isolation."""
+
+    def test_true_when_no_item_carries_a_discogs_titles_entry(self):
+        """The exact shape the L1018 last-resort branch produces."""
+        item = _item(id=1, artist="Stereolab", title="Peng!")
+        assert _lacks_tracklist_confirmation([item], {}) is True
+
+    def test_false_when_the_item_is_registered(self):
+        """The shape every genuine tracklist-validated match produces."""
+        item = _item(id=1, artist="Stereolab", title="Peng!")
+        assert _lacks_tracklist_confirmation([item], {1: _resolved_release(1)}) is False
+
+    def test_false_for_empty_items(self):
+        """No items is a no-op strategy outcome (Outcome.empty()), not a
+        demotion -- ``TrackOnCompilation.attempt()`` never reaches this
+        predicate on that path, but the predicate itself must not claim
+        confirmation is lacking for nothing."""
+        assert _lacks_tracklist_confirmation([], {}) is False
+
+
+class TestTrackOnCompilationAttemptDemotion:
+    """``TrackOnCompilation.attempt()`` routes on whether the execute func's
+    items earned a ``discogs_titles`` entry (LML#1239)."""
+
+    @pytest.mark.asyncio
+    async def test_last_resort_only_items_are_demoted_not_asserted(self):
+        """A keyword-only hit (no ``discogs_titles`` entry) comes back as
+        ``song_not_found=True`` / ``found_on_compilation`` left False --
+        never as a confirmed compilation find."""
+        item = _item(id=1, artist="Stereolab", title="Peng!")
+        execute = AsyncMock(return_value=([item], {}))
+        strategy = TrackOnCompilation(db=AsyncMock(), execute=execute)
+        parsed = ParsedRequest(artist="Stereolab", song="Zzyzx Marginal Fanfare", raw_message="x")
+
+        outcome = await strategy.attempt(parsed, SearchState(results=[]), "x")
+
+        assert outcome.items == [item]
+        assert outcome.song_not_found_after is True
+        assert outcome.found_on_compilation_after is False
+        assert outcome.preserve_prior_results_as_fallback is False
+
+    @pytest.mark.asyncio
+    async def test_tracklist_validated_items_still_confirm(self):
+        """A genuinely validated match (registered in ``discogs_titles``) is
+        unaffected -- still the full ``Outcome.compilation()`` signal."""
+        item = _item(id=1, artist="Various Artists", title="Peng! (Comp)")
+        titles = {1: _resolved_release(1)}
+        execute = AsyncMock(return_value=([item], titles))
+        strategy = TrackOnCompilation(db=AsyncMock(), execute=execute)
+        parsed = ParsedRequest(artist="Stereolab", song="Prisoner of Mars", raw_message="x")
+
+        outcome = await strategy.attempt(parsed, SearchState(results=[]), "x")
+
+        assert outcome.items == [item]
+        assert outcome.song_not_found_after is False
+        assert outcome.found_on_compilation_after is True
+        assert outcome.preserve_prior_results_as_fallback is True
+        assert outcome.discogs_titles == titles
+
+    @pytest.mark.asyncio
+    async def test_no_items_is_a_plain_no_op(self):
+        execute = AsyncMock(return_value=([], {}))
+        strategy = TrackOnCompilation(db=AsyncMock(), execute=execute)
+        parsed = ParsedRequest(artist="Stereolab", song="Prisoner of Mars", raw_message="x")
+
+        outcome = await strategy.attempt(parsed, SearchState(results=[]), "x")
+
+        assert outcome.items == []
+        assert outcome.song_not_found_after is None
+        assert outcome.found_on_compilation_after is False
