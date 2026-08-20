@@ -579,6 +579,39 @@ class Settings(BaseSettings):
             "source-stamped rows + flip False. See WXYC/library-metadata-lookup#850."
         ),
     )
+    lml_resolve_sibling_pressing_artwork: bool = Field(
+        default=False,
+        description=(
+            "When True, the artwork fallback cascade (_resolve_fallback_artwork in "
+            "lookup/artwork.py) tries a sibling pressing of the same album -- via "
+            "the release's master_id, resolve_sibling_artwork in "
+            "lookup/sibling_artwork.py -- between the release's own cover (which "
+            "LML#1242's require_artwork_answer re-ask must have already asked "
+            "Discogs about) and the artist-image fallback. Cache-first "
+            "(DiscogsCacheService.get_sibling_release_artwork, answering only from "
+            "artwork_url IS NOT NULL AND NOT not_found rows), then one bounded live "
+            "get_master + get_release check gated on the same "
+            "allow_release_resolution_fallback bulk kill switch the cover rung uses. "
+            "Default False -- but NOT for the reason this flag originally carried. "
+            "The index blocker is discharged: idx_release_master_id was absent from "
+            "the prod release table (WXYC/discogs-etl#412, the cache leg a measured "
+            "192ms full scan of all 148,491 rows), was created there 2026-08-20 "
+            "(EXPLAIN after: 0.069ms, 5 buffers), and WXYC/discogs-etl#415 makes it "
+            "survive the copy-swap rebuild that had been dropping it. What keeps the "
+            "flag off is now VALUE, not viability. Measured against the known-failed "
+            "population the whole rung recovers 40 of 4,139 rows -- 0.97% -- and "
+            "WXYC/discogs-etl#413 shows that ceiling belongs to the cache's dedup "
+            "ranking rather than to this code: 8,431 masters have exactly one "
+            "pressing cached and no artwork on it, so the cheap cache leg has no "
+            "sibling to find for them. Those are precisely the misses that fall "
+            "through to the live leg, where get_master has no PG cache and every "
+            "call is a live Discogs round-trip on the interactive artwork-miss path. "
+            "Flipping True today therefore spends a live round-trip on the misses "
+            "LEAST likely to be recoverable, to buy ~1%. Re-measure once #413 widens "
+            "what dedup retains -- that number, not the index, should decide the "
+            "flip. See WXYC/library-metadata-lookup#1237 and #1241."
+        ),
+    )
     lml_location_union_enabled: bool = Field(
         default=True,
         description=(

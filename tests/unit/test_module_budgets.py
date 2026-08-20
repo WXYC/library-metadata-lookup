@@ -287,6 +287,18 @@ MODULE_BUDGETS: dict[str, int] = {
     # multiple of 50 at or above 1.3x the post-change 959-line size.
     "lookup/router.py": 1250,
     "lookup/rowless.py": 450,
+    # LML#1237/#1241: the sibling-pressing artwork rung, extracted out of
+    # lookup/artwork.py (which sat at 488/500 on main, with no headroom left
+    # for a second new rung) rather than appended -- the same extract-don't-
+    # append policy that produced rowless.py and the enrichment/ probe
+    # modules. A self-contained concern: resolve_sibling_artwork has no
+    # dependency on fetch_artwork_for_items's control flow, only on the
+    # release _resolve_fallback_artwork already fetched. Most of the module
+    # is docstring -- the cost/ordering/gating rationale is load-bearing
+    # context for why this rung runs where it does and defaults off (LML#1241
+    # review, WXYC/discogs-etl#412). 1.3x its 143-line measured size (185.9)
+    # -> smallest multiple of 50 at or above that.
+    "lookup/sibling_artwork.py": 200,
     "lookup/server_timing_legs.py": 100,
     "lookup/spine_deadline.py": 250,
     "lookup/strategies/__init__.py": 150,
