@@ -21,6 +21,7 @@ from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
 from config.settings import Settings, get_settings
+from core.build_info import COMMIT_SHA_PATH, resolve_commit_sha
 from core.bulk_body import parse_bulk_body
 from core.bulk_concurrency import (
     ClientDisconnectedWhileQueuedError,
@@ -83,6 +84,7 @@ from lookup.location_union import (
     LOCATION_UNION_INDEX_HIT_STAT_KEY,
     LOCATION_UNION_INDEX_MISS_STAT_KEY,
 )
+from lookup.miss_kind import miss_telemetry_properties
 from lookup.models import (
     BulkLookupRequest,
     BulkLookupResponse,
@@ -107,6 +109,13 @@ if TYPE_CHECKING:
     from posthog import Posthog
 
 logger = logging.getLogger(__name__)
+
+# Deployed commit, bound ONCE at import (LML#1233). `/lookup` is the hot path
+# and `resolve_commit_sha` reads a file, so a per-request call here would be
+# the class of tax LML#949 removed. `/health` deliberately does NOT share this
+# binding — it re-resolves per request because the deploy-reconciliation gate
+# reads its answer and a stale SHA there would be worse than none.
+COMMIT_SHA: str | None = resolve_commit_sha(COMMIT_SHA_PATH)
 
 router = APIRouter(tags=["lookup"])
 
@@ -802,6 +811,9 @@ async def handle_lookup(
                 {
                     "results_count": len(results),
                     "search_type": response.search_type,
+                    # LML#1233 miss attribution (7 keys). `search_type` above
+                    # is NOT a miss signal -- see `lookup/miss_kind.py`.
+                    **miss_telemetry_properties(response, commit_sha=COMMIT_SHA),
                     "had_artist": bool(request.artist),
                     "had_album": bool(request.album),
                     "had_song": bool(request.song),
@@ -1196,6 +1208,11 @@ async def handle_bulk_lookup(
                     "error_count": counts["error"],
                     "max_concurrent": max_concurrent,
                     "endpoint_family": ENDPOINT_FAMILY_LOOKUP_BULK,
+                    # Deploy attribution only (LML#1233): this payload is
+                    # batch-level and has no `response` to derive `miss_kind`
+                    # from. Bulk already carries `no_match_count`, and the
+                    # Layer 2 alert scopes to `endpoint_family = 'lookup'`.
+                    "commit_sha": COMMIT_SHA,
                     "low_priority": True,
                     "environment": get_settings().environment,  # LML#1170
                     **({"caller_reason": x_caller_reason} if x_caller_reason is not None else {}),

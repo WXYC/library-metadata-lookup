@@ -31,7 +31,6 @@ collapse to ``app.include_router(readiness_router(...))``.
 
 import asyncio
 import logging
-import os
 from pathlib import Path
 
 from fastapi import APIRouter, Depends
@@ -39,6 +38,8 @@ from fastapi.responses import JSONResponse
 from wxyc_fastapi.healthcheck import DEFAULT_TIMEOUT_SECONDS, Check
 
 from config.settings import Settings, get_settings
+from core import build_info
+from core.build_info import resolve_commit_sha
 from core.dependencies import get_discogs_service, get_library_db
 from discogs.breaker import BreakerState
 from discogs.live_request_counter import get_discogs_live_requests_total
@@ -52,15 +53,11 @@ router = APIRouter(tags=["health"])
 
 CORE_SERVICES = {"database"}
 
-# A blank ``COMMIT_SHA`` placeholder is tracked at the repo root; CI's "Record
-# deployed commit SHA" step overwrites it with the deployed commit before
-# ``railway up``. Two filters must NOT exclude it, or it silently never reaches
-# the running image (re-null-ing commit_sha): ``.gitignore`` — ``railway up``
-# honors it and would drop the file from the upload tarball; and ``.dockerignore``
-# — the Dockerfile build (``railway.toml`` builder=DOCKERFILE, ``COPY . .``)
-# honors it and would drop the file from the image. See ``_resolve_commit_sha``
-# and WXYC/library-metadata-lookup#509.
-COMMIT_SHA_PATH = Path(__file__).resolve().parent.parent / "COMMIT_SHA"
+# Re-bound from ``core.build_info`` (LML#1233) so the file location has one
+# definition, while this module global stays the seam tests redirect via
+# ``monkeypatch.setattr(health, "COMMIT_SHA_PATH", ...)``. See that module for
+# the .gitignore / .dockerignore constraints on the file itself.
+COMMIT_SHA_PATH = build_info.COMMIT_SHA_PATH
 
 
 def _resolve_commit_sha(commit_sha_path: Path | None = None) -> str | None:
@@ -84,23 +81,19 @@ def _resolve_commit_sha(commit_sha_path: Path | None = None) -> str | None:
     Empty / whitespace-only values at any tier are treated as absent so the
     documented "null when unset" contract holds, and downstream deploy-gate
     equality checks (e.g. WXYC/Backend-Service#1361) are never fooled by ``""``.
+
+    The resolution itself lives in ``core.build_info.resolve_commit_sha``
+    (LML#1233), which ``lookup/router.py`` also uses to stamp the deployed SHA
+    onto ``lookup_completed``. This wrapper is kept — rather than callers
+    reaching for the ``core`` helper directly — because the module-global
+    indirection above IS the test seam, and it must be re-read on every call.
+    That is also why the shared helper takes its path as a required argument
+    and does no caching of its own: ``/health`` is called per request and the
+    deploy gate reads its answer, so a stale SHA here would be worse than none.
     """
     if commit_sha_path is None:
         commit_sha_path = COMMIT_SHA_PATH
-    try:
-        # utf-8-sig drops a leading BOM if some editor/tool wrote one; plain
-        # ``.strip()`` would leave ``﻿`` and break exact-equality gates.
-        file_sha = commit_sha_path.read_text(encoding="utf-8-sig").strip()
-    except (OSError, ValueError):
-        # OSError: missing file / dir-at-path / permission. ValueError covers
-        # UnicodeDecodeError (a corrupt, non-UTF-8 file). ``/health`` is the
-        # Railway healthcheck path and must never 500 on a bad identity file —
-        # degrade to the env / None tiers instead.
-        file_sha = ""
-    if file_sha:
-        return file_sha
-    env_sha = (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "").strip()
-    return env_sha or None
+    return resolve_commit_sha(commit_sha_path)
 
 
 async def _check_database(db: LibraryDB) -> str:

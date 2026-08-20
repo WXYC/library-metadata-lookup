@@ -188,6 +188,13 @@ MODULE_BUDGETS: dict[str, int] = {
     # or above the new measured size.
     "lookup/location_union.py": 300,
     "lookup/matching.py": 550,
+    # LML#1233 miss taxonomy. Carved out of `lookup/router.py` rather than
+    # written at its `send_to_posthog` site, which had 27 lines of headroom
+    # against its own ceiling — the same extract-don't-append policy that
+    # produced `endpoint_family.py` and `server_timing_legs.py`. Sized by the
+    # standard formula: smallest multiple of 50 at or above 1.3x the 93-line
+    # post-change size.
+    "lookup/miss_kind.py": 150,
     "lookup/models.py": 150,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
     # transparent-fold calibration): the location-union task is now threaded
