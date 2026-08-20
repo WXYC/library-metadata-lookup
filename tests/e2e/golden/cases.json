@@ -1,0 +1,3343 @@
+[
+  {
+    "id": "lml1184-arabian-prince-nonsense-track",
+    "shape": "artist_song",
+    "frozen": true,
+    "issue": "LML#1184",
+    "note": "The control for the case above, and the diagnostic the issue itself used: when Discogs finds nothing, the artist fallback works and both shelved rows come back. Frozen alongside it so a change that 'fixes' the compilation case by disabling the fallback altogether cannot pass.",
+    "query": {
+      "artist": "Arabian Prince",
+      "song": "Qqzzx Nonexistent Track"
+    },
+    "requires_rows": [
+      [
+        "Arabian Prince",
+        "Brother Arab"
+      ],
+      [
+        "Arabian Prince",
+        "Innovative Life: The Anthology 1984-1989"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#99 Arabian Prince — Brother Arab",
+        "#54515 Arabian Prince — Innovative Life: The Anthology 1984-1989"
+      ]
+    }
+  },
+  {
+    "id": "lml1184-arabian-prince-strange-life",
+    "shape": "artist_song",
+    "frozen": true,
+    "issue": "LML#1184",
+    "note": "A track that resolves to a compilation WXYC does not shelve must not erase the artist's own shelved albums. In production the row-less compilation item REPLACED both Arabian Prince rows, so the caller got a single id=0 result pointing at a record nobody can pull off the shelf. miss_kind is 'hit' before and after the fix -- only the result list moved, which is why the verdict has to carry it.",
+    "query": {
+      "artist": "Arabian Prince",
+      "song": "Strange Life"
+    },
+    "settings": {
+      "lml_resolve_nonlibrary_release": true
+    },
+    "requires_discogs": true,
+    "requires_routes": [
+      "track:strange life|arabian prince"
+    ],
+    "requires_rows": [
+      [
+        "Arabian Prince",
+        "Brother Arab"
+      ],
+      [
+        "Arabian Prince",
+        "Innovative Life: The Anthology 1984-1989"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#0 row-less: Arabian Prince — Chrome Children Vol. 2",
+        "#99 Arabian Prince — Brother Arab",
+        "#54515 Arabian Prince — Innovative Life: The Anthology 1984-1989"
+      ]
+    }
+  },
+  {
+    "id": "lml1225-space-lizzard-battle-star",
+    "shape": "song_only",
+    "frozen": true,
+    "issue": "LML#1225",
+    "note": "The query-coverage gate must REJECT a tracklist entry that is a sub-phrase of the typed query. Discogs release 6194406 carries B2 'Battle For Space'; token_set_ratio against 'space lizzard battle star hell cat' is 85.71, over the 85 fuzzy threshold, and the shelved Population One row came back with song_not_found=false -- an uncaveated confident hit for a song that does not exist.",
+    "query": {
+      "song": "Space Lizzard Battle Star"
+    },
+    "requires_discogs": true,
+    "requires_routes": [
+      "track:space lizzard battle star|"
+    ],
+    "requires_rows": [
+      [
+        "Population One",
+        "Theater of a confused Mind"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "lml717-lone-galaxy-garden",
+    "shape": "artist_album_song",
+    "frozen": true,
+    "issue": "LML#717",
+    "note": "A non-library release plus an album title that fuzz-collides with a WRONG-ARTIST library row (Lone / 'Galaxy Garden' vs Galaxy 2 Galaxy / 'Galaxy to Galaxy', token_set_ratio 80). The wrong row must not surface: in production it did, and because it was a non-empty result it structurally preempted the non-library resolver. Note what the verdict has to carry to see this: before the fix the response was ALSO a hit (one row, Galaxy 2 Galaxy / 'Galaxy to Galaxy', found_on_compilation true), so miss_kind is identical on both sides and only the result identity distinguishes them.",
+    "query": {
+      "artist": "Lone",
+      "album": "Galaxy Garden",
+      "song": "Crystal Caverns 1991"
+    },
+    "requires_discogs": true,
+    "requires_routes": [
+      "search:lone|galaxy garden"
+    ],
+    "requires_rows": [
+      [
+        "Galaxy 2 Galaxy",
+        "Galaxy to Galaxy"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#0 row-less: Lone (2) — Galaxy Garden"
+      ]
+    }
+  },
+  {
+    "id": "lml801-aphex-twin-fingerbib-cold-cache",
+    "shape": "artist_song",
+    "frozen": true,
+    "issue": "LML#801 / LML#802",
+    "note": "The same recall gap as the case above, through the mechanism that actually broke. There is deliberately NO track route for 'Fingerbib', so the Discogs track search comes back empty -- which is exactly what LML#802's CTE prune did in production, and what a cold or degraded cache does generally. ARTIST_PLUS_ALBUM then falls through to the artist-only leg, which returns the whole eighteen-row Aphex Twin shelf, and *Richard D. James Album* sits eighth. Before LML#808 track validation only ever saw the top MAX_SEARCH_RESULTS rows by rowid, so the album carrying the track was dropped before anything could confirm it and the caller got five unrelated releases with song_not_found=true. Every shelf row is independently resolvable in the Discogs fixture (SHELF_RELEASE_ARTISTS), because that per-row search is what the widened validation walks.",
+    "query": {
+      "artist": "Aphex Twin",
+      "song": "Fingerbib"
+    },
+    "requires_discogs": true,
+    "requires_routes": [
+      "search:aphex twin|richard d. james album"
+    ],
+    "requires_rows": [
+      [
+        "Aphex Twin",
+        "Richard D. James Album"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#87 Aphex Twin — Richard D. James Album"
+      ]
+    }
+  },
+  {
+    "id": "lml801-aphex-twin-milkman",
+    "shape": "artist_song",
+    "frozen": true,
+    "issue": "LML#801 / LML#802",
+    "note": "Artist+track must surface the one shelved album that carries the track, even though it sits eighth on an eighteen-row shelf. In production the artist-only fallback truncated to the first five rows by rowid and *Richard D. James Album* never entered the returned set. song_not_found=False is the load-bearing half: it asserts the track was CONFIRMED, not that the shelf happened to rank right.",
+    "query": {
+      "artist": "Aphex Twin",
+      "song": "Milkman"
+    },
+    "requires_discogs": true,
+    "requires_routes": [
+      "track:milkman|aphex twin"
+    ],
+    "requires_rows": [
+      [
+        "Aphex Twin",
+        "Richard D. James Album"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#87 Aphex Twin — Richard D. James Album"
+      ]
+    }
+  },
+  {
+    "id": "ab-a-tribe-called-quest-the-low-end-theory",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "A Tribe Called Quest",
+      "album": "The Low End Theory"
+    },
+    "requires_rows": [
+      [
+        "A Tribe Called Quest",
+        "The Low End Theory"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#9 A Tribe Called Quest — The Low End Theory"
+      ]
+    }
+  },
+  {
+    "id": "ab-angel-olsen-big-time",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Angel Olsen",
+      "album": "Big Time"
+    },
+    "requires_rows": [
+      [
+        "Angel Olsen",
+        "Big Time"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#69631 Angel Olsen — Big Time"
+      ]
+    }
+  },
+  {
+    "id": "ab-animal-collective-hollinndagain",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Animal Collective",
+      "album": "Hollinndagain"
+    },
+    "requires_rows": [
+      [
+        "Animal Collective",
+        "Hollinndagain"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#49892 Animal Collective — Hollinndagain"
+      ]
+    }
+  },
+  {
+    "id": "ab-aphex-twin-classics",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Aphex Twin",
+      "album": "Classics"
+    },
+    "requires_rows": [
+      [
+        "Aphex Twin",
+        "Classics"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#84 Aphex Twin — Classics"
+      ]
+    }
+  },
+  {
+    "id": "ab-aphex-twin-hangable-auto-bulb",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Aphex Twin",
+      "album": "Hangable Auto Bulb"
+    },
+    "requires_rows": [
+      [
+        "Aphex Twin",
+        "Hangable Auto Bulb"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#86 Aphex Twin — Hangable Auto Bulb 12\"",
+        "#48779 Aphex Twin — Hangable Auto Bulb"
+      ]
+    }
+  },
+  {
+    "id": "ab-aphex-twin-polyson-window",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Aphex Twin",
+      "album": "Polyson Window"
+    },
+    "requires_rows": [
+      [
+        "Aphex Twin",
+        "Polyson Window"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#85 Aphex Twin — Polyson Window"
+      ]
+    }
+  },
+  {
+    "id": "ab-aphex-twin-raising-the-titanic",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Aphex Twin",
+      "album": "Raising The Titanic"
+    },
+    "requires_rows": [
+      [
+        "Aphex Twin",
+        "Raising The Titanic"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#82 Aphex Twin — Raising The Titanic"
+      ]
+    }
+  },
+  {
+    "id": "ab-aphex-twin-selected-ambient-works-vol-1-85-92",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Aphex Twin",
+      "album": "Selected Ambient works vol 1, '85-'92"
+    },
+    "requires_rows": [
+      [
+        "Aphex Twin",
+        "Selected Ambient works vol 1, '85-'92"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#89 Aphex Twin — Selected Ambient works vol 1, '85-'92"
+      ]
+    }
+  },
+  {
+    "id": "ab-aphex-twin-selected-ambient-works-vol-2",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Aphex Twin",
+      "album": "Selected Ambient works vol 2"
+    },
+    "requires_rows": [
+      [
+        "Aphex Twin",
+        "Selected Ambient works vol 2"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#80 Aphex Twin — Selected Ambient works vol 2"
+      ]
+    }
+  },
+  {
+    "id": "ab-aphex-twin-windolicker",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Aphex Twin",
+      "album": "Windolicker"
+    },
+    "requires_rows": [
+      [
+        "Aphex Twin",
+        "Windolicker"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#90 Aphex Twin — Windolicker"
+      ]
+    }
+  },
+  {
+    "id": "ab-arthur-russell-corn",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Arthur Russell",
+      "album": "Corn"
+    },
+    "requires_rows": [
+      [
+        "Arthur Russell",
+        "Corn"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#64903 Arthur Russell — Corn"
+      ]
+    }
+  },
+  {
+    "id": "ab-arthur-russell-master-mix-red-hot-and-arthur-russell",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Arthur Russell",
+      "album": "Master Mix: Red Hot and Arthur Russell"
+    },
+    "requires_rows": [
+      [
+        "Arthur Russell",
+        "Master Mix: Red Hot and Arthur Russell"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#64655 Arthur Russell — Master Mix: Red Hot and Arthur Russell"
+      ]
+    }
+  },
+  {
+    "id": "ab-arthur-russell-pictures-of-bunny-rabbit",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Arthur Russell",
+      "album": "Pictures of Bunny Rabbit"
+    },
+    "requires_rows": [
+      [
+        "Arthur Russell",
+        "Pictures of Bunny Rabbit"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#70232 Arthur Russell — Pictures of Bunny Rabbit"
+      ]
+    }
+  },
+  {
+    "id": "ab-autechre-all-tomorrow-s-parties",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Autechre",
+      "album": "All tomorrow's parties"
+    },
+    "requires_rows": [
+      [
+        "Autechre",
+        "All tomorrow's parties"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#65882 Autechre — All tomorrow's parties"
+      ]
+    }
+  },
+  {
+    "id": "ab-autechre-confield",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Autechre",
+      "album": "Confield"
+    },
+    "requires_rows": [
+      [
+        "Autechre",
+        "Confield"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#65880 Autechre — Confield"
+      ]
+    }
+  },
+  {
+    "id": "ab-beach-house-devotion",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Beach House",
+      "album": "Devotion"
+    },
+    "requires_rows": [
+      [
+        "Beach House",
+        "Devotion"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#51000 Beach House — Devotion"
+      ]
+    }
+  },
+  {
+    "id": "ab-billie-holiday-fine-and-mellow",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Billie Holiday",
+      "album": "Fine and Mellow"
+    },
+    "requires_rows": [
+      [
+        "Billie Holiday",
+        "Fine and Mellow"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#6052 Billie Holiday — Fine and Mellow"
+      ]
+    }
+  },
+  {
+    "id": "ab-billie-holiday-first-issue-great-american-songbook",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Billie Holiday",
+      "album": "First Issue, Great American Songbook"
+    },
+    "requires_rows": [
+      [
+        "Billie Holiday",
+        "First Issue, Great American Songbook"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#6056 Billie Holiday — First Issue, Great American Songbook"
+      ]
+    }
+  },
+  {
+    "id": "ab-billie-holiday-first-verve-sessions",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Billie Holiday",
+      "album": "First Verve Sessions"
+    },
+    "requires_rows": [
+      [
+        "Billie Holiday",
+        "First Verve Sessions"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#6042 Billie Holiday — First Verve Sessions"
+      ]
+    }
+  },
+  {
+    "id": "ab-billie-holiday-the-essential-billie-holiday-carnegie-hall",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Billie Holiday",
+      "album": "The Essential Billie Holiday: Carnegie Hall"
+    },
+    "requires_rows": [
+      [
+        "Billie Holiday",
+        "The Essential Billie Holiday: Carnegie Hall"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#46813 Billie Holiday — The Essential Billie Holiday: Carnegie Hall"
+      ]
+    }
+  },
+  {
+    "id": "ab-billie-holiday-the-original-recordings",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Billie Holiday",
+      "album": "The Original Recordings"
+    },
+    "requires_rows": [
+      [
+        "Billie Holiday",
+        "The Original Recordings"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#6039 Billie Holiday — The Original Recordings"
+      ]
+    }
+  },
+  {
+    "id": "ab-billie-holiday-the-quintessential-billie-holiday-vol-4-1937",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Billie Holiday",
+      "album": "The Quintessential Billie Holiday vol. 4 (1937)"
+    },
+    "requires_rows": [
+      [
+        "Billie Holiday",
+        "The Quintessential Billie Holiday vol. 4 (1937)"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#6049 Billie Holiday — The Quintessential Billie Holiday vol. 4 (1937)"
+      ]
+    }
+  },
+  {
+    "id": "ab-billie-holiday-the-quintessential-billie-holiday-vol-5-1937",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Billie Holiday",
+      "album": "The Quintessential Billie Holiday vol. 5 (1937-38)"
+    },
+    "requires_rows": [
+      [
+        "Billie Holiday",
+        "The Quintessential Billie Holiday vol. 5 (1937-38)"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#6050 Billie Holiday — The Quintessential Billie Holiday vol. 5 (1937-38)"
+      ]
+    }
+  },
+  {
+    "id": "ab-billie-holiday-the-quintessential-billie-holiday-vol-9-1940",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Billie Holiday",
+      "album": "The Quintessential Billie Holiday vol. 9 (1940-42)"
+    },
+    "requires_rows": [
+      [
+        "Billie Holiday",
+        "The Quintessential Billie Holiday vol. 9 (1940-42)"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#6053 Billie Holiday — The Quintessential Billie Holiday vol. 9 (1940-42)"
+      ]
+    }
+  },
+  {
+    "id": "ab-billie-holiday-this-is-jazz-vol-15",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Billie Holiday",
+      "album": "This is jazz, vol. 15"
+    },
+    "requires_rows": [
+      [
+        "Billie Holiday",
+        "This is jazz, vol. 15"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#69255 Billie Holiday — This is jazz, vol. 15"
+      ]
+    }
+  },
+  {
+    "id": "ab-blood-orange-coastal-grooves",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Blood Orange",
+      "album": "Coastal Grooves"
+    },
+    "requires_rows": [
+      [
+        "Blood Orange",
+        "Coastal Grooves"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#70651 Blood Orange — Coastal Grooves"
+      ]
+    }
+  },
+  {
+    "id": "ab-boards-of-canada-tomorrow-s-harvest",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Boards of Canada",
+      "album": "Tomorrow's Harvest"
+    },
+    "requires_rows": [
+      [
+        "Boards of Canada",
+        "Tomorrow's Harvest"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#62915 Boards of Canada — Tomorrow's Harvest"
+      ]
+    }
+  },
+  {
+    "id": "ab-brian-eno-ambient-5-apollo",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Brian Eno",
+      "album": "Ambient 5 - Apollo"
+    },
+    "requires_rows": [
+      [
+        "Brian Eno",
+        "Ambient 5 - Apollo"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#24478 Brian Eno — Ambient 5 - Apollo"
+      ]
+    }
+  },
+  {
+    "id": "ab-brian-eno-begegnungen",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Brian Eno",
+      "album": "Begegnungen"
+    },
+    "requires_rows": [
+      [
+        "Brian Eno",
+        "Begegnungen"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#24804 Brian Eno — Begegnungen"
+      ]
+    }
+  },
+  {
+    "id": "ab-brian-eno-discreet-music",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Brian Eno",
+      "album": "Discreet Music"
+    },
+    "requires_rows": [
+      [
+        "Brian Eno",
+        "Discreet Music"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#24641 Brian Eno — Discreet Music"
+      ]
+    }
+  },
+  {
+    "id": "ab-brian-eno-june-1-1974",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Brian Eno",
+      "album": "June 1, 1974"
+    },
+    "requires_rows": [
+      [
+        "Brian Eno",
+        "June 1, 1974"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#24242 Brian Eno — June 1, 1974"
+      ]
+    }
+  },
+  {
+    "id": "ab-brian-eno-music-for-films",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Brian Eno",
+      "album": "Music for Films"
+    },
+    "requires_rows": [
+      [
+        "Brian Eno",
+        "Music for Films"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#24779 Brian Eno — Music for Films"
+      ]
+    }
+  },
+  {
+    "id": "ab-brian-eno-the-pearl",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Brian Eno",
+      "album": "The Pearl"
+    },
+    "requires_rows": [
+      [
+        "Brian Eno",
+        "The Pearl"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#24744 Brian Eno — The Pearl"
+      ]
+    }
+  },
+  {
+    "id": "ab-broadcast-pendelum",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Broadcast",
+      "album": "Pendelum"
+    },
+    "requires_rows": [
+      [
+        "Broadcast",
+        "Pendelum"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#37326 Broadcast — Pendelum"
+      ]
+    }
+  },
+  {
+    "id": "ab-broadcast-the-noise-made-by-people",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Broadcast",
+      "album": "The Noise Made by People"
+    },
+    "requires_rows": [
+      [
+        "Broadcast",
+        "The Noise Made by People"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#16735 Broadcast — The Noise Made by People"
+      ]
+    }
+  },
+  {
+    "id": "ab-broadcast-work-and-nonwork",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Broadcast",
+      "album": "Work and Nonwork"
+    },
+    "requires_rows": [
+      [
+        "Broadcast",
+        "Work and Nonwork"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#16734 Broadcast — Work and Nonwork"
+      ]
+    }
+  },
+  {
+    "id": "ab-burial-chemz-dolphinz",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Burial",
+      "album": "Chemz / Dolphinz"
+    },
+    "requires_rows": [
+      [
+        "Burial",
+        "Chemz / Dolphinz"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#69097 Burial — Chemz / Dolphinz"
+      ]
+    }
+  },
+  {
+    "id": "ab-caetano-veloso-estrangeiro",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Caetano Veloso",
+      "album": "Estrangeiro"
+    },
+    "requires_rows": [
+      [
+        "Caetano Veloso",
+        "Estrangeiro"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#57302 Caetano Veloso — Estrangeiro"
+      ]
+    }
+  },
+  {
+    "id": "ab-caetano-veloso-music-typewriter",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Caetano Veloso",
+      "album": "Music Typewriter"
+    },
+    "requires_rows": [
+      [
+        "Caetano Veloso",
+        "Music Typewriter"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#57307 Caetano Veloso — Music Typewriter"
+      ]
+    }
+  },
+  {
+    "id": "ab-caetano-veloso-prenda-minha",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Caetano Veloso",
+      "album": "Prenda Minha"
+    },
+    "requires_rows": [
+      [
+        "Caetano Veloso",
+        "Prenda Minha"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#57306 Caetano Veloso — Prenda Minha"
+      ]
+    }
+  },
+  {
+    "id": "ab-cat-power-moon-pix",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Cat Power",
+      "album": "moon pix"
+    },
+    "requires_rows": [
+      [
+        "Cat Power",
+        "moon pix"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#17737 Cat Power — Moon Pix",
+        "#50792 Cat Power — moon pix"
+      ]
+    }
+  },
+  {
+    "id": "ab-cat-power-myra-lee",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Cat Power",
+      "album": "Myra Lee"
+    },
+    "requires_rows": [
+      [
+        "Cat Power",
+        "Myra Lee"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#17735 Cat Power — Myra Lee"
+      ]
+    }
+  },
+  {
+    "id": "ab-cat-power-the-covers-record",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Cat Power",
+      "album": "The Covers Record"
+    },
+    "requires_rows": [
+      [
+        "Cat Power",
+        "The Covers Record"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#17738 Cat Power — The Covers Record"
+      ]
+    }
+  },
+  {
+    "id": "ab-charles-mingus-let-my-children-hear-music",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Charles Mingus",
+      "album": "Let My Children Hear Music"
+    },
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "Let My Children Hear Music"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7102 Charles Mingus — Let My Children Hear Music"
+      ]
+    }
+  },
+  {
+    "id": "ab-charles-mingus-mingus-at-carnegie-hall",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Charles Mingus",
+      "album": "Mingus At Carnegie Hall"
+    },
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "Mingus At Carnegie Hall"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7104 Charles Mingus — Mingus At Carnegie Hall"
+      ]
+    }
+  },
+  {
+    "id": "ab-charles-mingus-mingus-moves",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Charles Mingus",
+      "album": "Mingus Moves"
+    },
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "Mingus Moves"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7103 Charles Mingus — Mingus Moves"
+      ]
+    }
+  },
+  {
+    "id": "ab-charles-mingus-mingus-plays-piano-spontaneous-compositions-",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Charles Mingus",
+      "album": "Mingus Plays Piano (Spontaneous Compositions and Improvisations)"
+    },
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "Mingus Plays Piano (Spontaneous Compositions and Improvisations)"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7139 Charles Mingus — Mingus Plays Piano (Spontaneous Compositions and Improvisations)"
+      ]
+    }
+  },
+  {
+    "id": "ab-charles-mingus-portrait",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Charles Mingus",
+      "album": "Portrait"
+    },
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "Portrait"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7134 Charles Mingus — Portrait"
+      ]
+    }
+  },
+  {
+    "id": "ab-charles-mingus-something-like-a-bird",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Charles Mingus",
+      "album": "Something Like a Bird"
+    },
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "Something Like a Bird"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7117 Charles Mingus — Something Like a Bird"
+      ]
+    }
+  },
+  {
+    "id": "ab-charles-mingus-the-art-of-charles-mingus",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Charles Mingus",
+      "album": "The Art of Charles Mingus"
+    },
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "The Art of Charles Mingus"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7135 Charles Mingus — The Art of Charles Mingus"
+      ]
+    }
+  },
+  {
+    "id": "ab-charles-mingus-three-or-four-shades-of-blue",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Charles Mingus",
+      "album": "Three or Four Shades of Blue"
+    },
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "Three or Four Shades of Blue"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7107 Charles Mingus — Three or Four Shades of Blue"
+      ]
+    }
+  },
+  {
+    "id": "ab-chuquimamani-condori-dj-e",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Chuquimamani-Condori",
+      "album": "DJ E"
+    },
+    "requires_rows": [
+      [
+        "Chuquimamani-Condori",
+        "DJ E"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#70755 Chuquimamani-Condori — DJ E"
+      ]
+    }
+  },
+  {
+    "id": "ab-cocteau-twins-carousel",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Cocteau Twins",
+      "album": "Carousel"
+    },
+    "requires_rows": [
+      [
+        "Cocteau Twins",
+        "Carousel"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#70586 Cocteau Twins — Carousel"
+      ]
+    }
+  },
+  {
+    "id": "ab-cocteau-twins-victorialand-tiny-dynamite-echoes-in-a-shall",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Cocteau Twins",
+      "album": "Victorialand / tiny dynamite / echoes in a shallow bay"
+    },
+    "requires_rows": [
+      [
+        "Cocteau Twins",
+        "Victorialand / tiny dynamite / echoes in a shallow bay"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#70729 Cocteau Twins — Victorialand / tiny dynamite / echoes in a shallow bay"
+      ]
+    }
+  },
+  {
+    "id": "ab-colin-stetson-all-this-i-do-for-glory",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Colin Stetson",
+      "album": "All this I do for Glory"
+    },
+    "requires_rows": [
+      [
+        "Colin Stetson",
+        "All this I do for Glory"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#66894 Colin Stetson — All this I do for Glory"
+      ]
+    }
+  },
+  {
+    "id": "ab-colin-stetson-never-were-the-way-she-was",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Colin Stetson",
+      "album": "Never were the way she was"
+    },
+    "requires_rows": [
+      [
+        "Colin Stetson",
+        "Never were the way she was"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#64736 Colin Stetson — Never were the way she was"
+      ]
+    }
+  },
+  {
+    "id": "ab-dam-funk-invite-the-light",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Dam-Funk",
+      "album": "Invite the Light"
+    },
+    "requires_rows": [
+      [
+        "Dam-Funk",
+        "Invite the Light"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#65239 Dam-Funk — Invite the Light"
+      ]
+    }
+  },
+  {
+    "id": "ab-damien-jurado-caught-in-the-trees",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Damien Jurado",
+      "album": "caught in the trees"
+    },
+    "requires_rows": [
+      [
+        "Damien Jurado",
+        "caught in the trees"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#55178 Damien Jurado — caught in the trees"
+      ]
+    }
+  },
+  {
+    "id": "ab-damien-jurado-i-break-chairs",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Damien Jurado",
+      "album": "I Break Chairs"
+    },
+    "requires_rows": [
+      [
+        "Damien Jurado",
+        "I Break Chairs"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#28626 Damien Jurado — I Break Chairs"
+      ]
+    }
+  },
+  {
+    "id": "ab-damien-jurado-where-shall-you-take-me",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Damien Jurado",
+      "album": "Where shall you take me?"
+    },
+    "requires_rows": [
+      [
+        "Damien Jurado",
+        "Where shall you take me?"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#36942 Damien Jurado — Where shall you take me?"
+      ]
+    }
+  },
+  {
+    "id": "ab-jessica-pratt-quiet-signs",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Jessica Pratt",
+      "album": "Quiet Signs"
+    },
+    "requires_rows": [
+      [
+        "Jessica Pratt",
+        "Quiet Signs"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#68028 Jessica Pratt — Quiet Signs"
+      ]
+    }
+  },
+  {
+    "id": "ab-lone-once-in-a-while",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Lone",
+      "album": "Once in a While"
+    },
+    "requires_rows": [
+      [
+        "Lone",
+        "Once in a While"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#57624 Lone — Once in a While"
+      ]
+    }
+  },
+  {
+    "id": "ab-miss-ana-roxanne-7",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist has no shelf presence at all. If this starts returning rows the matcher has loosened -- a corpus of hits alone cannot see that.",
+    "query": {
+      "artist": "Ana Roxanne",
+      "album": "Because Of A Flower"
+    },
+    "requires_absent_artists": [
+      "Ana Roxanne"
+    ],
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-miss-csillagrablók-2",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist has no shelf presence at all. If this starts returning rows the matcher has loosened -- a corpus of hits alone cannot see that.",
+    "query": {
+      "artist": "Csillagrablók",
+      "album": "Nem Tudom"
+    },
+    "requires_absent_artists": [
+      "Csillagrablók"
+    ],
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-miss-duke-ellington-john-coltrane-5",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist has no shelf presence at all. If this starts returning rows the matcher has loosened -- a corpus of hits alone cannot see that.",
+    "query": {
+      "artist": "Duke Ellington & John Coltrane",
+      "album": "In A Sentimental Mood"
+    },
+    "requires_absent_artists": [
+      "Duke Ellington & John Coltrane"
+    ],
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-miss-hermanos-gutiérrez-1",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist has no shelf presence at all. If this starts returning rows the matcher has loosened -- a corpus of hits alone cannot see that.",
+    "query": {
+      "artist": "Hermanos Gutiérrez",
+      "album": "El Bueno Y El Malo"
+    },
+    "requires_absent_artists": [
+      "Hermanos Gutiérrez"
+    ],
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-miss-klein-6",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist has no shelf presence at all. If this starts returning rows the matcher has loosened -- a corpus of hits alone cannot see that.",
+    "query": {
+      "artist": "Klein",
+      "album": "Harmattan"
+    },
+    "requires_absent_artists": [
+      "Klein"
+    ],
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-miss-large-professor-4",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist has no shelf presence at all. If this starts returning rows the matcher has loosened -- a corpus of hits alone cannot see that.",
+    "query": {
+      "artist": "Large Professor",
+      "album": "1st Class"
+    },
+    "requires_absent_artists": [
+      "Large Professor"
+    ],
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-miss-nilüfer-yanya-0",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist has no shelf presence at all. If this starts returning rows the matcher has loosened -- a corpus of hits alone cannot see that.",
+    "query": {
+      "artist": "Nilüfer Yanya",
+      "album": "Painless"
+    },
+    "requires_absent_artists": [
+      "Nilüfer Yanya"
+    ],
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-miss-sessa-3",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist has no shelf presence at all. If this starts returning rows the matcher has loosened -- a corpus of hits alone cannot see that.",
+    "query": {
+      "artist": "Sessa",
+      "album": "Estrela Acesa"
+    },
+    "requires_absent_artists": [
+      "Sessa"
+    ],
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-nofallback-aphex-twin-syro-deluxe-edition",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "query": {
+      "artist": "Aphex Twin",
+      "album": "Syro Deluxe Edition"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#64369 Aphex Twin — Syro"
+      ]
+    }
+  },
+  {
+    "id": "ab-nofallback-big-thief-double-infinity",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "query": {
+      "artist": "Big Thief",
+      "album": "Double Infinity"
+    },
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-nofallback-brian-eno-reflection",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "query": {
+      "artist": "Brian Eno",
+      "album": "Reflection"
+    },
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-nofallback-broadcast-spell-blanket",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "query": {
+      "artist": "Broadcast",
+      "album": "Spell Blanket"
+    },
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-nofallback-burial-antidawn",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "query": {
+      "artist": "Burial",
+      "album": "Antidawn"
+    },
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-nofallback-cat-power-sun-rays-over-nothing",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "query": {
+      "artist": "Cat Power",
+      "album": "Sun Rays Over Nothing"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#62033 Cat Power — Sun"
+      ]
+    }
+  },
+  {
+    "id": "ab-nofallback-colleen-le-jour-et-la-nuit",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Seeded artist, album WXYC does not shelve. Pins the artist-only fallback: the answer is the shelf with song_not_found set, not a miss.",
+    "query": {
+      "artist": "Colleen",
+      "album": "Le jour et la nuit"
+    },
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "ab-population-one-concrete-environments",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Population One",
+      "album": "Concrete Environments"
+    },
+    "requires_rows": [
+      [
+        "Population One",
+        "Concrete Environments"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#65385 Population One — Concrete Environments"
+      ]
+    }
+  },
+  {
+    "id": "ab-stereolab-find-me-finding-you",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Stereolab",
+      "album": "Find Me Finding You"
+    },
+    "requires_rows": [
+      [
+        "Stereolab",
+        "Find Me Finding You"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#66689 Stereolab — Find Me Finding You"
+      ]
+    }
+  },
+  {
+    "id": "ab-stereolab-the-first-of-the-microbe-hunters-ep",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Stereolab",
+      "album": "The First of the Microbe Hunters [EP]"
+    },
+    "requires_rows": [
+      [
+        "Stereolab",
+        "The First of the Microbe Hunters [EP]"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#45360 Stereolab — The First of the Microbe Hunters [EP]"
+      ]
+    }
+  },
+  {
+    "id": "ab-stereolab-transient-random-noise-bursts-with-announcem",
+    "shape": "artist_album",
+    "frozen": false,
+    "note": "Artist+album against a real catalog row -- the dominant production shape.",
+    "query": {
+      "artist": "Stereolab",
+      "album": "Transient Random-Noise Bursts with Announcements"
+    },
+    "requires_rows": [
+      [
+        "Stereolab",
+        "Transient Random-Noise Bursts with Announcements"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#45341 Stereolab — Transient Random-Noise Bursts with Announcements"
+      ]
+    }
+  },
+  {
+    "id": "artist-a-tribe-called-quest",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "A Tribe Called Quest"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#5 A Tribe Called Quest — Description of a Fool 12\"",
+        "#6 A Tribe Called Quest — Left My Wallet in El Segundo",
+        "#7 A Tribe Called Quest — People's Instinctive Travels",
+        "#8 A Tribe Called Quest — People's Instinctive Travels",
+        "#9 A Tribe Called Quest — The Low End Theory"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-angel-olsen-unfucktheworld",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Angel Olsen",
+      "album": "Burn your fire for no witness",
+      "song": "Unfucktheworld"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Angel Olsen",
+        "Burn your fire for no witness"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#63560 Angel Olsen — Burn your fire for no witness"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-anne-gillis-carriole-fantôme",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Anne Gillis",
+      "album": "Vhoysee",
+      "song": "Carriole Fantôme"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Anne Gillis",
+        "Vhoysee"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#71056 Anne Gillis — Vhoysee"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-arthur-russell-5-minutes-b-b-b-bombing-mix",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Arthur Russell",
+      "album": "The Sleeping Bag Sessions",
+      "song": "5 Minutes (B-B-B Bombing Mix)"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Arthur Russell",
+        "The Sleeping Bag Sessions"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#54793 Arthur Russell — The Sleeping Bag Sessions"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-autechre-ilanders",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Autechre",
+      "album": "Oversteps",
+      "song": "Ilanders"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Autechre",
+        "Oversteps"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#65885 Autechre — Oversteps"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-beach-house-dark-spring",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Beach House",
+      "album": "7",
+      "song": "Dark Spring"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Beach House",
+        "7"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#67751 Beach House — 7"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-big-thief-rock-and-sing",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Big Thief",
+      "album": "Two Hands",
+      "song": "Rock And Sing"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Big Thief",
+        "Two Hands"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#68711 Big Thief — Two Hands"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-billie-holiday-that-old-devil-called-love",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Billie Holiday",
+      "album": "Fine and Mellow",
+      "song": "That Old Devil Called Love"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Billie Holiday",
+        "Fine and Mellow"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#6052 Billie Holiday — Fine and Mellow"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-brian-eno-here-he-comes",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Brian Eno",
+      "album": "More Blank Than Frank",
+      "song": "Here He Comes"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Brian Eno",
+        "More Blank Than Frank"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#24840 Brian Eno — More Blank Than Frank"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-broadcast-colour-me-in",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Broadcast",
+      "album": "Haha Sound",
+      "song": "Colour Me In"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Broadcast",
+        "Haha Sound"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#37567 Broadcast — Haha Sound"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-burial-distant-lights",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Burial",
+      "album": "Burial",
+      "song": "Distant Lights"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Burial",
+        "Burial"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#50530 Burial — Burial"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-caetano-veloso-os-passistas",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Caetano Veloso",
+      "album": "Livro",
+      "song": "Os Passistas"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Caetano Veloso",
+        "Livro"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#57305 Caetano Veloso — Livro"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-charles-mingus-better-git-it-in-your-soul",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Charles Mingus",
+      "album": "Mingus Ah Um (remastered)",
+      "song": "Better Git It In Your Soul"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "Mingus Ah Um (remastered)"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7119 Charles Mingus — Mingus Ah Um (remastered)",
+        "#7120 Charles Mingus — Mingus Ah Um (remastered)"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-colin-stetson-like-wolves-on-the-fold",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Colin Stetson",
+      "album": "All this I do for Glory",
+      "song": "Like Wolves On The Fold"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Colin Stetson",
+        "All this I do for Glory"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#66894 Colin Stetson — All this I do for Glory"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-dam-funk-junie-s-transmission",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Dam-Funk",
+      "album": "Invite the Light",
+      "song": "Junie's Transmission"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Dam-Funk",
+        "Invite the Light"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#65239 Dam-Funk — Invite the Light"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-damien-jurado-cloudy-shoes",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Damien Jurado",
+      "album": "Saint Bartlett",
+      "song": "Cloudy Shoes"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Damien Jurado",
+        "Saint Bartlett"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#57610 Damien Jurado — Saint Bartlett"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-jessica-pratt-wrong-hand",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Jessica Pratt",
+      "album": "On your own love Again",
+      "song": "Wrong Hand"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Jessica Pratt",
+        "On your own love Again"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#64592 Jessica Pratt — On your own love Again"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-juana-molina-no-es-tan-cierto",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Juana Molina",
+      "album": "Tres Cosas",
+      "song": "No Es Tan Cierto"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Juana Molina",
+        "Tres Cosas"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#46524 Juana Molina — Tres Cosas"
+      ]
+    }
+  },
+  {
+    "id": "artist-album-song-stereolab-brakhage",
+    "shape": "artist_album_song",
+    "frozen": false,
+    "note": "Artist+album+song against a real Discogs tracklist. Pins that the track is confirmed on the shelved album, not merely that the album was found.",
+    "query": {
+      "artist": "Stereolab",
+      "album": "Dots and Loops",
+      "song": "Brakhage"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Stereolab",
+        "Dots and Loops"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#45353 Stereolab — Dots and Loops"
+      ]
+    }
+  },
+  {
+    "id": "artist-animal-collective",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Animal Collective"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#37318 Animal Collective — Here Comes the Indian",
+        "#37799 Animal Collective — Danse Manatee",
+        "#37800 Animal Collective — Campfire Songs",
+        "#46634 Animal Collective — Sung Tongs",
+        "#48123 Animal Collective — Prospect Hummer EP"
+      ]
+    }
+  },
+  {
+    "id": "artist-autechre",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Autechre"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#65873 Autechre — Tri Repetae",
+        "#65874 Autechre — Amber",
+        "#65875 Autechre — incunabula",
+        "#65876 Autechre — Chiastic Slide",
+        "#65877 Autechre — LP 5"
+      ]
+    }
+  },
+  {
+    "id": "artist-beach-house",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Beach House"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#49878 Beach House — S/T",
+        "#51000 Beach House — Devotion",
+        "#55615 Beach House — Teen Dream",
+        "#64864 Beach House — Depression Cherry",
+        "#65135 Beach House — Thank your lucky stars"
+      ]
+    }
+  },
+  {
+    "id": "artist-brian-eno",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Brian Eno"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#21596 Brian Eno — Taking Tiger Mountain (By Strategy)",
+        "#22818 Brian Eno — Another Green World",
+        "#23409 Brian Eno — Before and After Science",
+        "#23795 Brian Eno — My Life in the Bush of Ghosts",
+        "#24056 Brian Eno — Here Come the Warm Jets"
+      ]
+    }
+  },
+  {
+    "id": "artist-burial",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Burial"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#50530 Burial — Burial",
+        "#50711 Burial — Ghost Hardware EP",
+        "#50896 Burial — Untrue",
+        "#63547 Burial — Rival Dealer",
+        "#66435 Burial — Young death / Nightmarket"
+      ]
+    }
+  },
+  {
+    "id": "artist-caetano-veloso",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Caetano Veloso"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#57302 Caetano Veloso — Estrangeiro",
+        "#57303 Caetano Veloso — A arte de Caetano Veloso",
+        "#57304 Caetano Veloso — Caetano Veloso",
+        "#57305 Caetano Veloso — Livro",
+        "#57306 Caetano Veloso — Prenda Minha"
+      ]
+    }
+  },
+  {
+    "id": "artist-carmen-villain",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Carmen Villain"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#68965 Carmen Villain — Sketch for Winter IX : Perlita",
+        "#70509 Carmen Villain — Only Love from Now On",
+        "#71683 Carmen Villain — Nutrition"
+      ]
+    }
+  },
+  {
+    "id": "artist-charles-mingus",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Charles Mingus"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#7102 Charles Mingus — Let My Children Hear Music",
+        "#7103 Charles Mingus — Mingus Moves",
+        "#7104 Charles Mingus — Mingus At Carnegie Hall",
+        "#7105 Charles Mingus — Changes One",
+        "#7106 Charles Mingus — Changes Two"
+      ]
+    }
+  },
+  {
+    "id": "artist-galaxy-2-galaxy",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Galaxy 2 Galaxy"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#70229 Galaxy 2 Galaxy — Galaxy to Galaxy"
+      ]
+    }
+  },
+  {
+    "id": "artist-juana-molina",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Juana Molina"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#46524 Juana Molina — Tres Cosas",
+        "#54454 Juana Molina — Un Dia",
+        "#54455 Juana Molina — Segundo",
+        "#54456 Juana Molina — Salvese quien pueda",
+        "#54457 Juana Molina — Son"
+      ]
+    }
+  },
+  {
+    "id": "artist-population-one",
+    "shape": "artist_only",
+    "frozen": false,
+    "note": "Artist-only lookup returns that artist's shelf. Pins the shelf ordering, which a ranking change would otherwise reorder silently.",
+    "query": {
+      "artist": "Population One"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#64374 Population One — Theater of a confused Mind",
+        "#65385 Population One — Concrete Environments",
+        "#67564 Population One — Hippnotic Culture Remixed",
+        "#69231 Population One — Reporting from Detroit"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-anne-gillis-bangkok-la-nuit",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Anne Gillis",
+      "song": "Bangkok La Nuit"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Anne Gillis",
+        "Vhoysee"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#71056 Anne Gillis — Vhoysee"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-arthur-russell-tiger-stripes-extended-version",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Arthur Russell",
+      "song": "Tiger Stripes (Extended Version)"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Arthur Russell",
+        "The Sleeping Bag Sessions"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#54793 Arthur Russell — The Sleeping Bag Sessions"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-autechre-known-1",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Autechre",
+      "song": "known(1)"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Autechre",
+        "Oversteps"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#65885 Autechre — Oversteps"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-big-thief-forgotten-eyes",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Big Thief",
+      "song": "Forgotten Eyes"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Big Thief",
+        "Two Hands"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#68711 Big Thief — Two Hands"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-brian-eno-everything-merges-with-the-night",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Brian Eno",
+      "song": "Everything Merges With The Night"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Brian Eno",
+        "More Blank Than Frank"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#24840 Brian Eno — More Blank Than Frank"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-broadcast-pendulum",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Broadcast",
+      "song": "Pendulum"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Broadcast",
+        "Haha Sound"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#37567 Broadcast — Haha Sound"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-caetano-veloso-onde-o-rio-é-mais-baiano",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Caetano Veloso",
+      "song": "Onde O Rio É Mais Baiano"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Caetano Veloso",
+        "Livro"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#57305 Caetano Veloso — Livro"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-charles-mingus-goodbye-pork-pie-hat",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Charles Mingus",
+      "song": "Goodbye Pork Pie Hat"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "Mingus Ah Um (remastered)"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7119 Charles Mingus — Mingus Ah Um (remastered)",
+        "#7120 Charles Mingus — Mingus Ah Um (remastered)"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-colin-stetson-between-water-and-wind",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Colin Stetson",
+      "song": "Between Water And Wind"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Colin Stetson",
+        "All this I do for Glory"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#66894 Colin Stetson — All this I do for Glory"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-dam-funk-we-continue",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Dam-Funk",
+      "song": "We Continue"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Dam-Funk",
+        "Invite the Light"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#65239 Dam-Funk — Invite the Light"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-damien-jurado-arkansas",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Damien Jurado",
+      "song": "Arkansas"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Damien Jurado",
+        "Saint Bartlett"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#57610 Damien Jurado — Saint Bartlett"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-jessica-pratt-game-that-i-play",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Jessica Pratt",
+      "song": "Game That I Play"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Jessica Pratt",
+        "On your own love Again"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#64592 Jessica Pratt — On your own love Again"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-juana-molina-el-cristal",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Juana Molina",
+      "song": "El Cristal"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Juana Molina",
+        "Tres Cosas"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#46524 Juana Molina — Tres Cosas"
+      ]
+    }
+  },
+  {
+    "id": "artist-song-stereolab-miss-modular",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "Artist+song with no album -- the shape LML#801 broke on. The album has to be recovered from the tracklist.",
+    "query": {
+      "artist": "Stereolab",
+      "song": "Miss Modular"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Stereolab",
+        "Dots and Loops"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#45353 Stereolab — Dots and Loops"
+      ]
+    }
+  },
+  {
+    "id": "song-only-big-thief-the-toy",
+    "shape": "song_only",
+    "frozen": false,
+    "note": "Song only, no artist. SONG_AS_TRACK's lane, where LML#1225 showed the title gate carrying validation alone.",
+    "query": {
+      "song": "The Toy"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Big Thief",
+        "Two Hands"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#68711 Big Thief — Two Hands"
+      ]
+    }
+  },
+  {
+    "id": "song-only-broadcast-before-we-begin",
+    "shape": "song_only",
+    "frozen": false,
+    "note": "Song only, no artist. SONG_AS_TRACK's lane, where LML#1225 showed the title gate carrying validation alone.",
+    "query": {
+      "song": "Before We Begin"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Broadcast",
+        "Haha Sound"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#37567 Broadcast — Haha Sound"
+      ]
+    }
+  },
+  {
+    "id": "song-only-caetano-veloso-manhatã",
+    "shape": "song_only",
+    "frozen": false,
+    "note": "Song only, no artist. SONG_AS_TRACK's lane, where LML#1225 showed the title gate carrying validation alone.",
+    "query": {
+      "song": "Manhatã"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Caetano Veloso",
+        "Livro"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#57305 Caetano Veloso — Livro"
+      ]
+    }
+  },
+  {
+    "id": "song-only-charles-mingus-boogie-stop-shuffle",
+    "shape": "song_only",
+    "frozen": false,
+    "note": "Song only, no artist. SONG_AS_TRACK's lane, where LML#1225 showed the title gate carrying validation alone.",
+    "query": {
+      "song": "Boogie Stop Shuffle"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Charles Mingus",
+        "Mingus Ah Um (remastered)"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#7119 Charles Mingus — Mingus Ah Um (remastered)",
+        "#7120 Charles Mingus — Mingus Ah Um (remastered)"
+      ]
+    }
+  },
+  {
+    "id": "song-only-colin-stetson-spindrift",
+    "shape": "song_only",
+    "frozen": false,
+    "note": "Song only, no artist. SONG_AS_TRACK's lane, where LML#1225 showed the title gate carrying validation alone.",
+    "query": {
+      "song": "Spindrift"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Colin Stetson",
+        "All this I do for Glory"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#66894 Colin Stetson — All this I do for Glory"
+      ]
+    }
+  },
+  {
+    "id": "song-only-juana-molina-sálvese-quién-pueda",
+    "shape": "song_only",
+    "frozen": false,
+    "note": "Song only, no artist. SONG_AS_TRACK's lane, where LML#1225 showed the title gate carrying validation alone.",
+    "query": {
+      "song": "Sálvese Quién Pueda"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Juana Molina",
+        "Tres Cosas"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#46524 Juana Molina — Tres Cosas"
+      ]
+    }
+  },
+  {
+    "id": "song-only-stereolab-the-flower-called-nowhere",
+    "shape": "song_only",
+    "frozen": false,
+    "note": "Song only, no artist. SONG_AS_TRACK's lane, where LML#1225 showed the title gate carrying validation alone.",
+    "query": {
+      "song": "The Flower Called Nowhere"
+    },
+    "requires_discogs": true,
+    "requires_rows": [
+      [
+        "Stereolab",
+        "Dots and Loops"
+      ]
+    ],
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": false,
+      "results": [
+        "#45353 Stereolab — Dots and Loops"
+      ]
+    }
+  },
+  {
+    "id": "track-miss-anon-qqzzx-vulpine-escarpment",
+    "shape": "song_only",
+    "frozen": false,
+    "note": "A track that is on no shelf and in no Discogs fixture. The miss direction for the track lanes: if this starts returning a confident row, a validation gate has stopped gating.",
+    "query": {
+      "song": "Qqzzx Vulpine Escarpment"
+    },
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "track-miss-anon-thrattlebone-nine-nine",
+    "shape": "song_only",
+    "frozen": false,
+    "note": "A track that is on no shelf and in no Discogs fixture. The miss direction for the track lanes: if this starts returning a confident row, a validation gate has stopped gating.",
+    "query": {
+      "song": "Thrattlebone Nine Nine"
+    },
+    "expect": {
+      "miss_kind": "miss_clean",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": []
+    }
+  },
+  {
+    "id": "track-miss-cocteau-twins-grebulon-overture-nine",
+    "shape": "artist_song",
+    "frozen": false,
+    "note": "A track that is on no shelf and in no Discogs fixture. The miss direction for the track lanes: if this starts returning a confident row, a validation gate has stopped gating.",
+    "query": {
+      "artist": "Cocteau Twins",
+      "song": "Grebulon Overture Nine"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": true,
+      "found_on_compilation": false,
+      "results": [
+        "#18568 Cocteau Twins — Head over Heels",
+        "#18569 Cocteau Twins — Garlands",
+        "#18570 Cocteau Twins — Treasure",
+        "#18571 Cocteau Twins — Aikea-Guinea",
+        "#18572 Cocteau Twins — Pink Opaque"
+      ]
+    }
+  },
+  {
+    "id": "track-miss-stereolab-zzyzx-marginal-fanfare",
+    "shape": "artist_song",
+    "frozen": false,
+    "suspect": true,
+    "note": "A track that is on no shelf and in no Discogs fixture. The miss direction for the track lanes: if this starts returning a confident row, a validation gate has stopped gating. SUSPECT (found by this corpus on its first run, 2026-08-20): the recorded verdict is a confident, uncaveated hit -- found_on_compilation=True, song_not_found=False, context 'Found \"Zzyzx Marginal Fanfare\" by Stereolab on: Peng!' -- for a track that exists nowhere. TRACK_ON_COMPILATION's last-resort branch (`if not results and keyword_matches and not discogs_found_releases`) surfaces the best library keyword hit when Discogs returns nothing, and the compilation Outcome labels it confirmed. This is the LML#1225 user-visible failure -- a confident row for a song that does not exist -- reached through a path #1225's tracklist-gate fix does not cover, because no tracklist is ever consulted.",
+    "query": {
+      "artist": "Stereolab",
+      "song": "Zzyzx Marginal Fanfare"
+    },
+    "expect": {
+      "miss_kind": "hit",
+      "song_not_found": false,
+      "found_on_compilation": true,
+      "results": [
+        "#45348 Stereolab — Peng!"
+      ]
+    }
+  }
+]
