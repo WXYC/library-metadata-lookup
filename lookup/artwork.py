@@ -25,6 +25,7 @@ from lookup.artist_resolution import (
 from lookup.matching import is_self_titled, map_library_format_to_discogs
 from lookup.release_resolution import ResolvedRelease, resolve_release_for_track_cached
 from lookup.rowless import ROWLESS_LIBRARY_ID, ROWLESS_NO_ALBUM_CONFIDENCE
+from lookup.sibling_artwork import resolve_sibling_artwork
 
 logger = logging.getLogger(__name__)
 
@@ -49,52 +50,52 @@ async def _resolve_fallback_artwork(
     *,
     allow_release_resolution_fallback: bool = True,
 ) -> str | None:
-    """Try the release's own cover (images[0]), then artist image.
+    """Try the release's own cover, then a sibling pressing, then artist image.
 
-    LML#687: the label-image rung was removed -- a label logo is essentially
-    never correct album art (the motivating case: Autechre's *Confield* had no
-    cover and returned the Warp Records logo as its artwork). A missing cover
-    now resolves to ``None`` after the artist-image rung rather than falling
-    all the way through to the release's label. #687 was later reopened: that
-    "no cover" premise was itself wrong for both cases it was argued from --
-    see the LML#1237 fix below.
+    LML#687 removed the label-image rung -- a label logo is essentially never
+    correct album art -- then was reopened when that removal's "no cover"
+    premise turned out wrong for both motivating albums: they have real
+    covers in the cache, just under sibling release ids LML did not bind.
+    Two independent fixes followed, in a load-bearing order:
 
-    LML#1237: ``get_release``'s LML#542 widened predicate treats a
-    tracklist-bearing cache row as a hit even when it has never been asked
-    about artwork (``artwork_checked_at IS NULL``), so a bulk-loaded release
-    with no live Discogs check yet reads as coverless here without Discogs
-    ever being asked. This is the caller whose entire question IS the
-    artwork, so it asks for an artwork-authoritative answer via
-    ``get_release(..., require_artwork_answer=True)`` -- narrows the
-    predicate back down for this call only; every other ``get_release``
-    caller is unaffected (LML#537 not regressed). A *successful* live ask is
-    written back to PG unconditionally, so a release that Discogs actually
-    answers for pays this cost at most once, ever -- not once per lookup. That
-    bound is conditional, not absolute: a failed ask (breaker shed, network
-    error, exhausted retries) writes nothing back, so the row stays
-    never-asked and can be re-attempted on a later lookup. The breaker and
-    the shared rate gate (#879) cap how often that retry can happen -- they
-    do not cap it at exactly once -- so treat this as "amortizes to at most
-    one live call per release once Discogs is reachable," not as a hard
-    per-release ceiling.
+    1. **LML#1242, the release's OWN cover, checked first.** A bulk-loaded
+       release ``get_release`` has never live-checked for artwork
+       (``artwork_checked_at IS NULL``) otherwise reads as coverless without
+       Discogs ever being asked -- 96% of the misdiagnosed rows in a prod
+       measurement. ``get_release(..., require_artwork_answer=True)`` narrows
+       ``get_release``'s LML#542 widened cache-hit predicate back down for
+       this one caller so that never-asked state becomes a live re-ask
+       instead. A successful ask writes back to PG, so this amortizes to at
+       most once per release, not once per lookup (LML#537 unaffected for
+       every other ``get_release`` caller).
+    2. **LML#1237/#1241, a SIBLING pressing's cover, checked second and
+       gated.** The residual case once the release's own cover has genuinely
+       come back empty -- ``lookup.sibling_artwork.resolve_sibling_artwork``.
+       This MUST run after step 1, never before: binding a sibling's cover
+       onto a release that was never itself asked would look like a fix
+       while getting the 96% case wrong, exactly the ordering bug LML#1241's
+       review caught in the original PR#1240. Gated off by default via
+       ``settings.lml_resolve_sibling_pressing_artwork``. Its index blocker
+       (WXYC/discogs-etl#412) is discharged; what holds the flag off now is
+       that the rung measures 0.97% recovery against the known-failed
+       population, a ceiling owned by the cache's dedup ranking
+       (WXYC/discogs-etl#413) rather than by this code. See that flag's
+       description and ``lookup/sibling_artwork.py``'s module docstring for
+       the full cost/gating rationale.
 
     ``allow_release_resolution_fallback`` (default ``True``, the normal
     ``/lookup`` path) is the SAME bulk kill switch ``fetch_artwork_for_items``
-    already threads through for the resolution fan-out (LML#671/#652): the
-    ``/lookup/bulk`` 35k-album drain passes ``False`` so a slice of the
-    12,364-release never-asked population can't turn into a single-run
-    stampede against the shared Discogs rate bucket (#879). With the switch
-    off, this falls back to the pre-#1237 behavior -- read whatever PG has,
-    never re-ask. A caller that omits this keyword entirely (rather than
-    passing it explicitly either way) silently gets ``True`` -- i.e. silently
-    opts INTO live re-asking. That default is right for ``/lookup``, the
-    common case, but it is a trap for a new batch/background caller: the
-    LML#1020 compilation-artwork drain (``scripts/build_compilation_track_location.py``)
-    originally hit exactly this by not passing the flag at all, and had to be
-    fixed to pass ``False`` explicitly -- see that call site's comment. Any
-    new caller that walks more than a handful of releases against a live
-    ``DiscogsService`` outside of a single interactive ``/lookup`` request
-    MUST pass ``False`` explicitly; do not rely on the default.
+    threads through for the resolution fan-out (LML#671/#652): ``/lookup/bulk``
+    passes ``False`` so a never-asked slice can't stampede the shared Discogs
+    rate bucket (#879). Off, step 1 reads whatever PG has instead of
+    re-asking, and step 2's live leg (``get_master`` + ``get_release``) is
+    skipped the same way -- only its cheap local cache leg can still run. A
+    caller that omits this keyword silently gets ``True`` (opts into live
+    re-asking on both steps); that is right for ``/lookup`` but a trap for a
+    new batch caller -- see the LML#1020 drain's call site for the pattern to
+    follow. Any caller walking more than a handful of releases against a live
+    ``DiscogsService`` outside one interactive ``/lookup`` request MUST pass
+    ``False`` explicitly.
 
     Structurally invalid ids (``release_id <= 0``) short-circuit before the
     Discogs round-trip — the LML#401 synthesis pattern produces a
@@ -117,6 +118,15 @@ async def _resolve_fallback_artwork(
     # two-call path produces via populateReleaseMetadata.
     if release.artwork_url:
         return release.artwork_url
+
+    if get_settings().lml_resolve_sibling_pressing_artwork:
+        sibling_artwork = await resolve_sibling_artwork(
+            discogs_service,
+            release,
+            allow_release_resolution_fallback=allow_release_resolution_fallback,
+        )
+        if sibling_artwork:
+            return sibling_artwork
 
     if release.artist_id:
         image = await discogs_service.get_artist_image(release.artist_id)
