@@ -85,6 +85,33 @@ async def _run_case(case: Any, library_path: Path, discogs_fixture: dict[str, An
         clear_library_caches()
 
 
+def classify_case_result(case: Any, previous: Any, actual: Any) -> str:
+    """Decide what a freshly-observed verdict means for one case.
+
+    A pure function of the three values a case's run produces, so it is unit-
+    testable without spinning up the FastAPI app -- and so the frozen refusal
+    is one rule instead of a condition inlined in the driver loop.
+
+    Returns one of:
+
+    - `"unchanged"` -- `previous == actual`; nothing to do.
+    - `"frozen_drift"` -- `case.frozen` and the verdict moved, REGARDLESS of
+      whether `previous` is `None`. A frozen case with `expect: null` is a
+      `build_golden_corpus.py` skeleton not yet hand-authored -- not an
+      ordinary new case -- and must refuse exactly like a frozen case whose
+      recorded verdict actually moved. Gating on `previous is not None` here
+      was the LML#1233 review's laundering path: null a frozen case's expect,
+      re-run, and the new behavior gets written with no refusal at all.
+    - `"changed"` -- everything else: a non-frozen case, moved or newly
+      recorded.
+    """
+    if previous == actual:
+        return "unchanged"
+    if case.frozen:
+        return "frozen_drift"
+    return "changed"
+
+
 def _describe(label: str, verdict: Any) -> list[str]:
     if verdict is None:
         return [f"  {label}: (never recorded)"]
@@ -116,11 +143,10 @@ async def _main_async(args: argparse.Namespace) -> int:
             actual = await _run_case(case, library_path, discogs_fixture)
             recorded = by_id[case.id].get("expect")
             previous = corpus.Verdict.from_json(recorded) if recorded is not None else None
-            if previous == actual:
-                continue
-            if case.frozen and previous is not None:
+            outcome = classify_case_result(case, previous, actual)
+            if outcome == "frozen_drift":
                 frozen_drift.append((case, actual))
-            else:
+            elif outcome == "changed":
                 changed.append((case, actual))
 
     for case, actual in changed:
@@ -150,8 +176,7 @@ async def _main_async(args: argparse.Namespace) -> int:
 
     if not changed:
         logger.info("no expectations moved")
-        if not args.format_only:
-            return 0
+        return 0
 
     if args.dry_run:
         logger.info("--dry-run: %d expectation(s) would be rewritten", len(changed))
@@ -180,6 +205,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    # `--format-only` is handled entirely here and returns before `_main_async`
+    # ever runs -- so `args.format_only` is always False for the rest of this
+    # function and for `_main_async` (LML#1233 review flagged a dead check
+    # there that read as though it were reachable; removed rather than kept
+    # composable, since the two modes don't share any state worth threading
+    # through one run: format-only never runs a case, and a real rebaseline
+    # always writes through the same canonical `corpus.dump_cases` writer, so
+    # there is nothing left for a combined flag to additionally fix).
     if args.format_only:
         from tests.e2e.golden import corpus
 

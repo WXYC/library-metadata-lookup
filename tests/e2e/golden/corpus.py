@@ -43,6 +43,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from wxyc_etl.schema import library_columns
+
+from core.dependencies import _DISCOGS_POOL_MAX_SIZE_DEFAULT, _DISCOGS_POOL_MAX_SIZE_ENV_VAR
+from core.search import (
+    DEFAULT_SEARCH_BUDGET_MS,
+    DEFAULT_SEARCH_HARD_TIMEOUT_MS,
+    SEARCH_BUDGET_ENV_VAR,
+    SEARCH_HARD_TIMEOUT_ENV_VAR,
+)
 from discogs.models import (
     ArtistDetails,
     DiscogsSearchRequest,
@@ -54,7 +63,19 @@ from discogs.models import (
     TrackReleasesResponse,
 )
 from library.db import LIBRARY_FTS_CREATE_SQL
+from lookup.admission import (
+    ADMISSION_LOOP_LAG_SHED_ENV_VAR,
+    ADMISSION_SHED_ENFORCE_ENV_VAR,
+    DEFAULT_ADMISSION_LOOP_LAG_SHED_MS,
+)
+from lookup.matching import MAX_SEARCH_RESULTS
 from lookup.miss_kind import MISS_CLEAN, MISS_DEGRADED, MISS_TIMEOUT, OUTCOME_HIT
+from lookup.timeouts import (
+    _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S,
+    _BANDCAMP_LIVE_PROBE_TIMEOUT_DEFAULT_S,
+    APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
+    BANDCAMP_LIVE_PROBE_TIMEOUT_ENV_VAR,
+)
 
 GOLDEN_DIR = Path(__file__).resolve().parent
 LIBRARY_PATH = GOLDEN_DIR / "library.json"
@@ -92,10 +113,13 @@ SHAPE_FLOORS: dict[str, int] = {
     "song_only": 6,
 }
 
-#: `/lookup` truncates to `lookup.matching.MAX_SEARCH_RESULTS`. Recording more
-#: than a handful would mean that cap moved; the guard test says so rather
-#: than letting a case quietly grow a 50-line expectation.
-MAX_RECORDED_RESULTS = 8
+#: `/lookup` truncates to `lookup.matching.MAX_SEARCH_RESULTS`. Imported rather
+#: than restated: a hand-copied literal here would drift silently the moment
+#: the production cap changed, which is exactly the regression this guard
+#: exists to catch (LML#1233 review -- the two values had already drifted,
+#: 8 vs 5). Recording more than the cap would mean it moved; the guard test
+#: says so rather than letting a case quietly grow a 50-line expectation.
+MAX_RECORDED_RESULTS = MAX_SEARCH_RESULTS
 
 #: Marker on a recorded result that has no WXYC catalog row behind it -- the
 #: LML#628/#631 row-less shape, `LibraryItem(id=0)`. Kept visible in the
@@ -109,10 +133,19 @@ ROWLESS_MARKER = "row-less: "
 #: defaults derived below. Settings are read through `config.settings`'s
 #: `lru_cache`d `get_settings()`, which most of the pipeline calls *directly*
 #: rather than through FastAPI's `Depends` -- so a `dependency_overrides` entry
-#: reaches the router and nothing under it. Env vars plus a `cache_clear()` are
-#: the only override that reaches every call site, and they are also the only
-#: thing that stops a developer's `.env` from silently changing a verdict
-#: locally that CI records differently.
+#: reaches the router and nothing under it. Env vars plus a `cache_clear()`
+#: reach every call site -- but only for `Settings` fields. A second class of
+#: knob bypasses `Settings` entirely and is read straight off `os.environ` at
+#: call time (`core.search.resolve_positive_int_env` and friends): the search
+#: budget/hard-timeout, the admission loop-lag shed, the lookup in-flight cap's
+#: pool size, and the Apple/Bandcamp per-probe timeouts. A corpus that pinned
+#: only `Settings` was NOT immune to a developer's `.env` moving a verdict --
+#: `LML_SEARCH_BUDGET_MS=1` starves the strategy cascade and flips
+#: `lml1184-arabian-prince-strange-life` from hit to a clean miss (LML#1233
+#: review). These are pinned explicitly below, each to the literal default its
+#: own module declares, so this list can drift only if someone edits it by
+#: hand -- never silently, by a knob moving without the corresponding pin
+#: moving too.
 _PINNED_ENV: dict[str, str] = {
     "DISCOGS_TOKEN": "",
     "DISCOGS_API_KEY": "",
@@ -123,6 +156,22 @@ _PINNED_ENV: dict[str, str] = {
     # Not a default (it ships True): telemetry is pinned off so a corpus run
     # can never emit a `lookup_completed` event into a real project.
     "ENABLE_TELEMETRY": "false",
+    # -- non-Settings knobs read straight from os.environ (see the docstring
+    # above). Each value is the literal default the owning module declares,
+    # imported rather than restated so this dict can't drift from it silently.
+    SEARCH_BUDGET_ENV_VAR: str(DEFAULT_SEARCH_BUDGET_MS),
+    SEARCH_HARD_TIMEOUT_ENV_VAR: str(DEFAULT_SEARCH_HARD_TIMEOUT_MS),
+    ADMISSION_LOOP_LAG_SHED_ENV_VAR: str(DEFAULT_ADMISSION_LOOP_LAG_SHED_MS),
+    ADMISSION_SHED_ENFORCE_ENV_VAR: "false",
+    # Not `LML_LOOKUP_MAX_CONCURRENT` itself: its declared default is computed
+    # (`min(ceiling, pool_max)`, `lookup/router.py`), not a literal, so pinning
+    # a number here could silently exceed the pool and log a spurious warning
+    # if the pool default ever changed independently. Pinning the pool size
+    # its computation depends on makes the *result* deterministic without
+    # hand-picking a number that has to be kept in sync with two modules.
+    _DISCOGS_POOL_MAX_SIZE_ENV_VAR: str(_DISCOGS_POOL_MAX_SIZE_DEFAULT),
+    APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR: str(round(_APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S * 1000)),
+    BANDCAMP_LIVE_PROBE_TIMEOUT_ENV_VAR: str(round(_BANDCAMP_LIVE_PROBE_TIMEOUT_DEFAULT_S * 1000)),
 }
 
 
@@ -235,16 +284,36 @@ class Case:
     def request_body(self) -> dict[str, Any]:
         """The `/api/v1/lookup` payload for this case.
 
-        `raw_message` is synthesized rather than stored: it is only ever read
-        for logging and telemetry on this path, and storing a second copy of
-        the query invites the two drifting apart.
+        `raw_message` is synthesized rather than stored, but it is NOT read
+        for logging alone: `core.search.detect_ambiguous_format` parses it to
+        decide whether SWAPPED_INTERPRETATION should retry an "X - Y" / "X, Y"
+        / "X. Y" reading, and `TRACK_ON_COMPILATION`
+        (`lookup/strategies/track_on_compilation.py`) greps it for a
+        parenthetical remix/mix/version/edit tag. A synthesized value can
+        therefore change which strategy runs, not just what gets logged.
+
+        The one raw_message shape this corpus can honestly call
+        production-realistic is the two-field one CLAUDE.md documents
+        (`"Jessica Pratt - On Your Own Love Again"`): a single dash between
+        exactly the two typed fields. Joining a THIRD field the same way --
+        `"Artist - Album - Song"` -- does not extend that shape, it fabricates
+        one: `detect_ambiguous_format`'s dash pattern is non-greedy and splits
+        at the FIRST dash, so SWAPPED_INTERPRETATION would read that string as
+        `("Artist", "Album - Song")`, a split no real raw message ever
+        produces for a 3-field query. There is no established production
+        mapping from three structured fields back to one raw message to
+        synthesize instead (unlike the two-field case, nothing here says what
+        a DJ would have typed), so one- and three-field queries get a
+        space-joined `raw_message` that never trips `detect_ambiguous_format`
+        at all, rather than a fabricated shape that might.
         """
         body: dict[str, Any] = {k: v for k, v in self.query.items() if v}
-        body["raw_message"] = " - ".join(
+        present = [
             v
             for v in (self.query.get("artist"), self.query.get("album"), self.query.get("song"))
             if v
-        )
+        ]
+        body["raw_message"] = " - ".join(present) if len(present) == 2 else " ".join(present)
         return body
 
     def to_json(self) -> dict[str, Any]:
@@ -430,21 +499,33 @@ def verdict_from_payload(payload: dict[str, Any]) -> Verdict:
     )
 
 
+def verdict_shape_is_consistent(verdict: Verdict) -> bool:
+    """`results` is non-empty iff `miss_kind` is a hit.
+
+    Mirrors :func:`verdict_from_payload`'s own contract exactly: every miss
+    kind -- `miss_clean`, `miss_timeout`, `miss_degraded` alike -- is derived
+    from an empty `results` list (see the `elif`/`else` chain above), never a
+    populated one. The only bifurcation that can ever be genuinely
+    contradictory is hit-vs-any-miss, not clean-vs-not-clean -- a case
+    expecting `miss_timeout` or `miss_degraded` with no results is well-formed,
+    not a contradiction (LML#1233 review).
+    """
+    if verdict.miss_kind == OUTCOME_HIT:
+        return bool(verdict.results)
+    return not verdict.results
+
+
 # ---------------------------------------------------------------------------
 # Library seeding
 # ---------------------------------------------------------------------------
 
-LIBRARY_COLUMNS = (
-    "id",
-    "title",
-    "artist",
-    "call_letters",
-    "artist_call_number",
-    "release_call_number",
-    "genre",
-    "format",
-    "alternate_artist_name",
-)
+#: The code under test's own column list (`library/db.py` imports the same
+#: name to validate `library.db`'s schema), not a hand-copied second tuple --
+#: exactly the reason `LIBRARY_FTS_CREATE_SQL` below is imported rather than
+#: restated too. `scripts/build_golden_corpus.py::LIBRARY_FIELDS` imports it
+#: too, so there is one column list, not two that can drift apart (LML#1233
+#: review).
+LIBRARY_COLUMNS = tuple(library_columns())
 
 _CREATE_LIBRARY_SQL = """
     CREATE TABLE library (
@@ -499,7 +580,13 @@ def build_library_db(path: Path, rows: list[dict[str, Any]]) -> Path:
         placeholders = ", ".join("?" for _ in LIBRARY_COLUMNS)
         conn.executemany(
             f"INSERT INTO library ({', '.join(LIBRARY_COLUMNS)}) VALUES ({placeholders})",
-            [tuple(row.get(col) for col in LIBRARY_COLUMNS) for row in rows],
+            # `row[col]`, not `row.get(col)`: a row missing an expected column
+            # is a fixture bug (library.json regenerated by an older column
+            # list, or a column added to LIBRARY_COLUMNS without regenerating
+            # the fixture) and must raise, not silently insert NULL for every
+            # row and let the corpus record that as though it meant something
+            # (LML#1233 review).
+            [tuple(row[col] for col in LIBRARY_COLUMNS) for row in rows],
         )
         conn.execute("INSERT INTO library_fts(library_fts) VALUES('rebuild')")
         conn.commit()
@@ -599,8 +686,20 @@ class FakeDiscogsService:
     # -- the faked I/O boundary -------------------------------------------
 
     async def search(
-        self, request: DiscogsSearchRequest, *, skip_pg: bool = False, **_: Any
+        self,
+        request: DiscogsSearchRequest,
+        limit: int = 5,
+        *,
+        skip_pg: bool = False,
+        **_: Any,
     ) -> DiscogsSearchResponse:
+        # `limit` defaults to 5, mirroring `DiscogsService.search`
+        # (`discogs/service.py`), and is applied the same way its sibling
+        # methods below apply theirs (`ids[:limit]`) -- previously ignored
+        # entirely, so a route carrying more candidates than the caller asked
+        # for would hand all of them back (LML#1233 review). Latent against
+        # today's fixture (every route carries at most one id) but not against
+        # a future one.
         key = _route_key(request.artist, request.album)
         ids = self._album_searches.get(key, [])
         self._record(f"search:{key}", bool(ids), candidate_search=True)
@@ -612,7 +711,7 @@ class FakeDiscogsService:
                     release_id=rid,
                     release_url=self._releases[rid].release_url,
                 )
-                for rid in ids
+                for rid in ids[:limit]
             ],
             total=len(ids),
         )

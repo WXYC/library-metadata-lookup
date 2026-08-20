@@ -67,7 +67,7 @@ Several suites are *discovery nets*: they sweep the source tree (glob + regex/AS
 
 ## Golden corpus (LML#1233 Layer 3)
 
-`tests/e2e/golden/` is a checked-in corpus of frozen lookups: 142 queries, each recorded against a seeded catalog and a seeded Discogs universe, asserted on every PR. It exists for **per-commit attribution** — the production miss-rate alert of [`lml-1233-lookup-miss-monitoring.md`](plans/lml-1233-lookup-miss-monitoring.md) Layer 2 is lagging and confounded and answers *did something break*; this tier is deterministic and answers *which change broke it*, before merge. It additionally catches the failure `results_count` structurally cannot see: a lookup returning the **wrong** rows rather than none.
+`tests/e2e/golden/` is a checked-in corpus of frozen lookups: 143 queries, each recorded against a seeded catalog and a seeded Discogs universe, asserted on every PR. It exists for **per-commit attribution** — the production miss-rate alert of [`lml-1233-lookup-miss-monitoring.md`](plans/lml-1233-lookup-miss-monitoring.md) Layer 2 is lagging and confounded and answers *did something break*; this tier is deterministic and answers *which change broke it*, before merge. It additionally catches the failure `results_count` structurally cannot see: a lookup returning the **wrong** rows rather than none.
 
 It runs in the **default** pytest job. No marker, no PostgreSQL, no network, no `library.db` — `pyproject.toml` already collects `tests/e2e/`, so there is no workflow, marker, or `check-ci-marker-sync` interaction. It adds roughly a second.
 
@@ -92,7 +92,7 @@ Sampled against the production query-shape mix — 21 days of alert-scope `looku
 
 | shape | production | corpus | note |
 |---|---|---|---|
-| artist+album | 76.1% (13.0% zero-result) | 81 | the dominant shape; a recall regression shows here first |
+| artist+album | 76.1% (13.0% zero-result) | 82 | the dominant shape; a recall regression shows here first |
 | artist+album+song | 17.9% (2.2%) | 19 | |
 | artist+song | 3.8% (0.0%) | 20 | over-represented — LML#801/#1184's lane |
 | artist only | 1.9% (24.0%) | 12 | over-represented — cheap, and pins shelf ordering |
@@ -100,7 +100,7 @@ Sampled against the production query-shape mix — 21 days of alert-scope `looku
 
 The small shapes are deliberately over-weighted: three of the four calibration regressions live in the two lanes that are 4% of traffic, and sampling them proportionally would put one or two cases on the code most likely to break.
 
-**Misses are over-weighted too** — 16 of 142 (11%) against production's 10.5%, and all of them deliberate rather than incidental: eight artists with no shelf presence at all, four tracks that exist nowhere, four albums the station does not hold. Every sampled hit case is a hit by construction, so without those the corpus could only ever notice recall getting *worse*. A false positive and a recall win look identical from the outside — both turn a miss into a hit — and the miss cases are the only thing that tells them apart.
+**Misses are over-weighted too** — 16 of 143 (11%) against production's 10.5%, and all of them deliberate rather than incidental, split across four sources: eight artists with no shelf presence at all (`ABSENT_ARTIST_QUERIES`), tracks that exist nowhere (`NONSENSE_TRACK_QUERIES`), albums the station does not shelve for a seeded artist (`ABSENT_ALBUM_QUERIES`), and the frozen `lml1225-space-lizzard-battle-star` case, whose miss *is* the LML#1225 fix. The last two are not one-query-in-one-miss-out: several `NONSENSE_TRACK_QUERIES` and `ABSENT_ALBUM_QUERIES` entries hit instead, through mechanisms the corpus is specifically built to also pin (an unmarked-suspect hit, an accidental fuzzy collision, the genuine artist-only fallback) — see those tuples' docstrings in `scripts/build_golden_corpus.py` for exactly which query lands where and why, rather than a flat per-category count here that would just drift again the next time a query moves categories. Every sampled hit case is a hit by construction, so without the deliberate misses the corpus could only ever notice recall getting *worse*. A false positive and a recall win look identical from the outside — both turn a miss into a hit — and the miss cases are the only thing that tells them apart.
 
 Note that the corpus does **not** stratify on the caller segments of the plan's Finding 3. Caller class arrives as a header and changes admission and budget policy, not matching, so it is not a property of a query a corpus can hold fixed.
 
@@ -113,6 +113,8 @@ Cases run under the repo's own checked-in `Settings` defaults, pinned into the e
 ```
 
 which puts the dependency in the reviewed diff instead of in an environment. Note that settings must be pinned through the **environment**, not `app.dependency_overrides[get_settings]`: most of the pipeline calls `config.settings.get_settings()` directly rather than through `Depends`, so a dependency override reaches the router and nothing under it.
+
+`Settings` fields are not the only knobs read at request time: the search budget/hard-timeout, the admission loop-lag shed, the lookup in-flight cap's pool size, and the Apple/Bandcamp per-probe timeouts all bypass `Settings` and read `os.environ` directly (`core.search.resolve_positive_int_env` and its callers). `corpus._PINNED_ENV` pins each of these explicitly, to the literal default its own module declares — the boolean-field derivation above can't reach them automatically, since they aren't `Settings` fields at all. `LML_SEARCH_BUDGET_MS=1` is the concrete proof this pin closes a real gap: unpinned, it starves the strategy cascade and flips `lml1184-arabian-prince-strange-life` from a hit to a clean miss (LML#1233 review).
 
 The corpus therefore records default-config behavior. Production's Railway flag values are out of its scope, by construction: CI cannot read them, and a baseline that depends on an environment it cannot observe is not a baseline.
 
