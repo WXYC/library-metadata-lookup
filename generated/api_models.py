@@ -3217,6 +3217,10 @@ class AlbumSearchResult(BaseModel):
     genre_name: str
     label: str
     label_id: int | None = None
+    artist_id: int | None = Field(
+        None,
+        description="The WXYC catalog artist id, sharing the `library.artist_id` keyspace. Optional here (never required): it lands ahead of the Backend-Service change that populates it (BS#2227), so a consumer compiled against this field must still tolerate its absence until that deploys.\n",
+    )
     legacy_release_id: int | None = Field(
         None,
         description="The library row's surrogate key (BS#1963), NOT NULL in the database since migration 0137. Optional here (never required) because the column is emitted per-projection, not globally: NOT NULL is a claim about the column, while `required` is a promise that the key appears on the wire, and WXYC/Backend-Service#2167 is open precisely because the LML search-proxy rows do not emit it explicitly yet. Promoting this to required once every projection returning the schema provably emits it is worth doing, and needs a per-projection audit rather than a text edit. Matches the CatalogExportRow and BulkResolveInput precedent.\n",
