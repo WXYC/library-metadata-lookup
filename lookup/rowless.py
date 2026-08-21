@@ -49,10 +49,14 @@ def _credits_token(text: str, token_form: str, token_folded: str) -> bool:
     LML#1244: the exact ``normalize_for_comparison`` equality alone misses a
     Discogs credit that differs from the typed token only in punctuation
     ("Melt-Banana" vs "Melt Banana") — the same asymmetry
-    ``artist_matches_item`` had. ``token_folded`` is pre-guarded empty-safe
-    by the caller (``fold_punctuation_for_comparison`` on an all-punctuation
-    token yields ``""``, and ``"x".startswith("")`` would wrongly pass), so
-    an empty ``token_folded`` short-circuits this to the as-is check alone.
+    ``artist_matches_item`` had.
+
+    The ``bool(token_folded)`` guard below drops the folded comparison when
+    the typed token is all punctuation and so folds to ``""``. Unlike
+    ``artist_matches_item``, this is an equality rather than a prefix, so an
+    empty ``token_folded`` could never wildcard-match every credit; what the
+    guard actually prevents is narrower — an all-punctuation token matching
+    an all-punctuation credit, two strings that share no real content.
     """
     text_normalized = normalize_for_comparison(text)
     if text_normalized == token_form:
@@ -102,9 +106,14 @@ def _select_rowless_artist_release(
     (LML#1244 — "Melt Banana" typed against a "Melt-Banana" Discogs credit,
     or the reverse). A coincidental token→name hit is dropped, as is any
     release whose credit differs from the token by more than punctuation —
-    V/A compilations credited to "Various" and collaborations credited
-    "<artist> & <other>" among them — so the survivors are releases credited
-    to the artist alone.
+    V/A compilations credited to "Various" among them — so the survivors are
+    releases credited to the artist alone.
+
+    Note the fold does erase collaboration separators: ``&`` and ``/`` are
+    punctuation under ``[^\\w\\s]``, so a token "13 God" now reaches a credit
+    "13 & God", deliberately. What still excludes a collaboration is the
+    *equality*, not the separator — a token "<artist>" folds to strictly
+    fewer words than a credit "<artist> & <other>", so the two never equate.
 
     Among the survivors, take the highest Discogs ``confidence``, breaking a tie
     by **input order**. The upstream query is artist-only

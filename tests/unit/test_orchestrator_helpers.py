@@ -446,6 +446,77 @@ class TestArtistMatchesItem:
         item = make_library_item(id=1, artist="A.R. Kane", title="69")
         assert artist_matches_item(item, "AR Kane") is False
 
+    # ------------------------------------------------------------------
+    # Trailing punctuation must not open the prefix (LML#1244 review).
+    #
+    # A query whose own name ENDS in punctuation ("Adult.", "Neu!", "T++")
+    # loses that terminator to the fold, turning a *terminated* prefix into
+    # an *open* one: "adult." matched only rows starting "adult.", but
+    # "adult" prefix-matches Adult Books / Adult Mom / Adult Net. The
+    # retrieval feeding those rows is real -- ``_fts_normalize("Adult.")``
+    # is "adult", so ``_fallback_like_search`` builds ``artist LIKE
+    # '%adult%'`` -- and ``artist_matches_item`` is the ONLY artist gate on
+    # ``search_album()`` inside ``search_song_as_artist`` and on
+    # ``_release_matches_library_row``, so a widened gate there binds a
+    # wrong-artist library row to a Discogs release (the #400
+    # metadata-contamination shape).
+    #
+    # So the folded rungs demand EQUALITY when the query ends in
+    # punctuation, and stay an open prefix otherwise. A token-boundary rule
+    # would not work: "adult books".startswith("adult ") is True.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "query, wrong_artist",
+        [
+            # Real WXYC catalog artists whose names end in punctuation, each
+            # paired with a different catalog artist the unguarded fold
+            # wrongly admitted. Measured against the library.db snapshot:
+            # 47 artists gained a cross-artist hit, worst 'T++' (+2,686).
+            ("Adult.", "Adult Books"),
+            ("Adult.", "Adult Rodeo"),
+            ("Alaska!", "Alaska y Dinarama"),
+            ("Neu!", "Neurosis"),
+            ("Johnny!", "Johnny Ace"),
+            ("POW!", "Power Trip"),
+            ("T++", "A Tribe Called Quest"),
+            ("D+", "D Mob"),
+            ("K.", "K-9 Posse"),
+        ],
+    )
+    def test_trailing_punctuation_query_does_not_open_the_prefix(self, query, wrong_artist):
+        """A query ending in punctuation must not prefix-match a different
+        artist that merely shares the folded stem (LML#1244 review)."""
+        item = make_library_item(id=1, artist=wrong_artist, title="Album")
+        assert artist_matches_item(item, query) is False, (
+            f"query {query!r} must not match the unrelated artist {wrong_artist!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "query, catalog_artist",
+        [
+            # The equality form still has to admit the punctuation-only
+            # difference the fix exists for, in both directions.
+            ("Alaska!", "Alaska"),
+            ("Mark-Almond", "Mark Almond"),
+            ("SW.", "SW"),
+            ("Adult.", "Adult."),
+        ],
+    )
+    def test_trailing_punctuation_query_still_matches_its_own_artist(self, query, catalog_artist):
+        """The equality rung keeps the punctuation fold working for a query
+        that ends in punctuation -- it narrows the rung, it does not
+        disable it."""
+        item = make_library_item(id=1, artist=catalog_artist, title="Album")
+        assert artist_matches_item(item, query) is True
+
+    def test_trailing_punctuation_query_still_prefix_matches_via_the_as_is_rung(self):
+        """The genuine continuation case survives: 'D.I.' still reaches
+        'D.I. Go Pop', because the untouched as-is rung -- not the folded
+        one -- is what covers a query and row sharing their punctuation."""
+        item = make_library_item(id=1, artist="D.I. Go Pop", title="Album")
+        assert artist_matches_item(item, "D.I.") is True
+
 
 # ---------------------------------------------------------------------------
 # Tests: build_context_message

@@ -103,6 +103,20 @@ CROSS_REFERENCE_NAMES_SEPARATOR = " | "
 
 _PUNCTUATION_RE = re.compile(r"[^\w\s]")
 
+# A query whose own name ends in punctuation ("Adult.", "Neu!", "T++") loses
+# that terminator to the fold. See ``artist_matches_item`` for why that has to
+# switch the folded rungs from an open prefix to an equality.
+_TRAILING_PUNCTUATION_RE = re.compile(r"[^\w\s]\s*$")
+
+
+def _folded_hit(candidate: str, query: str, *, exact: bool) -> bool:
+    """Does the folded ``candidate`` satisfy the folded ``query``?
+
+    ``exact`` narrows the comparison from an open prefix to an equality. See
+    :func:`artist_matches_item` for when and why it is set.
+    """
+    return candidate == query if exact else candidate.startswith(query)
+
 
 def fold_punctuation_for_comparison(s: str) -> str:
     """Fold punctuation to a space and collapse whitespace runs.
@@ -154,11 +168,27 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     when folding leaves the query side empty, so an all-punctuation query
     (e.g. "...") can't match arbitrary rows the way an unguarded
     ``"anything".startswith("")`` would.
+
+    The folded rungs demand **equality** when the query itself ends in
+    punctuation, and stay an open prefix otherwise. A trailing "." or "!"
+    is a terminator: it marks where the name ends, and folding it away
+    turns a terminated prefix into an open one. Left open, query "Adult."
+    (a real WXYC artist) folds to "adult" and prefix-matches Adult Books,
+    Adult Mom and Adult Net; "T++" folds to "t" and reaches 2,686 artists.
+    That matters because this predicate is the *only* artist gate on
+    ``search_album()`` inside ``search_song_as_artist`` and on
+    ``_release_matches_library_row``, where admitting a wrong-artist row
+    binds it to a Discogs release. A token-boundary rule would not help --
+    ``"adult books".startswith("adult ")`` is True -- and the genuine
+    continuation case ("D.I." reaching "D.I. Go Pop") needs no folded rung
+    at all, because the untouched as-is rung already covers a query and a
+    row that share their punctuation.
     """
     artist_normalized = normalize_for_comparison(artist)
     artist_no_article = strip_leading_article(artist_normalized)
     artist_folded = fold_punctuation_for_comparison(artist_normalized)
     artist_folded_no_article = strip_leading_article(artist_folded) if artist_folded else ""
+    folded_exact = bool(_TRAILING_PUNCTUATION_RE.search(artist_normalized))
 
     candidates = [item.artist, item.alternate_artist_name]
     if item.cross_reference_names:
@@ -175,10 +205,10 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
         ):
             return True
         cand_folded = fold_punctuation_for_comparison(cand_normalized)
-        if artist_folded and cand_folded.startswith(artist_folded):
+        if artist_folded and _folded_hit(cand_folded, artist_folded, exact=folded_exact):
             return True
-        if artist_folded_no_article and strip_leading_article(cand_folded).startswith(
-            artist_folded_no_article
+        if artist_folded_no_article and _folded_hit(
+            strip_leading_article(cand_folded), artist_folded_no_article, exact=folded_exact
         ):
             return True
     return False
