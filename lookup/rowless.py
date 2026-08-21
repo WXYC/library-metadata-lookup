@@ -26,7 +26,7 @@ from entity.release_resolution_cache import (
 )
 from entity.sources import PgSource
 from library.models import LibraryItem
-from lookup.name_folding import fold_punctuation_for_comparison
+from lookup.name_folding import fold_punctuation_for_comparison, folded_hit
 from lookup.release_resolution import ResolvedRelease, resolve_release_for_track
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,9 @@ def _credits_token(text: str, token_form: str, token_folded: str) -> bool:
     text_normalized = normalize_for_comparison(text)
     if text_normalized == token_form:
         return True
-    return bool(token_folded) and fold_punctuation_for_comparison(text_normalized) == token_folded
+    return bool(token_folded) and folded_hit(
+        fold_punctuation_for_comparison(text_normalized), token_folded, exact=True
+    )
 
 
 def _own_release_credit(

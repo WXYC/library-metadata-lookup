@@ -15,7 +15,18 @@ and ``server_timing_legs.py``). The concern is genuinely shared — both
 consume it, and keeping the policy in one place is what stops them drifting on
 what counts as the same artist.
 
-Deliberately NOT merged with :func:`library.db._fts_normalize`, which folds
+Deliberately NOT delegated to ``wxyc_etl.text.to_identity_match_form_with_punctuation``,
+the crate's nearest primitive, even though it agrees with this fold on almost
+every catalog name. That export bundles three steps — fold punctuation, strip
+the leading article, strip a trailing parenthetical — and the callers here need
+the first without the second. ``artist_matches_item`` applies its own article
+logic (LML#364) in a side-dependent order, so adopting the bundle would
+double-apply it; and the trailing-paren strip is a behavior change of its own
+("South [UK]" collapses to "south"). The crate exposes no fold-only variant. If
+one is ever added, this module should delegate to it — that is the intended
+end state, not a permanent fork.
+
+Deliberately NOT merged with :func:`library.db._fts_normalize` either, which folds
 punctuation to a space for the same reason but at a different fidelity: it is
 ASCII-only because the FTS5/LIKE tokenizers it feeds are, and it leaves
 whitespace runs uncollapsed because both its callers ``.split()`` the result.
