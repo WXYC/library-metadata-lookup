@@ -101,6 +101,31 @@ def limit_results(results: list) -> list:
 CROSS_REFERENCE_NAMES_SEPARATOR = " | "
 
 
+_PUNCTUATION_RE = re.compile(r"[^\w\s]")
+
+
+def fold_punctuation_for_comparison(s: str) -> str:
+    """Fold punctuation to a space and collapse whitespace runs.
+
+    Layered onto ``normalize_for_comparison`` (LML#1244) so a query
+    differing from the catalog artist only in punctuation still matches —
+    SQLite FTS5 already tokenizes on punctuation and retrieves the rows;
+    ``artist_matches_item`` was the layer discarding them.
+
+    Punctuation folds to a SPACE, never to nothing. A space-free fold
+    ("catstevens") would let the ``startswith`` prefix match span word
+    boundaries — query "Cats" would wrongly prefix-match "Cat Stevens".
+    Punct-to-space preserves the existing char-prefix semantics instead.
+
+    Known, accepted residue: "AR Kane" still does not match "A.R. Kane"
+    ("ar kane" vs "a r kane" — the periods split single letters into their
+    own tokens). Chasing that would mean collapsing letter-period runs,
+    which risks the exact cross-word substring matching this space-fold
+    exists to avoid.
+    """
+    return " ".join(_PUNCTUATION_RE.sub(" ", s).split())
+
+
 def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     """Check if a library item matches the given artist name.
 
@@ -119,9 +144,21 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     are compared as-is first; on miss, both are also compared with the
     leading article stripped. The stripped path is skipped when stripping
     leaves the query empty so a bare "The" doesn't match arbitrary rows.
+
+    Also tolerates a punctuation asymmetry (LML#1244) — a catalog row filed
+    as "Melt-Banana" must match a listener typing "Melt Banana", and the
+    reverse. Both the as-is and article-stripped comparisons run first and
+    are unchanged; the punctuation-folded comparisons (plain and
+    article-stripped) run last, on both sides via
+    :func:`fold_punctuation_for_comparison`. Each folded path is skipped
+    when folding leaves the query side empty, so an all-punctuation query
+    (e.g. "...") can't match arbitrary rows the way an unguarded
+    ``"anything".startswith("")`` would.
     """
     artist_normalized = normalize_for_comparison(artist)
     artist_no_article = strip_leading_article(artist_normalized)
+    artist_folded = fold_punctuation_for_comparison(artist_normalized)
+    artist_folded_no_article = strip_leading_article(artist_folded) if artist_folded else ""
 
     candidates = [item.artist, item.alternate_artist_name]
     if item.cross_reference_names:
@@ -135,6 +172,13 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
             return True
         if artist_no_article and strip_leading_article(cand_normalized).startswith(
             artist_no_article
+        ):
+            return True
+        cand_folded = fold_punctuation_for_comparison(cand_normalized)
+        if artist_folded and cand_folded.startswith(artist_folded):
+            return True
+        if artist_folded_no_article and strip_leading_article(cand_folded).startswith(
+            artist_folded_no_article
         ):
             return True
     return False

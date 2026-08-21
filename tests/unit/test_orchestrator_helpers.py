@@ -176,6 +176,23 @@ class TestFilterResultsByArtist:
         filtered = filter_results_by_artist(results, "Plug")
         assert len(filtered) == 0
 
+    # ------------------------------------------------------------------
+    # Punctuation tolerance (LML#1244) -- filter_results_by_artist delegates
+    # to artist_matches_item, so it inherits the punctuation fold for free.
+    # See TestArtistMatchesItem below for the exhaustive per-class coverage;
+    # this is a thin smoke test confirming the delegation still holds.
+    # ------------------------------------------------------------------
+
+    def test_filters_by_artist_tolerates_punctuation(self):
+        """'Melt Banana' query surfaces the catalog row filed as 'Melt-Banana'."""
+        results = [
+            make_library_item(id=1, artist="Melt-Banana", title="Cell Scape"),
+            make_library_item(id=2, artist="Boredoms", title="Vision Creation Newsun"),
+        ]
+        filtered = filter_results_by_artist(results, "Melt Banana")
+        assert len(filtered) == 1
+        assert filtered[0].artist == "Melt-Banana"
+
 
 # ---------------------------------------------------------------------------
 # Tests: artist_matches_item
@@ -333,6 +350,101 @@ class TestArtistMatchesItem:
             cross_reference_names="C. Spencer Yeh",
         )
         assert artist_matches_item(item, "Stereolab") is False
+
+    # ------------------------------------------------------------------
+    # Punctuation tolerance -- bidirectional (LML#1244).
+    #
+    # ``normalize_for_comparison`` (``to_match_form``) lowercases and folds
+    # diacritics but preserves punctuation, so a catalog row filed with a
+    # hyphen, period, apostrophe, etc. never prefix-matches the punctuation-
+    # free query a listener types (and vice versa) -- SQLite FTS5 already
+    # tokenizes on punctuation and retrieves the rows; the artist filter was
+    # the layer discarding them. This is the punctuation analogue of #364's
+    # leading-article fold: a sibling comparison layered onto the existing
+    # ladder, run last, so anything that matched before the fix still does.
+    # ------------------------------------------------------------------
+
+    def test_melt_banana_hyphen_query_matches_punctuated_catalog_row(self):
+        """The reported production bug: 'Melt Banana' must match the catalog
+        row filed as 'Melt-Banana' (WXYC/library-metadata-lookup#1244)."""
+        item = make_library_item(id=30762, artist="Melt-Banana", title="Hedgehog EP")
+        assert artist_matches_item(item, "Melt Banana") is True
+
+    @pytest.mark.parametrize(
+        "punctuation_class, catalog_artist, query",
+        [
+            # Each class is a real WXYC library.db artist, picked with the
+            # punctuation embedded (not trailing) so the pre-fix comparison
+            # genuinely fails char-for-char, not just because the query is
+            # shorter than the candidate. Counts are the ticket's measured
+            # catalog population carrying that punctuation class.
+            ("hyphen (420 artists)", "A-Ha", "A Ha"),
+            ("period (484 artists)", "D.I.", "D I"),
+            ("apostrophe (366 artists)", "Z'ev", "Z Ev"),
+            ("ampersand (313 artists)", "13 & God", "13 God"),
+            ("brackets (86 artists)", "South [UK]", "South UK"),
+            ("comma (81 artists)", "If, Bwana", "If Bwana"),
+            ("slash (76 artists)", "F/I", "F I"),
+            ("parens (55 artists)", "ES (London)", "ES London"),
+            ("exclamation (43 artists)", "Yo! Majesty", "Yo Majesty"),
+        ],
+    )
+    def test_punctuation_class_query_matches_catalog_row(
+        self, punctuation_class, catalog_artist, query
+    ):
+        """A punctuation-free query matches the punctuated catalog row, for
+        every punctuation class actually present in the library (LML#1244)."""
+        item = make_library_item(id=1, artist=catalog_artist, title="Album")
+        assert artist_matches_item(item, query) is True, (
+            f"{punctuation_class}: query {query!r} should match catalog row {catalog_artist!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "catalog_artist, query",
+        [
+            ("Melt Banana", "Melt-Banana"),
+            ("Yo Majesty", "Yo! Majesty"),
+            ("A Ha", "A-Ha"),
+        ],
+    )
+    def test_punctuated_query_matches_punctuation_free_catalog_row(self, catalog_artist, query):
+        """Reverse direction: a punctuated query (as a Discogs credit or a
+        DJ's typed request might carry it) matches a catalog row filed
+        without the punctuation."""
+        item = make_library_item(id=1, artist=catalog_artist, title="Album")
+        assert artist_matches_item(item, query) is True
+
+    def test_punctuation_fold_does_not_create_substring_match(self):
+        """Folding punctuation to a SPACE (never to nothing) must not widen
+        the startswith prefix match into a substring match across word
+        boundaries -- 'Cats' must not match 'Cat Stevens'."""
+        item = make_library_item(id=1, artist="Cat Stevens", title="Tea for the Tillerman")
+        assert artist_matches_item(item, "Cats") is False
+
+    def test_punctuation_fold_negative_control_distinct_artists(self):
+        """Two real, distinct, punctuation-carrying catalog artists must not
+        collapse into a match just because both happen to carry punctuation."""
+        item = make_library_item(id=1, artist="A-Trak", title="Album")
+        assert artist_matches_item(item, "A-Ha") is False
+
+    def test_all_punctuation_query_does_not_match_arbitrary_row(self):
+        """Degenerate input: a query that is entirely punctuation folds to
+        the empty string. Unguarded, 'anything'.startswith('') is always
+        True, which would match arbitrary rows -- mirrors #364's bare-
+        leading-article guard."""
+        item = make_library_item(id=1, artist="Stereolab", title="Aluminum Tunes")
+        assert artist_matches_item(item, "...") is False
+
+    def test_ar_kane_period_residue_is_acceptable(self):
+        """Known, accepted residue: 'AR Kane' does not match 'A.R. Kane'.
+
+        Both fold to distinct single-letter tokens ('ar kane' vs 'a r
+        kane'), so the query is not a folded prefix of the catalog row.
+        Chasing this would require collapsing letter-period runs, which
+        risks exactly the cross-word substring matching the space-fold is
+        designed to avoid. Documented here as a pin, not a bug."""
+        item = make_library_item(id=1, artist="A.R. Kane", title="69")
+        assert artist_matches_item(item, "AR Kane") is False
 
 
 # ---------------------------------------------------------------------------

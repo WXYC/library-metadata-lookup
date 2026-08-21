@@ -26,6 +26,7 @@ from entity.release_resolution_cache import (
 )
 from entity.sources import PgSource
 from library.models import LibraryItem
+from lookup.matching import fold_punctuation_for_comparison
 from lookup.release_resolution import ResolvedRelease, resolve_release_for_track
 
 logger = logging.getLogger(__name__)
@@ -42,15 +43,35 @@ logger = logging.getLogger(__name__)
 _PACKED_TITLE_SEPARATOR = re.compile(r"\s[-–—]\s")
 
 
-def _own_release_credit(r: DiscogsSearchResult, token_form: str) -> tuple[str, str] | None:
+def _credits_token(text: str, token_form: str, token_folded: str) -> bool:
+    """Does ``text`` (normalized) equal the typed token, as-is or punctuation-folded?
+
+    LML#1244: the exact ``normalize_for_comparison`` equality alone misses a
+    Discogs credit that differs from the typed token only in punctuation
+    ("Melt-Banana" vs "Melt Banana") — the same asymmetry
+    ``artist_matches_item`` had. ``token_folded`` is pre-guarded empty-safe
+    by the caller (``fold_punctuation_for_comparison`` on an all-punctuation
+    token yields ``""``, and ``"x".startswith("")`` would wrongly pass), so
+    an empty ``token_folded`` short-circuits this to the as-is check alone.
+    """
+    text_normalized = normalize_for_comparison(text)
+    if text_normalized == token_form:
+        return True
+    return bool(token_folded) and fold_punctuation_for_comparison(text_normalized) == token_folded
+
+
+def _own_release_credit(
+    r: DiscogsSearchResult, token_form: str, token_folded: str
+) -> tuple[str, str] | None:
     """``(artist, album_title)`` to surface when ``r`` credits the typed token, else None.
 
     Recovers a title-derived-empty credit the live Discogs path left in ``r.album``
-    (LML#663). Still requires exact normalized-equality to ``token_form``, so V/A
+    (LML#663). Requires normalized-equality to ``token_form`` -- tolerating a
+    punctuation-only difference via ``token_folded`` (LML#1244) -- so V/A
     "Various" and collaborations stay excluded — the gate is re-sourced, not loosened.
     """
     clean = (r.artist or "").strip()
-    if normalize_for_comparison(clean) == token_form:
+    if _credits_token(clean, token_form, token_folded):
         return clean, r.album or ""
     if clean:
         # A non-empty credit that simply differs — a real mismatch (coincidental
@@ -61,11 +82,11 @@ def _own_release_credit(r: DiscogsSearchResult, token_form: str) -> tuple[str, s
     packed = (r.album or "").strip()
     if not packed:
         return None
-    if normalize_for_comparison(packed) == token_form:
+    if _credits_token(packed, token_form, token_folded):
         # Self-titled: the title is just the artist name.
         return packed, packed
     parts = _PACKED_TITLE_SEPARATOR.split(packed, maxsplit=1)
-    if len(parts) == 2 and normalize_for_comparison(parts[0]) == token_form:
+    if len(parts) == 2 and _credits_token(parts[0], token_form, token_folded):
         return parts[0].strip(), parts[1].strip()
     return None
 
@@ -77,10 +98,13 @@ def _select_rowless_artist_release(
 
     Credit gate: keep only releases whose credited artist normalizes-equal to
     the typed token (the artist-only analog of ``find_best_typed_match``'s
-    floor). A coincidental token→name hit is dropped, as is any release whose
-    credit differs from the token — V/A compilations credited to "Various" and
-    collaborations credited "<artist> & <other>" among them — so the survivors
-    are releases credited to the artist alone.
+    floor), tolerating a punctuation-only difference between the two
+    (LML#1244 — "Melt Banana" typed against a "Melt-Banana" Discogs credit,
+    or the reverse). A coincidental token→name hit is dropped, as is any
+    release whose credit differs from the token by more than punctuation —
+    V/A compilations credited to "Various" and collaborations credited
+    "<artist> & <other>" among them — so the survivors are releases credited
+    to the artist alone.
 
     Among the survivors, take the highest Discogs ``confidence``, breaking a tie
     by **input order**. The upstream query is artist-only
@@ -104,6 +128,12 @@ def _select_rowless_artist_release(
     malformed-upstream path.
     """
     token_form = normalize_for_comparison(token)
+    # LML#1244: tolerate a punctuation-only difference between the typed token
+    # and the Discogs credit ("Melt Banana" vs "Melt-Banana"), the same
+    # asymmetry ``artist_matches_item`` was fixed for. Empty when ``token``
+    # folds to nothing (all-punctuation input) — ``_credits_token`` treats
+    # that as "no folded comparison", never as a wildcard match.
+    token_folded = fold_punctuation_for_comparison(token_form)
     # (release, (recovered_artist, album_title)) for every release crediting the
     # typed token. ``_own_release_credit`` recovers a credit the live Discogs path
     # left title-derived-empty (LML#663), so a cold-cache request matches the
@@ -111,7 +141,8 @@ def _select_rowless_artist_release(
     own = [
         (r, credit)
         for r in discogs_releases
-        if r.release_id > 0 and (credit := _own_release_credit(r, token_form)) is not None
+        if r.release_id > 0
+        and (credit := _own_release_credit(r, token_form, token_folded)) is not None
     ]
     if not own:
         return None
