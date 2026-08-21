@@ -107,3 +107,23 @@ class TestSelectRowlessArtistReleasePunctuation:
         result = _select_rowless_artist_release("Melt Banana", [release])
 
         assert result is None
+
+    def test_collaboration_credit_still_rejected(self):
+        """A '<artist> & <other>' collaboration credit stays excluded.
+
+        ``&`` is punctuation under ``[^\\w\\s]``, so the fold does erase the
+        separator -- deliberately, since a token "13 God" should reach a
+        credit "13 & God". What keeps a collaboration out is not the
+        separator but the *equality*: folding "Melt-Banana & Boredoms" gives
+        "melt banana boredoms", which is a token longer than "melt banana"
+        and so still fails. Pinned because the gate's docstring rests on it.
+        """
+        release = make_discogs_result(
+            release_id=3,
+            artist="Melt-Banana & Boredoms",
+            album="Split",
+            confidence=0.9,
+        )
+        result = _select_rowless_artist_release("Melt Banana", [release])
+
+        assert result is None
