@@ -26,7 +26,7 @@ from entity.release_resolution_cache import (
 )
 from entity.sources import PgSource
 from library.models import LibraryItem
-from lookup.matching import fold_punctuation_for_comparison
+from lookup.name_folding import fold_punctuation_for_comparison
 from lookup.release_resolution import ResolvedRelease, resolve_release_for_track
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,12 @@ def _credits_token(text: str, token_form: str, token_folded: str) -> bool:
     empty ``token_folded`` could never wildcard-match every credit; what the
     guard actually prevents is narrower — an all-punctuation token matching
     an all-punctuation credit, two strings that share no real content.
+
+    That equality is also why this gate needs no counterpart to
+    ``artist_matches_item``'s trailing-punctuation narrowing. Folding a
+    terminator away is only dangerous when it turns a terminated prefix into
+    an open one; an equality has no prefix to open. The two gates share the
+    fold, and differ in comparator on purpose.
     """
     text_normalized = normalize_for_comparison(text)
     if text_normalized == token_form:

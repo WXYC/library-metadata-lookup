@@ -510,6 +510,60 @@ class TestArtistMatchesItem:
         item = make_library_item(id=1, artist=catalog_artist, title="Album")
         assert artist_matches_item(item, query) is True
 
+    # ------------------------------------------------------------------
+    # The fold must not manufacture a leading article (LML#1244 review).
+    #
+    # Folding before stripping lets `strip_leading_article` see an initial
+    # that the fold itself just separated: "A-Ha" -> "a ha" -> "ha", an open
+    # two-character prefix that reaches Habib Koite and 240 others. The "A"
+    # in "A-Ha" or "A.C. Newman" is part of the name, never an article. The
+    # query side therefore strips first and folds second -- the order
+    # ``wxyc_etl``'s own ``to_identity_match_form_with_punctuation`` uses.
+    # The candidate side keeps fold-then-strip, so a catalog row filed
+    # "The.Black Dog" is still reachable from a query "Black Dog".
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "query, wrong_artist",
+        [
+            ("A-Ha", "Habib Koite"),
+            ("A-Ha", "Haco"),
+            ("A&E", "E-40"),
+            ("A&E", "An Emotional Fish"),
+            ("A.C. Newman", "C Average"),
+            ("A-Trak", "Trans Am"),
+        ],
+    )
+    def test_fold_does_not_manufacture_a_leading_article(self, query, wrong_artist):
+        """An initial the fold separates is not an article to strip."""
+        item = make_library_item(id=1, artist=wrong_artist, title="Album")
+        assert artist_matches_item(item, query) is False, (
+            f"query {query!r} must not reach {wrong_artist!r} via a manufactured article"
+        )
+
+    def test_catalog_side_article_attached_to_punctuation_is_still_reachable(self):
+        """The candidate side still folds before stripping, so a cataloger
+        filing 'The.Black Dog' stays reachable from a query 'Black Dog' --
+        the #364 case the folded article rung exists to serve."""
+        item = make_library_item(id=1, artist="The.Black Dog", title="Bytes")
+        assert artist_matches_item(item, "Black Dog") is True
+
+    @pytest.mark.parametrize(
+        "catalog_artist, query",
+        [
+            ("Super_Collider", "Super Collider"),
+            ("CD_Slopper", "CD Slopper"),
+            ("I_LIKE_DOG_FACE", "I like dog face"),
+        ],
+    )
+    def test_underscore_folds_like_other_punctuation(self, catalog_artist, query):
+        """Underscore is punctuation to a listener, and to ``wxyc_etl``'s own
+        fold -- but Python's ``\\w`` counts it as a word character, so it has
+        to be folded explicitly. Eight catalog artists carry one, and two of
+        them are the same artist filed both ways."""
+        item = make_library_item(id=1, artist=catalog_artist, title="Album")
+        assert artist_matches_item(item, query) is True
+
     def test_trailing_punctuation_query_still_prefix_matches_via_the_as_is_rung(self):
         """The genuine continuation case survives: 'D.I.' still reaches
         'D.I. Go Pop', because the untouched as-is rung -- not the folded

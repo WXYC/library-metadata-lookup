@@ -198,6 +198,19 @@ MODULE_BUDGETS: dict[str, int] = {
     # context for anyone reading the `miss_clean` series.
     "lookup/miss_kind.py": 250,
     "lookup/models.py": 150,
+    # LML#1244 punctuation fold. Carved out of `lookup/matching.py` rather
+    # than written at its `artist_matches_item` site, which would have pushed
+    # that file past its own 550 ceiling — the same extract-don't-append
+    # policy that produced `endpoint_family.py`, `server_timing_legs.py` and
+    # `miss_kind.py`. Sized by the standard formula: smallest multiple of 50
+    # at or above 1.3x the 80-line measured size. Most of that is docstring —
+    # the module is three small functions, and the prose is the load-bearing
+    # part, since it records *why* punctuation folds to a space rather than
+    # to nothing, and why this fold is deliberately not merged with
+    # `library.db._fts_normalize`. Both `lookup/matching.py`'s prefix gate and
+    # `lookup/rowless.py`'s equality gate consume it, so drift here would
+    # silently split what the two halves of the same lane call one artist.
+    "lookup/name_folding.py": 150,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
     # transparent-fold calibration): the location-union task is now threaded
     # through `_step_search_pipeline` into the TRACK_ON_COMPILATION execute

@@ -17,6 +17,11 @@ from clients.streaming.matching import score_match
 from discogs.matching import strip_discogs_suffix
 from discogs.models import DiscogsSearchResult, ReleaseInfo
 from library.models import LibraryItem
+from lookup.name_folding import (
+    ends_in_punctuation,
+    fold_punctuation_for_comparison,
+    folded_hit,
+)
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -101,45 +106,6 @@ def limit_results(results: list) -> list:
 CROSS_REFERENCE_NAMES_SEPARATOR = " | "
 
 
-_PUNCTUATION_RE = re.compile(r"[^\w\s]")
-
-# A query whose own name ends in punctuation ("Adult.", "Neu!", "T++") loses
-# that terminator to the fold. See ``artist_matches_item`` for why that has to
-# switch the folded rungs from an open prefix to an equality.
-_TRAILING_PUNCTUATION_RE = re.compile(r"[^\w\s]\s*$")
-
-
-def _folded_hit(candidate: str, query: str, *, exact: bool) -> bool:
-    """Does the folded ``candidate`` satisfy the folded ``query``?
-
-    ``exact`` narrows the comparison from an open prefix to an equality. See
-    :func:`artist_matches_item` for when and why it is set.
-    """
-    return candidate == query if exact else candidate.startswith(query)
-
-
-def fold_punctuation_for_comparison(s: str) -> str:
-    """Fold punctuation to a space and collapse whitespace runs.
-
-    Layered onto ``normalize_for_comparison`` (LML#1244) so a query
-    differing from the catalog artist only in punctuation still matches —
-    SQLite FTS5 already tokenizes on punctuation and retrieves the rows;
-    ``artist_matches_item`` was the layer discarding them.
-
-    Punctuation folds to a SPACE, never to nothing. A space-free fold
-    ("catstevens") would let the ``startswith`` prefix match span word
-    boundaries — query "Cats" would wrongly prefix-match "Cat Stevens".
-    Punct-to-space preserves the existing char-prefix semantics instead.
-
-    Known, accepted residue: "AR Kane" still does not match "A.R. Kane"
-    ("ar kane" vs "a r kane" — the periods split single letters into their
-    own tokens). Chasing that would mean collapsing letter-period runs,
-    which risks the exact cross-word substring matching this space-fold
-    exists to avoid.
-    """
-    return " ".join(_PUNCTUATION_RE.sub(" ", s).split())
-
-
 def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     """Check if a library item matches the given artist name.
 
@@ -169,6 +135,15 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     (e.g. "...") can't match arbitrary rows the way an unguarded
     ``"anything".startswith("")`` would.
 
+    The two transforms do not commute, so the folded article rung applies
+    them in a deliberate order that differs by side. The **query** strips
+    the article first and folds second: folding first would let
+    ``strip_leading_article`` mistake an initial the fold had just separated
+    ("A-Ha" → "a ha" → "ha") for an article, and that stem open-prefixes
+    Habib Koite and 240 other rows. The **candidate** folds first and strips
+    second, which is what keeps a cataloger's "The.Black Dog" reachable from
+    a query "Black Dog".
+
     The folded rungs demand **equality** when the query itself ends in
     punctuation, and stay an open prefix otherwise. A trailing "." or "!"
     is a terminator: it marks where the name ends, and folding it away
@@ -187,8 +162,14 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     artist_normalized = normalize_for_comparison(artist)
     artist_no_article = strip_leading_article(artist_normalized)
     artist_folded = fold_punctuation_for_comparison(artist_normalized)
-    artist_folded_no_article = strip_leading_article(artist_folded) if artist_folded else ""
-    folded_exact = bool(_TRAILING_PUNCTUATION_RE.search(artist_normalized))
+    # Strip THEN fold on the query side. Folding first would let
+    # ``strip_leading_article`` see an initial the fold had just separated --
+    # "A-Ha" -> "a ha" -> "ha" -- and that two-character stem open-prefixes
+    # Habib Koite and 240 others. The "A" in "A-Ha" or "A.C. Newman" is part
+    # of the name. This is the order ``wxyc_etl``'s own
+    # ``to_identity_match_form_with_punctuation`` uses.
+    artist_folded_no_article = fold_punctuation_for_comparison(artist_no_article)
+    folded_exact = ends_in_punctuation(artist_normalized)
 
     candidates = [item.artist, item.alternate_artist_name]
     if item.cross_reference_names:
@@ -205,9 +186,9 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
         ):
             return True
         cand_folded = fold_punctuation_for_comparison(cand_normalized)
-        if artist_folded and _folded_hit(cand_folded, artist_folded, exact=folded_exact):
+        if artist_folded and folded_hit(cand_folded, artist_folded, exact=folded_exact):
             return True
-        if artist_folded_no_article and _folded_hit(
+        if artist_folded_no_article and folded_hit(
             strip_leading_article(cand_folded), artist_folded_no_article, exact=folded_exact
         ):
             return True
