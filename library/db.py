@@ -111,7 +111,19 @@ def _fts_normalize(query: str) -> str:
 
     Used by :meth:`LibraryDB._fallback_like_search` and
     :meth:`LibraryDB._fuzzy_search`, which both split the result on
-    whitespace to build their word lists.
+    whitespace to build their word lists. That ``.split()`` is why the
+    whitespace runs the substitution leaves behind ("A.R. Kane" becomes
+    "a r  kane", two spaces) are never collapsed here — they are invisible
+    at both call sites. A third caller would have to collapse them.
+
+    Deliberately NOT the same function as
+    :func:`lookup.matching.fold_punctuation_for_comparison`, which folds
+    punctuation to a space for the same reason. This one is ASCII-only
+    because the FTS5 and LIKE tokenizers it feeds are; that one is
+    Unicode-aware because it compares artist *names*. Routing a name
+    through this class would erase a CJK or Cyrillic artist to whitespace
+    entirely ("少年ナイフ" -> five spaces). Same concept, two fidelities:
+    do not merge them.
     """
     return re.sub(r"[^a-z0-9\s]", " ", normalize_for_comparison(query))
 
