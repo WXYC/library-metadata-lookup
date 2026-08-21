@@ -144,6 +144,19 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     second, which is what keeps a cataloger's "The.Black Dog" reachable from
     a query "Black Dog".
 
+    That candidate-side order has a cost worth naming: it can manufacture an
+    article on the catalog side too, since folding separates an initial the
+    stripper then eats ("A&E" → "a e" → "e", "A.M. Sixty" → "m sixty"). It is
+    tolerated because it lands on same-artist recoveries — a query "A E"
+    *should* reach "A&E" — and because the candidate is the side being
+    prefix-matched, so a shorter stem admits fewer queries rather than more.
+    The over-reach that does bite (a query stripping down to a 1-2 character
+    stem and open-prefixing unrelated rows) is the *query* side of #364's
+    article rung, which behaves identically on main for anyone typing the
+    spoken form. It is tracked as LML#1250 and is deliberately not patched
+    here — fixing it at the article rung fixes the larger spoken-form
+    population, not just the names this fold happens to touch.
+
     The folded rungs demand **equality** when the query itself ends in
     punctuation, and stay an open prefix otherwise. A trailing "." or "!"
     is a terminator: it marks where the name ends, and folding it away
