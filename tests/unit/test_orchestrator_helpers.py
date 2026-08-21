@@ -510,6 +510,31 @@ class TestArtistMatchesItem:
         item = make_library_item(id=1, artist=catalog_artist, title="Album")
         assert artist_matches_item(item, query) is True
 
+    @pytest.mark.parametrize("wrong_artist", ["Rasputina", "Rascals", "Ras G"])
+    def test_trailing_underscore_is_a_terminator_too(self, wrong_artist):
+        """A trailing '_' has to narrow the folded rung exactly like any other
+        terminator (LML#1244 review).
+
+        The fold spells '_' out because Python's ``\\w`` counts it as a word
+        character while ``wxyc_etl``'s Rust fold treats it as punctuation. The
+        trailing-terminator check has to make the same exception, or the two
+        regexes in one module disagree about what punctuation is: 'Ras_' folds
+        to 'ras' -- the terminator erased -- while ``ends_in_punctuation``
+        reports False, leaving the rung an open prefix. That is precisely the
+        terminated-prefix-becomes-open-prefix failure the guard exists to
+        prevent, leaking through the one character the guard forgot.
+        """
+        item = make_library_item(id=1, artist=wrong_artist, title="Album")
+        assert artist_matches_item(item, "Ras_") is False, (
+            f"query 'Ras_' must not open-prefix the unrelated artist {wrong_artist!r}"
+        )
+
+    def test_trailing_underscore_query_still_matches_its_own_artist(self):
+        """Narrowing to equality must not stop 'Ras_' reaching 'Ras G'-style
+        folding of its own name -- the fold still applies, it is just exact."""
+        item = make_library_item(id=1, artist="Ras", title="Album")
+        assert artist_matches_item(item, "Ras_") is True
+
     # ------------------------------------------------------------------
     # The fold must not manufacture a leading article (LML#1244 review).
     #
@@ -540,6 +565,27 @@ class TestArtistMatchesItem:
         assert artist_matches_item(item, query) is False, (
             f"query {query!r} must not reach {wrong_artist!r} via a manufactured article"
         )
+
+    @pytest.mark.parametrize(
+        "query, catalog_artist",
+        [
+            ("A E", "A&E"),
+            ("M Sixty", "A.M. Sixty"),
+        ],
+    )
+    def test_candidate_side_manufactured_article_is_tolerated(self, query, catalog_artist):
+        """The candidate side folds THEN strips, so it can manufacture an
+        article the catalog name never had ("A&E" -> "a e" -> "e").
+
+        Pinned rather than fixed (LML#1244 review). It lands on same-artist
+        recoveries -- a listener typing "A E" should reach "A&E" -- and the
+        candidate is the side being prefix-matched, so a shorter stem admits
+        fewer queries, not more. The over-reach that does bite is the *query*
+        side of the article rung reducing to a 1-2 character stem, which
+        reproduces on main and is tracked as LML#1250.
+        """
+        item = make_library_item(id=1, artist=catalog_artist, title="Album")
+        assert artist_matches_item(item, query) is True
 
     def test_catalog_side_article_attached_to_punctuation_is_still_reachable(self):
         """The candidate side still folds before stripping, so a cataloger

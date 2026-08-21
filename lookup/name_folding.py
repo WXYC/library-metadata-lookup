@@ -25,15 +25,26 @@ whitespace entirely ("少年ナイフ" -> five spaces). Same concept, two fideli
 
 import re
 
-# ``_`` is spelled out because Python's ``\w`` counts it as a word character
-# while ``wxyc_etl``'s Rust fold treats it as punctuation. Without it, LML and
-# the shared crate would disagree on eight catalog artists (Super_Collider,
-# I_LIKE_DOG_FACE, Ras_G, ...) about whether two names are the same artist.
-_PUNCTUATION_RE = re.compile(r"[^\w\s]|_")
+# What this module counts as one punctuation character. ``_`` is spelled out
+# because Python's ``\w`` counts it as a word character while ``wxyc_etl``'s
+# Rust fold treats it as punctuation. Without it, LML and the shared crate
+# would disagree on eight catalog artists (Super_Collider, I_LIKE_DOG_FACE,
+# Ras_G, ...) about whether two names are the same artist.
+#
+# Both regexes below are built from this one class on purpose. They answer
+# different questions -- "which characters do I erase?" and "does the name end
+# in one?" -- and an answer of "yes" to the first with "no" to the second is
+# exactly the bug: the fold erases a terminator that ``ends_in_punctuation``
+# then fails to report, leaving the folded rung an open prefix on a name that
+# was terminated. Sharing the class makes the two unable to drift (LML#1244
+# review); '_' was the character they had already drifted on.
+_PUNCTUATION_CHAR = r"(?:[^\w\s]|_)"
 
-# A query whose own name ends in punctuation ("Adult.", "Neu!", "T++") loses
-# that terminator to the fold. See :func:`ends_in_punctuation`.
-_TRAILING_PUNCTUATION_RE = re.compile(r"[^\w\s]\s*$")
+_PUNCTUATION_RE = re.compile(_PUNCTUATION_CHAR)
+
+# A query whose own name ends in punctuation ("Adult.", "Neu!", "T++", "Ras_")
+# loses that terminator to the fold. See :func:`ends_in_punctuation`.
+_TRAILING_PUNCTUATION_RE = re.compile(rf"{_PUNCTUATION_CHAR}\s*$")
 
 
 def fold_punctuation_for_comparison(s: str) -> str:
