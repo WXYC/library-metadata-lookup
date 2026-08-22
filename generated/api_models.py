@@ -468,6 +468,54 @@ class Show(BaseModel):
     end_time: AwareDatetime | None = None
 
 
+class OpenShow(BaseModel):
+    """
+    One open show as reported by `GET /flowsheet/open-shows`. Distinct from `Show`: it carries the derived `entry_count`, `is_current` and `likely_abandoned` fields, and omits `end_time`, which is NULL for every member of this collection by construction.
+
+    """
+
+    id: int
+    primary_dj_id: str | None = Field(
+        ...,
+        description="NULL for legacy/tubafrenzy-originated shows and for any show whose DJ account was deleted (`ON DELETE SET NULL`). Such a show can still be closed via `force-end`.\n",
+    )
+    dj_name: str | None = Field(
+        ...,
+        description="The public DJ handle, resolved through the standard chain (per-show override, then the linked account's handle, then the legacy tubafrenzy handle). Never a real name. NULL when unresolvable.\n",
+    )
+    show_name: str | None = Field(...)
+    start_time: AwareDatetime
+    legacy_show_id: int | None = Field(
+        ..., description="The tubafrenzy surrogate key, when this show was mirrored."
+    )
+    entry_count: int = Field(
+        ...,
+        description="Flowsheet rows belonging to this show, all entry types included.",
+    )
+    is_current: bool = Field(
+        ...,
+        description="True for the single show every on-air read resolves to. Present so a client can never offer to close the live broadcast.\n",
+    )
+    likely_abandoned: bool = Field(
+        ...,
+        description="Advisory only — an operator hint, not a verdict. True when the show is not current and has fewer than four entries. A show with many entries can still be abandoned; check `start_time`.\n",
+    )
+
+
+class OpenShowsResponse(BaseModel):
+    shows: list[OpenShow] = Field(
+        ..., description="Ordered oldest-first by `start_time`, tie-broken on `id`."
+    )
+    total_in_window: int = Field(
+        ...,
+        description="How many open shows the window holds in total, before `limit` truncates. `shows.length < total_in_window` is the only way a caller can tell it is looking at a partial answer.\n",
+    )
+    older_open_show_count: int = Field(
+        ...,
+        description="Open shows that started BEFORE the window, reported as a count and never listed. Almost all of these are legacy imports whose `show_end` never arrived; see the endpoint description. Widen `window_hours` to reach them.\n\n**Expected to go to zero and stay there.** This field and the 30-year `window_hours` ceiling both exist for one finite cohort — the ~2,813 shows WXYC/Backend-Service#1543 repairs from the final tubafrenzy dump. Once that lands, both are vestigial and a later contract version should drop them rather than preserve them out of habit.\n",
+    )
+
+
 class ShowDJ(BaseModel):
     show_id: int | None = None
     dj_id: int | None = None
