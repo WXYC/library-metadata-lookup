@@ -131,16 +131,49 @@ class TestGuardsIntact:
             ("Melt Banana", "Melt-Banana Orchestra"),  # 56.25 raw, 68.75 folded
         ],
     )
-    def test_genuinely_different_artists_still_rejected(self, query, candidate):
-        """These are below the floor today and must stay below it after the fold.
+    def test_token_gain_does_not_inflate(self, query, candidate):
+        """The direction that is *not* the hazard, pinned anyway.
 
-        ``Melt-Banana Orchestra`` is the load-bearing case: it differs from the
-        query by punctuation *and* an extra token, so it is exactly what a
-        careless fold would newly admit. It cannot, because ``score_match``
-        uses ``token_sort_ratio`` rather than ``token_set_ratio`` -- sorting
-        tokens rather than set-comparing them, so a query that is a strict
-        subset of the candidate does not inflate to 100 the way LML#719's
-        subset-inflation bug did. Folded it scores 68.75, still short.
+        ``Melt-Banana Orchestra`` differs from the query by punctuation *and*
+        an extra token. It cannot inflate, because ``score_match`` uses
+        ``token_sort_ratio`` rather than ``token_set_ratio`` -- the extra token
+        stays in the denominator, so a strict-subset query does not reach 100
+        the way LML#719's subset-inflation bug did. Folded it scores 68.75.
+        """
+        assert _artist_pair_verified(query, candidate) is False
+
+    @pytest.mark.parametrize(
+        "query,candidate,folded_score",
+        [
+            ("Bark!", "Barker", 80.00),
+            ("Splint!", "Splinters", 80.00),
+            ("KOKOKO!", "Koko", 80.00),
+            ("Dinosaur Jr.", "Dinosaurs", 80.00),
+            ("Curren$y", "Current Joys", 80.00),
+            ("The Go Go's", "The So So Glos", 80.00),
+            ("Screamin' Sirens", "Screaming Trees", 80.00),
+            ("Santiago!", "Santigold", 82.35),
+            ("Christiane F.", "Christians", 81.82),
+            ("Daddy G", "Daddy-O", 85.71),
+        ],
+    )
+    def test_length_shortening_does_not_admit_a_different_artist(
+        self, query, candidate, folded_score
+    ):
+        """The direction that IS the hazard, and the reason the folded rung
+        demands equality rather than the 80 floor.
+
+        Folding *removes* mass from a short name, shrinking the denominator and
+        pushing the ratio up onto the floor. Every pair here is a genuinely
+        different WXYC catalog artist whose folded score lands at or just above
+        80 -- seven of them at exactly 80.00, which is a boundary effect rather
+        than a tail. A floor-based folded rung admits all of them (38 such
+        flips across the catalog); requiring equality admits none.
+
+        Note these are *not* symmetrical with the token-gain cases above: there
+        the extra mass protects the denominator, here the fold destroys it.
+        Covering only the first direction is what let this class through
+        initially.
         """
         assert _artist_pair_verified(query, candidate) is False
 
@@ -175,6 +208,23 @@ class TestGuardsIntact:
     @pytest.mark.parametrize("candidate", [None, "", "   ", 42])
     def test_non_string_and_empty_candidates_rejected(self, candidate):
         assert _artist_pair_verified("Melt Banana", candidate) is False
+
+    def test_folded_rung_requires_equality_not_the_floor(self):
+        """The rung's contract, stated directly.
+
+        A pair differing only in punctuation folds to 100. A pair differing by
+        anything else scores below it and must be refused, even when it clears
+        the shared 80 floor -- that gap is the entire LML#1253-review finding.
+        """
+        from lookup.artist_resolution import _FOLDED_EQUALITY_SCORE
+        from lookup.name_folding import fold_punctuation_for_comparison as fold
+
+        assert _FOLDED_EQUALITY_SCORE == 100.0
+        assert _FOLDED_EQUALITY_SCORE > SCORE_MATCH_ACCEPTANCE_FLOOR
+        # Same name, punctuation aside -> equality.
+        assert score_match(fold("Melt Banana"), fold("Melt-Banana")) == 100.0
+        # Different names that a floor-based rung would have admitted.
+        assert SCORE_MATCH_ACCEPTANCE_FLOOR <= score_match(fold("Bark!"), fold("Barker")) < 100.0
 
     def test_floor_is_not_lowered(self):
         """This is a normalization fix, not a threshold fix. The floor is

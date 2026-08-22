@@ -102,12 +102,22 @@ class TestSearchAndEnrichmentAgree:
         assert all(_artist_pair_verified("Stereolab", i.artist) for i in items)
 
     @pytest.mark.asyncio
-    async def test_gate_still_rejects_a_different_artist_in_the_same_db(self, db):
-        """False positives excluded (bug-fix protocol): widening the gate for
-        punctuation must not authorize an unrelated catalog artist. Boredoms
-        shares the fixture and the genre; it must not verify against the
-        Melt-Banana request under either spelling.
+    async def test_gate_rejects_every_other_artist_the_db_holds(self, db):
+        """False positives excluded (bug-fix protocol), driven off the fixture
+        rather than off hardcoded strings.
+
+        Reads the artists the database actually contains and asserts the gate
+        authorizes exactly the Melt-Banana rows for a Melt-Banana request. A
+        fixture that later grows a near-miss artist is then covered
+        automatically, which a hand-listed pair of names would not be.
         """
+        rows = await db.search(query="", limit=100) or []
+        catalog = {r.artist for r in rows if r.artist}
+        if not catalog:  # search("") is not a supported query shape on every backend
+            catalog = {"Melt-Banana", "Stereolab", "Boredoms"}
+
         for query in ("Melt Banana", "Melt-Banana"):
-            assert _artist_pair_verified(query, "Boredoms") is False
-            assert _artist_pair_verified(query, "Stereolab") is False
+            verified = {a for a in catalog if _artist_pair_verified(query, a)}
+            assert verified == {"Melt-Banana"}, (
+                f"{query!r} authorized {verified} -- expected only the Melt-Banana rows"
+            )

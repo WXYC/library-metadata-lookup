@@ -277,7 +277,13 @@ async def enrich_artwork_results(
     # whether THAT item's library row anchors the request — hoisting to
     # top-1-only suppresses every non-top-1 item's probe artwork
     # unconditionally. Per-item library-row computation in ``_artist_pair_verified``
-    # is cheap (two short helper calls; both early-exit on empty inputs).
+    # stays affordable, but is no longer as cheap as this note once claimed:
+    # since LML#1252 a *miss* costs a second ``score_match`` over the
+    # punctuation-folded pair, so the common non-matching case runs the
+    # normalization battery twice rather than once. Still two short in-process
+    # calls with no I/O, and the hit path is unchanged (the folded rung is only
+    # reached after the raw comparison fails), but the per-item loop is the
+    # place that would notice if a third rung were ever added here.
     top1_release_artist = getattr(top1_release, "artist", None)
     release_side_artist_verified = _artist_pair_verified(
         request_artist_stripped, top1_release_artist
