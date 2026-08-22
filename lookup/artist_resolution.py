@@ -79,6 +79,18 @@ def _skip_prefetch_on_synthesis_enabled() -> bool:
     return resolve_bool_env(_SKIP_PREFETCH_ON_SYNTHESIS_ENV_VAR, default=True)
 
 
+_FOLDED_EQUALITY_SCORE: float = 100.0
+"""What the LML#1252 folded rung in :func:`_artist_pair_verified` requires.
+
+Deliberately *not* ``SCORE_MATCH_ACCEPTANCE_FLOOR``. The folded rung asks
+whether two names are the same once punctuation is ignored, and equality is
+that question stated exactly; anything below 100 differs by more than
+punctuation and belongs to the raw rung. Named rather than inlined so the
+distinction from the shared floor is legible at the call site — the two are
+answering different questions and must not be conflated if one moves.
+"""
+
+
 def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
     """Score-floor + V/A guard for one (request, candidate-artist) hop.
 
@@ -109,28 +121,58 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
     **after** the raw comparison misses, and the raw result is never
     discarded, so no pair that verifies today can start failing.
 
+    **The folded rung demands equality, not the 80 floor**, and that is the
+    whole of its safety argument. The rung exists to answer one narrow
+    question — "are these the same name once punctuation is ignored?" — and
+    the honest expression of that question is equality. A folded pair scoring
+    anything *below* 100 differs by more than punctuation, which is the raw
+    rung's business, not this one's.
+
+    Running the folded rung at the shared floor instead is measurably wrong,
+    and not for the reason a reader might expect. ``score_match`` uses
+    ``token_sort_ratio``, so LML#719-style subset inflation is impossible: a
+    folded "Melt Banana" scores only 68.75 against "Melt-Banana Orchestra"
+    because the extra token stays in the denominator. The real hazard runs the
+    other way — the fold *removes* mass from a short name, shrinking the
+    denominator and pushing the ratio up onto the floor. Blocking all 23,815
+    catalog artists on their first four folded characters and diffing the
+    predicate against ``main``, a floor-based rung flips **38** cross-artist
+    pairs from reject to verify, 21 of them landing at exactly 80.00 — a
+    boundary effect, not a tail: "Bark!"/"Barker", "Dinosaur Jr."/"Dinosaurs",
+    "Curren$y"/"Current Joys", "The Go Go's"/"The So So Glos". Requiring
+    equality takes that to **3**, and all three are one artist the catalog
+    filed twice ("Mark Almond"/"Mark-Almond") — pairs that *should* verify.
+    Recall is untouched: rejections fall 571 → 100 either way, because a name
+    differing from its spoken form only in punctuation folds to equality by
+    construction.
+
+    Equality is also what keeps this gate coherent with the search axis it is
+    supposed to agree with. LML#1244's ``folded_hit`` already drops from prefix
+    to *exact* comparison when the query ends in punctuation, precisely because
+    folding a terminator turns a terminated name into an open one. Demanding
+    equality here applies that policy unconditionally, which is the stricter
+    and simpler half of the same rule.
+
     Two ordering facts are load-bearing:
 
     * The disambiguation strip runs **before** the fold. ``strip_discogs_disambig``
       finds ``(2)`` by its parentheses; folding first would erase them
       ("Sessa (2)" → "sessa 2") and leave the disambiguator glued to the name.
       The LML#1244 review established that these two transforms do not commute.
-    * The V/A guard runs **before** either, so folding "V/A" to "v a" cannot
-      sneak a compilation credit past ``is_compilation_artist`` (LML#1139,
-      LML#1144).
+    * The V/A guard runs **before** the fold — though only for ordering's sake,
+      not safety: it is evaluated on the raw candidate and the fold never
+      revisits it, so a compilation credit is rejected identically whichever
+      side of the fold the check sits on.
 
     The fold is :func:`lookup.name_folding.fold_punctuation_for_comparison` —
     the same policy the search axis uses, deliberately not a second local
     copy, because the two halves of one lane drifting on what counts as the
     same artist is what produced this gap in the first place.
 
-    This is a normalization fix, not a threshold fix: the floor is shared with
-    the streaming matcher, where LML#719 and LML#1139 document the false
-    positives it exists to stop. Widening is safe here because ``score_match``
-    uses ``token_sort_ratio`` rather than ``token_set_ratio`` — a query that is
-    a strict subset of the candidate does not inflate to 100 the way LML#719's
-    subset-inflation bug did, so a folded "Melt Banana" still scores only 68.75
-    against "Melt-Banana Orchestra" and stays out.
+    This is a normalization fix, not a threshold fix. ``SCORE_MATCH_ACCEPTANCE_FLOOR``
+    is shared with the streaming matcher, where LML#719 and LML#1139 document
+    the false positives it exists to stop, and it is neither read nor moved by
+    the folded rung.
     """
     if not query_stripped:
         return False
@@ -146,14 +188,16 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
         return False
     if score_match(query_stripped_canonical, candidate_stripped) >= SCORE_MATCH_ACCEPTANCE_FLOOR:
         return True
-    # LML#1252 — retry on the punctuation-folded pair. Skipped when either side
-    # folds away entirely (an all-punctuation name), so "..." cannot verify
-    # against an equally punctuation-only credit.
+    # LML#1252 — retry on the punctuation-folded pair, demanding equality
+    # rather than the shared floor (see the docstring: a floor-based rung flips
+    # 38 cross-artist pairs, equality flips 3, and recall is identical).
+    # Skipped when either side folds away entirely (an all-punctuation name),
+    # so "..." cannot verify against an equally punctuation-only credit.
     query_folded = fold_punctuation_for_comparison(query_stripped_canonical)
     candidate_folded = fold_punctuation_for_comparison(candidate_stripped)
     if not query_folded or not candidate_folded:
         return False
-    return score_match(query_folded, candidate_folded) >= SCORE_MATCH_ACCEPTANCE_FLOOR
+    return score_match(query_folded, candidate_folded) >= _FOLDED_EQUALITY_SCORE
 
 
 _resolver_cache = create_ttl_cache(maxsize=512, ttl=300)
