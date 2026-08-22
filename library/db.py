@@ -117,7 +117,7 @@ def _fts_normalize(query: str) -> str:
     at both call sites. A third caller would have to collapse them.
 
     Deliberately NOT the same function as
-    :func:`lookup.matching.fold_punctuation_for_comparison`, which folds
+    :func:`lookup.name_folding.fold_punctuation_for_comparison`, which folds
     punctuation to a space for the same reason. This one is ASCII-only
     because the FTS5 and LIKE tokenizers it feeds are; that one is
     Unicode-aware because it compares artist *names*. Routing a name
