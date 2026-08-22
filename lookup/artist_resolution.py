@@ -27,6 +27,7 @@ from core.env import resolve_bool_env
 from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import create_ttl_cache, should_skip_cache
+from lookup.name_folding import fold_punctuation_for_comparison
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,38 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
     canonicalized Discogs identifier. Verified empirically: ``Sessa`` vs
     ``Sessa (2)`` = 71.43, ``Stereolab`` vs ``Stereolab (UK)`` = 78.26 — both
     fail the 80 floor without the strip; both pass after symmetric strip.
+
+    A **punctuation** asymmetry is handled the same way (LML#1252). LML#1244
+    taught the search axis to fold punctuation, so a listener typing "Melt
+    Banana" finds the five Melt-Banana rows — but ``score_match`` is
+    punctuation-sensitive (that pair scores 54.55), so this gate went on
+    rejecting them and the rows arrived un-enriched: no artwork, no bio, for
+    571 of the 1,903 punctuated catalog artists. The fold is retried only
+    **after** the raw comparison misses, and the raw result is never
+    discarded, so no pair that verifies today can start failing.
+
+    Two ordering facts are load-bearing:
+
+    * The disambiguation strip runs **before** the fold. ``strip_discogs_disambig``
+      finds ``(2)`` by its parentheses; folding first would erase them
+      ("Sessa (2)" → "sessa 2") and leave the disambiguator glued to the name.
+      The LML#1244 review established that these two transforms do not commute.
+    * The V/A guard runs **before** either, so folding "V/A" to "v a" cannot
+      sneak a compilation credit past ``is_compilation_artist`` (LML#1139,
+      LML#1144).
+
+    The fold is :func:`lookup.name_folding.fold_punctuation_for_comparison` —
+    the same policy the search axis uses, deliberately not a second local
+    copy, because the two halves of one lane drifting on what counts as the
+    same artist is what produced this gap in the first place.
+
+    This is a normalization fix, not a threshold fix: the floor is shared with
+    the streaming matcher, where LML#719 and LML#1139 document the false
+    positives it exists to stop. Widening is safe here because ``score_match``
+    uses ``token_sort_ratio`` rather than ``token_set_ratio`` — a query that is
+    a strict subset of the candidate does not inflate to 100 the way LML#719's
+    subset-inflation bug did, so a folded "Melt Banana" still scores only 68.75
+    against "Melt-Banana Orchestra" and stays out.
     """
     if not query_stripped:
         return False
@@ -111,7 +144,16 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
     query_stripped_canonical = strip_discogs_disambig(query_stripped).strip()
     if not query_stripped_canonical:
         return False
-    return score_match(query_stripped_canonical, candidate_stripped) >= SCORE_MATCH_ACCEPTANCE_FLOOR
+    if score_match(query_stripped_canonical, candidate_stripped) >= SCORE_MATCH_ACCEPTANCE_FLOOR:
+        return True
+    # LML#1252 — retry on the punctuation-folded pair. Skipped when either side
+    # folds away entirely (an all-punctuation name), so "..." cannot verify
+    # against an equally punctuation-only credit.
+    query_folded = fold_punctuation_for_comparison(query_stripped_canonical)
+    candidate_folded = fold_punctuation_for_comparison(candidate_stripped)
+    if not query_folded or not candidate_folded:
+        return False
+    return score_match(query_folded, candidate_folded) >= SCORE_MATCH_ACCEPTANCE_FLOOR
 
 
 _resolver_cache = create_ttl_cache(maxsize=512, ttl=300)
