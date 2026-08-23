@@ -91,6 +91,27 @@ _PUNCTUATION_RE = re.compile(_PUNCTUATION_CHAR)
 # loses that terminator to the fold. See :func:`ends_in_punctuation`.
 _TRAILING_PUNCTUATION_RE = re.compile(rf"{_PUNCTUATION_CHAR}\s*$")
 
+# A name's *wrapping* punctuation run, leading and trailing. Built from the
+# same class as the two above, for the reason stated there: a third local
+# spelling of "which characters are punctuation" is how this lane drifts.
+# Python's bare ``[^\w]`` would be that third spelling, and it disagrees on
+# exactly the character the LML#1244 review already caught -- it counts ``_``
+# as a word character and so refuses to trim it.
+_WRAPPING_PUNCTUATION_RE = re.compile(rf"^{_PUNCTUATION_CHAR}+|{_PUNCTUATION_CHAR}+$")
+
+
+def trim_wrapping_punctuation(normalized: str) -> str:
+    """Strip leading and trailing punctuation runs, leaving the interior alone.
+
+    The counterpart to :func:`fold_punctuation_for_comparison` for callers that
+    must *keep* interior punctuation. The compilation-alias guard is the case:
+    ``wxyc_etl.text.is_compilation_artist`` keys on the ``/`` and ``.`` in
+    "v/a" and "v.a", so folding destroys the very characters it matches on,
+    while a wrapped alias ("(V/A)") is invisible to a first-character anchor.
+    Trimming only the wrapping run answers that without touching the interior.
+    """
+    return _WRAPPING_PUNCTUATION_RE.sub("", normalized)
+
 
 def fold_punctuation_for_comparison(s: str) -> str:
     """Fold punctuation to a space and collapse whitespace runs.

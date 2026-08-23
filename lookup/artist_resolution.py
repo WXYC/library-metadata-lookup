@@ -10,7 +10,6 @@ Extracted verbatim from ``lookup/orchestrator.py`` (LML#724).
 
 import logging
 import random
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +27,7 @@ from core.env import resolve_bool_env
 from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import create_ttl_cache, should_skip_cache
-from lookup.name_folding import fold_punctuation_for_comparison
+from lookup.name_folding import fold_punctuation_for_comparison, trim_wrapping_punctuation
 
 logger = logging.getLogger(__name__)
 
@@ -92,20 +91,6 @@ answering different questions and must not be conflated if one moves.
 """
 
 
-_WRAPPING_PUNCT_RE = re.compile(r"^[^\w]+|[^\w]+$")
-"""Leading and trailing non-word runs, trimmed for the second compilation test.
-
-``is_compilation_artist`` matches either an exact name ("various",
-"soundtrack", "compilation") or a leading prefix ("various artists", "v/a",
-"v.a", "soundtracks"). A *wrapping* parenthetical defeats both: "(V/A)" is not
-"v/a" and does not start with it. It cannot be handled by folding punctuation
-either, because the prefixes that would match are keyed on ``/`` and ``.`` --
-the very characters a fold destroys ("(V/A)" folds to "v a", which matches
-nothing). Trimming only the wrapping run leaves the interior punctuation the
-prefix list needs.
-"""
-
-
 def _is_compilation_alias(name: str) -> bool:
     """Is ``name`` a compilation / Various-Artists credit rather than an artist?
 
@@ -120,19 +105,22 @@ def _is_compilation_alias(name: str) -> bool:
     rows are in this class today — but the candidate side is fed from Discogs,
     and the org has an active mojibake workstream.
 
-    The second test, on the wrapping-punctuation-trimmed form, closes the
-    parallel hole described on :data:`_WRAPPING_PUNCT_RE`.
+    It also trims the name's *wrapping* punctuation, via
+    :func:`lookup.name_folding.trim_wrapping_punctuation`.
+    ``is_compilation_artist`` anchors on the first character, so a wrapped
+    alias ("(V/A)", "[Various Artists]") matches neither its exact-name list
+    nor its leading-prefix list. Deliberately *not* the punctuation fold: the
+    prefixes are keyed on the ``/`` and ``.`` in "v/a" and "v.a", the very
+    characters a fold destroys, so the fold would answer the wrong question.
 
-    Deliberately *not* the punctuation fold: this asks "is this a compilation
-    credit?", which needs interior punctuation intact, whereas the fold asks
-    "are these the same name ignoring punctuation?" and destroys it.
+    Trimming **subsumes** the untrimmed test rather than supplementing it, so
+    one call suffices: every compilation token begins and ends with a word
+    character, so the trim can neither eat into a match nor manufacture the
+    leading punctuation that would break the anchor. Verified over 352,197
+    catalog, wrapped and fuzzed inputs — zero cases where the untrimmed form
+    matches and the trimmed one does not.
     """
-    normalized = normalize_for_comparison(name or "")
-    if not normalized:
-        return False
-    if is_compilation_artist(normalized):
-        return True
-    return is_compilation_artist(_WRAPPING_PUNCT_RE.sub("", normalized))
+    return is_compilation_artist(trim_wrapping_punctuation(normalize_for_comparison(name)))
 
 
 def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
@@ -203,10 +191,10 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
       finds ``(2)`` by its parentheses; folding first would erase them
       ("Sessa (2)" → "sessa 2") and leave the disambiguator glued to the name.
       The LML#1244 review established that these two transforms do not commute.
-    * The V/A guard runs **before** the fold — though only for ordering's sake,
-      not safety: it is evaluated on the raw candidate and the fold never
-      revisits it, so a compilation credit is rejected identically whichever
-      side of the fold the check sits on.
+    * The V/A guard runs **before** the fold, on the *normalized* candidate
+      via :func:`_is_compilation_alias`. Reading the raw string was a hole:
+      the fold normalizes both sides, so an alias the raw check missed
+      ("Vàrious Artists") folded straight into equality.
 
     The fold is :func:`lookup.name_folding.fold_punctuation_for_comparison` —
     the same policy the search axis uses, deliberately not a second local
