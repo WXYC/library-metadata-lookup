@@ -46,11 +46,23 @@ spike alongside the Discogs health signals (`cache.api_calls`, the LML#683
 alerts) rather than as proof of a recall regression.
 
 `search_type` is deliberately not read here. It is a lane-derived label:
-`core.search.get_search_type_from_state` returns the *last strategy
-attempted* with no reference to result count, so `alternative` and
-`compilation` both appear on zero-result responses in production (LML#1233
-Finding 1, and the same trap BS#1359 fell into). Anything keying off it to
-define a miss is reading which lane ran, not what was found.
+`core.search.get_search_type_from_state` branches on the *last strategy
+attempted*, so `alternative` and `compilation` both appear on zero-result
+responses in production (LML#1233 Finding 1, and the same trap BS#1359 fell
+into). Anything keying off it to define a miss is reading which lane ran, not
+what was found.
+
+An earlier version of this paragraph said the derivation reads the last
+strategy "with no reference to result count." That was never quite true --
+the ARTIST_PLUS_ALBUM branch has consulted `song_not_found` for some time --
+and LML#1239 made it less true still by giving TRACK_ON_COMPILATION the same
+verdict mirror, while leaving SONG_AS_TRACK deliberately unmirrored (the
+reasoning is at that branch). The label is now partly verdict-sensitive and
+partly not, which strengthens rather than weakens the conclusion above: it is
+neither a pure lane label nor a reliable found/not-found signal, and no
+consumer should treat it as either. Backend-Service's
+`isTrustedLmlTrackContextMatch` gates on `search_type` alone, so the
+verdict-sensitive branches exist for that consumer -- not for this one.
 
 Split out of `lookup/router.py` rather than written at the emit site: that
 module sits at 1,223 of its 1,250-line budget ceiling

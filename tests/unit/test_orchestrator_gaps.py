@@ -4,13 +4,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from core.search import SearchState
+from core.search import SearchState, SearchStrategyType, _apply, get_search_type_from_state
+from generated.api_models import TrackMatchHint, TrackMatchSource
 from lookup.artwork import fetch_artwork_for_items
 from lookup.matching import _va_series_title_match, album_title_acceptable
 from lookup.orchestrator import resolve_albums_for_track
 from lookup.release_resolution import ResolvedRelease
 from lookup.strategies.artist_plus_album import search_library_with_fallback
 from lookup.strategies.song_as_artist import search_song_as_artist
+from lookup.strategies.song_as_track import SongAsTrack
 from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
 from lookup.strategies.track_on_compilation import (
     TrackOnCompilation,
@@ -1501,3 +1503,126 @@ class TestTrackOnCompilationAttemptDemotion:
         assert outcome.items == []
         assert outcome.song_not_found_after is None
         assert outcome.found_on_compilation_after is False
+
+
+# ---------------------------------------------------------------------------
+# SONG_AS_TRACK -- why the LML#1239 verdict mirror stops at TRACK_ON_COMPILATION
+# ---------------------------------------------------------------------------
+
+
+class TestSongAsTrackVerdictInvariant:
+    """The reachability argument behind leaving SONG_AS_TRACK's branch alone.
+
+    ``get_search_type_from_state`` now mirrors the verdict on the
+    TRACK_ON_COMPILATION branch -- ``SEARCH_TYPE_FALLBACK if song_not_found`` --
+    and deliberately does not on the SONG_AS_TRACK branch four lines below it,
+    even though both feed the same Backend-Service trust gate
+    (``isTrustedLmlTrackContextMatch``, which reads ``search_type`` alone).
+
+    The asymmetry is structural, not an oversight. TRACK_ON_COMPILATION owns a
+    last-resort branch that appends the top keyword-search hit without ever
+    consulting a tracklist -- that is what ``_lacks_tracklist_confirmation``
+    detects and what LML#1239 demotes. SONG_AS_TRACK has no such branch: every
+    item it can surface came through ``_match_track_releases_to_library``, which
+    appends to ``matched_items`` only inside the loop that also records that
+    item's ``TrackMatchHint``, and it returns them via ``Outcome.track_match``,
+    which sets ``song_not_found_after=False`` unconditionally. So the divergent
+    state a mirror would guard against -- items surfaced by SONG_AS_TRACK while
+    ``song_not_found`` is True -- is unreachable, and the mirror would be dead
+    code on a branch whose live behaviour it cannot change.
+
+    These two tests are the pin. If SONG_AS_TRACK ever grows an unvalidated
+    surfacing path, they fail, and the decision recorded above has to be retaken
+    rather than silently inherited.
+
+    Distinct from LML#1225, which is about the *quality* of the tracklist gate
+    (containment-only title matching in ``scan_tracklist_for_match``) rather than
+    about ``search_type`` disagreeing with the verdict. A precision fix there
+    does not change the invariant here.
+    """
+
+    @staticmethod
+    def _hint() -> TrackMatchHint:
+        return TrackMatchHint(
+            title="Zzyzx Marginal Fanfare",
+            artist_credit=None,
+            position=None,
+            confidence=0.85,
+            source=TrackMatchSource.discogs_release,
+        )
+
+    @pytest.mark.asyncio
+    async def test_surfacing_items_always_clears_song_not_found(self):
+        """Even from a state that arrived with ``song_not_found=True``."""
+        item = _item(id=1, artist="Stereolab", title="Peng!")
+        execute = AsyncMock(return_value=([item], {1: [self._hint()]}, {}))
+        strategy = SongAsTrack(db=AsyncMock(), execute=execute)
+        parsed = ParsedRequest(song="Zzyzx Marginal Fanfare", raw_message="x")
+        state = SearchState(results=[])
+        state.song_not_found = True
+
+        outcome = await strategy.attempt(parsed, state, "x")
+        _apply(state, outcome)
+        # The runner, not ``_apply``, records the attempt; mirror it so the
+        # derivation below sees the same last-tried strategy production does.
+        state.strategies_tried = [
+            SearchStrategyType.SONG_AS_ARTIST,
+            SearchStrategyType.SONG_AS_TRACK,
+        ]
+
+        assert outcome.items == [item]
+        assert outcome.song_not_found_after is False
+        assert state.song_not_found is False
+        assert get_search_type_from_state(state) == "compilation"
+
+    @pytest.mark.asyncio
+    async def test_every_surfaced_item_carries_a_track_hint(self):
+        """The structural property the reachability argument rests on.
+
+        ``matched_via_by_id`` is SONG_AS_TRACK's analogue of
+        TRACK_ON_COMPILATION's ``discogs_titles``: the record that a tracklist
+        was actually consulted. An item without one would be the unvalidated
+        shape LML#1239 demotes -- and the kernel has no code path that produces
+        it, because the only ``matched_items.append`` sits in the same loop body
+        as the ``matched_via_by_id`` write.
+        """
+        items = [
+            _item(id=1, artist="Stereolab", title="Peng!"),
+            _item(id=2, artist="Juana Molina", title="DOGA"),
+        ]
+        hints = {1: [self._hint()], 2: [self._hint()]}
+        execute = AsyncMock(return_value=(items, hints, {}))
+        strategy = SongAsTrack(db=AsyncMock(), execute=execute)
+
+        outcome = await strategy.attempt(
+            ParsedRequest(song="Zzyzx Marginal Fanfare", raw_message="x"),
+            SearchState(results=[]),
+            "x",
+        )
+
+        assert outcome.items == items
+        assert {item.id for item in outcome.items} == set(outcome.matched_via_by_id)
+
+    @pytest.mark.asyncio
+    async def test_no_items_leaves_the_prior_verdict_untouched(self):
+        """``Outcome.empty()`` writes no ``song_not_found_after``.
+
+        This is the one shape where SONG_AS_TRACK can be the last-tried strategy
+        with ``song_not_found`` True -- and it is a zero-result response by
+        construction (``should_attempt`` requires ``not state.results``, and this
+        path adds none), so the trust gate has nothing to trust either way.
+        """
+        execute = AsyncMock(return_value=([], {}, {}))
+        strategy = SongAsTrack(db=AsyncMock(), execute=execute)
+        state = SearchState(results=[])
+        state.song_not_found = True
+
+        outcome = await strategy.attempt(
+            ParsedRequest(song="Zzyzx Marginal Fanfare", raw_message="x"), state, "x"
+        )
+        _apply(state, outcome)
+
+        assert outcome.items == []
+        assert outcome.song_not_found_after is None
+        assert state.song_not_found is True
+        assert not state.results
