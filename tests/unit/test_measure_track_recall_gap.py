@@ -15,6 +15,7 @@ from scripts.measure_track_recall_gap import (
     GapCensusReport,
     LibraryRow,
     ReleaseCandidate,
+    artist_variants,
     load_library_rows,
     naive_like_comp_count,
     render_report,
@@ -23,11 +24,18 @@ from scripts.measure_track_recall_gap import (
 )
 
 
-def _write_library_db(tmp_path, rows: list[tuple[int, str, str]]):
+def _write_library_db(tmp_path, rows: list[tuple[int, str, str, str]]):
+    """Write a ``library``-shaped SQLite table. Rows are ``(id, artist, title, alt)``."""
     db_path = tmp_path / "library.db"
     con = sqlite3.connect(db_path)
-    con.execute("CREATE TABLE library (id INTEGER PRIMARY KEY, artist TEXT, title TEXT)")
-    con.executemany("INSERT INTO library (id, artist, title) VALUES (?, ?, ?)", rows)
+    con.execute(
+        "CREATE TABLE library (id INTEGER PRIMARY KEY, artist TEXT, title TEXT, "
+        "alternate_artist_name TEXT)"
+    )
+    con.executemany(
+        "INSERT INTO library (id, artist, title, alternate_artist_name) VALUES (?, ?, ?, ?)",
+        rows,
+    )
     con.commit()
     con.close()
     return str(db_path)
@@ -38,8 +46,8 @@ class TestLoadLibraryRows:
         db_path = _write_library_db(
             tmp_path,
             [
-                (1, "Stereolab", "Aluminum Tunes"),
-                (2, "Various Artists - Reggae", "The Sound of Dub"),
+                (1, "Stereolab", "Aluminum Tunes", None),
+                (2, "Various Artists - Reggae", "The Sound of Dub", None),
             ],
         )
 
@@ -50,12 +58,59 @@ class TestLoadLibraryRows:
             LibraryRow(id=2, artist="Various Artists - Reggae", title="The Sound of Dub"),
         ]
 
-    def test_null_artist_or_title_becomes_empty_string(self, tmp_path):
-        db_path = _write_library_db(tmp_path, [(1, None, None)])
+    def test_reads_the_alternate_artist_name(self, tmp_path):
+        """``build_filtered_discogs.py::extract_library_artists`` -- the real
+        prod cache-build filter this census claims to mirror -- unions
+        ``artist`` AND ``alternate_artist_name`` into its artist set. Dropping
+        the second column here would sort rows whose Discogs credit is only
+        reachable under the alternate name into the "no Discogs release under
+        that artist at all" bucket, overstating the gap on exactly the
+        compound-credit shape (``Company Flow & Cannibal Ox``) this ticket is
+        about.
+        """
+        db_path = _write_library_db(
+            tmp_path, [(1, "Company Flow", "The Cold Vein", "Company Flow & Cannibal Ox")]
+        )
+
+        assert load_library_rows(db_path) == [
+            LibraryRow(
+                id=1,
+                artist="Company Flow",
+                title="The Cold Vein",
+                alternate_artist="Company Flow & Cannibal Ox",
+            )
+        ]
+
+    def test_null_columns_become_empty_strings(self, tmp_path):
+        db_path = _write_library_db(tmp_path, [(1, None, None, None)])
 
         rows = load_library_rows(db_path)
 
-        assert rows == [LibraryRow(id=1, artist="", title="")]
+        assert rows == [LibraryRow(id=1, artist="", title="", alternate_artist="")]
+
+
+class TestArtistVariants:
+    def test_bare_row_is_just_its_artist(self):
+        assert artist_variants(LibraryRow(1, "Stereolab", "Aluminum Tunes")) == ["Stereolab"]
+
+    def test_alternate_name_is_included(self):
+        row = LibraryRow(1, "Common", "Resurrection", alternate_artist="Common Sense")
+
+        assert artist_variants(row) == ["Common", "Common Sense"]
+
+    def test_blank_or_duplicate_alternate_name_adds_nothing(self):
+        assert artist_variants(LibraryRow(1, "Sessa", "x", alternate_artist="   ")) == ["Sessa"]
+        assert artist_variants(LibraryRow(2, "Sessa", "x", alternate_artist="Sessa")) == ["Sessa"]
+
+    def test_compilation_alternate_name_is_dropped(self):
+        """``extract_library_artists`` runs ``is_compilation_artist`` over the
+        alternate column too, so an alternate that names a V/A shelf bucket
+        never enters the real filter's artist set and must not enter this
+        census's either.
+        """
+        row = LibraryRow(1, "Sessa", "x", alternate_artist="Various Artists - Brazil")
+
+        assert artist_variants(row) == ["Sessa"]
 
 
 class TestNaiveLikeCompCount:
@@ -133,6 +188,23 @@ class TestResolveReleaseForRow:
 
         assert resolve_release_for_row(row, [candidate]) is None
 
+    def test_resolves_through_the_alternate_artist_name(self):
+        """The complement of the Zapp case above: where the library *does*
+        record the compound credit as its alternate name, the real prod cache
+        admits the release under that name, so the census must resolve it
+        rather than counting the row as unreachable. The variant set goes to
+        ``find_best_typed_match``'s existing ``query_artist`` iterable support
+        -- no matcher change, no fabricated bridge.
+        """
+        row = LibraryRow(
+            1, "Company Flow", "The Cold Vein", alternate_artist="Company Flow & Cannibal Ox"
+        )
+        candidate = ReleaseCandidate(
+            release_id=200, title="The Cold Vein", artist_name="Company Flow & Cannibal Ox"
+        )
+
+        assert resolve_release_for_row(row, [candidate]) == candidate
+
     def test_picks_best_of_several_candidates(self):
         row = LibraryRow(1, "Large Professor", "1st Class")
         wrong = ReleaseCandidate(release_id=1, title="Class Act", artist_name="Large Professor")
@@ -184,6 +256,45 @@ class TestGapCensusReport:
         ``artist_shelf_with_resolvable_release`` reads as "solved" otherwise.
         """
         assert _report().to_dict()["tracklist_check_caveat"] == TRACKLIST_CHECK_CAVEAT
+
+    def test_to_dict_reports_no_headline_when_the_discogs_leg_was_skipped(self):
+        """``render_report`` already refuses to print a headline it did not
+        measure, but the JSON outlives the console run. Without this, a
+        library-only run written to ``--out`` serializes
+        ``could_gain_recall_no_new_collection: 0`` and
+        ``would_need_new_collection: 58473`` -- a reader meeting the artifact
+        alone sees a measured finding that NOTHING is resolvable, when in fact
+        nothing was tested. Same argument as the tracklist caveat.
+        """
+        as_dict = _report(artist_shelf_with_cached_tracklist=0, discogs_source=None).to_dict()
+
+        assert as_dict["discogs_measurement"] == "skipped"
+        assert as_dict["could_gain_recall_no_new_collection"] is None
+        assert as_dict["would_need_new_collection"] is None
+
+    def test_to_dict_marks_the_discogs_leg_measured_when_it_ran(self):
+        assert _report().to_dict()["discogs_measurement"] == "measured"
+
+    def test_splits_the_unresolved_rows_into_its_two_populations(self):
+        """ "Would need new collection" is two different problems wanting two
+        different remedies: rows with no Discogs release under any of their
+        artist names at all (the compound-credit shape), and rows that matched
+        an artist but had no title clear the floor. A title-floor change does
+        nothing for the first; a credit-splitting change does nothing for the
+        second. The report derives the split so a reader doesn't have to
+        subtract -- and can't subtract wrong.
+        """
+        report = _report()  # 90 artist-shelf, 60 exact-matched, 50 resolvable, 40 tracklisted
+
+        assert report.artist_shelf_without_exact_artist_match == 30  # 90 - 60
+        assert report.artist_shelf_matched_but_below_floor == 10  # 60 - 50
+        assert report.would_need_new_collection == 50  # 90 - 40
+
+    def test_the_two_populations_are_none_when_the_discogs_leg_was_skipped(self):
+        report = _report(artist_shelf_with_cached_tracklist=0, discogs_source=None)
+
+        assert report.artist_shelf_without_exact_artist_match is None
+        assert report.artist_shelf_matched_but_below_floor is None
 
 
 class TestRenderReport:
