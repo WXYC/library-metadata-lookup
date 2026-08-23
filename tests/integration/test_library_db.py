@@ -238,10 +238,9 @@ class TestFindSimilarArtist:
         await conn.commit()
 
         db = LibraryDB()
-        db._conn = conn
-        db._has_alternate_artist = True
-        db._has_album_artist = True
-        db._has_compilation_track_artist = True
+        # adopt_connection derives the _has_* flags from the schema, so they no
+        # longer have to be hand-set here (and can no longer disagree with it).
+        await db.adopt_connection(conn)
 
         try:
             result = await db.find_similar_artist("The Bleack Dog")

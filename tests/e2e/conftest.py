@@ -237,7 +237,7 @@ async def e2e_library_db():
     conn.row_factory = aiosqlite.Row
     await _create_schema(conn)
     await _seed_data(conn)
-    db._conn = conn
+    await db.adopt_connection(conn)
     yield db
     await conn.close()
 

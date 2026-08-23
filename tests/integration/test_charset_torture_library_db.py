@@ -60,7 +60,7 @@ async def empty_library_db():
     """)
     await conn.execute(LIBRARY_FTS_CREATE_SQL)
     await conn.commit()
-    db._conn = conn
+    await db.adopt_connection(conn)
     yield db
     await conn.close()
 

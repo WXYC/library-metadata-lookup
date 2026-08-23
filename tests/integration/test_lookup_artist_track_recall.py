@@ -114,7 +114,7 @@ async def aphex_library_db():
     await conn.commit()
 
     db = LibraryDB()
-    db._conn = conn
+    await db.adopt_connection(conn)
     yield db
     await conn.close()
 
