@@ -290,7 +290,12 @@ class LibraryDB:
                     f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL"
                 )
                 rows = await cursor.fetchall()
-                pool.update(row[0].lower() for row in rows if row[0])
+                # No truthiness filter: the SQL's IS NOT NULL is the whole
+                # inclusion rule, and dropping empty strings here would make
+                # the pool narrower than the predicate it reproduces --
+                # alternate_artist_name is '' rather than NULL for most of the
+                # catalog. See test_pool_admits_empty_strings_exactly_as_the_old_sql_did.
+                pool.update(row[0].lower() for row in rows)
             except Exception:
                 if (table, column) == mandatory:
                     raise

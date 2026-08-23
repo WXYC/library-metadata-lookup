@@ -1218,6 +1218,37 @@ class TestArtistNameExactMatchPool:
         await db.close()
 
     @pytest.mark.asyncio
+    async def test_pool_admits_empty_strings_exactly_as_the_old_sql_did(self, tmp_path):
+        """The pool's inclusion rule is the SQL's ``IS NOT NULL``, nothing narrower.
+
+        ``alternate_artist_name`` is empty-string-filled rather than NULL for
+        most of the catalog (59,816 of 64,676 rows in production), and the
+        replaced SQL's only filter was ``IS NOT NULL`` -- so ``LOWER(...) = ''``
+        matched. Filtering the pool on truthiness instead would drop those and
+        make the predicate narrower than the SQL it claims to reproduce. This
+        is inert in practice (``_step_prepare_request`` guards on
+        ``if parsed.artist``, and ``strip_leading_article(...) or artist_lower``
+        keeps ``artist_compare`` from collapsing to ``""`` on its own), but the
+        PR's load-bearing claim is exact equivalence, so pin it rather than
+        rely on the caller to keep the difference unreachable.
+        """
+        db_file = tmp_path / "test.db"
+        _create_library_db(db_file, ["Stereolab"], with_alternate_artist=True)
+        import sqlite3
+
+        conn = sqlite3.connect(db_file)
+        conn.execute("UPDATE library SET alternate_artist_name = '' WHERE artist = 'Stereolab'")
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+
+        assert "" in db._artist_name_pool_lower
+        assert await db._artist_exists_exactly("", "") is True
+        await db.close()
+
+    @pytest.mark.asyncio
     async def test_close_clears_the_pool(self, tmp_path):
         """``close()`` must drop the pool along with the connection.
 
