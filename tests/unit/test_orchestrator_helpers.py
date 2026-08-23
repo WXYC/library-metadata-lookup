@@ -580,9 +580,10 @@ class TestArtistMatchesItem:
         Pinned rather than fixed (LML#1244 review). It lands on same-artist
         recoveries -- a listener typing "A E" should reach "A&E" -- and the
         candidate is the side being prefix-matched, so a shorter stem admits
-        fewer queries, not more. The over-reach that does bite is the *query*
-        side of the article rung reducing to a 1-2 character stem, which
-        reproduces on main and is tracked as LML#1250.
+        fewer queries, not more. Both cases here still pass after LML#1250:
+        they land on the article rung's EQUALITY branch (query and candidate
+        reduce to the identical stem), which LML#1250's minimum-length floor
+        never gates -- only the open-prefix continuation branch is floored.
         """
         item = make_library_item(id=1, artist=catalog_artist, title="Album")
         assert artist_matches_item(item, query) is True
@@ -616,6 +617,58 @@ class TestArtistMatchesItem:
         one -- is what covers a query and row sharing their punctuation."""
         item = make_library_item(id=1, artist="D.I. Go Pop", title="Album")
         assert artist_matches_item(item, "D.I.") is True
+
+    # ------------------------------------------------------------------
+    # Short article-stem wildcard guard (LML#1250).
+    #
+    # The leading-article rung (#364) and its folded counterpart (#1244)
+    # strip an article and then open-prefix whatever stem remains, with no
+    # floor on how short that stem may be. "A Ha" strips to "ha", which
+    # prefix-matched 243 unrelated catalog artists on main; "A E" strips to
+    # "e", which prefix-matched 796. Measured against the library.db
+    # snapshot, neither lever alone closes this: a token-boundary rule
+    # ("ha" must be followed by a space, not just any character) resolves
+    # the within-word case ("ha" into "habib") but not the one-character
+    # case -- folding punctuation can manufacture a *genuine* token
+    # boundary around a single letter ("E-40" folds to "e 40", and "e 40"
+    # really does start with "e "), so boundary alone still let "A E"
+    # reach "E-40". A minimum stem length (>=2 characters) is what closes
+    # that residual gap; floor alone (no boundary) leaves "A Ha" -> "ha"
+    # untouched, since 2 characters cleared a 2-char floor. Both rules gate
+    # only the open-prefix continuation branch, never an exact match -- a
+    # genuinely short catalog artist is still reachable by typing it
+    # verbatim (see test_short_article_stem_still_matches_its_own_name).
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "query, wrong_artist",
+        [
+            ("A Ha", "Habib Koite"),
+            ("A E", "E-40"),
+        ],
+    )
+    def test_short_article_stem_does_not_wildcard_match(self, query, wrong_artist):
+        """The ticket's two reproducers (LML#1250)."""
+        item = make_library_item(id=1, artist=wrong_artist, title="Album")
+        assert artist_matches_item(item, query) is False
+
+    def test_single_letter_query_does_not_wildcard_an_article_prefixed_candidate(self):
+        """Every catalog artist filed with a leading article strips down to a
+        candidate the query's stem then open-prefixes -- 'A Minor Forest'
+        strips to 'minor forest', which a bare single-letter query 'M' must
+        not open-prefix. A single-letter query reaches dozens of catalog
+        artists this way; found via the catalog-wide sweep this ticket
+        requires, not one of the two named repro cases."""
+        item = make_library_item(id=1, artist="A Minor Forest", title="Album")
+        assert artist_matches_item(item, "M") is False
+
+    def test_short_article_stem_still_matches_its_own_name(self):
+        """The floor narrows the open-prefix continuation, not the rung --
+        an exact match at a short stem still works, in both directions."""
+        item = make_library_item(id=1, artist="Ha", title="Album")
+        assert artist_matches_item(item, "A Ha") is True
+        item = make_library_item(id=2, artist="E", title="Album")
+        assert artist_matches_item(item, "A E") is True
 
 
 # ---------------------------------------------------------------------------

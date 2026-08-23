@@ -181,3 +181,42 @@ def folded_hit(candidate: str, query: str, *, exact: bool) -> bool:
     with ``"adult "``.
     """
     return candidate == query if exact else candidate.startswith(query)
+
+
+# Minimum length (in characters) an article-stripped stem must retain before
+# :func:`article_stem_hit` will open-prefix a candidate on it (LML#1250).
+# Below this floor, only an exact match is admitted.
+#
+# Measured against the library.db snapshot (23,815 distinct artists), floor 2
+# and floor 3 are equivalent on every measured axis -- neither the ticket's
+# two reproducers nor the wider catalog-wide scan improve going from 2 to 3 --
+# so 2 is the smaller, and therefore chosen, sufficient value: it excludes
+# only a bare one-character stem, the shortest a fold can ever manufacture.
+_ARTICLE_STEM_MIN_LENGTH = 2
+
+
+def article_stem_hit(candidate: str, query: str, *, exact: bool) -> bool:
+    """Does the article-stripped ``candidate`` satisfy the article-stripped
+    ``query`` (LML#1250)?
+
+    Two guards on top of :func:`folded_hit`'s open-prefix-or-equality shape,
+    both scoped to the open-prefix branch -- an exact match at any length
+    still passes, since equality can never wildcard. A token boundary
+    (``startswith(query + " ")`` rather than a bare ``startswith``) closes
+    the *within-word* failure: "A Ha" strips to "ha", which open-prefix-
+    matched "Habib Koite" and 242 others before this fix, while "black dog"
+    still reaches "Black Dog Productions" (#364) since "productions" starts
+    after a real space. The boundary alone is not enough: folding
+    punctuation can manufacture a *genuine* boundary around a one-character
+    stem -- "A E" strips to "e", and "E-40" folds to "e 40", which really
+    does start with "e ". :data:`_ARTICLE_STEM_MIN_LENGTH` closes that
+    residual by skipping the open-prefix branch outright below the floor,
+    since a one-character stem is a wildcard no matter how it is delimited.
+    """
+    if candidate == query:
+        return True
+    if exact:
+        return False
+    if len(query) < _ARTICLE_STEM_MIN_LENGTH:
+        return False
+    return candidate.startswith(query + " ")
