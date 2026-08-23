@@ -32,7 +32,10 @@ from wxyc_etl.text import (
     to_match_form,
 )
 
-from lookup.name_folding import fold_punctuation_for_comparison
+from lookup.name_folding import (
+    fold_punctuation_for_comparison,
+    fold_punctuation_for_query_tokens,
+)
 
 #: A *balanced* trailing "(...)" or "[...]" is what the crate strips as a
 #: disambiguator. Unbalanced trailing punctuation is not -- "Sunn O)))" keeps
@@ -138,3 +141,66 @@ class TestTheRestrictionIsNecessary:
         gate on a population LML#1244 never measured."""
         assert fold_punctuation_for_comparison(to_match_form(name)) == local
         assert to_identity_match_form_with_punctuation(name) == crate
+
+
+class TestTheTwoFidelitiesDifferOnlyOnUnderscore:
+    """LML#1257: the query-token fold must track the comparison fold exactly,
+    except on ``_``.
+
+    ``fold_punctuation_for_query_tokens`` exists because the sites that build
+    ``LibraryDB.search`` queries must NOT fold ``_`` (the search layer already
+    folds it, and folding early starves their ``len(w) > 3`` floors). That is
+    a one-character policy difference, and it is the *only* one licensed.
+
+    The hazard this class guards is a second drift: if the comparison class
+    ever gains a character -- a Unicode apostrophe or dash the crate-parity
+    test above starts demanding -- and the query class is not derived from it,
+    the two folds would silently disagree on that character too, with nothing
+    failing. The implementation derives one from the other so that cannot
+    happen; these tests pin the property rather than the spelling, so a future
+    refactor back to two hand-written classes is caught here.
+    """
+
+    @pytest.mark.parametrize("name", PARITY_NAMES)
+    def test_underscore_free_names_fold_identically(self, name: str) -> None:
+        """On any name without ``_``, the two fidelities are the same
+        function. A failure means they drifted on some other character."""
+        normalized = to_match_form(name)
+        if "_" in normalized:
+            pytest.skip("covered by the underscore-bearing case below")
+        assert fold_punctuation_for_query_tokens(normalized) == (
+            fold_punctuation_for_comparison(normalized)
+        )
+
+    def test_the_corpus_contains_underscore_free_names(self) -> None:
+        """Vacuity guard: if every parity name carried an underscore, the
+        assertion above would skip its way to a pass."""
+        eligible = [p for p in PARITY_NAMES if "_" not in to_match_form(str(p.values[0]))]
+        assert len(eligible) >= 10, (
+            f"only {len(eligible)} corpus names are underscore-free; "
+            "the identical-fold assertion would be near-vacuous"
+        )
+
+    @pytest.mark.parametrize(
+        ("name", "comparison", "query_tokens"),
+        [
+            ("Super_Collider", "super collider", "super_collider"),
+            ("I_LIKE_DOG_FACE", "i like dog face", "i_like_dog_face"),
+            ("Ras_G", "ras g", "ras_g"),
+            ("s_w_z_k", "s w z k", "s_w_z_k"),
+            ("clicks_+_cuts", "clicks cuts", "clicks_ _cuts"),
+        ],
+    )
+    def test_underscore_is_the_one_licensed_divergence(
+        self, name: str, comparison: str, query_tokens: str
+    ) -> None:
+        """Reverse guard: on names that DO carry ``_`` the two must differ, and
+        differ in the documented direction. Real catalog rows -- folding these
+        for a search query is what would cost ``Ras_G`` and ``s_w_z_k`` every
+        significant word they have."""
+        normalized = to_match_form(name)
+        assert fold_punctuation_for_comparison(normalized) == comparison
+        assert fold_punctuation_for_query_tokens(normalized) == query_tokens
+        assert fold_punctuation_for_comparison(normalized) != (
+            fold_punctuation_for_query_tokens(normalized)
+        )

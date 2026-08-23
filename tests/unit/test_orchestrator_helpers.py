@@ -4162,11 +4162,10 @@ class TestSearchByKeyword:
 
         ``sig_artist`` applies a ``len(w) > 3`` floor *after* the fold, so
         folding ``_`` here deletes short names outright rather than splitting
-        them usefully. "Ras_G" -- a real WXYC catalog artist (row 3009xx,
-        "The gospel of the God Spell") -- folds to ``["ras","g"]``, neither
-        fragment clearing the floor, so the artist would contribute ZERO of
-        its two ``query_words`` slots and the keyword query would lose its
-        artist scoping entirely.
+        them usefully. "Ras_G" -- real catalog row 66277, "The gospel of the
+        God Spell" -- folds to ``["ras","g"]``, neither fragment clearing the
+        floor, so the artist would contribute ZERO of its two ``query_words``
+        slots and the keyword query would lose its artist scoping entirely.
 
         Nothing is gained by folding: ``db.search`` already folds ``_``
         itself, and queried against the real catalog "ras_g" and "ras g"
@@ -4175,7 +4174,7 @@ class TestSearchByKeyword:
         """
         from lookup.strategies.track_on_compilation import _search_by_keyword
 
-        item = make_library_item(id=45585, artist="Ras_G", title="The gospel of the God Spell")
+        item = make_library_item(id=66277, artist="Ras_G", title="The gospel of the God Spell")
 
         async def search(query, limit=None, **_):
             # The artist term must still be present and unfolded. Under the
@@ -4198,7 +4197,7 @@ class TestSearchByKeyword:
         results = await _search_by_keyword(mock_library_db, "Ras_G", parsed)
 
         assert len(results) == 1
-        assert results[0].id == 45585
+        assert results[0].id == 66277
 
 
 _PARSED_AB = ParsedRequest(
