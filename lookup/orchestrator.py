@@ -484,9 +484,10 @@ async def _step_prepare_request(
             # Resolve the fuzzy library-artist correction FIRST (a cheap, cached
             # local-SQLite lookup) so album resolution can gate its Discogs
             # tracklist validation on library membership of the CORRECTED artist
-            # (LML#866). Serializing (vs the former concurrent gather) costs a
-            # sub-millisecond local read and is required for the gate to use the
-            # same library-artist notion step 3 does. Because the correction now
+            # (LML#866). Serializing (vs the former concurrent gather) costs low
+            # single-digit microseconds uncached (LML#1248 replaced a non-sargable
+            # per-call SQL scan) and is required for the gate to use the same
+            # library-artist notion step 3 does. Because the correction now
             # completes before step 2 begins, there is no concurrent sibling task
             # to orphan when the LML#865 spine deadline trips.
             corrected = await services.db.find_similar_artist(parsed.artist)
