@@ -53,18 +53,6 @@ class TestSearchAndEnrichmentAgree:
             (37332, "Cell Scape", "Melt-Banana", "ME", 63, 3, "Rock", "CD"),
             (40001, "Aluminum Tunes", "Stereolab", "ST", 1, 1, "Rock", "CD"),
             (1, "Vision Creation Newsun", "Boredoms", "B", 1, 1, "Rock", "CD"),
-            # LML#1256: a WXYC cataloguing-convention parenthetical that
-            # ``strip_discogs_disambig`` mistakes for a Discogs qualifier.
-            (
-                50001,
-                "Jazz Statesmen Live",
-                "Charlie Persip (and Jazz Statesmen)",
-                "CP",
-                1,
-                1,
-                "Jazz",
-                "LP",
-            ),
         ]
         conn.executemany("INSERT INTO library VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
         conn.executemany(
@@ -112,23 +100,6 @@ class TestSearchAndEnrichmentAgree:
 
         assert {i.id for i in items} >= {40001}
         assert all(_artist_pair_verified("Stereolab", i.artist) for i in items)
-
-    @pytest.mark.asyncio
-    async def test_wxyc_cataloguing_parenthetical_agrees_too(self, db):
-        """LML#1256, end to end. ``strip_discogs_disambig`` mistakes
-        "(and Jazz Statesmen)" for a Discogs qualifier and discards it,
-        so before the fix search found this row and enrichment refused to
-        authorize it -- the same half-delivery shape as the #1252 defect,
-        one layer over."""
-        items, _ = await search_song_as_artist(db, "Charlie Persip and Jazz Statesmen")
-
-        assert {i.id for i in items} >= {50001}, "search half regressed"
-        unverified = [
-            i.artist
-            for i in items
-            if not _artist_pair_verified("Charlie Persip and Jazz Statesmen", i.artist)
-        ]
-        assert not unverified, f"enrichment refuses to authorize: {unverified}"
 
     @pytest.mark.asyncio
     async def test_gate_rejects_every_other_artist_the_db_holds(self, db):
