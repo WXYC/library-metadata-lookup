@@ -1,15 +1,22 @@
 """Unit tests for ``scripts/measure_track_recall_gap.py`` (LML#1264).
 
-Pure-logic + mocked-DB coverage. The real batched-query round trip against
-Postgres is exercised separately in
-``tests/integration/test_measure_track_recall_gap_pg.py``.
+Pure-logic coverage: shelf classification, artist-variant derivation, the 80/80
+resolution call, and the report's derived figures. The Postgres leg -- the
+temp-table COPY, the exact-match join and the tracklist probe -- has no unit
+coverage at all and is exercised only in
+``tests/integration/test_measure_track_recall_gap_pg.py``. The census's parity
+with the real cache-build filter is pinned in
+``tests/unit/test_measure_track_recall_gap_filter_parity.py``.
 """
 
 from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from scripts.measure_track_recall_gap import (
+    DERIVED_HEADLINE_KEYS,
     DOCUMENTED_PIN_COVERAGE_NOTE,
     TRACKLIST_CHECK_CAVEAT,
     GapCensusReport,
@@ -234,49 +241,10 @@ def _report(
 
 
 class TestGapCensusReport:
-    def test_headline_properties(self):
-        report = _report()
+    def test_to_dict_derives_every_headline_figure(self):
+        """The four derived figures, read through the serializer that emits them.
 
-        assert report.could_gain_recall_no_new_collection == 40
-        assert report.would_need_new_collection == 50  # 90 - 40
-
-    def test_to_dict_includes_derived_headline_fields(self):
-        report = _report()
-
-        as_dict = report.to_dict()
-
-        assert as_dict["could_gain_recall_no_new_collection"] == 40
-        assert as_dict["would_need_new_collection"] == 50
-        assert as_dict["pin_coverage_note"] == DOCUMENTED_PIN_COVERAGE_NOTE
-
-    def test_to_dict_carries_the_tracklist_caveat(self):
-        """A serialized report must travel with the reason its tracklist figure
-        cannot be read as coverage -- a JSON file outlives the console run that
-        produced it, and a bare ``artist_shelf_with_cached_tracklist`` equal to
-        ``artist_shelf_with_resolvable_release`` reads as "solved" otherwise.
-        """
-        assert _report().to_dict()["tracklist_check_caveat"] == TRACKLIST_CHECK_CAVEAT
-
-    def test_to_dict_reports_no_headline_when_the_discogs_leg_was_skipped(self):
-        """``render_report`` already refuses to print a headline it did not
-        measure, but the JSON outlives the console run. Without this, a
-        library-only run written to ``--out`` serializes
-        ``could_gain_recall_no_new_collection: 0`` and
-        ``would_need_new_collection: 58473`` -- a reader meeting the artifact
-        alone sees a measured finding that NOTHING is resolvable, when in fact
-        nothing was tested. Same argument as the tracklist caveat.
-        """
-        as_dict = _report(artist_shelf_with_cached_tracklist=0, discogs_source=None).to_dict()
-
-        assert as_dict["discogs_measurement"] == "skipped"
-        assert as_dict["could_gain_recall_no_new_collection"] is None
-        assert as_dict["would_need_new_collection"] is None
-
-    def test_to_dict_marks_the_discogs_leg_measured_when_it_ran(self):
-        assert _report().to_dict()["discogs_measurement"] == "measured"
-
-    def test_splits_the_unresolved_rows_into_its_two_populations(self):
-        """ "Would need new collection" is two different problems wanting two
+        "Would need new collection" is two different problems wanting two
         different remedies: rows with no Discogs release under any of their
         artist names at all (the compound-credit shape), and rows that matched
         an artist but had no title clear the floor. A title-floor change does
@@ -284,17 +252,50 @@ class TestGapCensusReport:
         second. The report derives the split so a reader doesn't have to
         subtract -- and can't subtract wrong.
         """
-        report = _report()  # 90 artist-shelf, 60 exact-matched, 50 resolvable, 40 tracklisted
+        # 90 artist-shelf, 60 exact-matched, 50 resolvable, 40 tracklisted.
+        as_dict = _report().to_dict()
 
-        assert report.artist_shelf_without_exact_artist_match == 30  # 90 - 60
-        assert report.artist_shelf_matched_but_below_floor == 10  # 60 - 50
-        assert report.would_need_new_collection == 50  # 90 - 40
+        assert as_dict["could_gain_recall_no_new_collection"] == 40
+        assert as_dict["would_need_new_collection"] == 50  # 90 - 40
+        assert as_dict["artist_shelf_without_exact_artist_match"] == 30  # 90 - 60
+        assert as_dict["artist_shelf_matched_but_below_floor"] == 10  # 60 - 50
 
-    def test_the_two_populations_are_none_when_the_discogs_leg_was_skipped(self):
-        report = _report(artist_shelf_with_cached_tracklist=0, discogs_source=None)
+    def test_to_dict_carries_the_caveats(self):
+        """A serialized report must travel with the reasons its figures cannot be
+        read at face value -- a JSON file outlives the console run that produced
+        it, and a bare ``artist_shelf_with_cached_tracklist`` equal to
+        ``artist_shelf_with_resolvable_release`` reads as "solved" otherwise.
+        """
+        as_dict = _report().to_dict()
 
-        assert report.artist_shelf_without_exact_artist_match is None
-        assert report.artist_shelf_matched_but_below_floor is None
+        assert as_dict["discogs_measurement"] == "measured"
+        assert as_dict["tracklist_check_caveat"] == TRACKLIST_CHECK_CAVEAT
+        assert as_dict["pin_coverage_note"] == DOCUMENTED_PIN_COVERAGE_NOTE
+
+    @pytest.mark.parametrize("key", DERIVED_HEADLINE_KEYS)
+    def test_to_dict_reports_no_headline_when_the_discogs_leg_was_skipped(self, key):
+        """``render_report`` already refuses to print a headline it did not
+        measure, but the JSON outlives the console run. Without this, a
+        library-only run written to ``--out`` serializes
+        ``could_gain_recall_no_new_collection: 0`` and
+        ``would_need_new_collection: 58473`` -- a reader meeting the artifact
+        alone sees a measured finding that NOTHING is resolvable, when in fact
+        nothing was tested. Parametrized over the whole roster so a fifth
+        derived figure cannot be added outside this guarantee.
+        """
+        as_dict = _report(artist_shelf_with_cached_tracklist=0, discogs_source=None).to_dict()
+
+        assert as_dict["discogs_measurement"] == "skipped"
+        assert as_dict[key] is None
+
+    def test_a_skipped_run_carries_no_tracklist_caveat(self):
+        """The mirror of the caveat rule: no reading instructions for a number
+        that isn't there. A caveat about a check that never ran implies a check
+        that ran.
+        """
+        as_dict = _report(artist_shelf_with_cached_tracklist=0, discogs_source=None).to_dict()
+
+        assert "tracklist_check_caveat" not in as_dict
 
 
 class TestRenderReport:
