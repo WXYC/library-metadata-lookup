@@ -1,102 +1,149 @@
 name: Codegen Drift (Scheduled)
 
-# Scheduled counterpart to ci.yml's `codegen-check` job (LML#1261).
-# `codegen-check` is `if: github.event_name == 'pull_request'`, so an
-# api.yaml merge in WXYC/wxyc-shared -- which produces no event in this repo
-# -- never triggers it. Drift then sits silently until the next contributor
-# opens an unrelated PR here and eats generated-model churn that has nothing
-# to do with their change.
+# Weekly, unattended re-run of ci.yml's `codegen-check` job: regenerate
+# generated/api_models.py and the entity/*.sql sidecars and diff. That job is
+# `if: github.event_name == 'pull_request'`, so an api.yaml merge in
+# WXYC/wxyc-shared -- which produces no event in this repo -- never triggers
+# it. Drift then sits silently until the next contributor opens an unrelated
+# PR here and eats generated-model churn that has nothing to do with their
+# change (#1261). This workflow is the missing signal, on its own schedule,
+# decoupled from PRs.
 #
-# This workflow runs the same regenerate-and-diff check on a weekly schedule
-# and, on drift, opens a single tracking issue rather than just going red
-# where nobody is watching. It deliberately does NOT touch ci.yml: that
-# file's `on:` block has no top-level `if:` gate, so adding `schedule:`
-# there would put every job (lint, typecheck, test, pg, external_api, both
-# deploy jobs...) on the same weekly timer, not just `codegen-check`. A new,
-# additive workflow avoids that.
+# A red scheduled run nobody watches is not a signal, so both outcomes that
+# need a human -- drift, and a check that never reached a verdict -- open a
+# tracking issue. Each outcome has its own title and its own open-issue
+# lookup, so neither suppresses the other; closing an issue is what lets the
+# next affected run open a fresh one.
+#
+# Deliberately a SEPARATE workflow file rather than a `schedule:` trigger
+# added to ci.yml -- that file's `on:` block has no top-level gate, so
+# `schedule:` there would put every job (lint, typecheck, test, pg,
+# external_api, both deploy jobs) on the same weekly timer, not just
+# `codegen-check`. ci.yml is untouched.
+#
+# Siblings with the same shape: WXYC/request-o-matic's codegen-drift.yml and
+# WXYC/wxyc-ios-64's spec-drift.yml. Keep the three in step -- they are one
+# mechanism aimed at one contract.
 
 on:
   schedule:
-    # Monday 13:00 UTC, weekly.
-    - cron: "0 13 * * 1"
+    - cron: "0 13 * * 1" # weekly, Monday 13:00 UTC
   workflow_dispatch:
 
-# issues:write is for the tracking issue opened on drift; contents:read is
-# the checkout floor. Neither job here pushes code or writes anywhere else.
+# contents:read is the floor for the checkout. Only the reporting job writes,
+# and it grants itself issues:write scoped to just that job.
 permissions:
   contents: read
-  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
-  codegen-drift:
-    name: Codegen Freshness (Scheduled)
+  check-drift:
+    name: Codegen Freshness (scheduled)
     runs-on: ubuntu-latest
+    outputs:
+      drift: ${{ steps.diff.outputs.drift }}
     steps:
       - uses: actions/checkout@v6
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: "pip"
-      # Same pinned toolchain as ci.yml's codegen-check job (see pyproject.toml
-      # dev deps + WXYC/library-metadata-lookup#249): datamodel-code-generator
-      # and ruff are pinned exactly so a new release of either cannot silently
-      # reformat the generated file and manufacture a false-positive drift
-      # signal here.
-      - run: pip install -e ".[dev]"
+
+      # Installs the project's pinned datamodel-code-generator + ruff (see
+      # pyproject.toml dev deps and #249), the same toolchain ci.yml's
+      # codegen-check job uses, so a new release of either cannot reformat
+      # the generated file and manufacture a false drift signal here.
+      - name: Install the pinned codegen toolchain
+        run: pip install -e ".[dev]"
+
       # GITHUB_TOKEN authenticates the raw.githubusercontent.com download of
-      # api.yaml (#1205) -- see generate_api_models.sh's header comment for
-      # the full rationale. contents:read is enough: wxyc-shared is public.
-      - run: bash scripts/generate_api_models.sh
+      # api.yaml (#1205); the script's header holds the full rationale and
+      # the token-safety properties. contents:read is enough -- wxyc-shared
+      # is public.
+      - name: Regenerate API models
+        run: bash scripts/generate_api_models.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
       # entity/*.sql are the canonical-DDL sidecars for the lml_cache.* store
-      # modules (LML#1038) -- generated from the Python DDL constants, never
-      # hand-edited. Same two generators ci.yml's codegen-check job runs.
-      - run: python -m scripts.regenerate_streaming_catalog_sql
-      - run: python -m scripts.regenerate_lml_cache_sql
-      # Same staged-diff approach as ci.yml's codegen-check job: `git add -A`
-      # over the generated paths brings a generator's new or removed output
-      # file into the index (not just changed ones), so `--exit-code` sees
-      # the true drift state instead of missing an untracked addition.
+      # modules (#1038) -- generated from the Python DDL constants, never
+      # hand-edited. Two generators (streaming_catalog.py's own, plus the
+      # shared one for its eight siblings) cover all 9.
+      - name: Regenerate entity SQL sidecars
+        run: |
+          python -m scripts.regenerate_streaming_catalog_sql
+          python -m scripts.regenerate_lml_cache_sql
+
+      # Stage first: a plain `git diff` compares tracked paths only, so a
+      # generator that starts emitting a *new* file (a ninth lml_cache
+      # module's entity/<name>.sql sidecar, or a codegen release that splits
+      # its output) leaves it untracked and the gate passes on an out-of-sync
+      # tree. `git add -A` over the generated paths brings additions and
+      # deletions into the index; --cached then sees them. The pathspecs stay
+      # scoped to the generated artifacts -- entity/ also holds hand-written
+      # store modules, and this gate is not about those -- and are quoted so
+      # git does the matching rather than the shell. Same approach as ci.yml's
+      # codegen-check job.
       - name: Check for drift
-        id: drift
+        id: diff
         run: |
           git add -A -- generated/ 'entity/*.sql'
           if git diff --cached --quiet -- generated/ 'entity/*.sql'; then
-            echo "drifted=false" >> "$GITHUB_OUTPUT"
+            echo "No drift: generated/ and entity/*.sql match their generators."
+            echo "drift=false" >> "$GITHUB_OUTPUT"
           else
-            echo "drifted=true" >> "$GITHUB_OUTPUT"
+            echo "Drift detected:"
+            git --no-pager diff --cached --stat -- generated/ 'entity/*.sql'
+            echo "drift=true" >> "$GITHUB_OUTPUT"
           fi
-      # A red scheduled run nobody watches is not a signal (LML#1261) -- open
-      # a tracking issue instead. Search by label first so a drift that
-      # persists across several Mondays gets one issue, not one per week;
-      # whoever lands the regeneration PR is expected to close it.
-      - name: Open tracking issue on drift
-        if: steps.drift.outputs.drifted == 'true'
+
+  report-drift:
+    name: Open tracking issue
+    needs: check-drift
+    # Two outcomes need a human: drift, and a check-drift job that never
+    # reached a verdict (the api.yaml download 429s, the pinned toolchain
+    # fails to install, the runner dies). Gating on the drift output alone
+    # skips this job in the second case and leaves nothing but a red
+    # scheduled run -- the unwatched signal this workflow exists to replace.
+    # `!cancelled()` keeps a deliberately cancelled run from filing anything.
+    if: >-
+      !cancelled()
+      && (needs.check-drift.result != 'success' || needs.check-drift.outputs.drift == 'true')
+    runs-on: ubuntu-latest
+    # The only job in this file that writes anything.
+    permissions:
+      issues: write
+    env:
+      # One literal per outcome, read by both the lookup and the create below,
+      # so a title edit cannot desync the two and start opening a duplicate
+      # every week.
+      DRIFT_ISSUE_TITLE: "generated/api_models.py or entity/*.sql is stale against its generator"
+      CHECK_FAILED_ISSUE_TITLE: "Scheduled codegen drift check could not run"
+    steps:
+      # Every `${{ }}` expression this script needs is routed through `env:`
+      # and read as a shell variable rather than inlined. Actions substitutes
+      # `${{ }}` textually before the shell parses the script, so an inline
+      # expression is a script-injection vector. Nothing here is
+      # attacker-controlled today; the habit costs nothing and matches
+      # wxyc-shared's check-api-spec-drift.yml.
+      - name: File the tracking issue
         env:
           GH_TOKEN: ${{ github.token }}
+          CHECK_RESULT: ${{ needs.check-drift.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
 
-          existing_issue=$(gh issue list \
-            --repo "$GITHUB_REPOSITORY" \
-            --label codegen-drift \
-            --state open \
-            --limit 1 \
-            --json number \
-            --jq '.[0].number // empty')
+          if [ "$CHECK_RESULT" = "success" ]; then
+            title="$DRIFT_ISSUE_TITLE"
+            body="$(cat <<EOF
+          The scheduled [Codegen Freshness]($RUN_URL) check found that \`generated/api_models.py\` and/or the \`entity/*.sql\` sidecars no longer match what their generators produce -- from wxyc-shared's current \`api.yaml\` on \`main\` for the models, and from the Python DDL constants for the sidecars -- using the toolchain pinned in pyproject.toml's dev deps.
 
-          if [ -n "$existing_issue" ]; then
-            echo "Open tracking issue already exists: #$existing_issue -- not filing a duplicate."
-            exit 0
-          fi
-
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-
-          body=$(cat <<EOF
-          The scheduled Codegen Freshness check found that \`generated/api_models.py\` and/or the \`entity/*.sql\` sidecars no longer match what \`scripts/generate_api_models.sh\`, \`scripts/regenerate_streaming_catalog_sql.py\`, and \`scripts/regenerate_lml_cache_sql.py\` produce from current \`wxyc-shared\` \`main\` with the pinned toolchain (datamodel-code-generator 0.56.1, ruff 0.15.6).
-
-          This means either \`api.yaml\` moved upstream since the committed snapshot was last regenerated, or the pinned generator/ruff versions produce different output than what's committed. Regenerate locally and open a PR:
+          Either \`api.yaml\` moved upstream since the committed snapshot was regenerated, or the pinned generator/ruff versions now produce different output than what is committed. Regenerate and open a PR:
 
           \`\`\`
           bash scripts/generate_api_models.sh
@@ -104,14 +151,50 @@ jobs:
           python -m scripts.regenerate_lml_cache_sql
           \`\`\`
 
-          See WXYC/library-metadata-lookup#1261 for why this check runs on a schedule, and ci.yml's \`codegen-check\` job for the PR-time gate this complements.
-
-          Workflow run: $run_url
+          See WXYC/library-metadata-lookup#1261 for why this check runs on a schedule, and ci.yml's \`codegen-check\` job for the PR-time gate it complements.
           EOF
-          )
+          )"
+          else
+            title="$CHECK_FAILED_ISSUE_TITLE"
+            body="$(cat <<EOF
+          The scheduled [Codegen Freshness]($RUN_URL) check never reached a verdict -- it failed before it could compare \`generated/api_models.py\` and the \`entity/*.sql\` sidecars against their generators.
+
+          Drift here is UNKNOWN, not absent. Read the run log for the failing step; the usual causes are a rate-limited or failed api.yaml download, a pinned-toolchain install failure, or a runner problem.
+
+          If it was transient, re-run the workflow and close this issue. If the check itself is broken, fix it -- while it stays broken, upstream \`api.yaml\` merges go unreported here.
+          EOF
+          )"
+          fi
+
+          # One open issue per title. The label lookup is the primary one: it
+          # is deterministic and does not depend on the search index. The
+          # title search is the fallback for a tracking issue whose label was
+          # removed by hand. Both filter on an EXACT title match -- matching
+          # on the label alone would let ANY open issue carrying it (a human
+          # triaging, a mislabel, an adjacent ticket) suppress every later
+          # report indefinitely, behind a green run.
+          find_open_issue() {
+            gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state open \
+              --limit 100 \
+              --json number,title \
+              "$@" \
+              | jq -r --arg title "$title" 'map(select(.title == $title)) | .[0].number // empty'
+          }
+
+          existing="$(find_open_issue --label codegen-drift)"
+          if [ -z "$existing" ]; then
+            existing="$(find_open_issue --search "\"$title\" in:title")"
+          fi
+
+          if [ -n "$existing" ]; then
+            echo "Open tracking issue #$existing already covers this -- not filing a duplicate."
+            exit 0
+          fi
 
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Scheduled codegen freshness check found drift" \
-            --label "codegen-drift" \
+            --title "$title" \
+            --label codegen-drift \
             --body "$body"
