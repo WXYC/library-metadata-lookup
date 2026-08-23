@@ -121,40 +121,51 @@ class TestGuardsIntact:
         assert _artist_pair_verified("Various Artists", candidate) is False
 
     @pytest.mark.parametrize(
-        "candidate",
+        "query,candidate",
         [
             # Diacritics. ``to_match_form`` folds them; ``is_compilation_artist``
             # does not, so the raw form reads as a real artist name.
-            "Vàrious Artists",
-            "Varìous Artists",
+            ("Various Artists", "Vàrious Artists"),
+            ("Various Artists", "Varìous Artists"),
             # Doubled/leading whitespace -- normalized away, raw not.
-            "  Various   Artists",
-            # Wrapping punctuation. ``strip_discogs_disambig`` only removes a
-            # *trailing* parenthetical, so a wrapped alias keeps its parens and
-            # matches neither the exact names nor the leading-prefix list --
-            # and the prefixes that would match ("v/a", "v.a") are keyed on the
-            # very characters a punctuation fold destroys.
-            "(V/A)",
-            "(V.A.)",
-            "(Various Artists)",
+            ("Various Artists", "  Various   Artists"),
+            # Wrapping punctuation. ``is_compilation_artist`` anchors on the
+            # FIRST character, so a wrapped alias matches neither its exact-name
+            # list nor its leading-prefix list. A fold cannot rescue these: the
+            # prefixes that would match ("v/a", "v.a") are keyed on the very
+            # characters a fold destroys.
+            ("V/A", "(V/A)"),
+            ("Various Artists", "[Various Artists]"),
+            ("Various Artists", "(Various Artists"),  # unbalanced, still wrapped
+            # Underscore. The wrapping trim is built from ``name_folding``'s
+            # shared ``_PUNCTUATION_CHAR`` rather than a local ``[^\w]``, which
+            # would count "_" as a word character and refuse to trim it -- the
+            # exact drift the LML#1244 review removed.
+            ("V/A", "_V/A_"),
         ],
     )
-    def test_compilation_guard_normalizes_before_testing(self, candidate):
+    def test_compilation_guard_normalizes_before_testing(self, query, candidate):
         """LML#1252 left ``is_compilation_artist`` reading un-normalized text.
 
         ``clients/streaming/matching.py``'s NORMALIZATION CONTRACT is explicit
         that callers pass ``to_match_form`` output precisely because the raw
         form misses leading/doubled whitespace and diacritics. This guard was
-        not honoring it, so a diacritic-bearing or wrapped compilation alias
-        read as a real artist and the folded rung -- which *does* normalize
-        both sides -- then bound V/A artwork and bio onto the row.
+        not honoring it, so a compilation alias read as a real artist and the
+        folded rung -- which *does* normalize both sides -- then bound V/A
+        artwork and bio onto the row.
+
+        **Every pair here verifies (wrongly) on ``main`` and is rejected here**,
+        so the mechanism is genuinely pinned. An earlier cut of this test used
+        "(V.A.)" and "(Various Artists)", which are already False on ``main``
+        because ``strip_discogs_disambig`` reduces them to "" and the empty
+        check returns first -- green, but vacuous.
 
         Latent rather than live: zero library.db rows are in this class today.
         It is closed because the candidate side is fed from Discogs and the org
         has an active mojibake workstream, so a diacritic-mangled compilation
         credit arriving here is a question of when, not whether.
         """
-        assert _artist_pair_verified("Various Artists", candidate) is False
+        assert _artist_pair_verified(query, candidate) is False
 
     @pytest.mark.parametrize(
         "candidate",
@@ -164,13 +175,15 @@ class TestGuardsIntact:
             "Varsity",
             "A Certain Ratio",
             "(etre)",
-            "Melt-Banana",
-            "Stereolab",
         ],
     )
     def test_normalized_guard_does_not_over_reject_real_artists(self, candidate):
         """The widened guard must not start swallowing real names that merely
-        begin with the same letters, or that are wholly parenthesized."""
+        begin with the same letters, or that are wholly parenthesized.
+
+        ``Melt-Banana`` and ``Stereolab`` are deliberately absent: they are
+        already implied by ``test_pairs_that_already_verified_still_verify``,
+        which can only pass if the guard returned False for them."""
         assert _is_compilation_alias(candidate) is False
 
     @pytest.mark.parametrize(
