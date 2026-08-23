@@ -1173,6 +1173,70 @@ class ConcertsResponse(BaseModel):
     pagination: PaginationInfo
 
 
+class Delta(IntEnum):
+    """
+    `1` when the listener liked the song, `-1` when they unliked it. The server clamps the resulting tally at zero: deltas are fire-and-forget and lossy by design, so a `-1` can arrive without its matching `1`.
+    """
+
+    integer__1 = -1
+    integer_1 = 1
+
+
+class SongLikeDelta(BaseModel):
+    """
+    One increment or decrement to a song's public like tally. Carries the song's identity and nothing whatsoever about who liked it — see `POST /likes/tally` for why no listener key exists anywhere in this contract.
+    """
+
+    song_key: str = Field(
+        ...,
+        description="The client's folded identity for the song: `SongKey.fold` applied to artist and title, joined with `|` (case-, diacritic-, and width-insensitive, whitespace collapsed). The server stores this verbatim as the tally's key and MUST NOT recompute it — the client's fold is authoritative for song identity. Album is deliberately excluded from the key, so a single, an LP cut, and a free-text replay all tally together.",
+    )
+    song_title: str = Field(
+        ..., description="Raw, unfolded song title, exactly as displayed on-device."
+    )
+    artist_name: str = Field(
+        ...,
+        description="Raw, unfolded artist name, exactly as displayed on-device — NOT the folded value baked into `song_key`. The server folds this itself with its own `fold_artist_name` (NFD, strip combining diacritics, lowercase — no width folding, no whitespace collapsing; the twin of the SQL `wxyc_schema.fold_artist_name`) to attempt a catalog match when `artist_id` is absent. The client's fold and the server's fold are deliberately different functions and are never required to agree: width-variant or multi-space artist names may match under one and miss under the other. This field exists for that best-effort match, not for identity — `song_key` alone owns that.",
+    )
+    release_title: str | None = Field(
+        None,
+        description="Album/release title, when the like has one. Optional: standalone tracks and some free-text plays carry no matched release.",
+    )
+    artist_id: int | None = Field(
+        None,
+        description="WXYC catalog artist id, when already resolved on-device (e.g. healed from a V2 flowsheet play). Optional and absent for name-only likes sourced from the V1 API or free-text plays; the server then falls back to matching `artist_name` via its own fold, leaving the artist unresolved — never failing the write — on a miss.",
+    )
+    delta: Delta = Field(
+        ...,
+        description="`1` when the listener liked the song, `-1` when they unliked it. The server clamps the resulting tally at zero: deltas are fire-and-forget and lossy by design, so a `-1` can arrive without its matching `1`.",
+    )
+
+
+class SongLikeTallyRequest(BaseModel):
+    """
+    Request body for `POST /likes/tally`. A batch of independent counter deltas — NOT a snapshot of anyone's library, and not an event log that could be reassembled into one.
+    """
+
+    deltas: list[SongLikeDelta] = Field(
+        ...,
+        description="One or more deltas, at most 1000. Order carries no meaning. A client normally sends a single delta per toggle; the array exists so a client adopting the feature can submit the likes already on the device in one request. A device holding more than 1000 likes chunks them across requests — there is no cross-request continuity to preserve, since each delta is independent and the endpoint holds no per-caller state.",
+        max_length=1000,
+        min_length=1,
+    )
+
+
+class SongLikeTallyResponse(BaseModel):
+    """
+    Response body for `POST /likes/tally`.
+    """
+
+    applied: int = Field(..., description="Number of deltas applied to the tallies.")
+    resolved: int = Field(
+        ...,
+        description="Of `applied`, how many carried or matched a WXYC catalog artist id. Diagnostic only: it describes catalog coverage, not the caller.",
+    )
+
+
 class AlbumReview(BaseModel):
     """
     One archived DJ album review, sourced from the WXYC album-review
