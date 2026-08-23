@@ -103,6 +103,90 @@ class TestNoRegression:
         assert _artist_pair_verified("Melt Banana", "Melt-Banana (2)") is True
 
 
+class TestUnstrippedDisambiguationContent:
+    """LML#1256: the entire #1252 residual.
+
+    ``strip_discogs_disambig`` (``wxyc_etl.text.strip_discogs_disambiguation``,
+    ``broad=True``) strips any 1-19 character trailing parenthetical -- right
+    for a Discogs qualifier ("Sessa (2)"), wrong for WXYC's own cataloguing
+    convention, where a trailing parenthetical is frequently part of the
+    artist's real name credit: "Charlie Persip (and Jazz Statesmen)", "Chick
+    Corea (Return to Forever)", "Annette (Funicello)". Rungs 1 and 2 above
+    both score the STRIPPED candidate, so for these names they compare the
+    query against a candidate whose disambiguation strip has already thrown
+    away real content -- "Charlie Persip" rather than "Charlie Persip (and
+    Jazz Statesmen)" -- and correctly fail to verify. That is the entire
+    #1252 residual: 100 of 1,911 punctuated catalog artists, all this shape.
+    """
+
+    @pytest.mark.parametrize(
+        "query,candidate",
+        [
+            # raw=97.06 -- clears the floor even unfolded; included so the
+            # fold rung is proven to subsume the case the ticket opens with.
+            ("Charlie Persip and Jazz Statesmen", "Charlie Persip (and Jazz Statesmen)"),
+            # raw=73.33 -- fails the floor unfolded. Only the fold recovers it.
+            ("Chick Corea Return to Forever", "Chick Corea (Return to Forever)"),
+            # raw=50.00 -- a mononym-plus-surname credit; fails the floor
+            # unfolded by a wide margin.
+            ("Annette Funicello", "Annette (Funicello)"),
+        ],
+    )
+    def test_wxyc_cataloguing_parenthetical_verifies(self, query, candidate):
+        assert _artist_pair_verified(query, candidate) is True
+
+    def test_strips_to_empty_can_verify_against_itself(self):
+        """The sharpest case in the ticket. ``strip_discogs_disambig("(etre)")``
+        returns "" -- "etre" is a 4-character alphanumeric parenthetical,
+        inside the 1-19 char disambiguator window -- which used to hit the
+        ``if not candidate_stripped: return False`` guard before either
+        scoring rung ran. "(etre)" could never verify against anything,
+        including itself."""
+        assert _artist_pair_verified("(etre)", "(etre)") is True
+
+    def test_strips_to_empty_verifies_against_its_spoken_form(self):
+        """Not just literal self-comparison -- the fold makes the parens
+        optional on the query side too, exactly like every other pair here."""
+        assert _artist_pair_verified("etre", "(etre)") is True
+
+    def test_raw_floor_score_is_position_dependent_fold_is_not(self):
+        """Documents why the new rung folds rather than adding a second
+        floor comparison on the raw (unstripped) pair.
+
+        The unfolded raw score is a different number for every pair above --
+        97.06, 73.33, 50.00 -- entirely a function of where the parenthesis
+        happens to land relative to token boundaries. That is the identical
+        looseness LML#1252's bug report measured on the *stripped* axis
+        ("Melt Banana"/"Melt-Banana" scored 54.55, "Anti Flag"/"Anti-Flag"
+        scored 88.89, for the same kind of punctuation difference). Folding
+        sidesteps it: every pair here differs from its candidate only by
+        punctuation, so it folds to exact equality regardless of where the
+        paren sits.
+        """
+        assert score_match(
+            "Charlie Persip and Jazz Statesmen", "Charlie Persip (and Jazz Statesmen)"
+        ) == pytest.approx(97.06, abs=0.01)
+        assert (
+            score_match("Chick Corea Return to Forever", "Chick Corea (Return to Forever)")
+            < SCORE_MATCH_ACCEPTANCE_FLOOR
+        )
+        assert (
+            score_match("Annette Funicello", "Annette (Funicello)") < SCORE_MATCH_ACCEPTANCE_FLOOR
+        )
+
+    @pytest.mark.parametrize(
+        "candidate",
+        [
+            "Various Artists (Rock Sampler)",
+            "V/A (Sampler)",
+        ],
+    )
+    def test_va_guard_survives_a_disambiguation_style_parenthetical(self, candidate):
+        """The V/A guard must reject a compilation alias even when it carries
+        a trailing parenthetical that could tempt the new raw-fold rung."""
+        assert _artist_pair_verified("Various Artists", candidate) is False
+
+
 class TestGuardsIntact:
     """Widening the comparison must not widen what the gate exists to reject."""
 

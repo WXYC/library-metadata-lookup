@@ -173,31 +173,86 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
     is shared with the streaming matcher, where LML#719 and LML#1139 document
     the false positives it exists to stop, and it is neither read nor moved by
     the folded rung.
+
+    **A third rung retries on the UNSTRIPPED pair, folded, at equality**
+    (LML#1256). ``strip_discogs_disambig(broad=True)`` strips any 1-19 char
+    trailing parenthetical — right for a Discogs qualifier, wrong for WXYC's
+    own cataloguing convention, where the parenthetical is frequently real
+    name content: "Charlie Persip (and Jazz Statesmen)", "Chick Corea (Return
+    to Forever)", "Annette (Funicello)". For these the strip discards content
+    before rungs 1-2 ever see it, so they correctly fail to verify a
+    candidate that IS the requested artist. Sharpest case: "(etre)" strips to
+    "", which used to hit an early ``if not candidate_stripped: return False``
+    before any rung ran, so it could never verify against anything.
+
+    The retry folds the **unstripped** candidate and query (pre-strip) at the
+    same equality bar as rung 2, never the shared floor. An unfolded floor
+    comparison on the raw pair was considered and rejected: measured against
+    the ticket's own examples, that score is a different number per pair
+    purely as a function of where the parenthesis lands relative to token
+    boundaries — 97.06, 73.33, 50.00 for the three cases above — the identical
+    position-dependent looseness LML#1252 measured on the *stripped* axis.
+    Folding removes that dependency: a pair differing only by punctuation
+    folds to exact equality regardless of where the paren sits; one that
+    differs by more does not.
+
+    Reached only when rungs 1-2 miss — those already answer "same artist"
+    whenever the strip found a genuine Discogs qualifier, so this rung exists
+    solely for the case the strip got wrong. The V/A guard still runs first,
+    against the unstripped candidate, so a compilation alias carrying a decoy
+    parenthetical ("Various Artists (Rock Sampler)") cannot reach it either.
     """
     if not query_stripped:
         return False
     if not isinstance(candidate, str):
         return False
-    candidate_stripped = strip_discogs_disambig(candidate).strip()
-    if not candidate_stripped:
+    candidate_raw = candidate.strip()
+    if not candidate_raw:
         return False
-    if is_compilation_artist(candidate_stripped):
+    if is_compilation_artist(candidate_raw):
         return False
-    query_stripped_canonical = strip_discogs_disambig(query_stripped).strip()
-    if not query_stripped_canonical:
-        return False
-    if score_match(query_stripped_canonical, candidate_stripped) >= SCORE_MATCH_ACCEPTANCE_FLOOR:
+
+    query_raw = query_stripped
+    candidate_stripped = strip_discogs_disambig(candidate_raw).strip()
+    query_stripped_canonical = strip_discogs_disambig(query_raw).strip()
+
+    if query_stripped_canonical and candidate_stripped:
+        if is_compilation_artist(candidate_stripped):
+            return False
+        if (
+            score_match(query_stripped_canonical, candidate_stripped)
+            >= SCORE_MATCH_ACCEPTANCE_FLOOR
+        ):
+            return True
+        # LML#1252 — retry on the punctuation-folded pair, demanding equality
+        # rather than the shared floor (see the docstring: a floor-based rung
+        # flips 38 cross-artist pairs, equality flips 3, and recall is
+        # identical). Skipped when either side folds away entirely (an
+        # all-punctuation name), so "..." cannot verify against an equally
+        # punctuation-only credit.
+        query_folded = fold_punctuation_for_comparison(query_stripped_canonical)
+        candidate_folded = fold_punctuation_for_comparison(candidate_stripped)
+        if (
+            query_folded
+            and candidate_folded
+            and score_match(query_folded, candidate_folded) >= _FOLDED_EQUALITY_SCORE
+        ):
+            return True
+
+    # LML#1256 — retry once more on the UNSTRIPPED pair, folded, at equality.
+    # Reached only when the disambiguation strip either destroyed the
+    # candidate entirely ("(etre)" -> "") or left a stripped pair that still
+    # doesn't match — i.e. exactly the population the strip got wrong.
+    query_raw_folded = fold_punctuation_for_comparison(query_raw)
+    candidate_raw_folded = fold_punctuation_for_comparison(candidate_raw)
+    if (
+        query_raw_folded
+        and candidate_raw_folded
+        and score_match(query_raw_folded, candidate_raw_folded) >= _FOLDED_EQUALITY_SCORE
+    ):
         return True
-    # LML#1252 — retry on the punctuation-folded pair, demanding equality
-    # rather than the shared floor (see the docstring: a floor-based rung flips
-    # 38 cross-artist pairs, equality flips 3, and recall is identical).
-    # Skipped when either side folds away entirely (an all-punctuation name),
-    # so "..." cannot verify against an equally punctuation-only credit.
-    query_folded = fold_punctuation_for_comparison(query_stripped_canonical)
-    candidate_folded = fold_punctuation_for_comparison(candidate_stripped)
-    if not query_folded or not candidate_folded:
-        return False
-    return score_match(query_folded, candidate_folded) >= _FOLDED_EQUALITY_SCORE
+
+    return False
 
 
 _resolver_cache = create_ttl_cache(maxsize=512, ttl=300)
