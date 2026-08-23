@@ -4155,45 +4155,47 @@ class TestSearchByKeyword:
     """Tests for ``track_on_compilation._search_by_keyword`` (LML#1257)."""
 
     @pytest.mark.asyncio
-    async def test_underscore_artist_folds_to_two_significant_words(self, mock_library_db):
-        """LML#1257: consolidated onto the shared LML#1244 fold, which folds
-        ``_`` to a space -- the old inline ``re.sub(r"[^\\w\\s]", " ", ...)``
-        left it glued to its neighbors, since Python's ``\\w`` treats ``_``
-        as a word character.
+    async def test_short_underscore_artist_keeps_scoping_the_keyword_query(self, mock_library_db):
+        """LML#1257: this site takes the *query-token* fidelity, which leaves
+        ``_`` alone -- pinning why it was NOT consolidated onto
+        ``fold_punctuation_for_comparison``.
 
-        ``lib_artist`` here is a significant-word source for an FTS5 keyword
-        query, not the identity-matching gate in ``lookup/matching.py`` --
-        but it can still be one of the catalog's underscore-bearing names.
-        Reproduces catalog row 45585, filed "Super_Collider" by
-        "Super_Collider" -- one of the 8 real WXYC catalog artists whose name
-        contains ``_`` (measured against the real ``library.db``,
-        2026-08-22). Before this fold, "Super_Collider" normalized to ONE
-        significant word ("super_collider"), producing the keyword query
-        "super_collider". Folding ``_`` to a space splits it into two
-        significant words ("super", "collider"), producing the keyword query
-        "super collider" instead.
+        ``sig_artist`` applies a ``len(w) > 3`` floor *after* the fold, so
+        folding ``_`` here deletes short names outright rather than splitting
+        them usefully. "Ras_G" -- a real WXYC catalog artist (row 3009xx,
+        "The gospel of the God Spell") -- folds to ``["ras","g"]``, neither
+        fragment clearing the floor, so the artist would contribute ZERO of
+        its two ``query_words`` slots and the keyword query would lose its
+        artist scoping entirely.
+
+        Nothing is gained by folding: ``db.search`` already folds ``_``
+        itself, and queried against the real catalog "ras_g" and "ras g"
+        return identical result sets (measured 2026-08-22). So the fold would
+        be pure loss here, which is why this site keeps the unfolded form.
         """
         from lookup.strategies.track_on_compilation import _search_by_keyword
 
-        item = make_library_item(id=45585, artist="Super_Collider", title="Super_Collider")
+        item = make_library_item(id=45585, artist="Ras_G", title="The gospel of the God Spell")
 
         async def search(query, limit=None, **_):
-            # Only the folded, two-word query surfaces the row -- pins that
-            # the fold (not incidental substring luck) is what finds it.
-            if query == "super collider":
+            # The artist term must still be present and unfolded. Under the
+            # comparison fold this query would have been "gospel spell" --
+            # artist-unscoped -- and this mock would return nothing.
+            if query == "ras_g gospel spell":
                 return [item]
             return []
 
         mock_library_db.search = AsyncMock(side_effect=search)
 
         parsed = ParsedRequest(
-            artist="Super_Collider",
-            raw_message="Super_Collider",
+            artist="Ras_G",
+            song="Gospel Spell",
+            raw_message="Ras_G - Gospel Spell",
             is_request=True,
             message_type=MessageType.REQUEST,
         )
 
-        results = await _search_by_keyword(mock_library_db, "Super_Collider", parsed)
+        results = await _search_by_keyword(mock_library_db, "Ras_G", parsed)
 
         assert len(results) == 1
         assert results[0].id == 45585

@@ -15,19 +15,22 @@ and ``server_timing_legs.py``). The concern is genuinely shared — both
 consume it, and keeping the policy in one place is what stops them drifting on
 what counts as the same artist.
 
-LML#1257 widened the consumer set from the artist axis to album and track
-title folding — ``lookup/strategies/artist_plus_album.py``,
-``track_on_compilation.py`` and ``track_release_matching.py`` had each grown
-their own copy of the pre-LML#1244 inline regex (``re.sub(r"[^\\w\\s]", " ",
-...)``), which folds every punctuation character *except* ``_`` since
-Python's ``\\w`` treats it as a word character. Routing them through this
-module's ``_`` handling is a real behavior change on those axes, not a
-no-op refactor: it now also folds the 7 catalog album titles and 8 catalog
-artist names that contain ``_`` (measured against the real ``library.db``,
-2026-08-22). ``discogs/matching.py``'s ``normalize_for_track_comparison``
-was surveyed and deliberately NOT adopted — it strips punctuation to the
-empty string rather than to a space, and that difference is load-bearing
-for its tracklist-validation consumers; see that function's own docstring.
+LML#1257 consolidated the five pre-LML#1244 inline copies of this fold that
+had grown in the strategies, and in doing so found the policy has **two
+fidelities** that differ on exactly one character, ``_``:
+
+- **Comparison** sites, where a folded string is matched against another
+  folded string, take :func:`fold_punctuation_for_comparison` — ``_`` and
+  all. ``lookup/strategies/artist_plus_album.py`` is the LML#1257 adopter.
+- **Query-construction** sites, where the fold is split into words that are
+  handed to ``LibraryDB.search``, take
+  :func:`fold_punctuation_for_query_tokens`, which leaves ``_`` alone. That
+  function carries the measurement behind the split.
+
+``discogs/matching.py``'s ``normalize_for_track_comparison`` was surveyed and
+adopted into neither — it strips punctuation to the empty string rather than
+to a space, and that is load-bearing for its tracklist-validation consumers;
+see that function's own docstring.
 
 Deliberately NOT delegated to ``wxyc_etl.text.to_identity_match_form_with_punctuation``,
 the crate's nearest primitive, even though it agrees with this fold on almost
@@ -67,6 +70,11 @@ _PUNCTUATION_CHAR = r"(?:[^\w\s]|_)"
 
 _PUNCTUATION_RE = re.compile(_PUNCTUATION_CHAR)
 
+# The same class minus the '_' clause (LML#1257). Spelled out rather than
+# derived, because the one character these two disagree on IS the policy
+# decision -- see :func:`fold_punctuation_for_query_tokens`.
+_QUERY_TOKEN_PUNCTUATION_RE = re.compile(r"[^\w\s]")
+
 # A query whose own name ends in punctuation ("Adult.", "Neu!", "T++", "Ras_")
 # loses that terminator to the fold. See :func:`ends_in_punctuation`.
 _TRAILING_PUNCTUATION_RE = re.compile(rf"{_PUNCTUATION_CHAR}\s*$")
@@ -90,6 +98,32 @@ def fold_punctuation_for_comparison(s: str) -> str:
     exists to avoid.
     """
     return " ".join(_PUNCTUATION_RE.sub(" ", s).split())
+
+
+def fold_punctuation_for_query_tokens(s: str) -> str:
+    """Fold punctuation to a space, but leave ``_`` alone, for query building.
+
+    The query-construction fidelity of this module's policy, and the reason
+    LML#1257 did not simply point every inline copy at
+    :func:`fold_punctuation_for_comparison`.
+
+    Callers here do not compare the result — they ``.split()`` it, drop the
+    short words (``len(w) > 3``), and hand what survives to
+    ``LibraryDB.search``. Folding ``_`` early is therefore pure loss, on two
+    measurements against the real ``library.db`` (2026-08-22):
+
+    1. **It buys nothing.** ``LibraryDB.search`` already folds ``_`` itself —
+       :func:`library.db._fts_normalize` collapses it for the LIKE/fuzzy legs
+       and FTS5's ``unicode61`` tokenizer splits on it for the FTS leg.
+       ``"ras_g"``/``"ras g"``, ``"s_w_z_k"``/``"s w z k"`` and
+       ``"super_collider"``/``"super collider"`` each return identical rows.
+    2. **It costs tokens.** Folding splits one long word into fragments the
+       ``len(w) > 3`` floor then discards. ``"Ras_G"`` becomes
+       ``["ras","g"]`` — neither survives, so the artist stops scoping the
+       query at all. ``"El_Txef_A"`` keeps only ``"txef"``; ``"s_w_z_k"``
+       keeps nothing.
+    """
+    return " ".join(_QUERY_TOKEN_PUNCTUATION_RE.sub(" ", s).split())
 
 
 def ends_in_punctuation(normalized: str) -> bool:

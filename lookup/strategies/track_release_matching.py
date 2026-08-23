@@ -34,7 +34,7 @@ from lookup.matching import (
     album_title_acceptable,
     artist_matches_item,
 )
-from lookup.name_folding import fold_punctuation_for_comparison
+from lookup.name_folding import fold_punctuation_for_query_tokens
 from lookup.release_resolution import ResolvedRelease, validate_release_for_track
 from lookup.rowless import (
     ROWLESS_LIBRARY_ID,
@@ -373,11 +373,13 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
             results = await _search_and_filter(stripped)
 
     if not results:
-        # LML#1257: consolidated onto the shared fold (LML#1244), which folds
-        # '_' to a space -- e.g. the catalog's "Super_Collider" now yields
-        # "super" and "collider" as separate significant words instead of one
-        # glued token.
-        words = fold_punctuation_for_comparison(album_title.lower()).split()
+        # LML#1257: the query-token fidelity, NOT the comparison one. These
+        # words build a db.search query, and db.search folds '_' itself, so
+        # folding it here would only feed shorter fragments to the
+        # len(w) > 3 floor below -- "s_w_z_k" would survive as no words at
+        # all, skipping the fuzzy pass entirely. See
+        # lookup/name_folding.fold_punctuation_for_query_tokens.
+        words = fold_punctuation_for_query_tokens(album_title.lower()).split()
         significant_words = [w for w in words if len(w) > 3 and w not in STOPWORDS]
 
         if significant_words:
