@@ -528,3 +528,24 @@ uv run --extra drain python -m scripts.ytm_coverage_drain \
   --sample-csv resolved_names.csv --limit 200 --concurrency 4 \
   --report-json /tmp/ytm_drain_report.json
 ```
+
+## Track-Recall Gap Census (`scripts/measure_track_recall_gap.py`)
+
+Measurement-only coverage census for [LML#1264](https://github.com/WXYC/library-metadata-lookup/issues/1264)'s acceptance criterion #1: "the gap is measured before it is fixed." LML has track-level recall for exactly two cases — V/A compilations (`lml_cache.compilation_track_location`) and songs with no artist (`SONG_AS_TRACK`) — so a track on a single-artist release, requested with its artist, is unreachable. This script writes nothing and touches no matcher, strategy, or `/lookup` behavior; it answers "how big is the hole."
+
+Four numbers, in order: (1) comp-shelf vs artist-shelf split of `library.db`, via the same `wxyc_etl.text.is_compilation_artist` classifier `scripts/build_compilation_track_location.py` gates on — not a hand-rolled `LIKE 'Various Artists%'` guess, which the script also reports side by side (`comp_shelf_naive_like_count`) because the two counts diverge (the classifier catches shelf forms like bare `"V/A"` and lowercase `"various"` the naive heuristic misses); (2) of the artist-shelf rows, how many resolve to a specific Discogs release today, via an exact-case-folded artist-name match (mirroring `scripts/build_filtered_discogs.py`'s own cache-build filter) cross-checked at the same 80/80 floor `clients/streaming/matching.py::find_best_typed_match` already applies for artwork resolution (LML#478) — reused read-only, not reimplemented; (3) of those, how many carry a cached tracklist (`release_track` rows); (4) the headline — artist-shelf rows that could gain track-level recall with **no new data collection** vs. rows that would need some.
+
+**Every Discogs-sourced number is an upper bound, and the script says so in its own output.** The real production discogs-cache is *filtered* to releases whose credited artist case-folds exactly against a WXYC library artist; a full, unscoped Discogs dump (`discogs_full` locally) carries no such filter. Numbers computed against `--discogs-url` describe what's resolvable if the cache held everything the full dump does — never "today's real coverage." `render_report` prints `UPPER BOUND` next to every such figure and refuses to conflate it with the `lml_cache.library_release_override` pin-coverage figure, which is prod-only data this script does not (and, without explicit approval to query prod, cannot) independently re-measure — it's surfaced from the documented `identity/bulk_resolve.py` code comment (`DOCUMENTED_PIN_COVERAGE_NOTE`) instead, clearly labeled as quoted, not derived.
+
+Omit `--discogs-url` (and unset `DATABASE_URL_DISCOGS`) to run the library-only half of the census with the Discogs-side measurement cleanly skipped, rather than pointed at nothing.
+
+```bash
+# library-only census (no Discogs access needed)
+uv run python -m scripts.measure_track_recall_gap --library-db library.db
+
+# full census against a local unscoped Discogs dump (upper bound; read docs/scripts.md above)
+uv run python -m scripts.measure_track_recall_gap \
+  --library-db /path/to/prod-snapshot/library.db \
+  --discogs-url postgresql://postgres@localhost:5432/discogs_full \
+  --out /tmp/lml_1264_census.json
+```
