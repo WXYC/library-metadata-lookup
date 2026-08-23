@@ -120,7 +120,7 @@ The corpus therefore records default-config behavior. Production's Railway flag 
 
 ### Frozen cases, and why they cannot be rebaselined
 
-Six cases are `"frozen": true`. Each pins a failure that already reached production once, cites its issue, and declares the catalog rows it needs (`requires_rows`) so it cannot pass vacuously if those rows are ever dropped from the fixture:
+Seven cases are `"frozen": true`. Each pins a failure that already reached production once, cites its issue, and declares the catalog rows it needs (`requires_rows`) so it cannot pass vacuously if those rows are ever dropped from the fixture:
 
 | case | pins |
 |---|---|
@@ -130,6 +130,7 @@ Six cases are `"frozen": true`. Each pins a failure that already reached product
 | `lml1225-space-lizzard-battle-star` | the query-coverage gate must reject a tracklist entry that is a sub-phrase of the typed query |
 | `lml1184-arabian-prince-strange-life` | a row-less compilation hit must not erase the artist's shelved albums |
 | `lml1184-arabian-prince-nonsense-track` | the control the issue itself used — with Discogs finding nothing, the artist fallback still returns both shelved rows |
+| `track-miss-stereolab-zzyzx-marginal-fanfare` | LML#1239: a track that exists nowhere must not come back as a *confident* compilation hit. The row is still returned — the fix caveats it rather than suppressing it — so `song_not_found: true` is the load-bearing half |
 
 Each of the six was verified by reverting its fix in a working tree and confirming the case goes red.
 
@@ -164,7 +165,9 @@ An improvement fails a case too. That symmetry is deliberate: a corpus that sile
 
 The corpus records what LML does, which is not always what it should do. A case whose verdict is believed wrong is marked `"suspect": true` with a note beginning `SUSPECT`, so the judgement lives next to the data and the day it changes reads as "the fix landed" rather than "something broke".
 
-One case carries that mark today. `track-miss-stereolab-zzyzx-marginal-fanfare` asks for a track that exists nowhere and gets back a confident, uncaveated hit — `found_on_compilation: true`, `song_not_found: false`, context `Found "Zzyzx Marginal Fanfare" by Stereolab on:` — pointing at *Peng!*. `TRACK_ON_COMPILATION`'s last-resort branch (`if not results and keyword_matches and not discogs_found_releases`, `lookup/strategies/track_on_compilation.py`) surfaces the best library keyword hit whenever Discogs returns nothing, and the compilation `Outcome` labels it confirmed. That is the LML#1225 user-visible failure — a confident row for a song that does not exist — reached through a path #1225's tracklist-gate fix does not cover, because no tracklist is ever consulted.
+**No case carries that mark today, and the one that did is the worked example.** `track-miss-stereolab-zzyzx-marginal-fanfare` was recorded on the corpus's first run (2026-08-20) as a confident, uncaveated hit — `found_on_compilation: true`, `song_not_found: false` — for a track that exists nowhere. `TRACK_ON_COMPILATION`'s last-resort branch (`if not results and keyword_matches and not discogs_found_releases`, `lookup/strategies/track_on_compilation.py`) surfaces the best library keyword hit whenever Discogs returns nothing, and the compilation `Outcome` labelled it confirmed — the LML#1225 user-visible failure, reached through a path #1225's tracklist-gate fix does not cover because no tracklist is ever consulted. LML#1239 fixed that branch, the case flipped on 2026-08-23, and it was rebaselined and promoted to `frozen` so the fix cannot quietly come undone.
+
+That promotion is why a case's judgement fields — `frozen`, `suspect`, `issue`, `note`, the `requires_*` guards — are carried forward by `merge_expectations` (`JUDGEMENT_KEYS`) rather than re-stamped from the builder's tables, and why `test_the_frozen_roster_agrees_with_the_committed_corpus` requires a promoted case to be recorded in `frozen_cases()` as well. Without both, a regeneration would silently revert the promotion while carrying the expectation forward, leaving every guard green: the frozen-case tests skip non-frozen cases, and the rebaseline tool's frozen-drift refusal never fires on a case that is no longer frozen.
 
 ### Fixture shape
 
