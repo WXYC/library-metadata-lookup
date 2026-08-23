@@ -245,20 +245,37 @@ class LibraryDB:
         ``library.artist``, ``library.alternate_artist_name``,
         ``library.album_artist``, ``compilation_track_artist.artist_name``
         -- gated by the same ``_has_*`` flags set just above. Each source is
-        loaded independently and wrapped in its own try/except: a schema
-        surprise in one source (notably ``compilation_track_artist``, whose
-        presence is detected only by table *name* via ``sqlite_master`` in
-        :meth:`connect` and never by checking for an ``artist_name`` column)
-        must degrade the pool to a partial set rather than raise out of
-        ``connect()`` and take down all library search over what is purely a
-        performance optimization. This was a review finding on #1249's
-        pool-building code; the isolation here is per-source specifically so
-        that one drifted table doesn't also blank out ``library.artist``,
-        which is mandatory and always present.
+        loaded independently and the three OPTIONAL ones are wrapped in their
+        own try/except: a schema surprise in one (notably
+        ``compilation_track_artist``, whose presence is detected only by table
+        *name* via ``sqlite_master`` in :meth:`connect` and never by checking
+        for an ``artist_name`` column) degrades the pool to a partial set
+        rather than raising out of ``connect()`` and taking down all library
+        search over what is purely a performance optimization. This was a
+        review finding on #1249's pool-building code.
+
+        ``library.artist`` is deliberately EXCLUDED from that swallow. It is
+        mandatory, and losing it does not cost a few names, it costs the whole
+        pool -- and an empty pool makes :meth:`_artist_exists_exactly` answer
+        ``False`` for every artist, silently disabling the #857 guard for the
+        connection's lifetime while search still appears to work. That is the
+        exact failure #857 exists to prevent (LML#1245 measured 52/52 such
+        corrections landing on genuinely different artists). A database that
+        cannot serve ``library.artist`` cannot serve catalog search either --
+        every result row selects it -- so failing loudly here loses nothing
+        that was still working.
+
+        Footprint: one lowercased ``str`` per distinct name across the present
+        sources. Measured at 27,517 names / ~3.4 MiB on the production
+        catalog (64,676 rows, no ``compilation_track_artist`` table), held per
+        worker process. Rebuilt on every :meth:`connect`, which includes the
+        #706 hot-swap reconnect -- and that one runs inline in the request
+        that detects the swap.
         """
         assert self._conn is not None  # Caller (connect) validates
 
-        sources: list[tuple[str, str]] = [("library", "artist")]
+        mandatory: tuple[str, str] = ("library", "artist")
+        sources: list[tuple[str, str]] = [mandatory]
         if self._has_alternate_artist:
             sources.append(("library", "alternate_artist_name"))
         if self._has_album_artist:
@@ -275,6 +292,8 @@ class LibraryDB:
                 rows = await cursor.fetchall()
                 pool.update(row[0].lower() for row in rows if row[0])
             except Exception:
+                if (table, column) == mandatory:
+                    raise
                 logger.warning(
                     f"Failed to load '{column}' from '{table}' while building the "
                     "artist-name exact-match pool (LML#1248); that source is "
@@ -302,6 +321,10 @@ class LibraryDB:
         if self._conn:
             await self._conn.close()
             self._conn = None
+            # The pool is the only per-database state that would otherwise
+            # outlive _conn; drop it with the connection so nothing can answer
+            # an exact-existence check from a closed database's names.
+            self._artist_name_pool_lower = set()
             clear_library_caches()
             logger.info("Closed SQLite connection")
 
@@ -691,6 +714,15 @@ class LibraryDB:
         "National" as an exact match, suppressing a correction that fires
         today). See LML#1248 and the ``TestArtistNameExactMatchPool`` tests
         in ``tests/unit/test_library_db.py`` for the guard.
+
+        One deliberate divergence from the old SQL: case folding is now full
+        Unicode. SQLite's ``LOWER()`` is ASCII-only, so "NILÜFER YANYA"
+        survived it unchanged and never matched a Python-lowered query --
+        the guard silently missed an artist the library genuinely owns.
+        Python's ``str.lower()``, which builds the pool, folds the whole
+        string, so it now matches. That widening runs toward the guard's
+        intent rather than away from it, and is pinned by
+        ``test_pool_case_folds_non_ascii_catalog_names``.
         """
         return artist_lower in self._artist_name_pool_lower or (
             artist_compare in self._artist_name_pool_lower

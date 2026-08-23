@@ -954,6 +954,7 @@ def _create_library_db(
     with_cta_table=False,
     cta_artist_names=None,
     cta_missing_artist_name_column=False,
+    omit_artist_column=False,
 ):
     """Build a minimal library.db for pool-construction tests.
 
@@ -962,7 +963,8 @@ def _create_library_db(
     ``cta_missing_artist_name_column=True`` creates a ``compilation_track_artist``
     table that exists (so the ``sqlite_master`` name probe finds it) but is
     shaped without an ``artist_name`` column -- the schema-drift case LML#1248
-    must tolerate.
+    must tolerate. Passing ``omit_artist_column=True`` drops ``library.artist``
+    entirely, so reading the pool's one mandatory source fails.
     """
     import sqlite3
 
@@ -977,19 +979,24 @@ def _create_library_db(
         "genre TEXT",
         "format TEXT",
     ]
+    if omit_artist_column:
+        columns.remove("artist TEXT")
     if with_alternate_artist:
         columns.append("alternate_artist_name TEXT")
     if with_album_artist:
         columns.append("album_artist TEXT")
     conn.execute(f"CREATE TABLE library ({', '.join(columns)})")
-    conn.execute("""
+    fts_columns = "title" if omit_artist_column else "title, artist"
+    conn.execute(f"""
         CREATE VIRTUAL TABLE library_fts USING fts5(
-            title, artist, content='library', content_rowid='id'
+            {fts_columns}, content='library', content_rowid='id'
         )
     """)
 
     for i, artist in enumerate(artists, start=1):
         values = [str(i), f"Album {i}", artist, "A", str(i), str(i), "Rock", "LP"]
+        if omit_artist_column:
+            values.remove(artist)
         if with_alternate_artist:
             values.append(None)
         if with_album_artist:
@@ -1167,6 +1174,66 @@ class TestArtistNameExactMatchPool:
         result = await db.find_similar_artist("Stereolab")
         assert result is None
         await db.close()
+
+    @pytest.mark.asyncio
+    async def test_mandatory_library_artist_source_failure_fails_connect(self, tmp_path):
+        """The optional-source swallow must NOT extend to ``library.artist``.
+
+        Degrading an optional source to absent costs a few names. Degrading
+        the mandatory one costs the whole pool, and an empty pool makes
+        :meth:`_artist_exists_exactly` answer ``False`` for every artist --
+        silently disabling the #857 guard for the lifetime of the connection
+        while search still appears to work. That is the failure mode #857
+        exists to prevent (LML#1245 measured 52/52 such corrections landing on
+        genuinely different artists). A database that cannot serve
+        ``library.artist`` cannot serve catalog search either, so it must fail
+        loudly at ``connect()`` rather than quietly.
+        """
+        db_file = tmp_path / "test.db"
+        _create_library_db(db_file, ["Stereolab"], omit_artist_column=True)
+        db = LibraryDB(db_path=db_file)
+
+        with pytest.raises(Exception, match="artist"):
+            await db.connect()
+
+    @pytest.mark.asyncio
+    async def test_pool_case_folds_non_ascii_catalog_names(self, tmp_path):
+        """Deliberate, measured divergence from the old SQL: full Unicode folding.
+
+        SQLite's ``LOWER()`` is ASCII-only, so the pre-#1248 SQL compared
+        ``"NILÜFER YANYA"`` (unchanged by ``LOWER``) against a Python-lowered
+        query and never matched -- the #857 guard silently missed an artist
+        the library genuinely owns. Python's ``str.lower()`` folds the whole
+        string, so the pool matches. The widening is toward the guard's intent
+        and is pinned here so it stays a decision rather than an accident.
+        """
+        db_file = tmp_path / "test.db"
+        _create_library_db(db_file, ["NILÜFER YANYA"])
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+
+        assert db._artist_name_pool_lower == {"nilüfer yanya"}
+        assert await db._artist_exists_exactly("nilüfer yanya", "nilüfer yanya") is True
+        assert await db.find_similar_artist("Nilüfer Yanya") is None
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_close_clears_the_pool(self, tmp_path):
+        """``close()`` must drop the pool along with the connection.
+
+        The pool is the only per-database state that outlives ``_conn``, so
+        leaving it populated would let any future path that reaches the check
+        without a live connection answer from the *previous* database's names.
+        """
+        db_file = tmp_path / "test.db"
+        _create_library_db(db_file, ["Stereolab"])
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        assert db._artist_name_pool_lower
+
+        await db.close()
+
+        assert db._artist_name_pool_lower == set()
 
 
 # ---------------------------------------------------------------------------

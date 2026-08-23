@@ -481,15 +481,15 @@ async def _step_prepare_request(
         with services.telemetry.track_step("album_lookup"):
             if parsed.song and not parsed.album:
                 services.telemetry.record_api_call("discogs")
-            # Resolve the fuzzy library-artist correction FIRST (a cheap, cached
-            # local-SQLite lookup) so album resolution can gate its Discogs
-            # tracklist validation on library membership of the CORRECTED artist
-            # (LML#866). Serializing (vs the former concurrent gather) costs low
-            # single-digit microseconds uncached (LML#1248 replaced a non-sargable
-            # per-call SQL scan) and is required for the gate to use the same
-            # library-artist notion step 3 does. Because the correction now
-            # completes before step 2 begins, there is no concurrent sibling task
-            # to orphan when the LML#865 spine deadline trips.
+            # Resolve the fuzzy library-artist correction FIRST (a cached local
+            # lookup) so album resolution can gate its Discogs tracklist validation
+            # on library membership of the CORRECTED artist (LML#866). Serializing
+            # (vs the former concurrent gather) adds this call's whole cost: nil
+            # cached, microseconds when LML#1248's in-memory exact-name set
+            # short-circuits, still milliseconds when it misses and the candidate
+            # LIKE-union runs. Required for the gate to use the same library-artist
+            # notion step 3 does, and the correction completing before step 2 leaves
+            # no concurrent sibling to orphan when the LML#865 spine deadline trips.
             corrected = await services.db.find_similar_artist(parsed.artist)
             if corrected:
                 state.corrected_artist = corrected
