@@ -171,6 +171,12 @@ class LibraryDB:
         self._has_cross_reference_names: bool = False
         self._has_compilation_track_artist: bool = False
         self._has_streaming_links: bool = False
+        self._artist_name_pool_lower: set[str] = set()
+        """Lowercased exact-match pool for :meth:`_artist_exists_exactly`
+        (LML#1248). Built once by :meth:`_build_artist_name_pool` at the end
+        of :meth:`connect`, from the same four source columns the old
+        per-call SQL scan queried. Empty until ``connect()`` runs, or
+        partial/empty if a source failed to load (schema drift)."""
 
     async def connect(self):
         """Open database connection."""
@@ -222,6 +228,63 @@ class LibraryDB:
             f"compilation_track_artist: {'yes' if self._has_compilation_track_artist else 'no'}, "
             f"streaming_links: {'yes' if self._has_streaming_links else 'no'})"
         )
+
+        await self._build_artist_name_pool()
+
+    async def _build_artist_name_pool(self) -> None:
+        """Materialize the lowercased exact-name pool for :meth:`_artist_exists_exactly`.
+
+        LML#1248: replaces a per-call, four-branch ``LOWER(artist) = ?``
+        table scan (non-sargable against ``idx_artist`` -- SQLite degrades
+        to `SCAN library USING COVERING INDEX`, ~4.9ms/branch, ~13-15ms
+        across up to four unioned branches on 64,676 rows) with a one-time
+        read into a ``set[str]``, so the per-call check becomes O(1)
+        membership testing.
+
+        Reads exactly the same four source columns the old SQL scanned --
+        ``library.artist``, ``library.alternate_artist_name``,
+        ``library.album_artist``, ``compilation_track_artist.artist_name``
+        -- gated by the same ``_has_*`` flags set just above. Each source is
+        loaded independently and wrapped in its own try/except: a schema
+        surprise in one source (notably ``compilation_track_artist``, whose
+        presence is detected only by table *name* via ``sqlite_master`` in
+        :meth:`connect` and never by checking for an ``artist_name`` column)
+        must degrade the pool to a partial set rather than raise out of
+        ``connect()`` and take down all library search over what is purely a
+        performance optimization. This was a review finding on #1249's
+        pool-building code; the isolation here is per-source specifically so
+        that one drifted table doesn't also blank out ``library.artist``,
+        which is mandatory and always present.
+        """
+        assert self._conn is not None  # Caller (connect) validates
+
+        sources: list[tuple[str, str]] = [("library", "artist")]
+        if self._has_alternate_artist:
+            sources.append(("library", "alternate_artist_name"))
+        if self._has_album_artist:
+            sources.append(("library", "album_artist"))
+        if self._has_compilation_track_artist:
+            sources.append(("compilation_track_artist", "artist_name"))
+
+        pool: set[str] = set()
+        for table, column in sources:
+            try:
+                cursor = await self._conn.execute(
+                    f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL"
+                )
+                rows = await cursor.fetchall()
+                pool.update(row[0].lower() for row in rows if row[0])
+            except Exception:
+                logger.warning(
+                    f"Failed to load '{column}' from '{table}' while building the "
+                    "artist-name exact-match pool (LML#1248); that source is "
+                    "skipped and the exact-match check degrades to a partial set "
+                    "for it.",
+                    exc_info=True,
+                )
+
+        self._artist_name_pool_lower = pool
+        logger.info(f"Built artist-name exact-match pool: {len(pool)} names")
 
     async def is_available(self) -> bool:
         """Check if the database connection is alive."""
@@ -610,35 +673,28 @@ class LibraryDB:
         Run before any fuzzy candidate search so a name that's already in the
         library (e.g. "John Lennon") is never "corrected" to a different,
         merely-similar-scoring artist that happened to survive the candidate cap.
+
+        LML#1248: answered from :attr:`_artist_name_pool_lower`, the
+        in-memory set :meth:`_build_artist_name_pool` materializes once at
+        :meth:`connect` time, rather than a per-call SQL scan -- issues no
+        SQL at all. Stays ``async def`` for interface stability with its one
+        caller, which already ``await``s it.
+
+        Tests only the two RAW lowercased query forms (``artist_lower``, the
+        typed name; ``artist_compare``, its leading-article-stripped form)
+        against the pool of RAW lowercased catalog names -- exactly what the
+        old SQL's ``LOWER(artist) = :artist_lower OR LOWER(artist) =
+        :artist_compare`` matched, column unstripped. Do not also build or
+        test against an article-stripped *pool* of catalog names: that would
+        widen the predicate beyond what today's SQL matches (e.g. a catalog
+        holding only "The National" would start reporting the bare query
+        "National" as an exact match, suppressing a correction that fires
+        today). See LML#1248 and the ``TestArtistNameExactMatchPool`` tests
+        in ``tests/unit/test_library_db.py`` for the guard.
         """
-        assert self._conn is not None  # Caller validates
-
-        exact_filter = "LOWER(artist) = ? OR LOWER(artist) = ?"
-        unions = [f"SELECT 1 FROM library WHERE {exact_filter}"]
-        params_list = [artist_lower, artist_compare]
-        if self._has_alternate_artist:
-            unions.append(
-                "SELECT 1 FROM library WHERE alternate_artist_name IS NOT NULL "
-                "AND (LOWER(alternate_artist_name) = ? OR LOWER(alternate_artist_name) = ?)"
-            )
-            params_list.extend([artist_lower, artist_compare])
-        if self._has_album_artist:
-            unions.append(
-                "SELECT 1 FROM library WHERE album_artist IS NOT NULL "
-                "AND (LOWER(album_artist) = ? OR LOWER(album_artist) = ?)"
-            )
-            params_list.extend([artist_lower, artist_compare])
-        if self._has_compilation_track_artist:
-            unions.append(
-                "SELECT 1 FROM compilation_track_artist "
-                "WHERE LOWER(artist_name) = ? OR LOWER(artist_name) = ?"
-            )
-            params_list.extend([artist_lower, artist_compare])
-
-        sql = f"SELECT 1 FROM ({' UNION ALL '.join(unions)}) LIMIT 1"
-        cursor = await self._conn.execute(sql, params_list)
-        row = await cursor.fetchone()
-        return row is not None
+        return artist_lower in self._artist_name_pool_lower or (
+            artist_compare in self._artist_name_pool_lower
+        )
 
     async def _find_similar_artist_uncached(self, artist: str, threshold: int = 85) -> str | None:
         assert self._conn is not None  # Caller validates
