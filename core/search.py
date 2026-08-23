@@ -1076,6 +1076,20 @@ def get_search_type_from_state(state: SearchState) -> str:
         # api.yaml v1.3.0 SearchType has no `song_as_track` value. Precise
         # provenance lives on matched_via.source per plan §5.1; from the
         # caller's lens, track-driven matches are compilation-class.
+        #
+        # LML#1239 deliberately did NOT add the verdict mirror here. It is not
+        # an oversight that this branch reads no `song_not_found` while the
+        # TRACK_ON_COMPILATION branch above does: TRACK_ON_COMPILATION owns a
+        # last-resort path that appends the top keyword hit without consulting
+        # a tracklist, and SONG_AS_TRACK owns none. Its only surfacing site is
+        # `_match_track_releases_to_library`, which appends to `matched_items`
+        # inside the same loop body that records that item's TrackMatchHint,
+        # and it returns via `Outcome.track_match`, which sets
+        # `song_not_found_after=False` unconditionally. Items surfaced here
+        # with `song_not_found` True is therefore an unreachable state, and a
+        # mirror would be dead code. Pinned by
+        # `TestSongAsTrackVerdictInvariant` in tests/unit/test_orchestrator_gaps.py,
+        # which fails if an unvalidated surfacing path is ever added.
         return "compilation"
 
     return SEARCH_TYPE_NONE
