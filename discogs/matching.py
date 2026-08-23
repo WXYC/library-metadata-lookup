@@ -95,11 +95,30 @@ def normalize_for_track_comparison(text: str | None) -> str:
     ``"r and b"`` — the same shape a DJ typing "R and B" would produce. See
     ``tests/unit/test_normalization_consolidation.py`` for the pinned
     behavior table.
+
+    LML#1257 surveyed this module as a candidate to consolidate onto
+    ``lookup.name_folding.fold_punctuation_for_comparison`` and rejected it: the
+    punctuation strip below deletes to the empty string, not to a space, and
+    that is not incidental. ``_token_is_covered``'s docstring names the
+    consequence directly — "Non-Stop" and "E-Bow The Letter" normalize to
+    single glued tokens ("nonstop", "ebowtheletter") on purpose, so hyphen and
+    spacing disagreements are absorbed by substring containment and the
+    ``token_set_ratio`` fuzzy fallback rather than by a token-boundary split.
+    Switching this fold to punct-to-space would change tokenization for every
+    consumer downstream — ``_content_tokens``, ``title_matches_query``,
+    ``query_is_covered_by_title``, and ultimately ``scan_tracklist_for_match``,
+    which feeds the LML#699 BMI composer-credit and track-position payload —
+    and that is exactly the untested, unmeasured behavior change LML#1257
+    declined to sweep in for tidiness. If this fold is ever converted, it
+    needs its own measurement against real tracklist data, not a shared call
+    with the artist/album/track identity fold.
     """
     if not text:
         return ""
     result = normalize_for_comparison(text)
     result = result.replace("&", " and ")
+    # Not lookup.name_folding.fold_punctuation_for_comparison (LML#1257): this
+    # strips punctuation to nothing, not to a space. See the docstring above.
     result = re.sub(r"[^\w\s]", "", result)
     result = re.sub(r"\s+", " ", result).strip()
     return result

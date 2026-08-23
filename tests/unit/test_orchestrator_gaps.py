@@ -1295,6 +1295,42 @@ class TestSearchAlbumFuzzy:
         assert len(results) == 1
         assert results[0].id == 58610
 
+    @pytest.mark.asyncio
+    async def test_underscore_query_folds_to_two_significant_words(self):
+        """LML#1257: consolidated the significant-words fold onto the shared
+        LML#1244 policy, which folds ``_`` to a space -- the old inline
+        ``re.sub(r"[^\\w\\s]", " ", ...)`` left it glued to its neighbors,
+        since Python's ``\\w`` treats ``_`` as a word character.
+
+        Reproduces catalog row 45585, filed "Super_Collider" by
+        "Super_Collider" -- one of the 8 real WXYC catalog artists whose name
+        contains ``_`` (measured against the real ``library.db``,
+        2026-08-22). Before this fold, a same-shaped query ("Super_Collider")
+        normalized to ONE 15-char significant word ("super_collider"), and
+        ``max_words = min(4, len(significant_words))`` paired with
+        ``range(max_words, 1, -1)`` means a single-word query never clears
+        the loop floor -- the old code returns nothing for this query shape,
+        unconditionally, without ever calling ``db.search`` for a fuzzy
+        attempt. Folding ``_`` to a space splits it into two words ("super",
+        "collider"), clears the floor, and finds the row.
+        """
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        item = _item(id=45585, artist="Super_Collider", title="Super_Collider")
+
+        async def search(query, limit=None, **_):
+            # Only the folded, two-word query surfaces the row -- pins that
+            # the fold (not incidental substring luck) is what finds it.
+            if query == "super collider":
+                return [item]
+            return []
+
+        db.search = AsyncMock(side_effect=search)
+
+        results = await search_album_fuzzy(db, "Super_Collider")
+        assert len(results) == 1
+        assert results[0].id == 45585
+
 
 # ---------------------------------------------------------------------------
 # filter_results_by_track_validation -- exception (lines 482-483)

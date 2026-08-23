@@ -15,7 +15,6 @@ and the artist isn't in the library at all) is also expressed via
 
 import asyncio
 import logging
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import ClassVar
@@ -38,6 +37,7 @@ from lookup.matching import (
     is_self_titled,
     library_artist_for,
 )
+from lookup.name_folding import fold_punctuation_for_comparison
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -117,8 +117,12 @@ async def search_library_with_fallback(
             results = filter_results_by_artist(results, lib_artist)
 
             album_lower = album.lower()
-            album_normalized = re.sub(r"[^\w\s]", " ", album_lower)
-            album_normalized = " ".join(album_normalized.split())
+            # LML#1257: consolidated onto the shared fold (LML#1244). Folds
+            # '_' to a space where the old inline regex left it glued to its
+            # neighbors, so a self-titled catalog row like "Super_Collider"
+            # now tokenizes as two words instead of one -- see
+            # lookup/name_folding.py for why '_' is punctuation here.
+            album_normalized = fold_punctuation_for_comparison(album_lower)
             album_words = {w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS}
             album_is_artist = lib_artist and normalize_for_comparison(
                 album
@@ -131,8 +135,7 @@ async def search_library_with_fallback(
                     continue
 
                 item_title_lower = (item.title or "").lower()
-                item_normalized = re.sub(r"[^\w\s]", " ", item_title_lower)
-                item_normalized = " ".join(item_normalized.split())
+                item_normalized = fold_punctuation_for_comparison(item_title_lower)
                 item_words = {
                     w for w in item_normalized.split() if len(w) > 2 and w not in STOPWORDS
                 }
