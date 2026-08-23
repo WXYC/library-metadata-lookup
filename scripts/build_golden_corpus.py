@@ -197,22 +197,12 @@ _ABSENT_ALBUM_NOTES: dict[str, str] = {
 NONSENSE_TRACK_QUERIES: tuple[tuple[str | None, str, str], ...] = (
     (None, "Qqzzx Vulpine Escarpment", ""),
     (None, "Thrattlebone Nine Nine", ""),
-    (
-        "Stereolab",
-        "Zzyzx Marginal Fanfare",
-        "SUSPECT (found by this corpus on its first run, 2026-08-20): the recorded "
-        "verdict is a confident, uncaveated hit -- found_on_compilation=True, "
-        'song_not_found=False, context \'Found "Zzyzx Marginal Fanfare" by Stereolab '
-        "on: Peng!' -- for a track that exists nowhere. TRACK_ON_COMPILATION's "
-        "last-resort branch (`if not results and keyword_matches and not "
-        "discogs_found_releases`) surfaces the best library keyword hit when Discogs "
-        "returns nothing, and the compilation Outcome labels it confirmed. This is "
-        "the LML#1225 user-visible failure -- a confident row for a song that does "
-        "not exist -- reached through a path #1225's tracklist-gate fix does not "
-        "cover, because no tracklist is ever consulted.",
-    ),
     ("Cocteau Twins", "Grebulon Overture Nine", ""),
 )
+#: `Stereolab / Zzyzx Marginal Fanfare` used to live here with a suspect-note.
+#: It graduated: the verdict it was flagged as doubting got fixed by LML#1239,
+#: so it now pins that fix and is hand-authored in `frozen_cases()` instead.
+#: A case only stays in this table while its verdict is still in question.
 
 #: Artists whose ENTIRE shelf gets a Discogs release extracted and routed by
 #: artist+album. LML#801's mechanism is the artist-only fallback returning the
@@ -1012,6 +1002,34 @@ def frozen_cases() -> list[dict[str, Any]]:
             ],
             "expect": None,
         },
+        {
+            "id": "track-miss-stereolab-zzyzx-marginal-fanfare",
+            "shape": "artist_song",
+            "frozen": True,
+            "issue": "LML#1239",
+            "note": (
+                "A track that is on no shelf and in no Discogs fixture. The miss "
+                "direction for the track lanes: if this starts returning a CONFIDENT "
+                "row, a validation gate has stopped gating. The only case in the corpus "
+                "that was recorded suspect and later graduated, which is why it is "
+                "hand-authored here rather than sampled: on the corpus's first run "
+                "(2026-08-20) it recorded a confident, uncaveated hit -- "
+                "found_on_compilation=True, song_not_found=False -- for a track that "
+                "exists nowhere, because TRACK_ON_COMPILATION's last-resort branch (`if "
+                "not results and keyword_matches and not discogs_found_releases`) "
+                "surfaces the best library keyword hit when Discogs returns nothing and "
+                "the compilation Outcome labels it confirmed. That is the LML#1225 "
+                "user-visible failure reached by a path #1225's tracklist gate never "
+                "covers, because no tracklist is consulted. LML#1239 fixed exactly that "
+                "branch, and the case flipped to song_not_found=True on 2026-08-23. The "
+                "row itself is still returned -- the fix caveats it rather than "
+                "suppressing it -- so the results list is unchanged, and that is the "
+                "half most likely to regress quietly."
+            ),
+            "query": {"artist": "Stereolab", "song": "Zzyzx Marginal Fanfare"},
+            "requires_rows": [["Stereolab", "Peng!"]],
+            "expect": None,
+        },
     ]
 
 
@@ -1020,27 +1038,85 @@ def frozen_cases() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+#: Case keys that record a HUMAN judgement rather than a fact the generator
+#: observed, and which `merge_expectations` therefore carries forward from the
+#: committed corpus instead of re-stamping from the tables in this file.
+#:
+#: `expect` was always carried, for a reason the rest of this roster inherits:
+#: a regeneration must never silently re-record a verdict, because that would
+#: make this script a way to launder a regression into the baseline. The same
+#: argument covers the judgement *about* a case. Freezing one, citing the issue
+#: it pins, declaring the rows it needs, or writing the note that explains any
+#: of it, are decisions a person made and committed; the generator has no
+#: better information about them and must not overwrite them.
+#:
+#: This was not always true, and the gap was live. `track-miss-stereolab-zzyzx-
+#: marginal-fanfare` was promoted from `suspect` to `frozen` in `cases.json`
+#: when LML#1239 landed the fix it had been flagged as waiting for. Because
+#: only `expect` was carried, the next sanctioned regeneration would have
+#: re-stamped it non-frozen and suspect from `NONSENSE_TRACK_QUERIES` while
+#: carrying the expectation forward -- reverting the judgement, keeping the
+#: verdict, and leaving every guard green: the frozen-case tests skip
+#: non-frozen cases, the suspect test passes on the regenerated note, and the
+#: rebaseline tool's frozen-drift refusal never fires on a case that is no
+#: longer frozen. `test_the_frozen_roster_agrees_with_the_committed_corpus`
+#: closes the other half by requiring the promotion to be recorded in
+#: `frozen_cases()` too, so a regeneration reproduces it from scratch.
+#:
+#: Deliberately NOT here: `id`, `shape` and `query` describe what the builder
+#: sampled. If a regeneration re-derives those, the new values win -- carrying
+#: them would park a stale query in front of a carried-forward expectation,
+#: which is this same failure in the opposite direction.
+JUDGEMENT_KEYS: tuple[str, ...] = (
+    "expect",
+    "frozen",
+    "suspect",
+    "issue",
+    "note",
+    "requires_discogs",
+    "requires_routes",
+    "requires_rows",
+    "requires_absent_artists",
+    "settings",
+)
+
+
 def merge_expectations(
     new_cases: list[dict[str, Any]], existing_path: Path
 ) -> list[dict[str, Any]]:
-    """Carry every existing expectation forward onto the regenerated skeletons.
+    """Carry every committed human judgement forward onto the regenerated skeletons.
 
-    A regeneration must never silently re-record verdicts: that would make
+    A regeneration must never silently re-record verdicts, nor silently undo a
+    decision someone recorded about a case: either would make
     `build_golden_corpus.py` a way to launder a regression into the baseline.
-    Cases that already exist keep their expectation; genuinely new cases come
-    out with `expect: null` and fail until rebaselined.
+    Cases that already exist keep their expectation and their judgement (see
+    `JUDGEMENT_KEYS`); genuinely new cases come out with `expect: null`, keep
+    the judgement this script stamped on them, and fail until rebaselined.
     """
     if not existing_path.exists():
         return new_cases
     with existing_path.open(encoding="utf-8") as handle:
         previous = {case["id"]: case for case in json.load(handle)}
     carried = 0
+    judgements = 0
     for case in new_cases:
         prior = previous.get(case["id"])
-        if prior and prior.get("expect") is not None:
+        if not prior:
+            continue
+        if prior.get("expect") is not None:
             case["expect"] = prior["expect"]
             carried += 1
-    logger.info("carried %d existing expectations forward", carried)
+        for key in JUDGEMENT_KEYS:
+            if key == "expect" or key not in prior:
+                continue
+            if case.get(key) != prior[key]:
+                judgements += 1
+            case[key] = prior[key]
+    logger.info(
+        "carried %d existing expectation(s) and %d committed judgement field(s) forward",
+        carried,
+        judgements,
+    )
     dropped = sorted(set(previous) - {c["id"] for c in new_cases})
     if dropped:
         logger.warning(
