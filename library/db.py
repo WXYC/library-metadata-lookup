@@ -1,17 +1,208 @@
+import asyncio
 import logging
+import math
 import re
 from pathlib import Path
 
 import aiosqlite
 from cachetools import TTLCache  # type: ignore[import-untyped]
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
+from rapidfuzz.distance import OSA
 from wxyc_etl.schema import library_columns
 from wxyc_etl.text import strip_leading_article
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
+from core.observability import capture_unsampled_counter
 from library.models import LibraryItem
 
 logger = logging.getLogger(__name__)
+
+ARTIST_CORRECTION_MARGIN_POINTS = 6
+"""How far ``find_similar_artist``'s winner must outscore its nearest rival.
+
+LML#1245. The winner must beat the best *distinct* runner-up by this many
+``fuzz.ratio`` points or the correction is withheld. Dense neighbourhoods --
+near-homographs like "Juana Molina"/"Juan Molina", and the V/A shelf credits,
+which are the densest region of the catalog -- are exactly where a full-pool
+scan is most dangerous, because that is where it reaches rivals the old
+anchored prefilter never surfaced. The margin fires there and nowhere else.
+
+Measured on a post-#1244 baseline, this guard plus the edit cap below takes
+false corrections from 22.0 per 1,000 lookups (``main``) to 17.7 while taking
+synthetic single-edit typo recall from 59.0% to 91.5% -- better on both axes,
+so it is not a trade. 6 is a round number chosen to demonstrate the shape,
+not an optimum; see the PR for the sweep this still owes.
+"""
+
+ARTIST_CORRECTION_EDIT_CAP_DIVISOR = 12
+"""Query characters per permitted edit, floor 1. See :func:`_artist_correction_edit_cap`.
+
+12, not the 8 the ticket proposed. 8 was explicitly a round number chosen to
+demonstrate the shape, and LML#1245's pre-merge condition 3 asks for a sweep;
+this is its answer. On the ``prod-20260719`` catalog, holding margin at 6 and
+measuring with :data:`_ARTIST_CORRECTION_DISTANCE`:
+
+    len/6   20.7 false/1k   93.1% recall
+    len/8   19.0            93.1%
+    len/10  18.0            93.1%
+    len/12  14.7            93.1%
+
+Recall is flat across the whole range and only precision moves, so the choice
+is free -- but only because the distance metric counts a transposition as one
+edit. Under plain Levenshtein the same sweep reads 91.1% / 85.5% / 79.5% as
+the cap tightens, and the divisor becomes a real trade. See
+:data:`_ARTIST_CORRECTION_DISTANCE`.
+"""
+
+_ARTIST_CORRECTION_DISTANCE = OSA
+"""Optimal string alignment, deliberately NOT plain Levenshtein.
+
+The two differ on exactly one operation: OSA charges a transposition one edit,
+Levenshtein charges it two (a delete plus an insert). Transposition is one of
+the three canonical single-key typo classes, so under Levenshtein the edit cap
+is roughly twice as strict for a third of all typos -- and because the penalty
+lands only on that third, it makes recall depend on the cap in a way that has
+nothing to do with how wrong the candidate is.
+
+Measured on ``prod-20260719``, margin 6, tightening the cap from len/6 to
+len/12: recall falls 93.1% -> 79.5% under Levenshtein and stays flat at 93.1%
+under OSA, while precision improves identically under both. The whole cost of
+the tighter cap was the transposition penalty. LML#1245 comment 4 specified
+``Levenshtein.distance``; this is a deliberate departure from the ticket, and
+it is what lets the shipped setting beat ``main`` on both axes rather than
+trading one for the other.
+"""
+
+_ARTIST_CORRECTION_TOP_K = 3
+"""Candidates retained per scoring axis, which is what makes the margin knowable.
+
+``process.extractOne`` returns the winner and nothing else, so it cannot
+answer "how close was the next one". Three per axis is provably enough to
+find the true top two by combined score: a candidate's combined score is its
+better axis, so if it is missing from that axis's top three then three others
+already score at least as high on it, and those are in the merged set. Ties
+collapse the margin to zero, which correctly withholds.
+"""
+
+_CORRECTION_POOL_POSTHOG_PREFIX = "library_artist_pool"
+_CORRECTION_POOL_UNUSABLE_EVENT = "artist_name_pool_unusable"
+
+
+def _capture_artist_name_pool_unusable(name_count: int) -> None:
+    """Emit the unsampled counter for a pool that could not be fully built.
+
+    Fired once per :meth:`LibraryDB._build_artist_name_pool`, at build time --
+    NOT per lookup. The degraded state persists for the life of the
+    connection, so a per-lookup counter would emit thousands of events
+    describing one fact and drown the signal it exists to raise.
+
+    The warning log already names which source failed. This adds the
+    queryable, sampling-independent series, because the user-visible symptom
+    is silent in both directions: exact-existence gets slower but stays
+    correct, and fuzzy correction simply stops firing. Nothing in the response
+    says so.
+
+    Delegates to ``core.observability.capture_unsampled_counter`` (LML#1204),
+    the shared detached-task counter shape: best-effort, gated by
+    ``Settings.enable_telemetry``, and unable to raise.
+    """
+    capture_unsampled_counter(
+        _CORRECTION_POOL_POSTHOG_PREFIX,
+        _CORRECTION_POOL_UNUSABLE_EVENT,
+        {"partial_name_count": name_count},
+    )
+
+
+def _artist_correction_edit_cap(query: str) -> int:
+    """Absolute edit budget for a correction, scaled to query length.
+
+    ``ceil(len / 12)``, floor 1. This is the lever ``fuzz.ratio`` lacks: ratio
+    is length-relative, so a fixed floor buys more absolute error the longer
+    the string. Eight independent substitutions in a fifty-character
+    compilation credit still score 86 -- comfortably over the 85 floor --
+    and eight independent mistakes is not a typo, whatever the ratio says.
+
+    Counted with :data:`_ARTIST_CORRECTION_DISTANCE`, which is why the
+    divisor can be this tight without costing recall.
+    """
+    return max(1, math.ceil(len(query) / ARTIST_CORRECTION_EDIT_CAP_DIVISOR))
+
+
+def _within_edit_cap(
+    query_lower: str,
+    query_compare: str,
+    candidate_lower: str,
+    candidate_compare: str,
+) -> bool:
+    """Whether either scoring axis puts the candidate inside its own edit cap.
+
+    Checked per axis rather than on a single pair, and each axis carries its
+    own cap from its own query length, because the two axes are two different
+    comparisons: the article-stripped form is a shorter string and earns a
+    correspondingly smaller budget. Passing on either is enough, mirroring the
+    ``max`` the scoring itself takes over the two axes -- the guard must not
+    be stricter than the thing it is guarding.
+    """
+    distance = _ARTIST_CORRECTION_DISTANCE.distance
+    return distance(query_lower, candidate_lower) <= _artist_correction_edit_cap(
+        query_lower
+    ) or distance(query_compare, candidate_compare) <= _artist_correction_edit_cap(query_compare)
+
+
+def _scan_artist_name_pool(
+    query_lower: str,
+    query_compare: str,
+    pool_lower: list[str],
+    pool_compare: list[str],
+    score_floor: float,
+) -> tuple[int | None, float, float]:
+    """Score the whole pool on both axes; return ``(index, score, runner_up)``.
+
+    Synchronous and pure so the caller can hand it to :func:`asyncio.to_thread`
+    -- scoring tens of thousands of names is CPU work and belongs off the
+    event loop.
+
+    ``score_floor`` is deliberately *below* the acceptance threshold, by
+    exactly :data:`ARTIST_CORRECTION_MARGIN_POINTS`. A runner-up that cannot
+    invalidate any acceptable winner need never be scored, but one that can
+    must not be filtered out before the margin is computed: a winner at 86
+    against a rival at 84 is the dangerous shape, and a cutoff at the
+    threshold would have discarded the rival and reported no contest.
+
+    Returns ``(None, 0.0, 0.0)`` when nothing clears the floor. Ranking breaks
+    ties on the candidate's own lowercased form, so a repeat lookup against an
+    unchanged pool cannot return a different name.
+    """
+    best_by_index: dict[int, float] = {}
+    for query, haystack in ((query_lower, pool_lower), (query_compare, pool_compare)):
+        for _candidate, score, index in process.extract(
+            query,
+            haystack,
+            scorer=fuzz.ratio,
+            limit=_ARTIST_CORRECTION_TOP_K,
+            score_cutoff=score_floor,
+        ):
+            if score > best_by_index.get(index, 0.0):
+                best_by_index[index] = score
+
+    if not best_by_index:
+        return None, 0.0, 0.0
+
+    ranked = sorted(best_by_index.items(), key=lambda pair: (-pair[1], pool_lower[pair[0]]))
+    winner_index, winner_score = ranked[0]
+    winner_lower = pool_lower[winner_index]
+
+    # The runner-up must be a genuinely different catalog name. The same name
+    # can arrive twice -- once per axis, or from two source columns -- and
+    # counting it against itself would zero the margin on every clean hit.
+    runner_up_score = 0.0
+    for index, score in ranked[1:]:
+        if pool_lower[index] != winner_lower:
+            runner_up_score = score
+            break
+
+    return winner_index, winner_score, runner_up_score
+
 
 LEADING_ARTICLES = frozenset({"the", "a", "an"})
 """English articles stripped from normalized artist names.
@@ -177,11 +368,39 @@ class LibraryDB:
         :attr:`_artist_name_pool_usable`, not emptiness: this is also empty
         before :meth:`adopt_connection` runs and after :meth:`close`."""
         self._artist_name_pool_usable: bool = False
-        """Whether :attr:`_artist_name_pool_lower` is a COMPLETE picture of
-        the catalog's artist names. False until :meth:`adopt_connection` runs,
-        and false again if any source failed to load, in which case
-        :meth:`_artist_exists_exactly` falls back to SQL rather than answer
-        from a pool that is missing names."""
+        """Whether the pool is a COMPLETE picture of the catalog's artist names.
+
+        False until :meth:`adopt_connection` runs, and false again if any
+        source failed to load. The two consumers respond to that
+        **asymmetrically**, which is the load-bearing detail:
+        :meth:`_artist_exists_exactly` falls back to SQL (fail CLOSED --
+        answering "not present" from an incomplete pool re-enables the
+        LML#857 wrong-artist corrections), while
+        :meth:`_find_similar_artist_uncached` withholds the correction
+        entirely (degrade to NO ANSWER -- scoring against a pool that is
+        missing names is how a query gets snapped onto the nearest
+        survivor). Neither may adopt the other's posture."""
+        self._artist_name_pool_names: list[str] = []
+        """Distinct catalog names in original casing -- what a correction returns.
+
+        Index-aligned with :attr:`_artist_name_pool_lower_list` and
+        :attr:`_artist_name_pool_compare`. These three plus
+        :attr:`_artist_name_pool_lower` are four views of ONE catalog read
+        (LML#1245 + LML#1248); see :meth:`_build_artist_name_pool`."""
+        self._artist_name_pool_lower_list: list[str] = []
+        """Lowercased names, index-aligned with :attr:`_artist_name_pool_names`.
+
+        The list, not the set: scoring needs a stable index to map a hit back
+        to its original casing, which a set cannot provide. The set is built
+        FROM this list, so the two share their string objects rather than
+        holding a second copy."""
+        self._artist_name_pool_compare: list[str] = []
+        """Leading-article-stripped lowercased names, the second scoring axis.
+
+        Only the fuzzy scan reads this. :meth:`_artist_exists_exactly` must
+        NOT: an article-stripped catalog pool widens the exact predicate
+        beyond what its SQL matched, suppressing corrections that fire today
+        (see that method's docstring)."""
 
     async def connect(self):
         """Open database connection."""
@@ -357,7 +576,11 @@ class LibraryDB:
         # merge two 64k index scans. Measured 35.1ms unioned vs 19.8ms here.
         # The 2-4 extra worker-thread round-trips are noise by comparison, and
         # per-source queries are what make a failure attributable.
-        pool: set[str] = set()
+        # One accumulator, four views. `seen_lower` dedupes; `names` keeps
+        # insertion order so the projections stay index-aligned and a rebuild
+        # against an unchanged catalog produces an identical pool.
+        names_ordered: list[str] = []
+        seen: set[str] = set()
         usable = True
         for table, column in self._artist_name_sources():
             try:
@@ -384,26 +607,55 @@ class LibraryDB:
                 names = [row[0] for row in await cursor.fetchall()]
                 if not all(isinstance(name, str) for name in names):
                     raise TypeError(f"non-text value in {table}.{column}")
-                pool.update(name.lower() for name in names)
+                # Dedupe on the ORIGINAL string, matching the old candidate
+                # query's `UNION` (exact equality, case-sensitive). Two
+                # differently-cased spellings are two catalog names, and a
+                # correction has to return one of them verbatim.
+                for name in names:
+                    if name not in seen:
+                        seen.add(name)
+                        names_ordered.append(name)
             except Exception:
                 usable = False
                 logger.warning(
                     f"Failed to load '{column}' from '{table}' while building the "
-                    "artist-name exact-match pool (LML#1248). The pool is "
-                    "unusable; the exact-existence check falls back to its "
-                    "original per-call SQL, which is slower but exact.",
+                    "artist-name pool (LML#1248/#1245). The pool is unusable; "
+                    "the exact-existence check falls back to its original "
+                    "per-call SQL, which is slower but exact, and fuzzy artist "
+                    "correction is suppressed until the next reconnect.",
                     exc_info=True,
                 )
 
-        # Rebuild at final size before retaining. A set grown by repeated
-        # update overshoots: 27,518 production names sit in a 131,072-slot
-        # table (2.00 MiB) where one built at size takes 65,536 (1.00 MiB).
-        # This is retained for the whole process lifetime, per worker, so the
-        # slack is permanent; reclaiming it costs ~0.4ms, once.
-        self._artist_name_pool_lower = set(pool)
+        # Derive the three scoring projections from that same read, rather
+        # than reading the catalog a second time for the fuzzy consumer. The
+        # exact set is built FROM the lowercased list, so the two share their
+        # string objects instead of holding independent copies -- which also
+        # rebuilds the set at final size, reclaiming the slack a set grown by
+        # repeated update carries (27,518 production names otherwise sit in a
+        # 131,072-slot table at 2.00 MiB where one built at size takes 1.00).
+        # This is retained per worker for the process lifetime, so the slack
+        # would be permanent.
+        self._artist_name_pool_names = names_ordered
+        self._artist_name_pool_lower_list = [name.lower() for name in names_ordered]
+        self._artist_name_pool_compare = [
+            strip_leading_article(lowered) or lowered
+            for lowered in self._artist_name_pool_lower_list
+        ]
+        # Two statements, not a redundant double cast: CPython presizes
+        # `set(x)` only when x is already a set or dict, so `set(list)` grows
+        # incrementally and overshoots -- 2,000 names land in twice the slots
+        # they need, permanently, per worker. Building once from the list and
+        # again from the resulting set reallocates the table at final size.
+        # The second pass copies references, so the strings stay shared with
+        # the list rather than being duplicated. Pinned by
+        # test_retained_pool_is_not_left_over_allocated.
+        deduped_lower = set(self._artist_name_pool_lower_list)
+        self._artist_name_pool_lower = set(deduped_lower)
         self._artist_name_pool_usable = usable
+        if not usable:
+            _capture_artist_name_pool_unusable(len(self._artist_name_pool_names))
         logger.info(
-            f"Built artist-name exact-match pool: {len(pool)} names "
+            f"Built artist-name pool: {len(self._artist_name_pool_names)} names "
             f"(usable: {'yes' if usable else 'no'})"
         )
 
@@ -423,9 +675,14 @@ class LibraryDB:
         if self._conn:
             await self._conn.close()
             self._conn = None
-            # Release the pool's ~3.4 MiB with the connection that justified
-            # holding it; adopt_connection rebuilds it for the next one.
+            # Release the pool's memory with the connection that justified
+            # holding it; adopt_connection rebuilds it for the next one. All
+            # four views, or the three lists keep the catalog alive after the
+            # set that documented the cost is gone.
             self._artist_name_pool_lower = set()
+            self._artist_name_pool_names = []
+            self._artist_name_pool_lower_list = []
+            self._artist_name_pool_compare = []
             self._artist_name_pool_usable = False
             clear_library_caches()
             logger.info("Closed SQLite connection")
@@ -862,94 +1119,114 @@ class LibraryDB:
         return await cursor.fetchone() is not None
 
     async def _find_similar_artist_uncached(self, artist: str, threshold: int = 85) -> str | None:
+        """Score the whole artist-name pool, then apply two guards (LML#1245).
+
+        Replaces an anchored, capped LIKE candidate query that failed to put
+        the correct answer in front of the scorer for roughly 45% of
+        near-miss queries. Two defects, both upstream of scoring, so no
+        threshold change could reach either: the prefilter anchored
+        ``'{first_word[:3]}%'`` to the start of the stored string (so
+        "22 Pistepirkko" could never reach "22-Pistepirkko" -- the leading
+        two-character token contributed no pattern at all), and it then
+        sliced at ``LIMIT 100`` in arbitrary storage order (so a multi-word
+        query generating thousands of candidates routinely lost the true
+        match to the cut). When the true match did reach ``fuzz.ratio`` it
+        won comfortably; it was simply never shown.
+
+        Scoring the full pool alone is not acceptable, and the first version
+        of this change proved it: recall went to 96.1% while false
+        corrections went 22.0 -> 41.0 per 1,000 lookups, every new one landing
+        on a genuinely different artist. A false correction is silent -- it
+        rewrites ``parsed.library_artist``, routes the LML#626 library channel
+        into another artist's catalog, and returns that artist's rows as a
+        successful lookup, so it never appears in the LML#1233 miss rate.
+
+        Two guards make the change strictly better than the prefilter rather
+        than a trade:
+
+        * :func:`_within_edit_cap` -- an absolute edit budget, where
+          ``fuzz.ratio`` only offers a length-relative one.
+        * :data:`ARTIST_CORRECTION_MARGIN_POINTS` -- the winner must beat its
+          nearest *distinct* rival, which is what makes a dense neighbourhood
+          refuse to resolve instead of picking.
+
+        Measured together against a post-#1244 baseline: **17.7 false
+        corrections per 1,000 at 91.5% synthetic single-edit typo recall,
+        against main's 22.0 and 59.0%.** Better on both axes.
+
+        The short-name ``effective_threshold`` below predates this change and
+        is deliberately untouched -- it is what keeps "Plug" off "Plugz"
+        (LML#626), one edit and inside the cap.
+        """
         assert self._conn is not None  # Caller validates
-        # Get candidate artists using prefix of first significant word
         artist_lower = artist.lower()
+        if not artist_lower:
+            return None
         artist_compare = strip_leading_article(artist_lower) or artist_lower
 
         if await self._artist_exists_exactly(artist_lower, artist_compare):
+            return None
+
+        if not self._artist_name_pool_usable:
+            # Degrade to NO CORRECTION, never to a narrower scan. This is the
+            # opposite posture from _artist_exists_exactly, which falls back
+            # to SQL on the same flag, and the asymmetry is deliberate: an
+            # exact check that answers from an incomplete pool is silently
+            # wrong, while a fuzzy scan over an incomplete pool snaps the
+            # query onto whichever near-neighbour happens to have survived.
+            # One wants the slow exact answer; the other wants no answer.
+            # _build_artist_name_pool has already logged and counted the
+            # cause, so this stays quiet at debug.
+            logger.debug(f"Skipping fuzzy correction for '{artist}': artist-name pool unusable")
             return None
 
         # For short names, a single-character difference is proportionally large,
         # so raise the threshold to prevent false corrections (e.g. "Plug" -> "Plugz")
         effective_threshold = max(threshold, 100 - len(artist_lower) * 2)
 
-        words = artist_lower.split()
+        # Floor the scan a margin below the acceptance threshold: a rival that
+        # scores at or under `threshold - margin` cannot invalidate any winner
+        # that clears `threshold`, but one just above it can, and cutting at
+        # the threshold itself would hide exactly those.
+        score_floor = max(0.0, float(effective_threshold - ARTIST_CORRECTION_MARGIN_POINTS))
 
-        # Use first non-article word with 3+ chars for candidate search
-        search_word = next(
-            (
-                w
-                for i, w in enumerate(words)
-                if len(w) >= 3 and not (i == 0 and w in LEADING_ARTICLES)
-            ),
-            None,
+        winner_index, best_score, runner_up_score = await asyncio.to_thread(
+            _scan_artist_name_pool,
+            artist_lower,
+            artist_compare,
+            self._artist_name_pool_lower_list,
+            self._artist_name_pool_compare,
+            score_floor,
         )
-        if not search_word:
+
+        if winner_index is None or best_score < effective_threshold:
             return None
 
-        prefix = search_word[:3]
-        candidate_patterns = [f"{prefix}%"]
-        candidate_patterns.extend(
-            f"%{w[:3]}%"
-            for w in words
-            if len(w) >= 3 and w != search_word and w not in LEADING_ARTICLES
-        )
+        best_match = self._artist_name_pool_names[winner_index]
+        candidate_lower = self._artist_name_pool_lower_list[winner_index]
+        candidate_compare = self._artist_name_pool_compare[winner_index]
 
-        # Same source list the exact-match pool is built from, so the two
-        # halves of this predicate cannot drift apart (see
-        # _artist_name_sources). Adding IS NOT NULL to the artist and
-        # compilation_track_artist legs, which previously omitted it, is
-        # inert: NULL never satisfies LIKE.
-        unions = []
-        params_list: list[str] = []
-        for table, column in self._artist_name_sources():
-            column_filter = " OR ".join(f"{column} LIKE ?" for _ in candidate_patterns)
-            unions.append(
-                f"SELECT {column} AS name FROM {table} "
-                f"WHERE {column} IS NOT NULL AND ({column_filter})"
+        margin = best_score - runner_up_score
+        if margin < ARTIST_CORRECTION_MARGIN_POINTS:
+            logger.debug(
+                f"Withholding correction '{artist}' -> '{best_match}': "
+                f"margin {margin:.1f} < {ARTIST_CORRECTION_MARGIN_POINTS} "
+                f"(score {best_score:.1f}, nearest rival {runner_up_score:.1f})"
             )
-            params_list.extend(candidate_patterns)
-
-        sql = (
-            f"SELECT DISTINCT name FROM ({' UNION '.join(unions)}) "
-            "ORDER BY CASE WHEN LOWER(name) = ? OR LOWER(name) = ? THEN 0 ELSE 1 END "
-            "LIMIT 100"
-        )
-        params_list = [*params_list, artist_lower, artist_compare]
-        cursor = await self._conn.execute(sql, params_list)
-        rows = await cursor.fetchall()
-
-        if not rows:
             return None
 
-        # Find best fuzzy match
-        best_match: str | None = None
-        best_score: float = 0
-
-        for row in rows:
-            candidate: str = row[0]
-            if not candidate:
-                continue
-
-            candidate_lower = candidate.lower()
-            candidate_compare = strip_leading_article(candidate_lower) or candidate_lower
-            score = max(
-                fuzz.ratio(artist_lower, candidate_lower),
-                fuzz.ratio(artist_compare, candidate_compare),
+        if not _within_edit_cap(artist_lower, artist_compare, candidate_lower, candidate_compare):
+            logger.debug(
+                f"Withholding correction '{artist}' -> '{best_match}': "
+                f"over the edit cap despite scoring {best_score:.1f}"
             )
-            if score > best_score and score >= effective_threshold:
-                best_score = score
-                best_match = candidate
+            return None
 
-        if (
-            best_match
-            and best_match.lower() != artist_lower
-            and strip_leading_article(best_match.lower()) != artist_compare
-        ):
+        if candidate_lower != artist_lower and candidate_compare != artist_compare:
             logger.info(
                 f"Corrected artist '{artist}' to '{best_match}' "
-                f"(score: {best_score}, threshold: {effective_threshold})"
+                f"(score: {best_score:.1f}, threshold: {effective_threshold}, "
+                f"margin: {margin:.1f})"
             )
             return best_match
 
