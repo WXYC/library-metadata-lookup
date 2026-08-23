@@ -32,6 +32,7 @@ above stops being true and should be re-read rather than silently outgrown.
 from __future__ import annotations
 
 import re
+import sqlite3
 from pathlib import Path
 
 from scripts.build_filtered_discogs import extract_library_artists
@@ -54,6 +55,23 @@ _ROW = LibraryRow(
 
 def _index() -> LibraryPairIndex:
     return LibraryPairIndex.from_library_rows([_ROW])
+
+
+def _write_library_db(tmp_path) -> str:
+    """``_ROW`` as a real ``library.db``, so the dev tool's own SQL can read it."""
+    db_path = tmp_path / "library.db"
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "CREATE TABLE library (id INTEGER PRIMARY KEY, artist TEXT, title TEXT, "
+        "alternate_artist_name TEXT)"
+    )
+    con.execute(
+        "INSERT INTO library (id, artist, title, alternate_artist_name) VALUES (?, ?, ?, ?)",
+        (_ROW.id, _ROW.artist, _ROW.title, _ROW.alternate_artist),
+    )
+    con.commit()
+    con.close()
+    return str(db_path)
 
 
 class TestTheCensusFollowsThePairRule:
@@ -93,18 +111,25 @@ class TestTheCensusFollowsThePairRule:
         """
         assert not _index().admits("Funcrusher Plus", ["Company Flow & Cannibal Ox"])
 
-    def test_the_dev_tool_admits_the_name_the_pair_rule_rejects(self):
-        """The differential, stated as one assertion over both rules.
+    def test_the_dev_tool_admits_the_name_the_pair_rule_rejects(self, tmp_path):
+        """The differential, run against both rules for real.
 
         Not a restatement of the test above: this pins that the two rules
         genuinely disagree about this fixture. If ``extract_library_artists``
         ever stopped reading the alternate column, the assertion above would
-        keep passing for the wrong reason -- the fixture would have gone
-        inert while still looking like a guard.
-        """
-        dev_tool_artists = extract_library_artists.__doc__ or ""
+        keep passing for the wrong reason -- the fixture would have gone inert
+        while still looking like a guard.
 
-        assert "alternate" in dev_tool_artists.lower()
+        Both halves therefore execute. An earlier version asserted on
+        ``extract_library_artists.__doc__`` instead of calling it, which is the
+        exact failure this module's docstring is about: a docstring outlives the
+        body it describes, so deleting the alternate-name query while leaving
+        the sentence "Includes both primary artist names and alternate artist
+        names" in place would have kept the guard green while gutting it.
+        """
+        db_path = _write_library_db(tmp_path)
+
+        assert "Company Flow & Cannibal Ox" in extract_library_artists(db_path)
         assert not _index().admits("Funcrusher Plus", ["Company Flow & Cannibal Ox"])
 
     def test_comp_shelf_rows_are_indexed_too(self):
