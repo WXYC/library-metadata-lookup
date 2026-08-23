@@ -485,11 +485,10 @@ async def _step_prepare_request(
             # lookup) so album resolution can gate its Discogs tracklist validation
             # on library membership of the CORRECTED artist (LML#866). Serializing
             # (vs the former concurrent gather) adds this call's whole cost: nil
-            # cached, microseconds when LML#1248's in-memory exact-name set
-            # short-circuits, still milliseconds when it misses and the candidate
-            # LIKE-union runs. Required for the gate to use the same library-artist
-            # notion step 3 does, and the correction completing before step 2 leaves
-            # no concurrent sibling to orphan when the LML#865 spine deadline trips.
+            # cached, microseconds on an LML#1248 in-memory exact-name hit, still
+            # milliseconds on a miss (the candidate LIKE-union). Required for the
+            # gate to use step 3's library-artist notion, and completing before
+            # step 2 leaves no sibling to orphan when the LML#865 deadline trips.
             corrected = await services.db.find_similar_artist(parsed.artist)
             if corrected:
                 state.corrected_artist = corrected

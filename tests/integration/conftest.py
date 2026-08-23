@@ -546,8 +546,10 @@ async def library_db():
     await _create_schema(conn)
     await _seed_data(conn)
 
-    # Bypass connect() path-checking by directly setting the connection
-    db._conn = conn
+    # Adopt the open connection instead of connect()-ing, which skips the
+    # path check but still derives the _has_* schema flags and the LML#1248
+    # artist-name pool. Assigning db._conn directly leaves both underived.
+    await db.adopt_connection(conn)
 
     yield db
 

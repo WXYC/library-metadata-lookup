@@ -87,7 +87,7 @@ async def mojibake_library_db():
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
     await _create_and_seed(conn)
-    db._conn = conn
+    await db.adopt_connection(conn)
     yield db
     await conn.close()
 

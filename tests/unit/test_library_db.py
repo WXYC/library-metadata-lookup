@@ -3,6 +3,7 @@
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiosqlite
 import pytest
 
 from library.db import LibraryDB, _fts_normalize, _to_fts_match_query
@@ -886,6 +887,7 @@ class TestFindSimilarArtist:
         db = LibraryDB()
         db._conn = AsyncMock()
         db._artist_name_pool_lower = {"john lennon"}
+        db._artist_name_pool_usable = True
 
         result = await db.find_similar_artist("John Lennon")
 
@@ -899,41 +901,21 @@ class TestFindSimilarArtist:
         A distractor artist ("Don Lennon") that would otherwise win the
         candidate-cap race must not cause "John Lennon" -- already an exact
         library artist -- to be corrected away.
-        """
-        import sqlite3
 
+        LML#1248: the short-circuit is now answered from the in-memory pool,
+        so it issues no SQL at all -- not even the single exact-check query
+        the old implementation ran. The ``execute`` spy below pins that.
+        """
         db_file = tmp_path / "test.db"
-        conn = sqlite3.connect(db_file)
-        conn.execute("""
-            CREATE TABLE library (
-                id INTEGER PRIMARY KEY,
-                title TEXT,
-                artist TEXT,
-                call_letters TEXT,
-                artist_call_number INTEGER,
-                release_call_number INTEGER,
-                genre TEXT,
-                format TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE VIRTUAL TABLE library_fts USING fts5(
-                title, artist,
-                content='library', content_rowid='id'
-            )
-        """)
-        conn.execute(
-            "INSERT INTO library VALUES "
-            "(1, 'Double Fantasy', 'John Lennon', 'L', 1, 1, 'Rock', 'LP')"
-        )
-        conn.execute(
-            "INSERT INTO library VALUES (2, 'Some Album', 'Don Lennon', 'L', 2, 2, 'Rock', 'LP')"
-        )
-        conn.commit()
-        conn.close()
+        _create_library_db(db_file, ["John Lennon", "Don Lennon"])
 
         db = LibraryDB(db_path=db_file)
         await db.connect()
+
+        async def _fail_if_called(*args, **kwargs):
+            raise AssertionError("_artist_exists_exactly must not issue SQL")
+
+        db._conn.execute = _fail_if_called  # type: ignore[method-assign]
 
         result = await db.find_similar_artist("John Lennon")
         assert result is None
@@ -943,6 +925,13 @@ class TestFindSimilarArtist:
 # ---------------------------------------------------------------------------
 # In-memory exact-name pool (LML#1248)
 # ---------------------------------------------------------------------------
+
+
+def _nth(values, index):
+    """``values[index]`` when supplied and long enough, else ``None``."""
+    if not values or index >= len(values):
+        return None
+    return values[index]
 
 
 def _create_library_db(
@@ -955,16 +944,23 @@ def _create_library_db(
     cta_artist_names=None,
     cta_missing_artist_name_column=False,
     omit_artist_column=False,
+    alternate_artist_names=None,
+    album_artists=None,
 ):
     """Build a minimal library.db for pool-construction tests.
 
-    ``artists`` seeds ``library.artist``. The optional-column/table flags
-    mirror the four schema variations ``connect()`` probes for. Passing
-    ``cta_missing_artist_name_column=True`` creates a ``compilation_track_artist``
-    table that exists (so the ``sqlite_master`` name probe finds it) but is
-    shaped without an ``artist_name`` column -- the schema-drift case LML#1248
-    must tolerate. Passing ``omit_artist_column=True`` drops ``library.artist``
-    entirely, so reading the pool's one mandatory source fails.
+    ``artists`` seeds ``library.artist``; ``alternate_artist_names`` and
+    ``album_artists`` are parallel lists seeding those optional columns (short
+    lists pad with ``None``), so a test asserting the pool unions all four
+    sources can actually put a distinct name in each. The optional-column and
+    optional-table flags mirror the schema variations ``adopt_connection``
+    probes for.
+
+    ``cta_missing_artist_name_column=True`` creates a
+    ``compilation_track_artist`` table that exists but has no ``artist_name``
+    column -- the drift a table-name-only probe cannot catch.
+    ``omit_artist_column=True`` drops ``library.artist`` entirely, so the pool
+    build's one indispensable source fails.
     """
     import sqlite3
 
@@ -994,13 +990,16 @@ def _create_library_db(
     """)
 
     for i, artist in enumerate(artists, start=1):
-        values = [str(i), f"Album {i}", artist, "A", str(i), str(i), "Rock", "LP"]
-        if omit_artist_column:
-            values.remove(artist)
+        values = [str(i), f"Album {i}", "A", str(i), str(i), "Rock", "LP"]
+        if not omit_artist_column:
+            # Positional insert: artist sits third, after id and title. Build
+            # it by position rather than removing it by value -- an artist
+            # literally named "1" would otherwise delete the id.
+            values.insert(2, artist)
         if with_alternate_artist:
-            values.append(None)
+            values.append(_nth(alternate_artist_names, i - 1))
         if with_album_artist:
-            values.append(None)
+            values.append(_nth(album_artists, i - 1))
         placeholders = ", ".join("?" for _ in values)
         conn.execute(f"INSERT INTO library VALUES ({placeholders})", values)
 
@@ -1037,68 +1036,56 @@ class TestArtistNameExactMatchPool:
     ``set[str]`` built once at ``connect()``, not a per-call SQL scan."""
 
     @pytest.mark.asyncio
-    async def test_exact_check_issues_no_per_call_sql(self, tmp_path):
-        """The dominant acceptance criterion: no SQL runs for the check itself.
+    async def test_predicate_not_widened_by_a_stripped_catalog_pool(self, tmp_path):
+        """Only the QUERY is article-stripped, never the catalog names.
 
-        Connects to a real on-disk db (building the pool), then swaps in an
-        ``execute`` spy that fails the test if called again -- proving the
-        exact-match short-circuit for "John Lennon" is answered purely from
-        the in-memory pool.
+        A catalog holding only "The Sea and Cake" (raw, unstripped) must NOT
+        report the bare query "Sea and Cake" as an exact match. If the pool
+        were ALSO built from article-stripped catalog names, it would hold
+        ``"sea and cake"``, this would wrongly return True, and a correction
+        that is free to fire today would be silently suppressed. Both query
+        forms are identical here because "Sea and Cake" carries no leading
+        article of its own to strip.
+
+        Note this builds the pool from a real database rather than injecting
+        one: injecting the pool would test the membership expression while
+        leaving ``_build_artist_name_pool`` -- the thing that could actually
+        introduce the stripping -- unguarded.
         """
         db_file = tmp_path / "test.db"
-        _create_library_db(db_file, ["John Lennon"])
+        _create_library_db(db_file, ["The Sea and Cake"])
         db = LibraryDB(db_path=db_file)
         await db.connect()
 
-        async def _fail_if_called(*args, **kwargs):
-            raise AssertionError("_artist_exists_exactly must not issue SQL")
-
-        db._conn.execute = _fail_if_called  # type: ignore[method-assign]
-
-        result = await db.find_similar_artist("John Lennon")
-
-        assert result is None
+        assert db._artist_name_pool_lower == {"the sea and cake"}
+        assert await db._artist_exists_exactly("sea and cake", "sea and cake") is False
+        # ...and the SQL it replaced agrees, which is the point.
+        assert await db._exists_exactly_via_sql("sea and cake", "sea and cake") is False
         await db.close()
 
     @pytest.mark.asyncio
-    async def test_predicate_not_widened_by_a_stripped_catalog_pool(self):
-        """Do not also test the query forms against an article-stripped
-        *catalog* pool -- only the query is stripped, never the catalog names.
-
-        A catalog holding only "The National" (raw, unstripped) must NOT
-        report the bare query "National" as an exact match. If the check
-        incorrectly also matched against a pool of article-stripped catalog
-        names (``{"national"}`` derived from "The National"), this would
-        wrongly return True and suppress a correction that should be free to
-        fire. Both query forms are identical here ("national") because
-        "National" itself carries no leading article to strip.
-        """
-        db = LibraryDB()
-        db._conn = AsyncMock()
-        db._artist_name_pool_lower = {"the national"}
-
-        exists = await db._artist_exists_exactly("national", "national")
-
-        assert exists is False
-        db._conn.execute.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_predicate_unchanged_for_ticket_example(self, tmp_path):
-        """Ticket-specified negative test: a catalog holding only "Beatles"
-        against a query of "The Beatles" must behave exactly as it does
-        today. Verified against the pre-#1248 SQL implementation: the query's
-        article-stripped form ("beatles") matches the raw catalog value
-        ("beatles") today, so the exact-check already fires and no
+        """Ticket-specified negative test, in the shape the ticket meant.
+
+        A catalog holding the bare "Sea and Cake" against a query of "The Sea
+        and Cake" must behave exactly as it does today. Verified against the
+        pre-#1248 SQL: the query's article-stripped form ("sea and cake")
+        matches the raw catalog value, so the exact-check already fires and no
         correction is offered. #1248 must reproduce that, not flip it.
+
+        This is the example the ticket used to illustrate the widening hazard,
+        and it does NOT discriminate a correct implementation from a widened
+        one -- it returns True either way. Kept as coverage of today's
+        behavior; ``test_predicate_not_widened_by_a_stripped_catalog_pool`` is
+        the actual guard.
         """
         db_file = tmp_path / "test.db"
-        _create_library_db(db_file, ["Beatles"])
+        _create_library_db(db_file, ["Sea and Cake"])
         db = LibraryDB(db_path=db_file)
         await db.connect()
 
-        result = await db.find_similar_artist("The Beatles")
-
-        assert result is None
+        assert await db._artist_exists_exactly("the sea and cake", "sea and cake") is True
+        assert await db.find_similar_artist("The Sea and Cake") is None
         await db.close()
 
     @pytest.mark.asyncio
@@ -1123,22 +1110,34 @@ class TestArtistNameExactMatchPool:
 
     @pytest.mark.asyncio
     async def test_pool_includes_all_four_present_sources(self, tmp_path):
-        """When every optional column/table is present, the pool is the
-        union of all four source columns' lowercased values."""
+        """The pool is the union of all four sources, one distinct name each.
+
+        Each source seeds a name that appears in NO other source, so dropping
+        any one branch from ``_artist_name_sources`` fails this test. Seeding
+        the optional columns NULL, as an earlier version did, made the
+        alternate_artist_name and album_artist halves unguarded.
+        """
         db_file = tmp_path / "test.db"
         _create_library_db(
             db_file,
             ["Stereolab"],
             with_alternate_artist=True,
+            alternate_artist_names=["Juana Molina"],
             with_album_artist=True,
+            album_artists=["Jessica Pratt"],
             with_cta_table=True,
             cta_artist_names=["Koo Nimo"],
         )
         db = LibraryDB(db_path=db_file)
         await db.connect()
 
-        assert "stereolab" in db._artist_name_pool_lower
-        assert "koo nimo" in db._artist_name_pool_lower
+        assert db._artist_name_pool_lower == {
+            "stereolab",
+            "juana molina",
+            "jessica pratt",
+            "koo nimo",
+        }
+        assert db._artist_name_pool_usable is True
 
         # Answered purely from the pool for a compilation-only artist too.
         result = await db.find_similar_artist("Koo Nimo")
@@ -1146,14 +1145,18 @@ class TestArtistNameExactMatchPool:
         await db.close()
 
     @pytest.mark.asyncio
-    async def test_compilation_track_artist_schema_drift_does_not_fail_connect(
-        self, tmp_path, caplog
-    ):
-        """LML#1249-review finding: ``_has_compilation_track_artist`` only
-        probes the table *name* via sqlite_master, never the ``artist_name``
-        column. A same-named-but-differently-shaped table must degrade the
-        pool to a partial set (missing that source), not raise out of
-        ``connect()`` and take down all library search.
+    async def test_compilation_track_artist_schema_drift_is_caught_by_the_probe(self, tmp_path):
+        """A same-named, differently-shaped CTA table must be detected as absent.
+
+        ``_has_compilation_track_artist`` used to be set from a
+        ``sqlite_master`` table-NAME probe, which a table lacking
+        ``artist_name`` sails straight past -- and THREE readers then select
+        that column: the pool build, the candidate UNION in
+        ``_find_similar_artist_uncached``, and ``search()``'s CTA join. Only
+        the first was guarded, so drift still raised
+        ``no such column: artist_name`` from the other two, on the request
+        path. Probing the column instead makes the flag mean what its readers
+        assume and fixes all three at once.
         """
         db_file = tmp_path / "test.db"
         _create_library_db(
@@ -1163,38 +1166,77 @@ class TestArtistNameExactMatchPool:
             cta_missing_artist_name_column=True,
         )
         db = LibraryDB(db_path=db_file)
+        await db.connect()  # must not raise
 
-        with caplog.at_level(logging.WARNING):
-            await db.connect()  # must not raise
+        assert db._has_compilation_track_artist is False
+        assert ("compilation_track_artist", "artist_name") not in db._artist_name_sources()
+        # The pool is complete for the sources that do exist, so no fallback.
+        assert db._artist_name_pool_lower == {"stereolab"}
+        assert db._artist_name_pool_usable is True
 
-        assert db._has_compilation_track_artist is True
-        # library.artist is unaffected by the CTA drift.
-        assert "stereolab" in db._artist_name_pool_lower
-
+        # The two other readers of artist_name no longer raise either.
+        assert await db.find_similar_artist("Stereolb") == "Stereolab"
+        assert await db.search(artist="Stereolab") != []
         result = await db.find_similar_artist("Stereolab")
         assert result is None
         await db.close()
 
     @pytest.mark.asyncio
-    async def test_mandatory_library_artist_source_failure_fails_connect(self, tmp_path):
-        """The optional-source swallow must NOT extend to ``library.artist``.
+    async def test_unbuildable_pool_falls_back_to_sql_rather_than_failing_open(self, tmp_path):
+        """A source that will not load costs latency, never correctness.
 
-        Degrading an optional source to absent costs a few names. Degrading
-        the mandatory one costs the whole pool, and an empty pool makes
-        :meth:`_artist_exists_exactly` answer ``False`` for every artist --
-        silently disabling the #857 guard for the lifetime of the connection
-        while search still appears to work. That is the failure mode #857
-        exists to prevent (LML#1245 measured 52/52 such corrections landing on
-        genuinely different artists). A database that cannot serve
-        ``library.artist`` cannot serve catalog search either, so it must fail
-        loudly at ``connect()`` rather than quietly.
+        See :meth:`LibraryDB._build_artist_name_pool` for why neither serving
+        a partial pool nor raising is acceptable here.
         """
         db_file = tmp_path / "test.db"
-        _create_library_db(db_file, ["Stereolab"], omit_artist_column=True)
+        _create_library_db(db_file, ["Stereolab"], with_alternate_artist=True)
         db = LibraryDB(db_path=db_file)
+        await db.connect()  # must not raise
 
-        with pytest.raises(Exception, match="artist"):
-            await db.connect()
+        # Simulate a source that reads cleanly at probe time but not at build
+        # time (e.g. a row of invalid UTF-8 aborting fetchall for the column).
+        original = db._artist_name_sources
+        db._artist_name_sources = lambda: [*original(), ("library", "no_such_column")]  # type: ignore[method-assign]
+        await db._build_artist_name_pool()
+        db._artist_name_sources = original  # type: ignore[method-assign]
+
+        assert db._artist_name_pool_usable is False
+        # Still exactly right, now via SQL rather than the pool.
+        assert await db._artist_exists_exactly("stereolab", "stereolab") is True
+        assert await db._artist_exists_exactly("not in the library", "not in the library") is False
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_non_text_catalog_value_disqualifies_the_pool(self, tmp_path):
+        """A BLOB-stored name must not silently shrink the pool.
+
+        ``artist`` has TEXT affinity, so SQLite coerces numerics on insert,
+        but a BLOB stays ``bytes`` -- and the old SQL coerced it, so
+        ``LOWER(artist)`` matched. See
+        :meth:`LibraryDB._build_artist_name_pool` for why that has to
+        disqualify the pool rather than quietly shrink it.
+        """
+        db_file = tmp_path / "test.db"
+        _create_library_db(db_file, ["Stereolab"])
+        import sqlite3
+
+        conn = sqlite3.connect(db_file)
+        conn.execute(
+            "INSERT INTO library VALUES (2, 'Album 2', ?, 'A', 2, 2, 'Rock', 'LP')",
+            (b"Cat Power",),
+        )
+        conn.commit()
+        assert conn.execute("SELECT typeof(artist) FROM library WHERE id=2").fetchone()[0] == "blob"
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+
+        assert db._artist_name_pool_usable is False
+        # The SQL fallback still matches it, exactly as before #1248.
+        assert await db._artist_exists_exactly("cat power", "cat power") is True
+        await db.close()
 
     @pytest.mark.asyncio
     async def test_pool_case_folds_non_ascii_catalog_names(self, tmp_path):
@@ -1206,6 +1248,11 @@ class TestArtistNameExactMatchPool:
         the library genuinely owns. Python's ``str.lower()`` folds the whole
         string, so the pool matches. The widening is toward the guard's intent
         and is pinned here so it stays a decision rather than an accident.
+
+        Asserted on the predicate itself, NOT on ``find_similar_artist``:
+        that returns ``None`` here either way, because the tail identity guard
+        in ``_find_similar_artist_uncached`` already folds with Python. Only
+        the two predicate assertions discriminate this change from ``main``.
         """
         db_file = tmp_path / "test.db"
         _create_library_db(db_file, ["NILÜFER YANYA"])
@@ -1214,8 +1261,48 @@ class TestArtistNameExactMatchPool:
 
         assert db._artist_name_pool_lower == {"nilüfer yanya"}
         assert await db._artist_exists_exactly("nilüfer yanya", "nilüfer yanya") is True
-        assert await db.find_similar_artist("Nilüfer Yanya") is None
+        # The SQL this replaced did NOT match, which is the divergence.
+        assert await db._exists_exactly_via_sql("nilüfer yanya", "nilüfer yanya") is False
         await db.close()
+
+    @pytest.mark.asyncio
+    async def test_adopt_connection_derives_the_state_connect_would(self, tmp_path):
+        """A ``LibraryDB`` wired by assigning ``_conn`` must still answer correctly.
+
+        Six fixtures across the integration and e2e tiers build a
+        ``LibraryDB`` over an already-open in-memory connection to skip
+        ``connect()``'s path check. Assigning ``db._conn`` directly, as they
+        used to, skipped the ``_has_*`` schema probes as well -- which is why
+        one of them hand-set three flags afterwards and the rest silently ran
+        with all of them ``False``. The pool made that pre-existing gap
+        load-bearing: a ``LibraryDB`` without one answers
+        :meth:`_artist_exists_exactly` ``False`` for every artist, voiding the
+        #857 guard across both tiers while the tests stay green, because the
+        downstream ``best_match.lower() != artist_lower`` fallthrough returns
+        ``None`` anyway. ``adopt_connection`` is the supported seam: it
+        derives everything ``connect()`` would, over a connection it did not
+        open.
+        """
+        db_file = tmp_path / "test.db"
+        _create_library_db(
+            db_file,
+            ["Stereolab"],
+            with_alternate_artist=True,
+            alternate_artist_names=["Juana Molina"],
+        )
+
+        conn = await aiosqlite.connect(db_file)
+        conn.row_factory = aiosqlite.Row
+        db = LibraryDB()
+        await db.adopt_connection(conn)
+
+        # Schema flags derived, not left at their constructor defaults.
+        assert db._has_alternate_artist is True
+        assert db._artist_name_pool_lower == {"stereolab", "juana molina"}
+        assert db._artist_name_pool_usable is True
+        assert await db._artist_exists_exactly("stereolab", "stereolab") is True
+
+        await conn.close()
 
     @pytest.mark.asyncio
     async def test_pool_admits_empty_strings_exactly_as_the_old_sql_did(self, tmp_path):
@@ -1250,12 +1337,7 @@ class TestArtistNameExactMatchPool:
 
     @pytest.mark.asyncio
     async def test_close_clears_the_pool(self, tmp_path):
-        """``close()`` must drop the pool along with the connection.
-
-        The pool is the only per-database state that outlives ``_conn``, so
-        leaving it populated would let any future path that reaches the check
-        without a live connection answer from the *previous* database's names.
-        """
+        """``close()`` releases the pool's memory with the connection."""
         db_file = tmp_path / "test.db"
         _create_library_db(db_file, ["Stereolab"])
         db = LibraryDB(db_path=db_file)
@@ -1265,6 +1347,7 @@ class TestArtistNameExactMatchPool:
         await db.close()
 
         assert db._artist_name_pool_lower == set()
+        assert db._artist_name_pool_usable is False
 
 
 # ---------------------------------------------------------------------------
@@ -1922,12 +2005,11 @@ class TestLibraryDBFindSimilarArtistCache:
 
         assert result1 == "Living Colour"
         assert result1 == result2
-        # One execute call for the first (uncached) lookup's candidate search.
-        # LML#1248: the exact-check no longer issues SQL (it's answered from
-        # the in-memory pool -- empty here, so it never short-circuits), so
-        # this counts only the candidate query; the second call is a cache
-        # hit and issues none.
-        assert db._conn.execute.call_count == 1
+        # Two execute calls for the first (uncached) lookup, one for the
+        # second: a cache hit. This LibraryDB was built without
+        # adopt_connection, so its pool is not usable and the exact-check
+        # takes its SQL fallback -- exactly the pre-LML#1248 call count.
+        assert db._conn.execute.call_count == 2
 
     @pytest.mark.asyncio
     async def test_find_similar_artist_caches_none(self):
@@ -1944,9 +2026,10 @@ class TestLibraryDBFindSimilarArtistCache:
 
         assert result1 is None
         assert result2 is None
-        # See test_find_similar_artist_cache_hit above: one execute call
-        # (candidate search only, LML#1248), the second lookup is a cache hit.
-        assert db._conn.execute.call_count == 1
+        # See test_find_similar_artist_cache_hit above: two calls on the
+        # uncached lookup (SQL-fallback exact-check + candidate search), none
+        # on the second, which is a cache hit.
+        assert db._conn.execute.call_count == 2
 
 
 class TestLibraryDBCacheInvalidation:
