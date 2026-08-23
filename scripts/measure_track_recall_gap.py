@@ -16,47 +16,68 @@ coverage census answering:
    ``scripts/build_compilation_track_location.py`` gates its own indexing on,
    not a hand-rolled ``LIKE`` guess -- see ``naive_like_comp_count`` below for
    why that distinction matters.
-2. Of the artist-shelf rows, how many resolve to a specific Discogs release
-   *today*, via the two real seams: ``lml_cache.library_release_override``
-   pins (prod-only data -- see the module note below) and an exact-artist
-   Discogs match cross-checked against the same 80/80 floor
-   ``clients/streaming/matching.py::find_best_typed_match`` already applies
-   at request time for artwork resolution (LML#478). Matching runs over the
-   union of ``library.artist`` and ``library.alternate_artist_name``, exactly
-   as the real cache-build filter does -- see ``artist_variants``, and do not
-   narrow it to the ``artist`` column alone.
-3. Of those, how many have a cached tracklist (``release_track`` rows)
-   available at all. **Against an unfiltered Discogs source this check is
-   non-discriminating** -- see the second TRAP below.
-4. The headline: how many artist-shelf rows could gain track-level recall
-   with **no new data collection**, vs. how many would need some (a new
-   Discogs match, a new override pin, or new track data upstream).
+2. Of the artist-shelf rows, how many can the Discogs cache hold a release for
+   *at all*? This is the **structural** question, and it is answered by
+   simulating the production cache filter (``LibraryPairIndex``) against the
+   Discogs source -- not by asking whether a matcher would score something.
+3. Of the releases that filter admits, how many artist-shelf rows resolve to a
+   specific one at the same 80/80 floor ``clients/streaming/matching.py::
+   find_best_typed_match`` already applies at request time for artwork
+   resolution (LML#478); and how many of those carry a cached tracklist.
+   **Against a full Discogs source the tracklist check is non-discriminating**
+   -- see ``TRACKLIST_CHECK_CAVEAT``.
+4. The headline: how many artist-shelf rows could gain track-level recall with
+   **no new data collection**, vs. how many would need some -- with the latter
+   split by *which* remedy would move it.
 
-TRAP (read before trusting any Discogs-side number this script prints): the
-real production discogs-cache is *filtered* -- it admits a release only when
-its credited artist name case-folds exactly against a WXYC library artist
-name (mirroring ``scripts/build_filtered_discogs.py``'s own filter SQL). A
-full, unscoped Discogs dump (``discogs_full`` locally) has no such filter, so
-every count this script derives from ``--discogs-url`` is an **upper bound**
-on what the real prod cache can currently see -- never presented as "today's
-real coverage." The ``lml_cache.library_release_override`` pin table lives
-only in the shared prod discogs-cache Postgres; this script does not query
-prod (out of scope, needs explicit approval), so pin coverage is reported
-from the documented code comment in ``identity/bulk_resolve.py`` --
-NOT independently re-measured here.
+WHICH FILTER THIS MIRRORS, AND WHICH ONE IT DELIBERATELY DOES NOT
+-----------------------------------------------------------------
+The production Discogs cache is built by ``discogs-etl``'s
+``rebuild-cache.sh``, which forwards ``--library-db`` to
+``discogs-xml-converter``. That binary admits a release through
+``src/library_pairs.rs::LibraryPairs``: an inverted index
+``normalized_title -> {normalized_artist}`` built from ``SELECT artist, title
+FROM library``, probed with the release's title and *every* credited artist
+(``release.artists`` chained with ``release.extra_artists``, i.e. both
+``extra = 0`` and ``extra = 1``). Pair-wise, both sides folded through
+``wxyc_etl::text::to_match_form``, primary ``library.artist`` column only.
+``LibraryPairIndex`` below is that rule, in Python.
 
-SECOND TRAP, specific to item 3: run against an unfiltered dump, the
-tracklist-presence check has no discriminating power. Practically every
-release in a full Discogs dump carries ``release_track`` rows (19,341,286 of
-19,341,287 in the 2026-08 local ``discogs_full``), so item 3 will report ~100%
-of item 2 no matter what the real state of track data is. That is not the
-"tracklist availability is solved" finding it superficially resembles -- the
-proposition was never tested. It is *not* a circular join (the item-2
-candidate SQL never touches ``release_track``); the check is simply vacuous
-at this source. The constraint that actually binds is whether a release is
-present in the **filtered prod discogs-cache at all**, and this script
-deliberately does not measure that -- prod access is out of scope. Read item
-3 as "no upstream track-data gap blocks these rows," never as coverage.
+``scripts/build_filtered_discogs.py``, in this repo, is **not** that filter.
+It is a local dev tool: artist-only, unions ``alternate_artist_name``, and
+writes a ``wxyc.*`` schema LML never queries (LML's runtime SQL is
+unqualified). Mirroring it -- which the first version of this census did, and
+which a code review then pushed it further toward -- measures a database
+nobody runs, and overstates coverage by roughly the difference between a ~4M
+release cache and a ~50K one. ``tests/unit/
+test_measure_track_recall_gap_filter_parity.py`` holds that distinction in
+place behaviourally, because prose did not.
+
+THE ONE PLACE THE TWO LEGS DELIBERATELY DISAGREE
+------------------------------------------------
+Admission (item 2) reads ``library.artist`` alone, because the production
+filter does. Resolution (item 3) reads ``artist_variants`` -- the union with
+``library.alternate_artist_name`` -- because LML's own runtime matcher does
+(``artist_matches_item``). That asymmetry is not an oversight to be tidied
+away: it *is* the census's finding. The substrate that decides what LML can
+see folds names more weakly than the consumer that searches it, which is the
+wrong way round, and the two legs are kept on different artist sets so the
+script states that rather than hiding it.
+
+TRAP (read before trusting any Discogs-side number): the source here is a
+full, unscoped Discogs dump (``discogs_full`` locally). Running the production
+filter over it yields **what the filter would admit from this dump vintage**,
+which is an upper bound on the real prod cache -- the cache is built from a
+different dump vintage and is further pruned after the fact (``verify_cache``
+drops releases on Discogs ANV mismatch). A row this census calls admissible
+may still be absent from prod today. The direction of the error is safe for
+the structural finding: a row the filter admits *nothing* for from the full
+dump cannot be in any cache built from any vintage of it.
+
+The ``lml_cache.library_release_override`` pin table lives only in the shared
+prod discogs-cache Postgres; this script does not query prod (out of scope,
+needs explicit approval), so pin coverage is reported from the documented code
+comment in ``identity/bulk_resolve.py`` -- NOT independently re-measured here.
 
 Usage:
     uv run python -m scripts.measure_track_recall_gap \\
@@ -74,11 +95,12 @@ import logging
 import os
 import sqlite3
 import sys
-from dataclasses import asdict, dataclass
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
 
 import asyncpg
 from dotenv import load_dotenv
-from wxyc_etl.text import is_compilation_artist
+from wxyc_etl.text import is_compilation_artist, to_match_form
 
 from clients.streaming.matching import find_best_typed_match
 
@@ -100,29 +122,38 @@ DOCUMENTED_PIN_COVERAGE_NOTE = (
     "discogs-cache access, which is out of this script's scope."
 )
 
-# Travels with the tracklist figure everywhere it is rendered or serialized,
-# because that figure's most likely misreading ("~100%, so track data is
-# solved") is also its most damaging one. See the module docstring's SECOND
-# TRAP for the underlying count.
-TRACKLIST_CHECK_CAVEAT = (
-    "NON-DISCRIMINATING against an unfiltered Discogs source -- nearly every release in a "
-    "full dump carries release_track rows, so this tracks item 2 whatever the real state of "
-    "track data. Not a coverage finding. The constraint that actually binds is membership in "
-    "the FILTERED prod discogs-cache, which this script does not measure."
+# Travels with every Discogs-side figure, because the question a reader will
+# ask of any of them ("is this the real cache?") has the same answer.
+ADMISSION_MODEL_NOTE = (
+    "Admission simulates discogs-xml-converter's LibraryPairs pair-wise (artist, title) "
+    "filter -- the rule that builds the prod cache -- against a FULL unscoped Discogs dump. "
+    "It is NOT scripts/build_filtered_discogs.py, which is a local dev tool with a different "
+    "(artist-only) rule and a schema LML never queries. Numbers are an upper bound on the real "
+    "cache: prod is built from a different dump vintage and pruned afterwards by verify_cache."
 )
 
-# The exact-match predicate mirrors scripts/build_filtered_discogs.py's own
-# cache-build filter ("left(artist_name, 200)" truncation included) so this
-# script's "artist known to Discogs" leg reproduces the real filter, not an
-# approximation of it.
-_EXACT_ARTIST_MATCH_SQL = """
-    SELECT ca.name AS library_artist, r.id AS release_id, r.title AS release_title,
-           ra.artist_name AS discogs_artist_name
-    FROM census_artists ca
-    JOIN release_artist ra
-        ON ra.extra = 0
-        AND lower(left(ra.artist_name, 200)) = lower(ca.name)
-    JOIN release r ON r.id = ra.release_id
+# Travels with the tracklist figure everywhere it is rendered or serialized,
+# because that figure's most likely misreading ("~100%, so track data is
+# solved") is also its most damaging one.
+TRACKLIST_CHECK_CAVEAT = (
+    "NON-DISCRIMINATING against a full Discogs source -- 19,341,286 of 19,341,287 releases in "
+    "the 2026-08 local dump carry release_track rows, so this tracks the resolvable count "
+    "whatever the real state of track data. Not a coverage finding. The constraint that "
+    "actually binds is admission, measured above."
+)
+
+_TITLE_SCAN_SQL = "SELECT id, title FROM release"
+
+# Both credit tiers, deliberately. ``matches_filter`` in discogs-xml-converter's
+# main.rs chains ``release.artists`` (extra=0) with ``release.extra_artists``
+# (extra=1) before probing the pair index, so a release whose only
+# library-matching credit is a producer or remixer IS in the cache. Restricting
+# this to ``extra = 0`` -- the habit inherited from the artist-only filter --
+# would narrow admission below production and overstate the structural gap.
+_ADMISSION_CREDIT_SQL = """
+    SELECT ra.release_id, ra.artist_name
+    FROM census_release_ids ids
+    JOIN release_artist ra ON ra.release_id = ids.release_id
 """
 
 _TRACKLIST_PRESENCE_SQL = """
@@ -134,8 +165,8 @@ _TRACKLIST_PRESENCE_SQL = """
 class LibraryRow:
     """One ``library.db`` row: just the columns this census needs.
 
-    ``alternate_artist`` carries ``library.alternate_artist_name``, which is
-    load-bearing rather than decorative here -- see ``artist_variants``.
+    ``alternate_artist`` carries ``library.alternate_artist_name``. It feeds the
+    resolve leg only, never admission -- see the module docstring.
     """
 
     id: int
@@ -156,14 +187,11 @@ class ShelfCensus:
 
 @dataclass(frozen=True, slots=True)
 class ReleaseCandidate:
-    """One Discogs release credited (``extra=0``) to a name matching a library artist.
+    """One admitted Discogs release, seen through one of its credits.
 
-    ``slots=True`` is not incidental. This library's artist-shelf names match
-    3.8M candidate rows against the full dump, all held live for the whole
-    resolve pass; slotting plus the ``sys.intern`` on ``artist_name`` in
-    ``find_exact_artist_candidates`` takes the structure from ~940 MB to
-    ~620 MB. This is the only structure in the script that scales with the
-    dump rather than with the library.
+    ``slots=True`` and the ``sys.intern`` in ``build_admitted_universe`` are not
+    incidental: the admitted universe is held live for the whole resolve pass,
+    and one release contributes one of these per credit.
     """
 
     release_id: int
@@ -171,14 +199,106 @@ class ReleaseCandidate:
     artist_name: str
 
 
+@dataclass(frozen=True)
+class LibraryPairIndex:
+    """The production cache filter, in Python.
+
+    A faithful port of ``discogs-xml-converter``'s
+    ``src/library_pairs.rs::LibraryPairs``: an inverted index
+    ``normalized_title -> {normalized_artist}``, built from every library row's
+    ``(artist, title)``, probed with a release's title and its credited artist
+    names. Both sides fold through ``wxyc_etl.text.to_match_form``.
+
+    Three properties of the real rule that are easy to "improve" and must not
+    be: it reads ``library.artist`` only (never ``alternate_artist_name``); it
+    excludes no row for being a compilation (a shelf label is only ever half of
+    a pair, so it cannot admit a release on its own); and it drops rows whose
+    artist or title folds to empty.
+    """
+
+    pairs: dict[str, frozenset[str]] = field(default_factory=dict)
+
+    @classmethod
+    def from_library_rows(cls, rows: Iterable[LibraryRow]) -> LibraryPairIndex:
+        building: dict[str, set[str]] = {}
+        for row in rows:
+            n_title = to_match_form(row.title)
+            n_artist = to_match_form(row.artist)
+            if not n_title or not n_artist:
+                continue
+            building.setdefault(n_title, set()).add(n_artist)
+        return cls(pairs={title: frozenset(artists) for title, artists in building.items()})
+
+    def __len__(self) -> int:
+        """Distinct normalized titles -- the index's key count."""
+        return len(self.pairs)
+
+    @property
+    def pair_count(self) -> int:
+        """Total ``(title, artist)`` pairs spanned. Diagnostic only."""
+        return sum(len(artists) for artists in self.pairs.values())
+
+    def artists_for_title(self, normalized_title: str) -> frozenset[str]:
+        """The artist set for an already-folded title; empty if the title is unknown."""
+        return self.pairs.get(normalized_title, frozenset())
+
+    def admits(self, title: str, artist_names: Iterable[str]) -> bool:
+        """Whether the prod cache filter would admit this release.
+
+        ``title`` and ``artist_names`` are the raw values as they appear on the
+        Discogs release; folding both sides here is what lets a
+        diacritic-mismatched pair still collide.
+        """
+        library_artists = self.artists_for_title(to_match_form(title))
+        if not library_artists:
+            return False
+        return any(to_match_form(name) in library_artists for name in artist_names)
+
+
+@dataclass(frozen=True)
+class AdmittedUniverse:
+    """Every release the production filter admits, indexed for the census.
+
+    ``by_artist`` is keyed by *folded credit name* and carries every credit of
+    an admitted release, not only the one that won it admission -- a library row
+    whose Discogs credit differs from the admitting one still needs something to
+    score. ``admitted_pairs`` holds the folded ``(artist, title)`` pairs, which
+    is how a row asks whether the cache can hold a release for **it**, as
+    opposed to for some sibling shelf row.
+    """
+
+    by_artist: dict[str, list[ReleaseCandidate]]
+    admitted_pairs: set[tuple[str, str]]
+    release_count: int
+
+
+@dataclass(frozen=True)
+class DiscogsLegCensus:
+    """Items 2-3, measured. Exists only when a Discogs source was given.
+
+    Every figure here is a *measured* count, none derived by subtraction: the
+    report's derived splits are differences of these, and a difference is only
+    trustworthy when both operands were counted in the same pass over the same
+    rows.
+    """
+
+    source: str
+    admitted_release_count: int
+    pair_admitted: int
+    pair_admitted_and_resolvable: int
+    resolvable: int
+    with_cached_tracklist: int
+
+
 #: The report's derived figures, in the order a reader meets them. One roster
 #: so ``to_dict`` cannot forget a property and the tests have a single list to
-#: parametrize over -- a fifth derived figure is added here and nowhere else.
+#: parametrize over -- a sixth derived figure is added here and nowhere else.
 DERIVED_HEADLINE_KEYS = (
     "could_gain_recall_no_new_collection",
     "would_need_new_collection",
-    "artist_shelf_without_exact_artist_match",
-    "artist_shelf_matched_but_below_floor",
+    "artist_shelf_not_pair_admitted",
+    "artist_shelf_pair_admitted_but_below_floor",
+    "artist_shelf_resolvable_without_pair_admission",
 )
 
 
@@ -186,82 +306,94 @@ DERIVED_HEADLINE_KEYS = (
 class GapCensusReport:
     """The full LML#1264 measurement, ready to render or serialize.
 
-    Measured counts only. The methodology caveats
-    (``DOCUMENTED_PIN_COVERAGE_NOTE``, ``TRACKLIST_CHECK_CAVEAT``) are not
-    fields: they describe how to read the numbers rather than being numbers,
-    and ``to_dict`` attaches them alongside the other derived annotations.
+    The Discogs leg is one optional structure rather than a handful of fields
+    that go to zero, so a library-only run cannot serialize an unmeasured zero
+    as though it were a finding. The methodology caveats
+    (``ADMISSION_MODEL_NOTE``, ``TRACKLIST_CHECK_CAVEAT``,
+    ``DOCUMENTED_PIN_COVERAGE_NOTE``) are not fields either: they describe how
+    to read the numbers rather than being numbers, and ``to_dict`` attaches them
+    alongside the derived figures they qualify.
     """
 
     total_library_rows: int
     comp_shelf_count: int
     comp_shelf_naive_like_count: int
     artist_shelf_count: int
-    artist_shelf_with_exact_artist_match: int
-    artist_shelf_with_resolvable_release: int
-    artist_shelf_with_cached_tracklist: int
-    discogs_source: str | None
-
-    @property
-    def discogs_leg_ran(self) -> bool:
-        """Whether items 2-4 were measured at all, or skipped for want of a source."""
-        return self.discogs_source is not None
+    discogs: DiscogsLegCensus | None
 
     @property
     def could_gain_recall_no_new_collection(self) -> int | None:
-        """Upper-bound count of rows resolvable + tracklisted with zero new collection."""
-        return self.artist_shelf_with_cached_tracklist if self.discogs_leg_ran else None
+        """Artist-shelf rows resolvable to a tracklisted release, no new collection."""
+        return None if self.discogs is None else self.discogs.with_cached_tracklist
 
     @property
     def would_need_new_collection(self) -> int | None:
         """Artist-shelf rows this census could not resolve to a cached tracklist."""
-        if not self.discogs_leg_ran:
+        if self.discogs is None:
             return None
-        return self.artist_shelf_count - self.artist_shelf_with_cached_tracklist
+        return self.artist_shelf_count - self.discogs.with_cached_tracklist
 
     @property
-    def artist_shelf_without_exact_artist_match(self) -> int | None:
-        """Rows with no Discogs release credited under ANY of their artist names.
+    def artist_shelf_not_pair_admitted(self) -> int | None:
+        """Rows the cache can hold NO release for -- the structural gap.
 
-        The first of the two populations inside ``would_need_new_collection``,
-        and the one holding the compound-credit shape LML#1264 is about. No
-        title-floor change reaches these rows -- there is no candidate to
-        score.
+        The largest and hardest of the three "would need new collection"
+        populations. No threshold, fold, or index inside LML reaches these rows:
+        there is no candidate to score, because the filter admitted nothing
+        under their ``(artist, title)`` pair. Only a wider cache filter (see
+        discogs-etl#414) or new data upstream moves them.
         """
-        if not self.discogs_leg_ran:
+        if self.discogs is None:
             return None
-        return self.artist_shelf_count - self.artist_shelf_with_exact_artist_match
+        return self.artist_shelf_count - self.discogs.pair_admitted
 
     @property
-    def artist_shelf_matched_but_below_floor(self) -> int | None:
-        """Rows that matched an artist but had no release title clear the 80/80 floor.
+    def artist_shelf_pair_admitted_but_below_floor(self) -> int | None:
+        """Rows whose release IS admitted, yet no candidate cleared the 80/80 floor.
 
-        The second population: candidates exist, none of them scored. This is
-        the bucket a title-gate change could in principle move -- and the one
-        where LML#1245 / LML#1250's wrong-artist hazards apply.
+        The opposite case, and the one a matcher change actually moves -- with
+        the wrong-artist hazards LML#1245 / LML#1250 document. Expected to be
+        small: admission requires the folded title and artist to match exactly,
+        so an admitted row's own release normally scores at or near 100.
         """
-        if not self.discogs_leg_ran:
+        if self.discogs is None:
             return None
-        return self.artist_shelf_with_exact_artist_match - self.artist_shelf_with_resolvable_release
+        return self.discogs.pair_admitted - self.discogs.pair_admitted_and_resolvable
+
+    @property
+    def artist_shelf_resolvable_without_pair_admission(self) -> int | None:
+        """Rows rescued by a release admitted under some *other* library row's pair.
+
+        A shelf row whose own pair is absent can still resolve fuzzily against a
+        release the cache holds for a sibling row -- a different pressing title,
+        or the alternate-name credit the admission leg refused to read. These are
+        the rows where the substrate-stricter-than-consumer asymmetry pays off,
+        and counting them is the only way to know the asymmetry matters.
+        """
+        if self.discogs is None:
+            return None
+        return self.discogs.resolvable - self.discogs.pair_admitted_and_resolvable
 
     def to_dict(self) -> dict:
         """Serialize the measurement together with the caveats that make it readable.
 
-        Two things this deliberately will not do. It will not emit a headline
-        the run did not measure: a library-only run (no ``--discogs-url``)
-        leaves items 2-4 at zero, and serializing the derived headline off
-        those zeroes would tell a reader who meets the JSON without the console
-        output that NOTHING is resolvable, a measured-looking finding where
-        nothing was tested. And it will not attach the tracklist caveat to a
-        run that ran no tracklist check. The artifact outlives the run that
-        produced it, so every number in it has to carry its own reading
-        instructions -- and no reading instructions for a number that isn't
-        there.
+        A library-only run emits no Discogs figure and no caveat about one: the
+        artifact outlives the run that produced it, so every number in it has to
+        carry its own reading instructions -- and no reading instructions for a
+        number that isn't there.
         """
         out = asdict(self)
-        out["discogs_measurement"] = "measured" if self.discogs_leg_ran else "skipped"
+        out.pop("discogs")
+        out["discogs_measurement"] = "measured" if self.discogs else "skipped"
         out.update({key: getattr(self, key) for key in DERIVED_HEADLINE_KEYS})
         out["pin_coverage_note"] = DOCUMENTED_PIN_COVERAGE_NOTE
-        if self.discogs_leg_ran:
+        if self.discogs is not None:
+            out["discogs_source"] = self.discogs.source
+            out["admitted_release_count"] = self.discogs.admitted_release_count
+            out["artist_shelf_pair_admitted"] = self.discogs.pair_admitted
+            out["artist_shelf_with_resolvable_release"] = self.discogs.resolvable
+            out["artist_shelf_with_cached_tracklist"] = self.discogs.with_cached_tracklist
+            out["admission_model_note"] = ADMISSION_MODEL_NOTE
             out["tracklist_check_caveat"] = TRACKLIST_CHECK_CAVEAT
         return out
 
@@ -273,8 +405,9 @@ def load_library_rows(db_path: str) -> list[LibraryRow]:
     ``library/db.py::LibraryDB.connect``'s own ``PRAGMA table_info`` check (and
     ``scripts/measure_artwork_match_floor.py``, which does the same). Older ETL
     snapshots predate the column; against one of those the census degrades to
-    an artist-column-only measurement -- narrower, and logged as such -- rather
-    than dying on an ``OperationalError`` a long way into a run.
+    an artist-column-only measurement -- narrower on the resolve leg, identical
+    on admission -- rather than dying on an ``OperationalError`` a long way into
+    a run.
     """
     con = sqlite3.connect(db_path)
     try:
@@ -283,9 +416,9 @@ def load_library_rows(db_path: str) -> list[LibraryRow]:
         has_alternate = "alternate_artist_name" in columns
         if not has_alternate:
             log.warning(
-                "library.db has no alternate_artist_name column -- matching on the artist "
-                "column alone. This UNDERSTATES resolvable rows relative to the real prod "
-                "cache filter; see artist_variants."
+                "library.db has no alternate_artist_name column -- the resolve leg will match "
+                "on the artist column alone, UNDERSTATING what LML's runtime matcher can reach. "
+                "Admission is unaffected; the prod filter never reads that column."
             )
         selected = "id, artist, title" + (", alternate_artist_name" if has_alternate else "")
         cur = con.execute(f"SELECT {selected} FROM library")
@@ -303,19 +436,21 @@ def load_library_rows(db_path: str) -> list[LibraryRow]:
 
 
 def artist_variants(row: LibraryRow) -> list[str]:
-    """Every library artist name a row can legitimately be matched under.
+    """Every artist name LML's RESOLVE leg may match a row under.
 
-    Mirrors ``scripts/build_filtered_discogs.py::extract_library_artists``,
-    which unions ``library.artist`` with ``library.alternate_artist_name`` --
-    dropping compilation-artist strings from *both* columns -- before the
-    exact-match join. That union is not cosmetic: 4,879 of the 64,815 rows in
-    the 2026-07-19 prod snapshot carry an alternate name, and they skew hard
-    toward the compound-credit shape LML#1264 is about ("Company Flow" /
-    "Company Flow & Cannibal Ox", "Common" / "Common Sense"). Measuring on
-    ``artist`` alone would file those rows under "no Discogs release credited
-    under that artist at all" when the real prod cache admits them under the
-    alternate name -- overstating the gap, and pointing the reader at the
-    wrong remedy for it.
+    Models the consumer, not the substrate. ``artist_matches_item`` in
+    ``lookup/orchestrator.py`` matches a library row on either its ``artist`` or
+    its ``alternate_artist_name``, so the census's resolve leg does too --
+    4,879 of the 64,815 rows in the 2026-07-19 prod snapshot carry an alternate
+    name, and they skew hard toward the compound-credit shape LML#1264 is about
+    ("Company Flow" / "Company Flow & Cannibal Ox", "Common" / "Common Sense").
+
+    A compilation string in either column is dropped: it is a shelf label, not
+    a credit any release would be matched against.
+
+    This must NOT be used for admission. ``LibraryPairIndex`` reads
+    ``library.artist`` alone because the production filter does; feeding it
+    these variants would credit the cache with releases it does not hold.
     """
     variants = [row.artist]
     alternate = row.alternate_artist.strip()
@@ -353,56 +488,93 @@ def split_shelf(rows: list[LibraryRow]) -> ShelfCensus:
     )
 
 
-async def find_exact_artist_candidates(
-    conn: asyncpg.Connection, artist_names: list[str]
-) -> dict[str, list[ReleaseCandidate]]:
-    """Batched exact-artist-name Discogs candidate lookup, one round trip.
+async def find_title_matched_releases(
+    conn: asyncpg.Connection, index: LibraryPairIndex
+) -> dict[int, str]:
+    """Pass 1 of admission: every release whose folded title is a library title.
 
-    Mirrors ``scripts/build_filtered_discogs.py``'s Phase 1 cache-build
-    filter (case-folded, 200-char-truncated exact match) -- the same
-    predicate the real prod discogs-cache build uses, run here against
-    whatever database ``conn`` is connected to. ``artist_names`` should be the
-    union of both library artist columns (see ``artist_variants``). Grouped by
-    the ORIGINAL library artist string (not lower-cased), so callers can look
-    candidates up by variant directly.
+    The production filter's inverted index is keyed by title, so this is the
+    same first probe, run over the whole catalogue. Streaming all ~19.3M rows
+    and folding each title in Python is deliberate: no SQL expression is
+    equivalent to ``to_match_form`` (``unaccent()`` is neither a superset nor a
+    subset of NFKD-plus-strip-combining), so any server-side prefilter would
+    silently drop diacritic-differing pairs -- exactly the collisions the fold
+    exists to make. ~60s against the 2026-08 local dump.
 
-    Streams via a server-side cursor rather than ``conn.fetch``, which avoids
-    buffering the whole result set before building the dict. Note this bounds
-    the *transient* copy only: the returned dict itself holds every candidate
-    (3.8M of them for this library against the full dump, ~620 MB after
-    ``ReleaseCandidate.__slots__`` and the interning below), and nothing bounds
-    that. Slicing ``artist_names`` is the seam if it ever needs bounding.
-
-    ``sys.intern`` on the credit name is worth ~125 MB: asyncpg hands back a
-    fresh ``str`` per row, but the 3.8M rows carry only ~20.5k distinct credits
-    (187x repetition), and the interned name is what
-    ``find_best_typed_match`` reads on every one of the resolve pass's
-    scorings.
+    Returns ``{release_id: raw title}``; the raw title is kept because the
+    resolve leg scores against it, not against the folded form.
     """
-    if not artist_names:
+    if not index.pairs:
         return {}
-    await conn.execute("CREATE TEMP TABLE IF NOT EXISTS census_artists (name TEXT)")
-    await conn.execute("DELETE FROM census_artists")
-    await conn.copy_records_to_table(
-        "census_artists", records=[(a,) for a in artist_names], columns=["name"]
-    )
-    # Load-bearing, unlike the lower(name) index build_filtered_discogs.py
-    # creates here: EXPLAIN against the full dump shows census_artists is
-    # seq-scanned into the hash side either way (it is always the small
-    # relation), so that index is dead -- but ANALYZE is what supplies the
-    # row estimate that keeps it on the small side.
-    await conn.execute("ANALYZE census_artists")
-    grouped: dict[str, list[ReleaseCandidate]] = {}
+    matched: dict[int, str] = {}
+    scanned = 0
     async with conn.transaction():
-        async for row in conn.cursor(_EXACT_ARTIST_MATCH_SQL):
-            grouped.setdefault(row["library_artist"], []).append(
-                ReleaseCandidate(
-                    release_id=row["release_id"],
-                    title=row["release_title"],
-                    artist_name=sys.intern(row["discogs_artist_name"]),
-                )
+        async for row in conn.cursor(_TITLE_SCAN_SQL, prefetch=50_000):
+            scanned += 1
+            title = row["title"] or ""
+            if to_match_form(title) in index.pairs:
+                matched[row["id"]] = title
+            if scanned % 5_000_000 == 0:
+                log.info("Scanned %d releases, %d title matches so far...", scanned, len(matched))
+    log.info("Title-match pass: %d/%d releases carry a library title", len(matched), scanned)
+    return matched
+
+
+async def build_admitted_universe(
+    conn: asyncpg.Connection, index: LibraryPairIndex, title_matched: dict[int, str]
+) -> AdmittedUniverse:
+    """Pass 2 of admission: of the title matches, which the pair rule admits.
+
+    Sweeps every credit of every title-matched release -- both ``extra`` tiers,
+    see ``_ADMISSION_CREDIT_SQL`` -- and admits a release when any of them lands
+    in its title's artist set. Credits arrive grouped by release only by
+    accident of the join order, so they are collected first and judged after.
+
+    ``sys.intern`` on the credit name matters here for the same reason it does
+    anywhere the resolve pass reads it 58,468 times: asyncpg hands back a fresh
+    ``str`` per row, and the admitted universe is held live throughout.
+    """
+    if not title_matched:
+        return AdmittedUniverse(by_artist={}, admitted_pairs=set(), release_count=0)
+
+    await conn.execute("CREATE TEMP TABLE IF NOT EXISTS census_release_ids (release_id INTEGER)")
+    await conn.execute("DELETE FROM census_release_ids")
+    await conn.copy_records_to_table(
+        "census_release_ids", records=[(rid,) for rid in title_matched], columns=["release_id"]
+    )
+    await conn.execute("ANALYZE census_release_ids")
+
+    credits: dict[int, list[str]] = {}
+    async with conn.transaction():
+        async for row in conn.cursor(_ADMISSION_CREDIT_SQL, prefetch=50_000):
+            credits.setdefault(row["release_id"], []).append(sys.intern(row["artist_name"] or ""))
+
+    by_artist: dict[str, list[ReleaseCandidate]] = {}
+    admitted_pairs: set[tuple[str, str]] = set()
+    admitted = 0
+    for release_id, names in credits.items():
+        title = title_matched[release_id]
+        n_title = to_match_form(title)
+        library_artists = index.artists_for_title(n_title)
+        folded = [(name, to_match_form(name)) for name in names]
+        if not any(n_name in library_artists for _, n_name in folded):
+            continue
+        admitted += 1
+        for name, n_name in folded:
+            by_artist.setdefault(n_name, []).append(
+                ReleaseCandidate(release_id=release_id, title=title, artist_name=name)
             )
-    return grouped
+            if n_name in library_artists:
+                admitted_pairs.add((n_name, n_title))
+    log.info(
+        "Admission pass: %d/%d title-matched releases admitted, spanning %d (artist, title) pairs",
+        admitted,
+        len(title_matched),
+        len(admitted_pairs),
+    )
+    return AdmittedUniverse(
+        by_artist=by_artist, admitted_pairs=admitted_pairs, release_count=admitted
+    )
 
 
 def resolve_release_for_row(
@@ -442,42 +614,48 @@ async def find_tracklist_release_ids(conn: asyncpg.Connection, release_ids: list
 
 
 async def measure_discogs_side(
-    conn: asyncpg.Connection, artist_shelf: list[LibraryRow]
-) -> tuple[int, int, int]:
-    """Items 2+3 of the census: exact-artist / resolvable / tracklisted counts.
+    conn: asyncpg.Connection, source: str, rows: list[LibraryRow], artist_shelf: list[LibraryRow]
+) -> DiscogsLegCensus:
+    """Items 2-3: simulate the prod filter, then resolve the artist shelf into it.
 
-    Matches on the union of both library artist columns, as the real prod
-    cache-build filter does -- see ``artist_variants``.
+    The index is built from **every** library row, not just the artist shelf,
+    because the real filter is -- a comp-shelf row's pair admits releases too,
+    and those releases are in the cache for an artist-shelf row to match
+    against.
     """
-    variants_by_row = [artist_variants(row) for row in artist_shelf]
-    distinct_artists = sorted({name for variants in variants_by_row for name in variants})
-    log.info("Matching %d distinct artist-shelf artist names...", len(distinct_artists))
-    candidates_by_artist = await find_exact_artist_candidates(conn, distinct_artists)
+    index = LibraryPairIndex.from_library_rows(rows)
     log.info(
-        "%d/%d distinct artists have an exact-case-folded Discogs match",
-        len(candidates_by_artist),
-        len(distinct_artists),
+        "Library pair index: %d distinct titles spanning %d (artist, title) pairs",
+        len(index),
+        index.pair_count,
     )
 
-    # One pass. A row is in ``candidates_by_artist`` under some variant exactly
-    # when that variant yielded at least one candidate, so "has an exact artist
-    # match" is just "this row's candidate list is non-empty" -- counting it
-    # here rather than in a second sweep keeps the two from drifting apart.
-    exact_artist_match_count = 0
+    title_matched = await find_title_matched_releases(conn, index)
+    universe = await build_admitted_universe(conn, index, title_matched)
+
+    pair_admitted = 0
+    pair_admitted_and_resolvable = 0
     resolved_release_ids: list[int] = []
-    for i, (row, variants) in enumerate(zip(artist_shelf, variants_by_row, strict=True), start=1):
-        candidates = [c for name in variants for c in candidates_by_artist.get(name, [])]
-        if candidates:
-            exact_artist_match_count += 1
+    for i, row in enumerate(artist_shelf, start=1):
+        own_pair = (to_match_form(row.artist), to_match_form(row.title))
+        admitted = own_pair in universe.admitted_pairs
+        pair_admitted += admitted
+        candidates = [
+            c
+            for name in artist_variants(row)
+            for c in universe.by_artist.get(to_match_form(name), [])
+        ]
         match = resolve_release_for_row(row, candidates)
         if match is not None:
             resolved_release_ids.append(match.release_id)
+            pair_admitted_and_resolvable += admitted
         if i % 5000 == 0:
             log.info("Resolved %d/%d artist-shelf rows so far...", i, len(artist_shelf))
     log.info(
-        "Resolved %d/%d artist-shelf rows to a specific release at the 80/80 floor",
-        len(resolved_release_ids),
+        "%d/%d artist-shelf rows are pair-admitted; %d resolve at the 80/80 floor",
+        pair_admitted,
         len(artist_shelf),
+        len(resolved_release_ids),
     )
 
     tracklisted_ids = await find_tracklist_release_ids(conn, sorted(set(resolved_release_ids)))
@@ -488,7 +666,14 @@ async def measure_discogs_side(
         len(resolved_release_ids),
         TRACKLIST_CHECK_CAVEAT,
     )
-    return exact_artist_match_count, len(resolved_release_ids), with_tracklist
+    return DiscogsLegCensus(
+        source=source,
+        admitted_release_count=universe.release_count,
+        pair_admitted=pair_admitted,
+        pair_admitted_and_resolvable=pair_admitted_and_resolvable,
+        resolvable=len(resolved_release_ids),
+        with_cached_tracklist=with_tracklist,
+    )
 
 
 async def build_report(library_db: str, discogs_url: str | None) -> GapCensusReport:
@@ -507,32 +692,20 @@ async def build_report(library_db: str, discogs_url: str | None) -> GapCensusRep
             "No --discogs-url / DATABASE_URL_DISCOGS given -- skipping the Discogs-side "
             "measurement (items 2-4). Reporting the library census only."
         )
-        return GapCensusReport(
-            total_library_rows=census.total,
-            comp_shelf_count=len(census.comp_shelf),
-            comp_shelf_naive_like_count=census.comp_shelf_naive_like_count,
-            artist_shelf_count=len(census.artist_shelf),
-            artist_shelf_with_exact_artist_match=0,
-            artist_shelf_with_resolvable_release=0,
-            artist_shelf_with_cached_tracklist=0,
-            discogs_source=None,
-        )
-
-    conn = await asyncpg.connect(discogs_url)
-    try:
-        exact_match, resolvable, tracklisted = await measure_discogs_side(conn, census.artist_shelf)
-    finally:
-        await conn.close()
+        leg = None
+    else:
+        conn = await asyncpg.connect(discogs_url)
+        try:
+            leg = await measure_discogs_side(conn, discogs_url, rows, census.artist_shelf)
+        finally:
+            await conn.close()
 
     return GapCensusReport(
         total_library_rows=census.total,
         comp_shelf_count=len(census.comp_shelf),
         comp_shelf_naive_like_count=census.comp_shelf_naive_like_count,
         artist_shelf_count=len(census.artist_shelf),
-        artist_shelf_with_exact_artist_match=exact_match,
-        artist_shelf_with_resolvable_release=resolvable,
-        artist_shelf_with_cached_tracklist=tracklisted,
-        discogs_source=discogs_url,
+        discogs=leg,
     )
 
 
@@ -550,8 +723,8 @@ def _render_lines(lines: list[str | tuple[str, int | None]]) -> str:
 
 
 def render_report(report: GapCensusReport) -> str:
-    """Console-friendly summary. Every Discogs-sourced number is labeled
-    an upper bound; the pin-coverage figure is labeled as documented,
+    """Console-friendly summary. Every Discogs-sourced number carries the model
+    it was simulated under; the pin-coverage figure is labeled as documented,
     not measured."""
     lines: list[str | tuple[str, int | None]] = [
         "LML#1264 track-recall gap census",
@@ -562,34 +735,41 @@ def render_report(report: GapCensusReport) -> str:
         ("Artist-shelf:", report.artist_shelf_count),
         "",
     ]
-    if not report.discogs_leg_ran:
+    if report.discogs is None:
         lines.append("Discogs-side measurement SKIPPED (no --discogs-url given).")
     else:
         lines.extend(
             [
-                f"Discogs source: {report.discogs_source}",
-                "UPPER BOUND -- computed against an unfiltered Discogs dump, not the",
-                "filtered prod discogs-cache; see the module docstring's TRAP note.",
-                ("  exact-artist-match:", report.artist_shelf_with_exact_artist_match),
-                ("  resolvable (80/80 floor):", report.artist_shelf_with_resolvable_release),
-                ("  + cached tracklist:", report.artist_shelf_with_cached_tracklist),
+                f"Discogs source: {report.discogs.source}",
+                ADMISSION_MODEL_NOTE,
+                ("Releases the prod filter admits:", report.discogs.admitted_release_count),
+                "",
+                "Artist-shelf rows:",
+                ("  pair-admitted (a cached release CAN exist):", report.discogs.pair_admitted),
+                ("  resolvable (80/80 floor, admitted universe):", report.discogs.resolvable),
+                ("  + cached tracklist:", report.discogs.with_cached_tracklist),
                 f"    ^ {TRACKLIST_CHECK_CAVEAT}",
                 "",
-                "Headline (UPPER BOUND):",
+                "Headline:",
                 (
                     "  could gain recall, no new collection:",
                     report.could_gain_recall_no_new_collection,
                 ),
                 ("  would need new collection:", report.would_need_new_collection),
                 "",
-                "...and those 'would need new collection' rows are two populations, two remedies:",
+                "...and those 'would need new collection' rows want different remedies:",
                 (
-                    "  no Discogs release under any of their artist names:",
-                    report.artist_shelf_without_exact_artist_match,
+                    "  STRUCTURAL -- the filter admits nothing for this pair:",
+                    report.artist_shelf_not_pair_admitted,
                 ),
                 (
-                    "  matched an artist, no title cleared the floor:",
-                    report.artist_shelf_matched_but_below_floor,
+                    "  admitted, but no title cleared the floor:",
+                    report.artist_shelf_pair_admitted_but_below_floor,
+                ),
+                "",
+                (
+                    "Rescued by a sibling row's admission (not their own pair):",
+                    report.artist_shelf_resolvable_without_pair_admission,
                 ),
             ]
         )
