@@ -21,7 +21,10 @@ coverage census answering:
    pins (prod-only data -- see the module note below) and an exact-artist
    Discogs match cross-checked against the same 80/80 floor
    ``clients/streaming/matching.py::find_best_typed_match`` already applies
-   at request time for artwork resolution (LML#478).
+   at request time for artwork resolution (LML#478). Matching runs over the
+   union of ``library.artist`` and ``library.alternate_artist_name``, exactly
+   as the real cache-build filter does -- see ``artist_variants``, and do not
+   narrow it to the ``artist`` column alone.
 3. Of those, how many have a cached tracklist (``release_track`` rows)
    available at all. **Against an unfiltered Discogs source this check is
    non-discriminating** -- see the second TRAP below.
@@ -131,11 +134,16 @@ _TRACKLIST_PRESENCE_SQL = """
 
 @dataclass(frozen=True)
 class LibraryRow:
-    """One ``library.db`` row: just the columns this census needs."""
+    """One ``library.db`` row: just the columns this census needs.
+
+    ``alternate_artist`` carries ``library.alternate_artist_name``, which is
+    load-bearing rather than decorative here -- see ``artist_variants``.
+    """
 
     id: int
     artist: str
     title: str
+    alternate_artist: str = ""
 
 
 @dataclass(frozen=True)
@@ -173,34 +181,108 @@ class GapCensusReport:
     tracklist_check_caveat: str = field(default=TRACKLIST_CHECK_CAVEAT)
 
     @property
-    def could_gain_recall_no_new_collection(self) -> int:
-        """Upper-bound count of rows resolvable + tracklisted with zero new collection."""
-        return self.artist_shelf_with_cached_tracklist
+    def discogs_leg_ran(self) -> bool:
+        """Whether items 2-4 were measured at all, or skipped for want of a source."""
+        return self.discogs_source is not None
 
     @property
-    def would_need_new_collection(self) -> int:
+    def could_gain_recall_no_new_collection(self) -> int | None:
+        """Upper-bound count of rows resolvable + tracklisted with zero new collection."""
+        return self.artist_shelf_with_cached_tracklist if self.discogs_leg_ran else None
+
+    @property
+    def would_need_new_collection(self) -> int | None:
         """Artist-shelf rows this census could not resolve to a cached tracklist."""
+        if not self.discogs_leg_ran:
+            return None
         return self.artist_shelf_count - self.artist_shelf_with_cached_tracklist
 
+    @property
+    def artist_shelf_without_exact_artist_match(self) -> int | None:
+        """Rows with no Discogs release credited under ANY of their artist names.
+
+        The first of the two populations inside ``would_need_new_collection``,
+        and the one holding the compound-credit shape LML#1264 is about. No
+        title-floor change reaches these rows -- there is no candidate to
+        score.
+        """
+        if not self.discogs_leg_ran:
+            return None
+        return self.artist_shelf_count - self.artist_shelf_with_exact_artist_match
+
+    @property
+    def artist_shelf_matched_but_below_floor(self) -> int | None:
+        """Rows that matched an artist but had no release title clear the 80/80 floor.
+
+        The second population: candidates exist, none of them scored. This is
+        the bucket a title-gate change could in principle move -- and the one
+        where LML#1245 / LML#1250's wrong-artist hazards apply.
+        """
+        if not self.discogs_leg_ran:
+            return None
+        return self.artist_shelf_with_exact_artist_match - self.artist_shelf_with_resolvable_release
+
     def to_dict(self) -> dict:
+        """Serialize, without ever emitting a headline the run did not measure.
+
+        A library-only run (no ``--discogs-url``) leaves items 2-4 at zero.
+        Serializing the derived headline from those zeroes would tell a reader
+        who meets the JSON without the console output that NOTHING is
+        resolvable -- a measured-looking finding where nothing was tested. The
+        headline keys go to ``None`` behind an explicit ``discogs_measurement``
+        marker instead. Same argument as ``TRACKLIST_CHECK_CAVEAT``: the
+        artifact outlives the run that produced it.
+        """
         out = asdict(self)
+        out["discogs_measurement"] = "measured" if self.discogs_leg_ran else "skipped"
         out["could_gain_recall_no_new_collection"] = self.could_gain_recall_no_new_collection
         out["would_need_new_collection"] = self.would_need_new_collection
+        out["artist_shelf_without_exact_artist_match"] = (
+            self.artist_shelf_without_exact_artist_match
+        )
+        out["artist_shelf_matched_but_below_floor"] = self.artist_shelf_matched_but_below_floor
         return out
 
 
 def load_library_rows(db_path: str) -> list[LibraryRow]:
-    """Read every ``(id, artist, title)`` row out of ``library.db``."""
+    """Read every ``(id, artist, title, alternate_artist_name)`` row out of ``library.db``."""
     con = sqlite3.connect(db_path)
     try:
         con.row_factory = sqlite3.Row
-        cur = con.execute("SELECT id, artist, title FROM library")
+        cur = con.execute("SELECT id, artist, title, alternate_artist_name FROM library")
         return [
-            LibraryRow(id=row["id"], artist=row["artist"] or "", title=row["title"] or "")
+            LibraryRow(
+                id=row["id"],
+                artist=row["artist"] or "",
+                title=row["title"] or "",
+                alternate_artist=row["alternate_artist_name"] or "",
+            )
             for row in cur.fetchall()
         ]
     finally:
         con.close()
+
+
+def artist_variants(row: LibraryRow) -> list[str]:
+    """Every library artist name a row can legitimately be matched under.
+
+    Mirrors ``scripts/build_filtered_discogs.py::extract_library_artists``,
+    which unions ``library.artist`` with ``library.alternate_artist_name`` --
+    dropping compilation-artist strings from *both* columns -- before the
+    exact-match join. That union is not cosmetic: 4,879 of the 64,815 rows in
+    the 2026-07-19 prod snapshot carry an alternate name, and they skew hard
+    toward the compound-credit shape LML#1264 is about ("Company Flow" /
+    "Company Flow & Cannibal Ox", "Common" / "Common Sense"). Measuring on
+    ``artist`` alone would file those rows under "no Discogs release credited
+    under that artist at all" when the real prod cache admits them under the
+    alternate name -- overstating the gap, and pointing the reader at the
+    wrong remedy for it.
+    """
+    variants = [row.artist]
+    alternate = row.alternate_artist.strip()
+    if alternate and alternate not in variants and not is_compilation_artist(alternate):
+        variants.append(alternate)
+    return variants
 
 
 # The naive heuristic a reader might reach for first -- and the one this
@@ -240,9 +322,17 @@ async def find_exact_artist_candidates(
     Mirrors ``scripts/build_filtered_discogs.py``'s Phase 1 cache-build
     filter (case-folded, 200-char-truncated exact match) -- the same
     predicate the real prod discogs-cache build uses, run here against
-    whatever database ``conn`` is connected to. Grouped by the ORIGINAL
-    library artist string (not lower-cased), so callers can look candidates
-    up by ``row.artist`` directly.
+    whatever database ``conn`` is connected to -- including its index on
+    ``lower(name)``, without which the join degrades to a sequential scan on
+    a full dump. ``artist_names`` should be the union of both library artist
+    columns (see ``artist_variants``). Grouped by the ORIGINAL library artist
+    string (not lower-cased), so callers can look candidates up by variant
+    directly.
+
+    Streams via a server-side cursor inside a transaction rather than
+    ``conn.fetch``: against an unfiltered dump the artist x release product
+    is large enough that buffering the whole result before building the dict
+    doubles peak memory for no benefit.
     """
     if not artist_names:
         return {}
@@ -251,16 +341,20 @@ async def find_exact_artist_candidates(
     await conn.copy_records_to_table(
         "census_artists", records=[(a,) for a in artist_names], columns=["name"]
     )
-    rows = await conn.fetch(_EXACT_ARTIST_MATCH_SQL)
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_census_artists ON census_artists (lower(name))"
+    )
+    await conn.execute("ANALYZE census_artists")
     grouped: dict[str, list[ReleaseCandidate]] = {}
-    for row in rows:
-        grouped.setdefault(row["library_artist"], []).append(
-            ReleaseCandidate(
-                release_id=row["release_id"],
-                title=row["release_title"],
-                artist_name=row["discogs_artist_name"],
+    async with conn.transaction():
+        async for row in conn.cursor(_EXACT_ARTIST_MATCH_SQL):
+            grouped.setdefault(row["library_artist"], []).append(
+                ReleaseCandidate(
+                    release_id=row["release_id"],
+                    title=row["release_title"],
+                    artist_name=row["discogs_artist_name"],
+                )
             )
-        )
     return grouped
 
 
@@ -272,13 +366,16 @@ def resolve_release_for_row(
     Reuses ``find_best_typed_match`` read-only (no matcher code is modified
     by this script) so "resolvable" means exactly what it means at request
     time for artwork resolution today -- not a newly-invented, more lenient
-    bar that would overstate the gap's closability.
+    bar that would overstate the gap's closability. The row's variant set
+    goes in through that function's existing ``query_artist`` iterable
+    support, which scores the candidate against each variant and keeps the
+    max; the floor itself is untouched.
     """
     if not candidates:
         return None
     return find_best_typed_match(
         candidates,
-        query_artist=row.artist,
+        query_artist=artist_variants(row),
         query_title=row.title,
         artist_fn=lambda c: c.artist_name,
         title_fn=lambda c: c.title,
@@ -302,11 +399,17 @@ async def find_tracklist_release_ids(conn: asyncpg.Connection, release_ids: list
 async def measure_discogs_side(
     conn: asyncpg.Connection, artist_shelf: list[LibraryRow]
 ) -> tuple[int, int, int]:
-    """Items 2+3 of the census: exact-artist / resolvable / tracklisted counts."""
-    distinct_artists = sorted({row.artist for row in artist_shelf})
+    """Items 2+3 of the census: exact-artist / resolvable / tracklisted counts.
+
+    Matches on the union of both library artist columns, as the real prod
+    cache-build filter does -- see ``artist_variants``.
+    """
+    distinct_artists = sorted({name for row in artist_shelf for name in artist_variants(row)})
     log.info("Matching %d distinct artist-shelf artist names...", len(distinct_artists))
     candidates_by_artist = await find_exact_artist_candidates(conn, distinct_artists)
-    exact_artist_match_count = sum(1 for row in artist_shelf if row.artist in candidates_by_artist)
+    exact_artist_match_count = sum(
+        1 for row in artist_shelf if any(n in candidates_by_artist for n in artist_variants(row))
+    )
     log.info(
         "%d/%d distinct artists have an exact-case-folded Discogs match",
         len(candidates_by_artist),
@@ -315,7 +418,8 @@ async def measure_discogs_side(
 
     resolved: dict[int, ReleaseCandidate] = {}
     for i, row in enumerate(artist_shelf, start=1):
-        match = resolve_release_for_row(row, candidates_by_artist.get(row.artist, []))
+        candidates = [c for n in artist_variants(row) for c in candidates_by_artist.get(n, [])]
+        match = resolve_release_for_row(row, candidates)
         if match is not None:
             resolved[row.id] = match
         if i % 5000 == 0:
@@ -393,10 +497,10 @@ def render_report(report: GapCensusReport) -> str:
         f"Total library rows:        {report.total_library_rows:>8,}",
         f"Comp-shelf (classifier):   {report.comp_shelf_count:>8,}",
         f"  (naive LIKE heuristic:   {report.comp_shelf_naive_like_count:>8,})",
-        f"Artist-shelf:               {report.artist_shelf_count:>8,}",
+        f"Artist-shelf:              {report.artist_shelf_count:>8,}",
         "",
     ]
-    if report.discogs_source is None:
+    if not report.discogs_leg_ran:
         lines.append("Discogs-side measurement SKIPPED (no --discogs-url given).")
     else:
         lines.extend(
@@ -411,8 +515,14 @@ def render_report(report: GapCensusReport) -> str:
                 "",
                 f"Headline (UPPER BOUND): could gain recall, no new collection: "
                 f"{report.could_gain_recall_no_new_collection:,}",
-                f"                         would need new collection:            "
+                f"                        would need new collection:            "
                 f"{report.would_need_new_collection:,}",
+                "",
+                "The 'would need new collection' rows are two populations, two remedies:",
+                f"  no Discogs release under any of their artist names: "
+                f"{report.artist_shelf_without_exact_artist_match:,}",
+                f"  matched an artist, no title cleared the floor:      "
+                f"{report.artist_shelf_matched_but_below_floor:,}",
             ]
         )
     lines.append("")

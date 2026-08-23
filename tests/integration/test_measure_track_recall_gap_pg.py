@@ -127,6 +127,22 @@ class TestFindExactArtistCandidates:
 
         assert "Zapp" not in candidates
 
+    async def test_an_alternate_artist_name_finds_its_compound_credit(self, pg_pool):
+        """The real cache-build filter unions ``library.alternate_artist_name``
+        into its artist set, so a row that records the compound credit as its
+        alternate name DOES reach the release the plain shelf artist cannot.
+        This is the same release 200 the previous test proves is unreachable
+        under bare "Zapp" -- the two together pin exactly where the boundary
+        sits, which is the distinction the census's headline split rests on.
+        """
+        async with pg_pool.acquire() as conn:
+            await _seed(conn)
+
+            candidates = await find_exact_artist_candidates(conn, ["Zapp", "Zapp & Roger"])
+
+        assert "Zapp" not in candidates
+        assert {c.release_id for c in candidates["Zapp & Roger"]} == {200}
+
     async def test_artist_with_no_discogs_match_is_absent_from_the_map(self, pg_pool):
         async with pg_pool.acquire() as conn:
             await _seed(conn)
