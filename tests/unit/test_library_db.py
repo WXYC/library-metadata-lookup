@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import pytest
 
-from library.db import LibraryDB, _fts_normalize, _to_fts_match_query
+from library.db import (
+    LIBRARY_FTS_CREATE_SQL,
+    LibraryDB,
+    _fts_normalize,
+    _to_fts_match_query,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -982,12 +987,11 @@ def _create_library_db(
     if with_album_artist:
         columns.append("album_artist TEXT")
     conn.execute(f"CREATE TABLE library ({', '.join(columns)})")
-    fts_columns = "title" if omit_artist_column else "title, artist"
-    conn.execute(f"""
-        CREATE VIRTUAL TABLE library_fts USING fts5(
-            {fts_columns}, content='library', content_rowid='id'
-        )
-    """)
+    if not omit_artist_column:
+        # The shared DDL, not a hand-rolled one: its unicode61 tokenizer
+        # config is load-bearing (see LIBRARY_FTS_TOKENIZER) and a local copy
+        # would silently drift from what production indexes.
+        conn.execute(LIBRARY_FTS_CREATE_SQL)
 
     for i, artist in enumerate(artists, start=1):
         values = [str(i), f"Album {i}", "A", str(i), str(i), "Rock", "LP"]
