@@ -220,7 +220,22 @@ MODULE_BUDGETS: dict[str, int] = {
     # adjacent and share `_PUNCTUATION_CHAR`, so splitting them into two
     # files would manufacture exactly the drift LML#1244 and LML#1257 exist
     # to prevent. Sized per the calibration convention: 1.3x150 -> 200.
-    "lookup/name_folding.py": 200,
+    #
+    # Raised again by LML#1250 (200 -> 250, measured 222) for the same reason
+    # the LML#1257 entry above declines to extract, now applied to the
+    # comparison predicates rather than the two fidelities. `article_stem_hit`
+    # is defined against `folded_hit` -- it is that function's open-prefix-or-
+    # equality shape plus two guards, both scoped to the open-prefix branch --
+    # and the two are consumed side by side by the same four rungs of
+    # `artist_matches_item`. Splitting them into two files would let a future
+    # change to what "exact" means reach one and not the other, which is the
+    # drift this module exists to prevent, and the added lines are the
+    # rationale for the guards rather than a second concern accumulating.
+    # Sized as a minimal-headroom grant (smallest multiple of 50 at or above
+    # the measured size, no 1.3x multiplier), the same under-grant
+    # `lookup/enrichment/__init__.py` above took: this absorbs one bounded,
+    # reviewed addition without licensing another 100 lines of it.
+    "lookup/name_folding.py": 250,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
     # transparent-fold calibration): the location-union task is now threaded
     # through `_step_search_pipeline` into the TRACK_ON_COMPILATION execute

@@ -18,6 +18,7 @@ from discogs.matching import strip_discogs_suffix
 from discogs.models import DiscogsSearchResult, ReleaseInfo
 from library.models import LibraryItem
 from lookup.name_folding import (
+    article_stem_hit,
     ends_in_punctuation,
     fold_punctuation_for_comparison,
     folded_hit,
@@ -150,12 +151,14 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     tolerated because it lands on same-artist recoveries — a query "A E"
     *should* reach "A&E" — and because the candidate is the side being
     prefix-matched, so a shorter stem admits fewer queries rather than more.
-    The over-reach that does bite (a query stripping down to a 1-2 character
-    stem and open-prefixing unrelated rows) is the *query* side of #364's
-    article rung, which behaves identically on main for anyone typing the
-    spoken form. It is tracked as LML#1250 and is deliberately not patched
-    here — fixing it at the article rung fixes the larger spoken-form
-    population, not just the names this fold happens to touch.
+
+    Both article-stripped rungs (this one and its folded counterpart below)
+    route their open-prefix comparison through :func:`article_stem_hit`
+    rather than a bare ``startswith`` (LML#1250) — a query stripping down to
+    a 1-2 character stem open-prefixed hundreds of unrelated rows on main,
+    regardless of which side of the article/punctuation asymmetry produced
+    the short stem, so both rungs take the same guard. See that function's
+    docstring for why a token boundary alone does not close the gap.
 
     The folded rungs demand **equality** when the query itself ends in
     punctuation, and stay an open prefix otherwise. A trailing "." or "!"
@@ -194,14 +197,14 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
         cand_normalized = normalize_for_comparison(candidate)
         if cand_normalized.startswith(artist_normalized):
             return True
-        if artist_no_article and strip_leading_article(cand_normalized).startswith(
-            artist_no_article
+        if artist_no_article and article_stem_hit(
+            strip_leading_article(cand_normalized), artist_no_article, exact=False
         ):
             return True
         cand_folded = fold_punctuation_for_comparison(cand_normalized)
         if artist_folded and folded_hit(cand_folded, artist_folded, exact=folded_exact):
             return True
-        if artist_folded_no_article and folded_hit(
+        if artist_folded_no_article and article_stem_hit(
             strip_leading_article(cand_folded), artist_folded_no_article, exact=folded_exact
         ):
             return True
