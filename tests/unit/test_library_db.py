@@ -1,6 +1,7 @@
 """Unit tests for library/db.py."""
 
 import logging
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -1337,6 +1338,26 @@ class TestArtistNameExactMatchPool:
 
         assert "" in db._artist_name_pool_lower
         assert await db._artist_exists_exactly("", "") is True
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_retained_pool_is_not_left_over_allocated(self, tmp_path):
+        """The retained pool is not left over-allocated by incremental growth.
+
+        A set grown by repeated ``update`` overshoots its table: 27,518
+        production names land in 131,072 slots (2.00 MiB) where a set built
+        at final size takes 65,536 (1.00 MiB). The pool is retained for the
+        whole process lifetime, per worker, so the slack is permanent --
+        rebuilding it once at the end costs ~0.4 ms and returns half of it.
+        """
+        db_file = tmp_path / "test.db"
+        _create_library_db(db_file, [f"Artist {i}" for i in range(2000)])
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+
+        pool = db._artist_name_pool_lower
+        assert len(pool) == 2000
+        assert sys.getsizeof(pool) == sys.getsizeof(set(pool))
         await db.close()
 
     @pytest.mark.asyncio
