@@ -3343,20 +3343,27 @@
   {
     "id": "track-miss-stereolab-zzyzx-marginal-fanfare",
     "shape": "artist_song",
-    "frozen": false,
-    "suspect": true,
-    "note": "A track that is on no shelf and in no Discogs fixture. The miss direction for the track lanes: if this starts returning a confident row, a validation gate has stopped gating. SUSPECT (found by this corpus on its first run, 2026-08-20): the recorded verdict is a confident, uncaveated hit -- found_on_compilation=True, song_not_found=False, context 'Found \"Zzyzx Marginal Fanfare\" by Stereolab on: Peng!' -- for a track that exists nowhere. TRACK_ON_COMPILATION's last-resort branch (`if not results and keyword_matches and not discogs_found_releases`) surfaces the best library keyword hit when Discogs returns nothing, and the compilation Outcome labels it confirmed. This is the LML#1225 user-visible failure -- a confident row for a song that does not exist -- reached through a path #1225's tracklist-gate fix does not cover, because no tracklist is ever consulted.",
+    "frozen": true,
+    "suspect": false,
+    "note": "A track that is on no shelf and in no Discogs fixture. The miss direction for the track lanes: if this starts returning a CONFIDENT row, a validation gate has stopped gating. FROZEN, and the history is the reason. Recorded 2026-08-20 on this corpus's first run as SUSPECT, because the verdict it captured was believed wrong at the time of recording: a confident, uncaveated hit (found_on_compilation=True, song_not_found=False) for a song that exists nowhere -- TRACK_ON_COMPILATION's last-resort branch (`if not results and keyword_matches and not discogs_found_releases`) surfaced the best library keyword hit when Discogs returned nothing, and the compilation Outcome labelled it confirmed. That is the LML#1225 user-visible failure reached by a path #1225's tracklist gate never covers, because no tracklist is consulted. LML#1239 (commit 0fce58ac) fixed exactly that branch, and this case flipped to song_not_found=True / found_on_compilation=False when the corpus was re-landed against main on 2026-08-23. The row itself is still returned -- the fix caveats it rather than suppressing it. Frozen now because the failure it pins reached production once; re-recording it requires a hand-edit and a reason.",
     "query": {
       "artist": "Stereolab",
       "song": "Zzyzx Marginal Fanfare"
     },
     "expect": {
       "miss_kind": "hit",
-      "song_not_found": false,
-      "found_on_compilation": true,
+      "song_not_found": true,
+      "found_on_compilation": false,
       "results": [
         "#45348 Stereolab — Peng!"
       ]
-    }
+    },
+    "issue": "LML#1239",
+    "requires_rows": [
+      [
+        "Stereolab",
+        "Peng!"
+      ]
+    ]
   }
 ]
