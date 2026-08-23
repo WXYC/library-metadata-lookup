@@ -341,16 +341,22 @@ class LibraryDB:
         shrinking it.
 
         Footprint: one lowercased ``str`` per distinct name across the present
-        sources -- 27,517 names / ~3.4 MiB on the April catalog snapshot this
+        sources -- 27,518 names / ~2.4 MiB on the April catalog snapshot this
         was measured against (64,676 rows, no ``compilation_track_artist``
         table), held per worker process. A catalog carrying CTA credits adds
         its distinct credit names on top, so size with headroom. Rebuilt on
-        every :meth:`connect`, which includes the #706 hot-swap reconnect --
-        and that one runs inline in the request that detects the swap, where
-        it costs about what two uncached misses of the old code cost.
+        every :meth:`adopt_connection`, which includes the #706 hot-swap
+        reconnect -- and that one runs inline in the request that detects the
+        swap, where the ~15ms costs about what three uncached misses of the
+        old code cost.
         """
         assert self._conn is not None  # Caller (adopt_connection) sets it
 
+        # One query per source, NOT one UNION over all of them: each column
+        # dedupes straight off its own covering index, where a UNION has to
+        # merge two 64k index scans. Measured 35.1ms unioned vs 19.8ms here.
+        # The 2-4 extra worker-thread round-trips are noise by comparison, and
+        # per-source queries are what make a failure attributable.
         pool: set[str] = set()
         usable = True
         for table, column in self._artist_name_sources():
@@ -364,6 +370,13 @@ class LibraryDB:
                 cursor = await self._conn.execute(
                     f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"
                 )
+                # fetchall, NOT `async for cur`: aiosqlite's __aiter__ pulls
+                # in small chunks, so streaming turns one worker-thread
+                # round-trip into ~a thousand per source. Measured on the real
+                # catalog: 96.6ms streaming vs 19.8ms here, ~4.9x worse, most
+                # of it on the event loop. The peak-memory saving is real but
+                # nowhere near worth that.
+                #
                 # Materialize before updating: set.update consumes a generator
                 # lazily, so a raise part-way through would leave an arbitrary
                 # row-ordered prefix behind and make "this source was skipped"
@@ -382,7 +395,12 @@ class LibraryDB:
                     exc_info=True,
                 )
 
-        self._artist_name_pool_lower = pool
+        # Rebuild at final size before retaining. A set grown by repeated
+        # update overshoots: 27,518 production names sit in a 131,072-slot
+        # table (2.00 MiB) where one built at size takes 65,536 (1.00 MiB).
+        # This is retained for the whole process lifetime, per worker, so the
+        # slack is permanent; reclaiming it costs ~0.4ms, once.
+        self._artist_name_pool_lower = set(pool)
         self._artist_name_pool_usable = usable
         logger.info(
             f"Built artist-name exact-match pool: {len(pool)} names "
