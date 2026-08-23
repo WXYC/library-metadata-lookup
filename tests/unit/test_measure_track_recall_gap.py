@@ -387,6 +387,57 @@ class TestGapCensusReport:
         assert as_dict["artist_shelf_not_pair_admitted"] == 30  # 90 - 60
         assert as_dict["artist_shelf_pair_admitted_but_below_floor"] == 2  # 60 - 58
         assert as_dict["artist_shelf_resolvable_without_pair_admission"] == 4  # 62 - 58
+        assert as_dict["artist_shelf_structural_and_unreached"] == 26  # 30 - 4
+        assert as_dict["artist_shelf_resolvable_without_cached_tracklist"] == 7  # 62 - 55
+
+    def test_the_remedy_split_partitions_would_need_new_collection(self):
+        """The three remedy populations must sum to the population they split.
+
+        They did not, before this was pinned. The console report presented
+        ``artist_shelf_not_pair_admitted`` + ``..._below_floor`` as the split of
+        ``would_need_new_collection``, and on the real run those printed 24,942
+        and 1 against a ``would_need`` of 24,757 -- a remedy population larger
+        than the population it claimed to partition. Two leaks caused it: the
+        rows a sibling row's admission rescues are not-pair-admitted yet DO
+        resolve, and a row can resolve to a release carrying no tracklist. Both
+        now have their own line, so the split balances by construction rather
+        than by the coincidence that ``tracklisted == resolvable``.
+
+        This report is quoted into tickets. An arithmetic incoherence in it
+        reads as a measurement error, and costs more than the finding is worth.
+        """
+        as_dict = _report(_leg()).to_dict()
+
+        assert (
+            as_dict["artist_shelf_structural_and_unreached"]
+            + as_dict["artist_shelf_pair_admitted_but_below_floor"]
+            + as_dict["artist_shelf_resolvable_without_cached_tracklist"]
+            == as_dict["would_need_new_collection"]
+        )
+
+    def test_the_split_still_balances_when_no_row_is_rescued(self):
+        """Vacuity guard for the partition above: the fixture's 4 rescued and 7
+        untracklisted rows make both leaks non-zero, so a sum that only balanced
+        for the degenerate case would pass there and fail here -- or vice versa.
+        """
+        leg = _leg(
+            pair_admitted=60,
+            pair_admitted_and_resolvable=60,
+            resolvable=60,
+            with_cached_tracklist=60,
+        )
+
+        as_dict = _report(leg).to_dict()
+
+        assert as_dict["artist_shelf_resolvable_without_pair_admission"] == 0
+        assert as_dict["artist_shelf_resolvable_without_cached_tracklist"] == 0
+        assert as_dict["artist_shelf_structural_and_unreached"] == 30
+        assert (
+            as_dict["artist_shelf_structural_and_unreached"]
+            + as_dict["artist_shelf_pair_admitted_but_below_floor"]
+            + as_dict["artist_shelf_resolvable_without_cached_tracklist"]
+            == as_dict["would_need_new_collection"]
+        )
 
     def test_the_leg_is_flattened_into_the_serialized_report(self):
         """The measured Discogs figures have to reach the artifact under their

@@ -296,8 +296,10 @@ class DiscogsLegCensus:
 DERIVED_HEADLINE_KEYS = (
     "could_gain_recall_no_new_collection",
     "would_need_new_collection",
-    "artist_shelf_not_pair_admitted",
+    "artist_shelf_structural_and_unreached",
     "artist_shelf_pair_admitted_but_below_floor",
+    "artist_shelf_resolvable_without_cached_tracklist",
+    "artist_shelf_not_pair_admitted",
     "artist_shelf_resolvable_without_pair_admission",
 )
 
@@ -335,17 +337,38 @@ class GapCensusReport:
 
     @property
     def artist_shelf_not_pair_admitted(self) -> int | None:
-        """Rows the cache can hold NO release for -- the structural gap.
+        """Rows the cache can hold no release for under their OWN pair.
 
-        The largest and hardest of the three "would need new collection"
-        populations. No threshold, fold, or index inside LML reaches these rows:
-        there is no candidate to score, because the filter admitted nothing
-        under their ``(artist, title)`` pair. Only a wider cache filter (see
-        discogs-etl#414) or new data upstream moves them.
+        The headline structural figure, and the one quoted into tickets. Note it
+        is deliberately NOT one of the three remedy populations below: a handful
+        of these rows still resolve against a release admitted under some other
+        library row's pair, so this count overlaps
+        ``could_gain_recall_no_new_collection`` by exactly
+        ``artist_shelf_resolvable_without_pair_admission``. Subtracting that
+        overlap gives ``artist_shelf_structural_and_unreached``, which is the
+        one that partitions.
         """
         if self.discogs is None:
             return None
         return self.artist_shelf_count - self.discogs.pair_admitted
+
+    @property
+    def artist_shelf_structural_and_unreached(self) -> int | None:
+        """Rows no cached release reaches at all -- the first remedy population.
+
+        The largest and hardest of the three. No threshold, fold, or index
+        inside LML reaches these rows: there is no candidate to score, because
+        the filter admitted nothing under their pair and no sibling row's
+        admission happened to cover them either. Only a wider cache filter (see
+        discogs-etl#414) or new data upstream moves them.
+        """
+        if self.discogs is None:
+            return None
+        return (
+            self.artist_shelf_count
+            - self.discogs.pair_admitted
+            - (self.discogs.resolvable - self.discogs.pair_admitted_and_resolvable)
+        )
 
     @property
     def artist_shelf_pair_admitted_but_below_floor(self) -> int | None:
@@ -373,6 +396,21 @@ class GapCensusReport:
         if self.discogs is None:
             return None
         return self.discogs.resolvable - self.discogs.pair_admitted_and_resolvable
+
+    @property
+    def artist_shelf_resolvable_without_cached_tracklist(self) -> int | None:
+        """Rows that resolve to a release carrying no tracklist -- the third remedy.
+
+        Zero on a full-dump run (see ``TRACKLIST_CHECK_CAVEAT``), and the line
+        exists anyway. Without it the remedy split only balances when
+        ``with_cached_tracklist`` happens to equal ``resolvable``, which is an
+        artifact of the source rather than a property of the census -- against a
+        real filtered cache it would not hold, and the split would silently stop
+        adding up.
+        """
+        if self.discogs is None:
+            return None
+        return self.discogs.resolvable - self.discogs.with_cached_tracklist
 
     def to_dict(self) -> dict:
         """Serialize the measurement together with the caveats that make it readable.
@@ -530,9 +568,21 @@ async def build_admitted_universe(
     in its title's artist set. Credits arrive grouped by release only by
     accident of the join order, so they are collected first and judged after.
 
-    ``sys.intern`` on the credit name matters here for the same reason it does
-    anywhere the resolve pass reads it 58,468 times: asyncpg hands back a fresh
-    ``str`` per row, and the admitted universe is held live throughout.
+    ``credits`` is the largest structure in the script and the only one that
+    scales with the dump rather than the library: it holds every credit of every
+    **title-matched** release (2,252,690 of them against the 2026-08 local dump,
+    3.3x the 683,740 that end up admitted), because a release's admission cannot
+    be decided until all of its credits have been seen. Measured peak RSS for
+    the whole census is 1.55 GB, which is where the run sits -- nothing bounds
+    it, and a library with more high-collision titles (``untitled``, ``1``,
+    ``live``, ``greatest hits``) would push it up. Chunking ``title_matched`` and
+    accumulating ``by_artist`` across chunks is the seam if it ever needs
+    bounding; it costs nothing but code, since chunks are independent.
+
+    ``sys.intern`` is what keeps that structure affordable: asyncpg hands back a
+    fresh ``str`` per credit row, and the ~5M credits carry far fewer distinct
+    names. The interned name is also what ``find_best_typed_match`` reads on
+    every scoring of the resolve pass, which holds ``by_artist`` live throughout.
     """
     if not title_matched:
         return AdmittedUniverse(by_artist={}, admitted_pairs=set(), release_count=0)
@@ -757,18 +807,26 @@ def render_report(report: GapCensusReport) -> str:
                 ),
                 ("  would need new collection:", report.would_need_new_collection),
                 "",
-                "...and those 'would need new collection' rows want different remedies:",
+                "...and those 'would need new collection' rows partition three ways,",
+                "three different remedies (the three below sum to it exactly):",
                 (
-                    "  STRUCTURAL -- the filter admits nothing for this pair:",
-                    report.artist_shelf_not_pair_admitted,
+                    "  STRUCTURAL -- no cached release reaches this row:",
+                    report.artist_shelf_structural_and_unreached,
                 ),
                 (
-                    "  admitted, but no title cleared the floor:",
+                    "  a release IS admitted, no title cleared the floor:",
                     report.artist_shelf_pair_admitted_but_below_floor,
                 ),
-                "",
                 (
-                    "Rescued by a sibling row's admission (not their own pair):",
+                    "  resolves, but that release has no cached tracklist:",
+                    report.artist_shelf_resolvable_without_cached_tracklist,
+                ),
+                "",
+                "Structural gap counted the other way -- rows with no release under",
+                "their OWN pair, including the few a sibling row's admission rescues:",
+                ("  not pair-admitted:", report.artist_shelf_not_pair_admitted),
+                (
+                    "  of which rescued (so NOT in the split above):",
                     report.artist_shelf_resolvable_without_pair_admission,
                 ),
             ]
