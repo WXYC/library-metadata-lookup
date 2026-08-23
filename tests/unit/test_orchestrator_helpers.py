@@ -1219,6 +1219,57 @@ class TestSearchLibraryWithFallback:
         assert len(results) == 1
         assert results[0].id == 57833
 
+    @pytest.mark.asyncio
+    async def test_underscore_catalog_title_matches_spaced_album_query(self, mock_library_db):
+        """LML#1257: the per-album word-overlap check in ``search_one_album``
+        now folds punctuation through the shared LML#1244 policy, which folds
+        ``_`` to a space -- the old inline ``re.sub(r"[^\\w\\s]", " ", ...)``
+        left ``_`` glued to its neighbors (Python's ``\\w`` treats it as a
+        word character).
+
+        Reproduces catalog row 45585, filed "Super_Collider" by
+        "Super_Collider" -- one of the 8 real WXYC catalog artists whose name
+        contains ``_`` (measured against the real ``library.db``,
+        2026-08-22). Before this fold, the catalog title normalized to ONE
+        15-char token ("super_collider") that a normally-spaced typed album
+        ("super collider") could never ``startswith``-match. Folding ``_`` to
+        a space splits the catalog title into two tokens ("super",
+        "collider"), which the typed album's own two tokens now match
+        exactly.
+        """
+        item = make_library_item(
+            id=45585,
+            artist="Super_Collider",
+            title="Super_Collider",
+            call_letters="S",
+        )
+
+        async def search(query, limit=None, **_):
+            # Only the combined artist+album query (search_one_album's own
+            # query shape) surfaces the row; the artist-only fallback query
+            # is starved so a positive result can only come from the
+            # word-overlap check this test targets.
+            if query == "Super_Collider Super Collider":
+                return [item]
+            return []
+
+        mock_library_db.search = AsyncMock(side_effect=search)
+
+        parsed = ParsedRequest(
+            artist="Super_Collider",
+            raw_message="Super_Collider - Super Collider",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+
+        results, fallback = await search_library_with_fallback(
+            mock_library_db, parsed, ["Super Collider"]
+        )
+
+        assert len(results) == 1
+        assert results[0].id == 45585
+        assert fallback is False
+
 
 # ---------------------------------------------------------------------------
 # Tests: search_with_alternative_interpretation
@@ -4098,6 +4149,54 @@ def _fire_cap_via_recorder():
     from lookup.concurrency import _record_search_api_call_cap_fired
 
     _record_search_api_call_cap_fired(cap=3, spent=5, items_remaining=10, items_total=15)
+
+
+class TestSearchByKeyword:
+    """Tests for ``track_on_compilation._search_by_keyword`` (LML#1257)."""
+
+    @pytest.mark.asyncio
+    async def test_underscore_artist_folds_to_two_significant_words(self, mock_library_db):
+        """LML#1257: consolidated onto the shared LML#1244 fold, which folds
+        ``_`` to a space -- the old inline ``re.sub(r"[^\\w\\s]", " ", ...)``
+        left it glued to its neighbors, since Python's ``\\w`` treats ``_``
+        as a word character.
+
+        ``lib_artist`` here is a significant-word source for an FTS5 keyword
+        query, not the identity-matching gate in ``lookup/matching.py`` --
+        but it can still be one of the catalog's underscore-bearing names.
+        Reproduces catalog row 45585, filed "Super_Collider" by
+        "Super_Collider" -- one of the 8 real WXYC catalog artists whose name
+        contains ``_`` (measured against the real ``library.db``,
+        2026-08-22). Before this fold, "Super_Collider" normalized to ONE
+        significant word ("super_collider"), producing the keyword query
+        "super_collider". Folding ``_`` to a space splits it into two
+        significant words ("super", "collider"), producing the keyword query
+        "super collider" instead.
+        """
+        from lookup.strategies.track_on_compilation import _search_by_keyword
+
+        item = make_library_item(id=45585, artist="Super_Collider", title="Super_Collider")
+
+        async def search(query, limit=None, **_):
+            # Only the folded, two-word query surfaces the row -- pins that
+            # the fold (not incidental substring luck) is what finds it.
+            if query == "super collider":
+                return [item]
+            return []
+
+        mock_library_db.search = AsyncMock(side_effect=search)
+
+        parsed = ParsedRequest(
+            artist="Super_Collider",
+            raw_message="Super_Collider",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+
+        results = await _search_by_keyword(mock_library_db, "Super_Collider", parsed)
+
+        assert len(results) == 1
+        assert results[0].id == 45585
 
 
 _PARSED_AB = ParsedRequest(

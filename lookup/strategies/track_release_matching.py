@@ -15,7 +15,6 @@ Extracted verbatim from ``lookup/orchestrator.py`` (LML#726).
 """
 
 import logging
-import re
 
 from wxyc_etl.text import is_compilation_artist
 
@@ -35,6 +34,7 @@ from lookup.matching import (
     album_title_acceptable,
     artist_matches_item,
 )
+from lookup.name_folding import fold_punctuation_for_comparison
 from lookup.release_resolution import ResolvedRelease, validate_release_for_track
 from lookup.rowless import (
     ROWLESS_LIBRARY_ID,
@@ -373,7 +373,11 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
             results = await _search_and_filter(stripped)
 
     if not results:
-        words = re.sub(r"[^\w\s]", " ", album_title.lower()).split()
+        # LML#1257: consolidated onto the shared fold (LML#1244), which folds
+        # '_' to a space -- e.g. the catalog's "Super_Collider" now yields
+        # "super" and "collider" as separate significant words instead of one
+        # glued token.
+        words = fold_punctuation_for_comparison(album_title.lower()).split()
         significant_words = [w for w in words if len(w) > 3 and w not in STOPWORDS]
 
         if significant_words:

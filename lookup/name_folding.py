@@ -15,6 +15,20 @@ and ``server_timing_legs.py``). The concern is genuinely shared — both
 consume it, and keeping the policy in one place is what stops them drifting on
 what counts as the same artist.
 
+LML#1257 widened the consumer set from the artist axis to album and track
+title folding — ``lookup/strategies/artist_plus_album.py``,
+``track_on_compilation.py`` and ``track_release_matching.py`` had each grown
+their own copy of the pre-LML#1244 inline regex (``re.sub(r"[^\\w\\s]", " ",
+...)``), which folds every punctuation character *except* ``_`` since
+Python's ``\\w`` treats it as a word character. Routing them through this
+module's ``_`` handling is a real behavior change on those axes, not a
+no-op refactor: it now also folds the 7 catalog album titles and 8 catalog
+artist names that contain ``_`` (measured against the real ``library.db``,
+2026-08-22). ``discogs/matching.py``'s ``normalize_for_track_comparison``
+was surveyed and deliberately NOT adopted — it strips punctuation to the
+empty string rather than to a space, and that difference is load-bearing
+for its tracklist-validation consumers; see that function's own docstring.
+
 Deliberately NOT delegated to ``wxyc_etl.text.to_identity_match_form_with_punctuation``,
 the crate's nearest primitive, even though it agrees with this fold on almost
 every catalog name. That export bundles three steps — fold punctuation, strip
