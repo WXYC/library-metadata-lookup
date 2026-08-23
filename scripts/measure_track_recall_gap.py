@@ -71,19 +71,17 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sqlite3
-from dataclasses import asdict, dataclass, field
+import sys
+from dataclasses import asdict, dataclass
 
 import asyncpg
+from dotenv import load_dotenv
 from wxyc_etl.text import is_compilation_artist
 
 from clients.streaming.matching import find_best_typed_match
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
 log = logging.getLogger("measure_track_recall_gap")
 
 DEFAULT_LIBRARY_DB_PATH = "library.db"
@@ -156,18 +154,43 @@ class ShelfCensus:
     comp_shelf_naive_like_count: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReleaseCandidate:
-    """One Discogs release credited (``extra=0``) to a name matching a library artist."""
+    """One Discogs release credited (``extra=0``) to a name matching a library artist.
+
+    ``slots=True`` is not incidental. This library's artist-shelf names match
+    3.8M candidate rows against the full dump, all held live for the whole
+    resolve pass; slotting plus the ``sys.intern`` on ``artist_name`` in
+    ``find_exact_artist_candidates`` takes the structure from ~940 MB to
+    ~620 MB. This is the only structure in the script that scales with the
+    dump rather than with the library.
+    """
 
     release_id: int
     title: str
     artist_name: str
 
 
+#: The report's derived figures, in the order a reader meets them. One roster
+#: so ``to_dict`` cannot forget a property and the tests have a single list to
+#: parametrize over -- a fifth derived figure is added here and nowhere else.
+DERIVED_HEADLINE_KEYS = (
+    "could_gain_recall_no_new_collection",
+    "would_need_new_collection",
+    "artist_shelf_without_exact_artist_match",
+    "artist_shelf_matched_but_below_floor",
+)
+
+
 @dataclass(frozen=True)
 class GapCensusReport:
-    """The full LML#1264 measurement, ready to render or serialize."""
+    """The full LML#1264 measurement, ready to render or serialize.
+
+    Measured counts only. The methodology caveats
+    (``DOCUMENTED_PIN_COVERAGE_NOTE``, ``TRACKLIST_CHECK_CAVEAT``) are not
+    fields: they describe how to read the numbers rather than being numbers,
+    and ``to_dict`` attaches them alongside the other derived annotations.
+    """
 
     total_library_rows: int
     comp_shelf_count: int
@@ -177,8 +200,6 @@ class GapCensusReport:
     artist_shelf_with_resolvable_release: int
     artist_shelf_with_cached_tracklist: int
     discogs_source: str | None
-    pin_coverage_note: str = field(default=DOCUMENTED_PIN_COVERAGE_NOTE)
-    tracklist_check_caveat: str = field(default=TRACKLIST_CHECK_CAVEAT)
 
     @property
     def discogs_leg_ran(self) -> bool:
@@ -223,39 +244,57 @@ class GapCensusReport:
         return self.artist_shelf_with_exact_artist_match - self.artist_shelf_with_resolvable_release
 
     def to_dict(self) -> dict:
-        """Serialize, without ever emitting a headline the run did not measure.
+        """Serialize the measurement together with the caveats that make it readable.
 
-        A library-only run (no ``--discogs-url``) leaves items 2-4 at zero.
-        Serializing the derived headline from those zeroes would tell a reader
-        who meets the JSON without the console output that NOTHING is
-        resolvable -- a measured-looking finding where nothing was tested. The
-        headline keys go to ``None`` behind an explicit ``discogs_measurement``
-        marker instead. Same argument as ``TRACKLIST_CHECK_CAVEAT``: the
-        artifact outlives the run that produced it.
+        Two things this deliberately will not do. It will not emit a headline
+        the run did not measure: a library-only run (no ``--discogs-url``)
+        leaves items 2-4 at zero, and serializing the derived headline off
+        those zeroes would tell a reader who meets the JSON without the console
+        output that NOTHING is resolvable, a measured-looking finding where
+        nothing was tested. And it will not attach the tracklist caveat to a
+        run that ran no tracklist check. The artifact outlives the run that
+        produced it, so every number in it has to carry its own reading
+        instructions -- and no reading instructions for a number that isn't
+        there.
         """
         out = asdict(self)
         out["discogs_measurement"] = "measured" if self.discogs_leg_ran else "skipped"
-        out["could_gain_recall_no_new_collection"] = self.could_gain_recall_no_new_collection
-        out["would_need_new_collection"] = self.would_need_new_collection
-        out["artist_shelf_without_exact_artist_match"] = (
-            self.artist_shelf_without_exact_artist_match
-        )
-        out["artist_shelf_matched_but_below_floor"] = self.artist_shelf_matched_but_below_floor
+        out.update({key: getattr(self, key) for key in DERIVED_HEADLINE_KEYS})
+        out["pin_coverage_note"] = DOCUMENTED_PIN_COVERAGE_NOTE
+        if self.discogs_leg_ran:
+            out["tracklist_check_caveat"] = TRACKLIST_CHECK_CAVEAT
         return out
 
 
 def load_library_rows(db_path: str) -> list[LibraryRow]:
-    """Read every ``(id, artist, title, alternate_artist_name)`` row out of ``library.db``."""
+    """Read every ``(id, artist, title, alternate_artist_name)`` row out of ``library.db``.
+
+    ``alternate_artist_name`` is introspected rather than assumed, mirroring
+    ``library/db.py::LibraryDB.connect``'s own ``PRAGMA table_info`` check (and
+    ``scripts/measure_artwork_match_floor.py``, which does the same). Older ETL
+    snapshots predate the column; against one of those the census degrades to
+    an artist-column-only measurement -- narrower, and logged as such -- rather
+    than dying on an ``OperationalError`` a long way into a run.
+    """
     con = sqlite3.connect(db_path)
     try:
         con.row_factory = sqlite3.Row
-        cur = con.execute("SELECT id, artist, title, alternate_artist_name FROM library")
+        columns = {row["name"] for row in con.execute("PRAGMA table_info(library)")}
+        has_alternate = "alternate_artist_name" in columns
+        if not has_alternate:
+            log.warning(
+                "library.db has no alternate_artist_name column -- matching on the artist "
+                "column alone. This UNDERSTATES resolvable rows relative to the real prod "
+                "cache filter; see artist_variants."
+            )
+        selected = "id, artist, title" + (", alternate_artist_name" if has_alternate else "")
+        cur = con.execute(f"SELECT {selected} FROM library")
         return [
             LibraryRow(
                 id=row["id"],
                 artist=row["artist"] or "",
                 title=row["title"] or "",
-                alternate_artist=row["alternate_artist_name"] or "",
+                alternate_artist=(row["alternate_artist_name"] or "") if has_alternate else "",
             )
             for row in cur.fetchall()
         ]
@@ -322,17 +361,23 @@ async def find_exact_artist_candidates(
     Mirrors ``scripts/build_filtered_discogs.py``'s Phase 1 cache-build
     filter (case-folded, 200-char-truncated exact match) -- the same
     predicate the real prod discogs-cache build uses, run here against
-    whatever database ``conn`` is connected to -- including its index on
-    ``lower(name)``, without which the join degrades to a sequential scan on
-    a full dump. ``artist_names`` should be the union of both library artist
-    columns (see ``artist_variants``). Grouped by the ORIGINAL library artist
-    string (not lower-cased), so callers can look candidates up by variant
-    directly.
+    whatever database ``conn`` is connected to. ``artist_names`` should be the
+    union of both library artist columns (see ``artist_variants``). Grouped by
+    the ORIGINAL library artist string (not lower-cased), so callers can look
+    candidates up by variant directly.
 
-    Streams via a server-side cursor inside a transaction rather than
-    ``conn.fetch``: against an unfiltered dump the artist x release product
-    is large enough that buffering the whole result before building the dict
-    doubles peak memory for no benefit.
+    Streams via a server-side cursor rather than ``conn.fetch``, which avoids
+    buffering the whole result set before building the dict. Note this bounds
+    the *transient* copy only: the returned dict itself holds every candidate
+    (3.8M of them for this library against the full dump, ~620 MB after
+    ``ReleaseCandidate.__slots__`` and the interning below), and nothing bounds
+    that. Slicing ``artist_names`` is the seam if it ever needs bounding.
+
+    ``sys.intern`` on the credit name is worth ~125 MB: asyncpg hands back a
+    fresh ``str`` per row, but the 3.8M rows carry only ~20.5k distinct credits
+    (187x repetition), and the interned name is what
+    ``find_best_typed_match`` reads on every one of the resolve pass's
+    scorings.
     """
     if not artist_names:
         return {}
@@ -341,9 +386,11 @@ async def find_exact_artist_candidates(
     await conn.copy_records_to_table(
         "census_artists", records=[(a,) for a in artist_names], columns=["name"]
     )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_census_artists ON census_artists (lower(name))"
-    )
+    # Load-bearing, unlike the lower(name) index build_filtered_discogs.py
+    # creates here: EXPLAIN against the full dump shows census_artists is
+    # seq-scanned into the hash side either way (it is always the small
+    # relation), so that index is dead -- but ANALYZE is what supplies the
+    # row estimate that keeps it on the small side.
     await conn.execute("ANALYZE census_artists")
     grouped: dict[str, list[ReleaseCandidate]] = {}
     async with conn.transaction():
@@ -352,7 +399,7 @@ async def find_exact_artist_candidates(
                 ReleaseCandidate(
                     release_id=row["release_id"],
                     title=row["release_title"],
-                    artist_name=row["discogs_artist_name"],
+                    artist_name=sys.intern(row["discogs_artist_name"]),
                 )
             )
     return grouped
@@ -386,9 +433,7 @@ def resolve_release_for_row(
 async def find_tracklist_release_ids(conn: asyncpg.Connection, release_ids: list[int]) -> set[int]:
     """Which of ``release_ids`` carry at least one ``release_track`` row.
 
-    Read the result through ``TRACKLIST_CHECK_CAVEAT``: against an unfiltered
-    Discogs dump this predicate is true of essentially every release, so it
-    cannot discriminate and its ~100% answer is not evidence of coverage.
+    Read the result through ``TRACKLIST_CHECK_CAVEAT``.
     """
     if not release_ids:
         return set()
@@ -404,42 +449,46 @@ async def measure_discogs_side(
     Matches on the union of both library artist columns, as the real prod
     cache-build filter does -- see ``artist_variants``.
     """
-    distinct_artists = sorted({name for row in artist_shelf for name in artist_variants(row)})
+    variants_by_row = [artist_variants(row) for row in artist_shelf]
+    distinct_artists = sorted({name for variants in variants_by_row for name in variants})
     log.info("Matching %d distinct artist-shelf artist names...", len(distinct_artists))
     candidates_by_artist = await find_exact_artist_candidates(conn, distinct_artists)
-    exact_artist_match_count = sum(
-        1 for row in artist_shelf if any(n in candidates_by_artist for n in artist_variants(row))
-    )
     log.info(
         "%d/%d distinct artists have an exact-case-folded Discogs match",
         len(candidates_by_artist),
         len(distinct_artists),
     )
 
-    resolved: dict[int, ReleaseCandidate] = {}
-    for i, row in enumerate(artist_shelf, start=1):
-        candidates = [c for n in artist_variants(row) for c in candidates_by_artist.get(n, [])]
+    # One pass. A row is in ``candidates_by_artist`` under some variant exactly
+    # when that variant yielded at least one candidate, so "has an exact artist
+    # match" is just "this row's candidate list is non-empty" -- counting it
+    # here rather than in a second sweep keeps the two from drifting apart.
+    exact_artist_match_count = 0
+    resolved_release_ids: list[int] = []
+    for i, (row, variants) in enumerate(zip(artist_shelf, variants_by_row, strict=True), start=1):
+        candidates = [c for name in variants for c in candidates_by_artist.get(name, [])]
+        if candidates:
+            exact_artist_match_count += 1
         match = resolve_release_for_row(row, candidates)
         if match is not None:
-            resolved[row.id] = match
+            resolved_release_ids.append(match.release_id)
         if i % 5000 == 0:
             log.info("Resolved %d/%d artist-shelf rows so far...", i, len(artist_shelf))
     log.info(
         "Resolved %d/%d artist-shelf rows to a specific release at the 80/80 floor",
-        len(resolved),
+        len(resolved_release_ids),
         len(artist_shelf),
     )
 
-    release_ids = sorted({match.release_id for match in resolved.values()})
-    tracklisted_ids = await find_tracklist_release_ids(conn, release_ids)
-    with_tracklist = sum(1 for match in resolved.values() if match.release_id in tracklisted_ids)
+    tracklisted_ids = await find_tracklist_release_ids(conn, sorted(set(resolved_release_ids)))
+    with_tracklist = sum(1 for rid in resolved_release_ids if rid in tracklisted_ids)
     log.info(
         "%d/%d resolved releases carry a cached tracklist -- %s",
         with_tracklist,
-        len(resolved),
+        len(resolved_release_ids),
         TRACKLIST_CHECK_CAVEAT,
     )
-    return exact_artist_match_count, len(resolved), with_tracklist
+    return exact_artist_match_count, len(resolved_release_ids), with_tracklist
 
 
 async def build_report(library_db: str, discogs_url: str | None) -> GapCensusReport:
@@ -487,17 +536,30 @@ async def build_report(library_db: str, discogs_url: str | None) -> GapCensusRep
     )
 
 
+def _render_lines(lines: list[str | tuple[str, int | None]]) -> str:
+    """Render prose lines as-is and ``(label, value)`` pairs into one aligned column.
+
+    The column width is derived from the labels actually present, so adding or
+    renaming a row can't silently misalign the table -- the failure mode of the
+    hand-padded f-strings this replaced.
+    """
+    width = max((len(line[0]) for line in lines if isinstance(line, tuple)), default=0)
+    return "\n".join(
+        line if isinstance(line, str) else f"{line[0]:<{width + 2}}{line[1]:>8,}" for line in lines
+    )
+
+
 def render_report(report: GapCensusReport) -> str:
     """Console-friendly summary. Every Discogs-sourced number is labeled
     an upper bound; the pin-coverage figure is labeled as documented,
     not measured."""
-    lines = [
+    lines: list[str | tuple[str, int | None]] = [
         "LML#1264 track-recall gap census",
         "=================================",
-        f"Total library rows:        {report.total_library_rows:>8,}",
-        f"Comp-shelf (classifier):   {report.comp_shelf_count:>8,}",
-        f"  (naive LIKE heuristic:   {report.comp_shelf_naive_like_count:>8,})",
-        f"Artist-shelf:              {report.artist_shelf_count:>8,}",
+        ("Total library rows:", report.total_library_rows),
+        ("Comp-shelf (classifier):", report.comp_shelf_count),
+        ("  same, by the naive LIKE heuristic:", report.comp_shelf_naive_like_count),
+        ("Artist-shelf:", report.artist_shelf_count),
         "",
     ]
     if not report.discogs_leg_ran:
@@ -508,26 +570,32 @@ def render_report(report: GapCensusReport) -> str:
                 f"Discogs source: {report.discogs_source}",
                 "UPPER BOUND -- computed against an unfiltered Discogs dump, not the",
                 "filtered prod discogs-cache; see the module docstring's TRAP note.",
-                f"  exact-artist-match:      {report.artist_shelf_with_exact_artist_match:>8,}",
-                f"  resolvable (80/80 floor):{report.artist_shelf_with_resolvable_release:>8,}",
-                f"  + cached tracklist:      {report.artist_shelf_with_cached_tracklist:>8,}",
-                f"    ^ {report.tracklist_check_caveat}",
+                ("  exact-artist-match:", report.artist_shelf_with_exact_artist_match),
+                ("  resolvable (80/80 floor):", report.artist_shelf_with_resolvable_release),
+                ("  + cached tracklist:", report.artist_shelf_with_cached_tracklist),
+                f"    ^ {TRACKLIST_CHECK_CAVEAT}",
                 "",
-                f"Headline (UPPER BOUND): could gain recall, no new collection: "
-                f"{report.could_gain_recall_no_new_collection:,}",
-                f"                        would need new collection:            "
-                f"{report.would_need_new_collection:,}",
+                "Headline (UPPER BOUND):",
+                (
+                    "  could gain recall, no new collection:",
+                    report.could_gain_recall_no_new_collection,
+                ),
+                ("  would need new collection:", report.would_need_new_collection),
                 "",
-                "The 'would need new collection' rows are two populations, two remedies:",
-                f"  no Discogs release under any of their artist names: "
-                f"{report.artist_shelf_without_exact_artist_match:,}",
-                f"  matched an artist, no title cleared the floor:      "
-                f"{report.artist_shelf_matched_but_below_floor:,}",
+                "...and those 'would need new collection' rows are two populations, two remedies:",
+                (
+                    "  no Discogs release under any of their artist names:",
+                    report.artist_shelf_without_exact_artist_match,
+                ),
+                (
+                    "  matched an artist, no title cleared the floor:",
+                    report.artist_shelf_matched_but_below_floor,
+                ),
             ]
         )
     lines.append("")
-    lines.append(f"Pin coverage (documented, NOT measured here): {report.pin_coverage_note}")
-    return "\n".join(lines)
+    lines.append(f"Pin coverage (documented, NOT measured here): {DOCUMENTED_PIN_COVERAGE_NOTE}")
+    return _render_lines(lines)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -557,8 +625,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 async def run(args: argparse.Namespace) -> GapCensusReport:
-    import os
-
     discogs_url = args.discogs_url or os.environ.get("DATABASE_URL_DISCOGS")
     try:
         report = await build_report(args.library_db, discogs_url)
@@ -574,8 +640,13 @@ async def run(args: argparse.Namespace) -> GapCensusReport:
 
 
 def main() -> None:
-    from dotenv import load_dotenv
-
+    # Configured here, not at import time: importing this module for its pure
+    # helpers (the unit suite does) must not reconfigure root logging.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
     load_dotenv()
     args = parse_args()
     asyncio.run(run(args))
