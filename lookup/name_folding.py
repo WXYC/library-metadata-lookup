@@ -1,4 +1,4 @@
-"""Punctuation policy for artist-name comparison (LML#1244).
+"""Punctuation policy for name comparison, and for query building (LML#1244).
 
 ``normalize_for_comparison`` (``wxyc_etl.text.to_match_form``) lowercases and
 folds diacritics but *preserves punctuation*, so a catalog row filed
@@ -44,11 +44,12 @@ one is ever added, this module should delegate to it — that is the intended
 end state, not a permanent fork.
 
 Deliberately NOT merged with :func:`library.db._fts_normalize` either, which folds
-punctuation to a space for the same reason but at a different fidelity: it is
-ASCII-only because the FTS5/LIKE tokenizers it feeds are, and it leaves
+punctuation to a space for the same reason but at a third, lower resolution: it
+is ASCII-only because the FTS5/LIKE tokenizers it feeds are, and it leaves
 whitespace runs uncollapsed because both its callers ``.split()`` the result.
 Routing an artist name through that class would erase a CJK or Cyrillic name to
-whitespace entirely ("少年ナイフ" -> five spaces). Same concept, two fidelities.
+whitespace entirely ("少年ナイフ" -> five spaces). Note it folds ``_``, which is
+what lets :func:`fold_punctuation_for_query_tokens` decline to.
 """
 
 import re
