@@ -23,7 +23,8 @@ coverage census answering:
    ``clients/streaming/matching.py::find_best_typed_match`` already applies
    at request time for artwork resolution (LML#478).
 3. Of those, how many have a cached tracklist (``release_track`` rows)
-   available at all.
+   available at all. **Against an unfiltered Discogs source this check is
+   non-discriminating** -- see the second TRAP below.
 4. The headline: how many artist-shelf rows could gain track-level recall
    with **no new data collection**, vs. how many would need some (a new
    Discogs match, a new override pin, or new track data upstream).
@@ -40,6 +41,19 @@ only in the shared prod discogs-cache Postgres; this script does not query
 prod (out of scope, needs explicit approval), so pin coverage is reported
 from the documented code comment in ``identity/bulk_resolve.py`` --
 NOT independently re-measured here.
+
+SECOND TRAP, specific to item 3: run against an unfiltered dump, the
+tracklist-presence check has no discriminating power. Practically every
+release in a full Discogs dump carries ``release_track`` rows (19,341,286 of
+19,341,287 in the 2026-08 local ``discogs_full``), so item 3 will report ~100%
+of item 2 no matter what the real state of track data is. That is not the
+"tracklist availability is solved" finding it superficially resembles -- the
+proposition was never tested. It is *not* a circular join (the item-2
+candidate SQL never touches ``release_track``); the check is simply vacuous
+at this source. The constraint that actually binds is whether a release is
+present in the **filtered prod discogs-cache at all**, and this script
+deliberately does not measure that -- prod access is out of scope. Read item
+3 as "no upstream track-data gap blocks these rows," never as coverage.
 
 Usage:
     uv run python -m scripts.measure_track_recall_gap \\
@@ -83,6 +97,17 @@ DOCUMENTED_PIN_COVERAGE_NOTE = (
     "non-compilation coverage. Both figures are quoted from committed code/prior "
     "work, NOT re-derived by this script -- verifying them directly needs prod "
     "discogs-cache access, which is out of this script's scope."
+)
+
+# Travels with the tracklist figure everywhere it is rendered or serialized,
+# because that figure's most likely misreading ("~100%, so track data is
+# solved") is also its most damaging one. See the module docstring's SECOND
+# TRAP for the underlying count.
+TRACKLIST_CHECK_CAVEAT = (
+    "NON-DISCRIMINATING against an unfiltered Discogs source -- nearly every release in a "
+    "full dump carries release_track rows, so this tracks item 2 whatever the real state of "
+    "track data. Not a coverage finding. The constraint that actually binds is membership in "
+    "the FILTERED prod discogs-cache, which this script does not measure."
 )
 
 # The exact-match predicate mirrors scripts/build_filtered_discogs.py's own
@@ -145,6 +170,7 @@ class GapCensusReport:
     artist_shelf_with_cached_tracklist: int
     discogs_source: str | None
     pin_coverage_note: str = field(default=DOCUMENTED_PIN_COVERAGE_NOTE)
+    tracklist_check_caveat: str = field(default=TRACKLIST_CHECK_CAVEAT)
 
     @property
     def could_gain_recall_no_new_collection(self) -> int:
@@ -261,7 +287,12 @@ def resolve_release_for_row(
 
 
 async def find_tracklist_release_ids(conn: asyncpg.Connection, release_ids: list[int]) -> set[int]:
-    """Which of ``release_ids`` carry at least one ``release_track`` row."""
+    """Which of ``release_ids`` carry at least one ``release_track`` row.
+
+    Read the result through ``TRACKLIST_CHECK_CAVEAT``: against an unfiltered
+    Discogs dump this predicate is true of essentially every release, so it
+    cannot discriminate and its ~100% answer is not evidence of coverage.
+    """
     if not release_ids:
         return set()
     rows = await conn.fetch(_TRACKLIST_PRESENCE_SQL, release_ids)
@@ -298,7 +329,12 @@ async def measure_discogs_side(
     release_ids = sorted({match.release_id for match in resolved.values()})
     tracklisted_ids = await find_tracklist_release_ids(conn, release_ids)
     with_tracklist = sum(1 for match in resolved.values() if match.release_id in tracklisted_ids)
-    log.info("%d/%d resolved releases carry a cached tracklist", with_tracklist, len(resolved))
+    log.info(
+        "%d/%d resolved releases carry a cached tracklist -- %s",
+        with_tracklist,
+        len(resolved),
+        TRACKLIST_CHECK_CAVEAT,
+    )
     return exact_artist_match_count, len(resolved), with_tracklist
 
 
@@ -371,6 +407,7 @@ def render_report(report: GapCensusReport) -> str:
                 f"  exact-artist-match:      {report.artist_shelf_with_exact_artist_match:>8,}",
                 f"  resolvable (80/80 floor):{report.artist_shelf_with_resolvable_release:>8,}",
                 f"  + cached tracklist:      {report.artist_shelf_with_cached_tracklist:>8,}",
+                f"    ^ {report.tracklist_check_caveat}",
                 "",
                 f"Headline (UPPER BOUND): could gain recall, no new collection: "
                 f"{report.could_gain_recall_no_new_collection:,}",

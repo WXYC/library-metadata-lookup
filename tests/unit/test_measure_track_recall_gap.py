@@ -11,6 +11,7 @@ import sqlite3
 
 from scripts.measure_track_recall_gap import (
     DOCUMENTED_PIN_COVERAGE_NOTE,
+    TRACKLIST_CHECK_CAVEAT,
     GapCensusReport,
     LibraryRow,
     ReleaseCandidate,
@@ -142,29 +143,33 @@ class TestResolveReleaseForRow:
         assert result == right
 
 
-class TestGapCensusReport:
-    def _report(self, **overrides) -> GapCensusReport:
-        defaults = {
-            "total_library_rows": 100,
-            "comp_shelf_count": 10,
-            "comp_shelf_naive_like_count": 9,
-            "artist_shelf_count": 90,
-            "artist_shelf_with_exact_artist_match": 60,
-            "artist_shelf_with_resolvable_release": 50,
-            "artist_shelf_with_cached_tracklist": 40,
-            "discogs_source": "postgresql://localhost/discogs_full",
-        }
-        defaults.update(overrides)
-        return GapCensusReport(**defaults)
+def _report(
+    *,
+    artist_shelf_with_cached_tracklist: int = 40,
+    discogs_source: str | None = "postgresql://localhost/discogs_full",
+) -> GapCensusReport:
+    """A census report with plausible fixed counts, varying only what a test asserts on."""
+    return GapCensusReport(
+        total_library_rows=100,
+        comp_shelf_count=10,
+        comp_shelf_naive_like_count=9,
+        artist_shelf_count=90,
+        artist_shelf_with_exact_artist_match=60,
+        artist_shelf_with_resolvable_release=50,
+        artist_shelf_with_cached_tracklist=artist_shelf_with_cached_tracklist,
+        discogs_source=discogs_source,
+    )
 
+
+class TestGapCensusReport:
     def test_headline_properties(self):
-        report = self._report()
+        report = _report()
 
         assert report.could_gain_recall_no_new_collection == 40
         assert report.would_need_new_collection == 50  # 90 - 40
 
     def test_to_dict_includes_derived_headline_fields(self):
-        report = self._report()
+        report = _report()
 
         as_dict = report.to_dict()
 
@@ -172,39 +177,41 @@ class TestGapCensusReport:
         assert as_dict["would_need_new_collection"] == 50
         assert as_dict["pin_coverage_note"] == DOCUMENTED_PIN_COVERAGE_NOTE
 
+    def test_to_dict_carries_the_tracklist_caveat(self):
+        """A serialized report must travel with the reason its tracklist figure
+        cannot be read as coverage -- a JSON file outlives the console run that
+        produced it, and a bare ``artist_shelf_with_cached_tracklist`` equal to
+        ``artist_shelf_with_resolvable_release`` reads as "solved" otherwise.
+        """
+        assert _report().to_dict()["tracklist_check_caveat"] == TRACKLIST_CHECK_CAVEAT
+
 
 class TestRenderReport:
     def test_labels_discogs_numbers_as_upper_bound(self):
-        report = GapCensusReport(
-            total_library_rows=100,
-            comp_shelf_count=10,
-            comp_shelf_naive_like_count=9,
-            artist_shelf_count=90,
-            artist_shelf_with_exact_artist_match=60,
-            artist_shelf_with_resolvable_release=50,
-            artist_shelf_with_cached_tracklist=40,
-            discogs_source="postgresql://localhost/discogs_full",
-        )
-
-        text = render_report(report)
+        text = render_report(_report())
 
         assert "UPPER BOUND" in text
         assert "postgresql://localhost/discogs_full" in text
         assert DOCUMENTED_PIN_COVERAGE_NOTE in text
 
-    def test_notes_skip_when_no_discogs_source(self):
-        report = GapCensusReport(
-            total_library_rows=100,
-            comp_shelf_count=10,
-            comp_shelf_naive_like_count=9,
-            artist_shelf_count=90,
-            artist_shelf_with_exact_artist_match=0,
-            artist_shelf_with_resolvable_release=0,
-            artist_shelf_with_cached_tracklist=0,
-            discogs_source=None,
-        )
+    def test_marks_the_tracklist_line_non_discriminating(self):
+        """The tracklist check cannot fail against an unfiltered dump -- nearly
+        every release in a full Discogs dump carries ``release_track`` rows --
+        so its figure must never be rendered as a bare coverage finding. The
+        rendered output has to say that, and has to name the constraint that
+        really binds (membership in the filtered prod discogs-cache) as the one
+        this script does not measure.
+        """
+        # The exact shape the real census produced: every resolvable row also
+        # tracklisted, which is the reading most likely to be mistaken for
+        # "solved" if it is rendered without the caveat.
+        text = render_report(_report(artist_shelf_with_cached_tracklist=50))
 
-        text = render_report(report)
+        assert "NON-DISCRIMINATING" in text
+        assert TRACKLIST_CHECK_CAVEAT in text
+
+    def test_notes_skip_when_no_discogs_source(self):
+        text = render_report(_report(artist_shelf_with_cached_tracklist=0, discogs_source=None))
 
         assert "SKIPPED" in text
         assert "UPPER BOUND" not in text
