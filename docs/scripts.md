@@ -529,6 +529,27 @@ uv run --extra drain python -m scripts.ytm_coverage_drain \
   --report-json /tmp/ytm_drain_report.json
 ```
 
+## Artist-Correction Measurement (`scripts/measure_artist_correction.py`)
+
+Measures `LibraryDB.find_similar_artist` on the two axes it trades between, for LML#1245. Committed rather than run ad hoc because the number it produces is the whole argument for the change, and a reviewer has to be able to re-derive it — five measurement designs in this repo have now been wrong in the same way, and three PRs open at once in August 2026 publicly contradicted each other about a fourth's figures.
+
+**Each side of each comparison declares its own runtime source.** That is the property the script exists to enforce, not a nicety:
+
+- *Precision* — catalog side is half of `library.db` (partitioned by md5 of the name, so the split is deterministic); query side is real artist names from the **other** half. Every probe is an artist the pool genuinely does not contain, so any non-`None` answer is a false correction. Sampling both sides from the same half is exactly what made PR #1249's original sweep report "Regressions: 0": with the true match always present, the failure class cannot occur.
+- *Recall* — catalog side is that same half; query side is **synthetic**, one keyboard-adjacent substitution, deletion or transposition applied to a catalog name of 6+ characters, discarding any mutation that collides with a real catalog name. This is a modelling assumption and the weakest part of the measurement. Production carries no query text — `lookup_completed` has `had_artist`/`had_album`/`had_song` as booleans, no string, not even a hash — so the real typo distribution is unobservable. Read every recall figure as "under this corpus".
+
+Both axes drive the real `find_similar_artist` over a real SQLite catalog, so nothing here forks a production predicate and there is no copy to drift. That is a better answer to the parity requirement than a parity test.
+
+```bash
+uv run python -m scripts.measure_artist_correction --library-db library.db
+uv run python -m scripts.measure_artist_correction --sweep            # margin x edit-cap grid
+uv run python -m scripts.measure_artist_correction --distance levenshtein
+```
+
+Copy the script into a checkout that predates the guards and it prints a single baseline row instead of a grid — that is how the `main` comparison is produced, and it is the only comparison worth making, because a figure measured against a differently-shaped pool is not comparable.
+
+**Known gap.** No local `library.db` carries a `compilation_track_artist` table. Production ships ~58k CTA credits and V/A shelf credits are the densest neighbourhoods in the catalog, so they stress the margin guard hardest. The script prints a warning and every figure it produces is an optimistic bound on that guard's workload. LML#1245's pre-merge condition 1 is not dischargeable until a CTA-bearing snapshot exists.
+
 ## Track-Recall Gap Census (`scripts/measure_track_recall_gap.py`)
 
 Measurement-only coverage census for [LML#1264](https://github.com/WXYC/library-metadata-lookup/issues/1264)'s acceptance criterion #1: "the gap is measured before it is fixed." LML has track-level recall for exactly two cases — V/A compilations (`lml_cache.compilation_track_location`) and songs with no artist (`SONG_AS_TRACK`) — so a track on a single-artist release, requested with its artist, is unreachable. This script writes nothing and touches no matcher, strategy, or `/lookup` behavior; it answers "how big is the hole."

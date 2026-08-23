@@ -1,5 +1,6 @@
 """Unit tests for library/db.py."""
 
+import asyncio
 import logging
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,10 +9,13 @@ import aiosqlite
 import pytest
 
 from library.db import (
+    _ARTIST_CORRECTION_DISTANCE,
     LIBRARY_FTS_CREATE_SQL,
     LibraryDB,
+    _artist_correction_edit_cap,
     _fts_normalize,
     _to_fts_match_query,
+    clear_library_caches,
 )
 
 # ---------------------------------------------------------------------------
@@ -710,26 +714,20 @@ class TestFindSimilarArtist:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_correction_found(self):
-        db = LibraryDB()
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchall = AsyncMock(return_value=[("Living Colour",)])
+    async def test_correction_found(self, tmp_path):
+        """Built through ``connect()`` rather than by assigning ``_conn``.
 
-        # Make rows subscriptable
-        class FakeRow:
-            def __init__(self, val):
-                self.val = val
-
-            def __getitem__(self, idx):
-                return self.val
-
-        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Living Colour")])
-        db._conn = AsyncMock()
-        db._conn.execute = AsyncMock(return_value=mock_cursor)
-        mock_cursor.fetchone = AsyncMock(return_value=None)
-
-        result = await db.find_similar_artist("Living Color")
-        assert result == "Living Colour"
+        LML#1245 moved candidate generation from a per-call SQL query to the
+        connect-time pool, so a ``LibraryDB`` handed a mock connection has no
+        pool, is not ``usable``, and correctly declines to correct. A mocked
+        fetchall no longer stands in for a catalog.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Nilufer Yanya", "Sessa"])
+        try:
+            assert await db.find_similar_artist("Nilufer Yanyaa") == "Nilufer Yanya"
+        finally:
+            await db.close()
 
     @pytest.mark.asyncio
     async def test_exact_match_returns_none(self):
@@ -753,24 +751,26 @@ class TestFindSimilarArtist:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_skips_none_candidates(self):
-        db = LibraryDB()
+    async def test_null_source_values_do_not_reach_the_pool(self, tmp_path):
+        """A NULL in an optional source column is filtered at build time.
 
-        class FakeRow:
-            def __init__(self, val):
-                self.val = val
-
-            def __getitem__(self, idx):
-                return self.val
-
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow(None), FakeRow("Radiohead")])
-        db._conn = AsyncMock()
-        db._conn.execute = AsyncMock(return_value=mock_cursor)
-        mock_cursor.fetchone = AsyncMock(return_value=None)
-
-        result = await db.find_similar_artist("Radiohed")
-        assert result == "Radiohead"
+        Previously asserted on a mocked row set containing ``None``; the
+        exclusion now happens in the pool build's ``IS NOT NULL``, so this
+        seeds a real catalog whose ``album_artist`` is NULL on one row and
+        checks the scan is unaffected.
+        """
+        clear_library_caches()
+        db = await _connected_db(
+            tmp_path,
+            ["Jessica Pratt", "Sessa"],
+            with_album_artist=True,
+            album_artists=[None, None],
+        )
+        try:
+            assert None not in db._artist_name_pool_names
+            assert await db.find_similar_artist("Jessica Prattt") == "Jessica Pratt"
+        finally:
+            await db.close()
 
     @pytest.mark.asyncio
     async def test_short_name_not_corrected_to_similar(self):
@@ -802,78 +802,53 @@ class TestFindSimilarArtist:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "misspelled, candidate, expected",
+        "misspelled, candidate",
         [
-            ("Living Color", "Living Colour", "Living Colour"),
-            ("Radiohed", "Radiohead", "Radiohead"),
+            ("Chuquimamani-Condor", "Chuquimamani-Condori"),
+            ("Hermanos Gutierez", "Hermanos Gutierrez"),
+            ("Duke Ellingtno", "Duke Ellington"),
         ],
     )
-    async def test_long_name_still_corrected(self, misspelled, candidate, expected):
-        """Regression guard: long names with typos are still corrected."""
-        db = LibraryDB()
+    async def test_long_name_still_corrected(self, tmp_path, misspelled, candidate):
+        """Regression guard: long names with typos are still corrected.
 
-        class FakeRow:
-            def __init__(self, val):
-                self.val = val
-
-            def __getitem__(self, idx):
-                return self.val
-
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow(candidate)])
-        db._conn = AsyncMock()
-        db._conn.execute = AsyncMock(return_value=mock_cursor)
-        mock_cursor.fetchone = AsyncMock(return_value=None)
-
-        result = await db.find_similar_artist(misspelled)
-        assert result == expected
+        Now over a real catalog -- the correction has to survive the LML#1245
+        margin and edit-cap guards, not just clear the ratio floor.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, [candidate, "Sessa"])
+        try:
+            assert await db.find_similar_artist(misspelled) == candidate
+        finally:
+            await db.close()
 
     @pytest.mark.asyncio
-    async def test_leading_article_skipped_for_candidate_prefix(self):
-        """Leading articles should not make the candidate query miss filed artist names."""
-        db = LibraryDB()
+    async def test_leading_article_query_still_reaches_a_filed_name(self, tmp_path):
+        """A query carrying a leading article still matches the filed form.
 
-        class FakeRow:
-            def __init__(self, val):
-                self.val = val
-
-            def __getitem__(self, idx):
-                return self.val
-
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Black Dog")])
-        db._conn = AsyncMock()
-        db._conn.execute = AsyncMock(return_value=mock_cursor)
-        mock_cursor.fetchone = AsyncMock(return_value=None)
-
-        result = await db.find_similar_artist("The Bleack Dog")
-
-        assert result == "Black Dog"
-        _, params = db._conn.execute.await_args.args
-        assert params == ["ble%", "%dog%", "the bleack dog", "bleack dog"]
-        assert "the%" not in params
+        This previously asserted on the LIKE parameter list -- ``["ble%",
+        "%dog%", ...]`` with no ``"the%"`` -- pinning the shape of a prefilter
+        LML#1245 deleted. What that prefilter existed to achieve is the
+        behaviour kept here: the article must not stop the query reaching a
+        catalog name filed without one. The full-pool scan gets this from the
+        second scoring axis rather than from candidate-term selection.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Black Dog", "Sessa"])
+        try:
+            assert await db.find_similar_artist("The Bleack Dog") == "Black Dog"
+        finally:
+            await db.close()
 
     @pytest.mark.asyncio
-    async def test_leading_article_exact_after_strip_is_not_corrected(self):
+    async def test_leading_article_exact_after_strip_is_not_corrected(self, tmp_path):
         """Exact matches after stripping an article should not mutate the parsed artist."""
-        db = LibraryDB()
-
-        class FakeRow:
-            def __init__(self, val):
-                self.val = val
-
-            def __getitem__(self, idx):
-                return self.val
-
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Black Dog")])
-        db._conn = AsyncMock()
-        db._conn.execute = AsyncMock(return_value=mock_cursor)
-        mock_cursor.fetchone = AsyncMock(return_value=None)
-
-        result = await db.find_similar_artist("The Black Dog")
-
-        assert result is None
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Black Dog", "Sessa"])
+        try:
+            assert await db.find_similar_artist("The Black Dog") is None
+        finally:
+            await db.close()
 
     @pytest.mark.asyncio
     async def test_exact_library_artist_short_circuits_before_candidate_search(self):
@@ -2007,54 +1982,60 @@ class TestLibraryDBSearchCache:
 
 
 class TestLibraryDBFindSimilarArtistCache:
-    @pytest.mark.asyncio
-    async def test_find_similar_artist_cache_hit(self):
-        """Second identical lookup should return cached result."""
-        db = LibraryDB()
+    """The per-process TTL cache in front of the scan.
 
-        class FakeRow:
-            def __init__(self, val):
-                self.val = val
-
-            def __getitem__(self, idx):
-                return self.val
-
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Living Colour")])
-        mock_cursor.fetchone = AsyncMock(return_value=None)
-        db._conn = AsyncMock()
-        db._conn.execute = AsyncMock(return_value=mock_cursor)
-
-        result1 = await db.find_similar_artist("Living Color")
-        result2 = await db.find_similar_artist("Living Color")
-
-        assert result1 == "Living Colour"
-        assert result1 == result2
-        # Two execute calls for the first (uncached) lookup, one for the
-        # second: a cache hit. This LibraryDB was built without
-        # adopt_connection, so its pool is not usable and the exact-check
-        # takes its SQL fallback -- exactly the pre-LML#1248 call count.
-        assert db._conn.execute.call_count == 2
+    Both tests previously counted ``_conn.execute`` calls on a mocked
+    connection. LML#1245 moved candidate generation off SQL entirely -- a
+    correction now issues no query at all -- so the call count no longer
+    distinguishes a cache hit from a miss. They count invocations of the
+    uncached scan instead, which is what the cache is actually there to
+    avoid, and run against a real catalog so the scan has something to find.
+    """
 
     @pytest.mark.asyncio
-    async def test_find_similar_artist_caches_none(self):
-        """None results (no correction) should also be cached."""
-        db = LibraryDB()
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchall = AsyncMock(return_value=[])
-        mock_cursor.fetchone = AsyncMock(return_value=None)
-        db._conn = AsyncMock()
-        db._conn.execute = AsyncMock(return_value=mock_cursor)
+    async def test_find_similar_artist_cache_hit(self, tmp_path):
+        """Second identical lookup returns the cached result without re-scanning."""
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Nilufer Yanya", "Sessa"])
+        try:
+            with patch.object(
+                LibraryDB,
+                "_find_similar_artist_uncached",
+                wraps=db._find_similar_artist_uncached,
+            ) as scan:
+                first = await db.find_similar_artist("Nilufer Yanyaa")
+                second = await db.find_similar_artist("Nilufer Yanyaa")
 
-        result1 = await db.find_similar_artist("Nonexistent")
-        result2 = await db.find_similar_artist("Nonexistent")
+            assert first == "Nilufer Yanya"
+            assert second == first
+            assert scan.await_count == 1
+        finally:
+            await db.close()
 
-        assert result1 is None
-        assert result2 is None
-        # See test_find_similar_artist_cache_hit above: two calls on the
-        # uncached lookup (SQL-fallback exact-check + candidate search), none
-        # on the second, which is a cache hit.
-        assert db._conn.execute.call_count == 2
+    @pytest.mark.asyncio
+    async def test_find_similar_artist_caches_none(self, tmp_path):
+        """A ``None`` verdict is cached too -- the expensive case to repeat.
+
+        A miss scores the whole pool and finds nothing, so it costs strictly
+        more than a hit, which can stop early. Caching only successes would
+        cache the cheap half.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Nilufer Yanya", "Sessa"])
+        try:
+            with patch.object(
+                LibraryDB,
+                "_find_similar_artist_uncached",
+                wraps=db._find_similar_artist_uncached,
+            ) as scan:
+                first = await db.find_similar_artist("Zzzqqx Nonexistent")
+                second = await db.find_similar_artist("Zzzqqx Nonexistent")
+
+            assert first is None
+            assert second is None
+            assert scan.await_count == 1
+        finally:
+            await db.close()
 
 
 class TestLibraryDBCacheInvalidation:
@@ -2443,3 +2424,328 @@ class TestGetItemsByIds:
 
         items = await db.get_items_by_ids([1, 2])
         assert items == {}
+
+
+# ---------------------------------------------------------------------------
+# LML#1245 -- full-pool correction with an edit-cap and a margin guard
+# ---------------------------------------------------------------------------
+
+
+async def _connected_db(tmp_path, artists, **kwargs):
+    """A ``LibraryDB`` over a real seeded catalog, connected the supported way.
+
+    Goes through ``adopt_connection`` rather than assigning ``_conn``, because
+    the correction path reads state that only ``adopt_connection`` derives --
+    a test that injects the connection exercises the degraded lane and proves
+    nothing about the fast one (LML#1248 review).
+    """
+    db_file = tmp_path / "test.db"
+    _create_library_db(db_file, artists, **kwargs)
+    db = LibraryDB(db_path=db_file)
+    await db.connect()
+    return db
+
+
+class TestFullPoolCandidateGeneration:
+    """The two candidate-generation defects LML#1245 was filed for.
+
+    Both live upstream of scoring: when the true match reached ``fuzz.ratio``
+    it won comfortably, so no threshold change could have reached either.
+    """
+
+    @pytest.mark.asyncio
+    async def test_match_not_anchored_to_the_start_of_the_stored_name(self, tmp_path):
+        """The old prefilter anchored ``'{first_word[:3]}%'`` to the string start.
+
+        "22 Pistepirkko" contributed no pattern at all -- "22" is two
+        characters -- so "22-Pistepirkko" was unreachable at any cap size.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["22-Pistepirkko", "Sessa", "Stereolab"])
+        try:
+            assert await db.find_similar_artist("22 Pistepirkko") == "22-Pistepirkko"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_true_match_beyond_the_old_hundred_row_cap(self, tmp_path):
+        """The old query sliced candidates at ``LIMIT 100`` in arbitrary order.
+
+        A multi-word query routinely generated thousands of candidates, and
+        the true match fell outside the slice. Here 150 decoys share the
+        "asa" prefix, so the true match cannot be in the first 100 rows by
+        storage order.
+        """
+        clear_library_caches()
+        decoys = [f"Asa Chang Tribute Band {i:03d}" for i in range(150)]
+        db = await _connected_db(tmp_path, [*decoys, "Asa-Chang and Junray"])
+        try:
+            assert await db.find_similar_artist("Asa Chang and Junray") == "Asa-Chang and Junray"
+        finally:
+            await db.close()
+
+
+class TestArtistCorrectionMarginGuard:
+    """The winner must beat the best *distinct* runner-up by a fixed margin.
+
+    A dense neighbourhood is exactly where a full-pool scan is most dangerous:
+    the scan reaches candidates the old prefilter never surfaced, and some of
+    them are genuinely different artists rather than spellings of one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_close_catalog_names_suppress_the_correction(self, tmp_path):
+        """Juana Molina and Juan Molina are different artists, both real.
+
+        A query one edit from the first and two from the second scores 91.7
+        and 87.0 -- a 4.7-point margin. The scan cannot tell which was meant,
+        so it must answer None rather than pick. This is the guard's cost as
+        well as its point: a genuine typo for "Juana Molina" is refused here
+        too.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Juana Molina", "Juan Molina", "Sessa"])
+        try:
+            assert await db.find_similar_artist("Juana Molino") is None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_an_isolated_winner_still_corrects(self, tmp_path):
+        """Same query shape, no close second: the correction fires.
+
+        The pairing with the test above is the whole evidence that the guard
+        keys on neighbourhood density rather than on the winner's own score --
+        the winner is identical in both.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Juana Molina", "Sessa", "Stereolab"])
+        try:
+            assert await db.find_similar_artist("Juana Molino") == "Juana Molina"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_the_same_name_in_two_sources_is_not_a_runner_up(self, tmp_path):
+        """A name reachable on both scoring axes, or from two columns, is one
+        candidate -- not a winner plus a runner-up that cancels it."""
+        clear_library_caches()
+        db = await _connected_db(
+            tmp_path,
+            ["Juana Molina", "Sessa"],
+            with_album_artist=True,
+            album_artists=["Juana Molina", None],
+        )
+        try:
+            assert await db.find_similar_artist("Juana Molino") == "Juana Molina"
+        finally:
+            await db.close()
+
+
+class TestArtistCorrectionEditCap:
+    """An absolute edit budget scaled to query length.
+
+    ``fuzz.ratio`` is length-relative, so a fixed ratio floor buys more
+    absolute error the longer the string: eight separate mistakes in a 50
+    character credit still scores 86. The cap is the lever ratio lacks.
+    """
+
+    @pytest.mark.parametrize(
+        "query_len,expected",
+        [(1, 1), (5, 1), (12, 1), (13, 2), (24, 2), (25, 3), (50, 5)],
+    )
+    def test_cap_scales_with_query_length_with_a_floor_of_one(self, query_len, expected):
+        assert _artist_correction_edit_cap("x" * query_len) == expected
+
+    @pytest.mark.parametrize(
+        "query,candidate,distance",
+        [
+            ("stereolab", "stereolba", 1),
+            ("jessica pratt", "jessica prtat", 1),
+        ],
+    )
+    def test_a_transposition_costs_one_edit_not_two(self, query, candidate, distance):
+        """The reason the cap is counted with OSA rather than Levenshtein.
+
+        Plain Levenshtein charges a transposition two edits -- a delete plus an
+        insert -- so a cap tight enough to be useful refuses a whole typo
+        class, and recall starts depending on the divisor for reasons
+        unrelated to how wrong the candidate is. Measured on prod-20260719 at
+        margin 6, tightening len/6 -> len/12 costs 93.1% -> 79.5% recall under
+        Levenshtein and nothing at all under OSA.
+        """
+        assert _ARTIST_CORRECTION_DISTANCE.distance(query, candidate) == distance
+
+    @pytest.mark.asyncio
+    async def test_a_high_ratio_winner_with_too_many_edits_is_refused(self, tmp_path):
+        """50 characters, eight substitutions: ratio 86.0, cap 7.
+
+        Clears the 85 floor and the margin guard, and is still refused --
+        eight independent errors is not a typo, whatever the ratio says.
+        """
+        clear_library_caches()
+        db = await _connected_db(
+            tmp_path,
+            ["Chuquimamani-Condori and Joshua Chuquimia Crampton", "Sessa"],
+        )
+        try:
+            garbled = "Chuudimsmaei-Candori ane Joshua thuquimia Clampton"
+            assert await db.find_similar_artist(garbled) is None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_the_same_long_name_with_one_edit_still_corrects(self, tmp_path):
+        """The paired control: length alone is not what the cap refuses."""
+        clear_library_caches()
+        canonical = "Chuquimamani-Condori and Joshua Chuquimia Crampton"
+        db = await _connected_db(tmp_path, [canonical, "Sessa"])
+        try:
+            typo = canonical.replace("Crampton", "Crampfon")
+            assert await db.find_similar_artist(typo) == canonical
+        finally:
+            await db.close()
+
+
+class TestArtistCorrectionInvariantsHold:
+    """The eleven pins from LML#1245's measurement, as behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_an_exact_library_artist_is_never_corrected(self, tmp_path):
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Juana Molina", "Juan Molina"])
+        try:
+            assert await db.find_similar_artist("Juana Molina") is None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_short_name_one_edit_away_is_not_snapped(self, tmp_path):
+        """The LML#626 canonical trap: "Plug" must not become "Plugz".
+
+        One edit, inside the cap. What refuses it is the short-name effective
+        threshold (92 for a four-character query), which predates this change
+        and is deliberately left alone.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Plugz", "Sessa"])
+        try:
+            assert await db.find_similar_artist("Plug") is None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_non_library_artist_is_not_corrected(self, tmp_path):
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Juana Molina", "Sessa", "Stereolab"])
+        try:
+            assert await db.find_similar_artist("Zzzqqx Nonexistent") is None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_single_edit_typo_still_corrects(self, tmp_path):
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Stereolab", "Sessa"])
+        try:
+            assert await db.find_similar_artist("Stereolb") == "Stereolab"
+        finally:
+            await db.close()
+
+
+class TestArtistCorrectionPoolDegradation:
+    """The degraded modes are ASYMMETRIC, and deliberately so.
+
+    Both consumers read one pool. Exact-existence fails **closed** to SQL,
+    because answering "not present" from an incomplete pool re-enables the
+    LML#857 wrong-artist corrections. Fuzzy correction degrades to **no
+    correction**, because the alternative -- scoring against a pool that is
+    missing names -- is how a query gets snapped onto the nearest survivor.
+    Neither may adopt the other's posture.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unusable_pool_suppresses_correction_rather_than_guessing(self, tmp_path):
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Stereolab", "Sessa"])
+        try:
+            assert await db.find_similar_artist("Stereolb") == "Stereolab"
+            clear_library_caches()
+            db._artist_name_pool_usable = False
+            assert await db.find_similar_artist("Stereolb") is None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_the_exact_check_still_falls_back_to_sql(self, tmp_path):
+        """The other half of the asymmetry, on the same unusable pool."""
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Stereolab", "Sessa"])
+        try:
+            db._artist_name_pool_usable = False
+            assert await db._artist_exists_exactly("stereolab", "stereolab") is True
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_close_releases_the_correction_projections(self, tmp_path):
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Stereolab", "Sessa"])
+        assert db._artist_name_pool_names
+        await db.close()
+        assert db._artist_name_pool_names == []
+        assert db._artist_name_pool_lower_list == []
+        assert db._artist_name_pool_compare == []
+        assert db._artist_name_pool_lower == set()
+        assert db._artist_name_pool_usable is False
+
+
+class TestArtistCorrectionOneReadTwoViews:
+    """Both consumers are served from a single catalog read (LML#1248/#1245)."""
+
+    @pytest.mark.asyncio
+    async def test_the_projections_are_index_aligned(self, tmp_path):
+        clear_library_caches()
+        db = await _connected_db(
+            tmp_path,
+            ["Stereolab", "The Sea and Cake"],
+            with_album_artist=True,
+            album_artists=["Juana Molina", None],
+        )
+        try:
+            names = db._artist_name_pool_names
+            assert len(names) == len(db._artist_name_pool_lower_list)
+            assert len(names) == len(db._artist_name_pool_compare)
+            for i, name in enumerate(names):
+                assert db._artist_name_pool_lower_list[i] == name.lower()
+            assert "juana molina" in db._artist_name_pool_lower_list
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_the_exact_set_shares_its_strings_with_the_lower_projection(self, tmp_path):
+        """``set(lower_list)`` rather than a second lowercasing pass.
+
+        Not a micro-optimisation: at the production CTA-bearing pool shape a
+        duplicated projection is megabytes per worker, and the pool is rebuilt
+        inline on the LML#706 hot-swap reconnect.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Stereolab", "Sessa"])
+        try:
+            for lowered in db._artist_name_pool_lower_list:
+                assert any(lowered is member for member in db._artist_name_pool_lower)
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_the_scan_runs_off_the_event_loop(self, tmp_path):
+        """Scoring the whole pool is CPU work; it must not block the loop."""
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Stereolab", "Sessa"])
+        try:
+            with patch("library.db.asyncio.to_thread", wraps=asyncio.to_thread) as spy:
+                await db.find_similar_artist("Stereolb")
+            assert spy.await_count == 1
+        finally:
+            await db.close()
