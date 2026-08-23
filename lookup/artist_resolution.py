@@ -97,8 +97,7 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
     Returns True iff:
 
     * ``query_stripped`` is non-empty (caller has already stripped),
-    * ``candidate`` is a non-empty string after stripping disambiguation
-      suffixes (``Stereolab (2)`` → ``Stereolab``) and surrounding whitespace,
+    * ``candidate`` is a non-empty string after trimming whitespace,
     * ``score_match(query, candidate)`` meets the shared acceptance floor, and
     * ``candidate`` is not a compilation/V-A alias.
 
@@ -159,10 +158,11 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
       finds ``(2)`` by its parentheses; folding first would erase them
       ("Sessa (2)" → "sessa 2") and leave the disambiguator glued to the name.
       The LML#1244 review established that these two transforms do not commute.
-    * The V/A guard runs **before** the fold — though only for ordering's sake,
-      not safety: it is evaluated on the raw candidate and the fold never
-      revisits it, so a compilation credit is rejected identically whichever
-      side of the fold the check sits on.
+    * The V/A guard runs **before** every scoring rung, and is evaluated on
+      every candidate form a rung scores — raw, stripped, and both folds.
+      One form is not enough: a *wrapping* parenthetical reads as
+      non-compilation raw ("(Various Artists)" keeps its parens) and strips
+      to "", so only the fold ever sees it (LML#1256 review).
 
     The fold is :func:`lookup.name_folding.fold_punctuation_for_comparison` —
     the same policy the search axis uses, deliberately not a second local
@@ -198,9 +198,8 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
 
     Reached only when rungs 1-2 miss — those already answer "same artist"
     whenever the strip found a genuine Discogs qualifier, so this rung exists
-    solely for the case the strip got wrong. The V/A guard still runs first,
-    against the unstripped candidate, so a compilation alias carrying a decoy
-    parenthetical ("Various Artists (Rock Sampler)") cannot reach it either.
+    solely for the case the strip got wrong. The V/A guard has already run,
+    against every form scored below, so no compilation alias reaches it.
     """
     if not query_stripped:
         return False
@@ -209,16 +208,20 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
     candidate_raw = candidate.strip()
     if not candidate_raw:
         return False
-    if is_compilation_artist(candidate_raw):
-        return False
 
     query_raw = query_stripped
     candidate_stripped = strip_discogs_disambig(candidate_raw).strip()
     query_stripped_canonical = strip_discogs_disambig(query_raw).strip()
+    candidate_folded = fold_punctuation_for_comparison(candidate_stripped)
+    candidate_raw_folded = fold_punctuation_for_comparison(candidate_raw)
+    # V/A guard, evaluated on EVERY candidate form a rung below scores.
+    if any(
+        form and is_compilation_artist(form)
+        for form in (candidate_raw, candidate_stripped, candidate_folded, candidate_raw_folded)
+    ):
+        return False
 
     if query_stripped_canonical and candidate_stripped:
-        if is_compilation_artist(candidate_stripped):
-            return False
         if (
             score_match(query_stripped_canonical, candidate_stripped)
             >= SCORE_MATCH_ACCEPTANCE_FLOOR
@@ -231,7 +234,6 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
         # all-punctuation name), so "..." cannot verify against an equally
         # punctuation-only credit.
         query_folded = fold_punctuation_for_comparison(query_stripped_canonical)
-        candidate_folded = fold_punctuation_for_comparison(candidate_stripped)
         if (
             query_folded
             and candidate_folded
@@ -244,7 +246,6 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
     # candidate entirely ("(etre)" -> "") or left a stripped pair that still
     # doesn't match — i.e. exactly the population the strip got wrong.
     query_raw_folded = fold_punctuation_for_comparison(query_raw)
-    candidate_raw_folded = fold_punctuation_for_comparison(candidate_raw)
     if (
         query_raw_folded
         and candidate_raw_folded

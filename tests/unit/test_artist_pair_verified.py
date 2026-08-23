@@ -186,6 +186,25 @@ class TestUnstrippedDisambiguationContent:
         a trailing parenthetical that could tempt the new raw-fold rung."""
         assert _artist_pair_verified("Various Artists", candidate) is False
 
+    @pytest.mark.parametrize(
+        "query,candidate",
+        [
+            ("Various Artists", "(Various Artists)"),
+            ("Soundtrack", "(Soundtrack)"),
+            ("Compilation", "(Compilation)"),
+        ],
+    )
+    def test_va_guard_survives_a_fully_parenthesized_alias(self, query, candidate):
+        """LML#1256 review. A *wrapping* parenthetical defeats every unfolded
+        form of the guard at once: ``is_compilation_artist`` reads False on
+        the raw name because the parens are still attached, and
+        ``strip_discogs_disambig`` reduces the whole name to "" so the
+        stripped form is never a compilation either. Only the folded form
+        sees "Various Artists" -- which is precisely the form rung 3 scores,
+        so the guard has to be evaluated there too or rung 3 folds the parens
+        away and verifies the pair."""
+        assert _artist_pair_verified(query, candidate) is False
+
 
 class TestGuardsIntact:
     """Widening the comparison must not widen what the gate exists to reject."""
