@@ -53,27 +53,38 @@ whitespace entirely ("少年ナイフ" -> five spaces). Same concept, two fideli
 
 import re
 
-# What this module counts as one punctuation character. ``_`` is spelled out
-# because Python's ``\w`` counts it as a word character while ``wxyc_etl``'s
-# Rust fold treats it as punctuation. Without it, LML and the shared crate
-# would disagree on eight catalog artists (Super_Collider, I_LIKE_DOG_FACE,
-# Ras_G, ...) about whether two names are the same artist.
+# The base punctuation class, and the query-token fidelity's whole answer:
+# plain ``\w``, so ``_`` counts as a word character and survives the fold
+# (LML#1257 -- see :func:`fold_punctuation_for_query_tokens` for why the
+# sites that build search queries need it that way).
+_QUERY_TOKEN_PUNCTUATION_CHAR = r"[^\w\s]"
+_QUERY_TOKEN_PUNCTUATION_RE = re.compile(_QUERY_TOKEN_PUNCTUATION_CHAR)
+
+# What this module counts as one punctuation character on the *comparison*
+# axis: the base class plus ``_``. The underscore is added back because
+# Python's ``\w`` counts it as a word character while ``wxyc_etl``'s Rust fold
+# treats it as punctuation. Without it, LML and the shared crate would
+# disagree on eight catalog artists (Super_Collider, I_LIKE_DOG_FACE, Ras_G,
+# ...) about whether two names are the same artist.
 #
-# Both regexes below are built from this one class on purpose. They answer
-# different questions -- "which characters do I erase?" and "does the name end
-# in one?" -- and an answer of "yes" to the first with "no" to the second is
-# exactly the bug: the fold erases a terminator that ``ends_in_punctuation``
-# then fails to report, leaving the folded rung an open prefix on a name that
-# was terminated. Sharing the class makes the two unable to drift (LML#1244
-# review); '_' was the character they had already drifted on.
-_PUNCTUATION_CHAR = r"(?:[^\w\s]|_)"
+# DERIVED from the base class rather than spelled out, so the two fidelities
+# can differ by '_' and by nothing else: a character added to the base class
+# reaches both, where two hand-written classes would let it reach one and not
+# the other -- a second silent drift of the kind this sharing exists to
+# prevent (LML#1257 review). ``TestTheTwoFidelitiesDifferOnlyOnUnderscore``
+# pins the invariant.
+#
+# Both regexes below are in turn built from this one class on purpose. They
+# answer different questions -- "which characters do I erase?" and "does the
+# name end in one?" -- and an answer of "yes" to the first with "no" to the
+# second is exactly the bug: the fold erases a terminator that
+# ``ends_in_punctuation`` then fails to report, leaving the folded rung an
+# open prefix on a name that was terminated. Sharing the class makes the two
+# unable to drift (LML#1244 review); '_' was the character they had already
+# drifted on.
+_PUNCTUATION_CHAR = rf"(?:{_QUERY_TOKEN_PUNCTUATION_CHAR}|_)"
 
 _PUNCTUATION_RE = re.compile(_PUNCTUATION_CHAR)
-
-# The same class minus the '_' clause (LML#1257). Spelled out rather than
-# derived, because the one character these two disagree on IS the policy
-# decision -- see :func:`fold_punctuation_for_query_tokens`.
-_QUERY_TOKEN_PUNCTUATION_RE = re.compile(r"[^\w\s]")
 
 # A query whose own name ends in punctuation ("Adult.", "Neu!", "T++", "Ras_")
 # loses that terminator to the fold. See :func:`ends_in_punctuation`.
