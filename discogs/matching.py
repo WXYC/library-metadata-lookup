@@ -97,9 +97,9 @@ def normalize_for_track_comparison(text: str | None) -> str:
     behavior table.
 
     LML#1257 surveyed this module as a candidate to consolidate onto
-    ``lookup.name_folding.fold_punctuation_for_comparison`` and rejected it: the
-    punctuation strip below deletes to the empty string, not to a space, and
-    that is not incidental. ``_token_is_covered``'s docstring names the
+    ``lookup.name_folding`` and rejected it for *both* of that module's
+    fidelities: they fold punctuation to a space, and the strip below deletes
+    to the empty string, which is not incidental. ``_token_is_covered``'s docstring names the
     consequence directly — "Non-Stop" and "E-Bow The Letter" normalize to
     single glued tokens ("nonstop", "ebowtheletter") on purpose, so hyphen and
     spacing disagreements are absorbed by substring containment and the
@@ -117,8 +117,8 @@ def normalize_for_track_comparison(text: str | None) -> str:
         return ""
     result = normalize_for_comparison(text)
     result = result.replace("&", " and ")
-    # Not lookup.name_folding.fold_punctuation_for_comparison (LML#1257): this
-    # strips punctuation to nothing, not to a space. See the docstring above.
+    # Not either lookup.name_folding fidelity (LML#1257): both fold to a
+    # space, and this strips to nothing. See the docstring above.
     result = re.sub(r"[^\w\s]", "", result)
     result = re.sub(r"\s+", " ", result).strip()
     return result
