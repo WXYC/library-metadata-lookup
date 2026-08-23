@@ -210,7 +210,17 @@ MODULE_BUDGETS: dict[str, int] = {
     # `library.db._fts_normalize`. Both `lookup/matching.py`'s prefix gate and
     # `lookup/rowless.py`'s equality gate consume it, so drift here would
     # silently split what the two halves of the same lane call one artist.
-    "lookup/name_folding.py": 150,
+    # Recalibrated by LML#1257 (150 -> 200, measured 150). The consolidation
+    # found the policy has two fidelities that differ on exactly one
+    # character: comparison sites fold `_`, query-construction sites must not
+    # (db.search folds it already, and folding early starves the significant-
+    # word floors -- "Ras_G" stops scoping its own query). This is the one
+    # case where the guardrail's usual "extract, don't append" answer is
+    # wrong: the whole point of the module is that the fidelities sit
+    # adjacent and share `_PUNCTUATION_CHAR`, so splitting them into two
+    # files would manufacture exactly the drift LML#1244 and LML#1257 exist
+    # to prevent. Sized per the calibration convention: 1.3x150 -> 200.
+    "lookup/name_folding.py": 200,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
     # transparent-fold calibration): the location-union task is now threaded
     # through `_step_search_pipeline` into the TRACK_ON_COMPILATION execute

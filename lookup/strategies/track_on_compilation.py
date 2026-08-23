@@ -64,7 +64,7 @@ from lookup.matching import (
     library_artist_for,
     limit_results,
 )
-from lookup.name_folding import fold_punctuation_for_comparison
+from lookup.name_folding import fold_punctuation_for_query_tokens
 from lookup.release_resolution import (
     ResolvedRelease,
     has_va_compilation,
@@ -242,17 +242,16 @@ async def _search_by_keyword(
     """Phase: direct keyword search, artist-filtered — a last-resort source
     used only if the Discogs probe pass finds nothing; never blocks it."""
     try:
-        # LML#1257: consolidated onto the shared fold (LML#1244), which folds
-        # '_' to a space. ``lib_artist`` here is a significant-word source for
-        # an FTS5 keyword query, not the identity-matching gate in
-        # lookup/matching.py -- but it can still be one of the catalog's
-        # underscore-bearing names (e.g. "Super_Collider"), so the same fold
-        # applies for the same reason.
+        # LML#1257: the query-token fidelity, NOT the comparison one. These
+        # words are handed to db.search, which folds '_' itself, and the
+        # len(w) > 3 floor below would discard the fragments an early fold
+        # produces -- "Ras_G" would contribute no artist term at all. See
+        # lookup/name_folding.fold_punctuation_for_query_tokens.
         artist_words = (
-            fold_punctuation_for_comparison(lib_artist.lower()).split() if lib_artist else []
+            fold_punctuation_for_query_tokens(lib_artist.lower()).split() if lib_artist else []
         )
         song_words = (
-            fold_punctuation_for_comparison(parsed.song.lower()).split() if parsed.song else []
+            fold_punctuation_for_query_tokens(parsed.song.lower()).split() if parsed.song else []
         )
 
         sig_artist = [w for w in artist_words if len(w) > 3 and w not in STOPWORDS]

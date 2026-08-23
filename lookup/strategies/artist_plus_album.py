@@ -116,13 +116,13 @@ async def search_library_with_fallback(
             results = await db.search(query=query, limit=_FETCH_LIMIT)
             results = filter_results_by_artist(results, lib_artist)
 
-            album_lower = album.lower()
-            # LML#1257: consolidated onto the shared fold (LML#1244). Folds
-            # '_' to a space where the old inline regex left it glued to its
-            # neighbors, so a self-titled catalog row like "Super_Collider"
-            # now tokenizes as two words instead of one -- see
-            # lookup/name_folding.py for why '_' is punctuation here.
-            album_normalized = fold_punctuation_for_comparison(album_lower)
+            # LML#1257: the comparison fidelity of the shared LML#1244 fold --
+            # both sides of the check below are folded and then matched
+            # against each other, so '_' must fold here or the catalog row
+            # "Super_Collider" can never meet a typed "Super Collider". (The
+            # query-building sites in the sibling strategies deliberately use
+            # the other fidelity; see lookup/name_folding.py.)
+            album_normalized = fold_punctuation_for_comparison(album.lower())
             album_words = {w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS}
             album_is_artist = lib_artist and normalize_for_comparison(
                 album
@@ -134,8 +134,7 @@ async def search_library_with_fallback(
                     filtered_results.append(item)
                     continue
 
-                item_title_lower = (item.title or "").lower()
-                item_normalized = fold_punctuation_for_comparison(item_title_lower)
+                item_normalized = fold_punctuation_for_comparison((item.title or "").lower())
                 item_words = {
                     w for w in item_normalized.split() if len(w) > 2 and w not in STOPWORDS
                 }
