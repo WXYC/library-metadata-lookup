@@ -187,11 +187,23 @@ def folded_hit(candidate: str, query: str, *, exact: bool) -> bool:
 # :func:`article_stem_hit` will open-prefix a candidate on it (LML#1250).
 # Below this floor, only an exact match is admitted.
 #
-# Measured against the library.db snapshot (23,815 distinct artists), floor 2
-# and floor 3 are equivalent on every measured axis -- neither the ticket's
-# two reproducers nor the wider catalog-wide scan improve going from 2 to 3 --
-# so 2 is the smaller, and therefore chosen, sufficient value: it excludes
-# only a bare one-character stem, the shortest a fold can ever manufacture.
+# Measured against the library.db snapshot (23,815 distinct artists): floor 2
+# and floor 3 close the ticket's two reproducers identically, and 2 is the
+# smaller sufficient value -- it excludes only a bare one-character stem, the
+# shortest a fold can ever manufacture.
+#
+# They are NOT equivalent catalog-wide, and the difference is worth stating
+# precisely rather than rounding to "equivalent": floor 3 additionally rejects
+# 20 pairs, every one of them from three queries -- "The Ex" (-> Ex Cops, Ex
+# Hex, Ex-Models, ...), "The Go" (-> Go West, Go Sailor, ...) and "The AM"
+# (-> AM Radio, AM Syndicate). That is exactly the two-character common-word
+# stem this fix declares out of scope, and all 20 do look like wrong-artist
+# admissions, so floor 3 is a live option -- but it is a policy decision about
+# whether a two-character stem may continue AT ALL, one rung wider than the
+# one-character wildcard #1250 asks about, and it would silently take the
+# open-prefix continuation away from every future two-character stem on the
+# strength of one snapshot. It belongs in that residual's own ticket, with its
+# own measurement, not smuggled in as a constant here.
 _ARTICLE_STEM_MIN_LENGTH = 2
 
 
