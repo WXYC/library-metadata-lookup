@@ -16,6 +16,7 @@ import pytest
 from scripts.build_golden_corpus import (
     LIBRARY_FIELDS,
     Fixture,
+    _case,
     frozen_cases,
     merge_expectations,
 )
@@ -242,3 +243,67 @@ def test_the_frozen_roster_agrees_with_the_committed_corpus():
         "Add the case to scripts/build_golden_corpus.py::frozen_cases() so a regeneration "
         "reproduces it, or drop the frozen mark."
     )
+
+
+# ---------------------------------------------------------------------------
+# One serializer for cases.json (LML#1233 re-land review)
+# ---------------------------------------------------------------------------
+
+
+def test_case_emits_exactly_what_the_corpus_serializer_emits():
+    """`_case` must not be a second encoding of the case shape.
+
+    It was: `_case` hand-built the dict while `corpus.Case.to_json` -- the
+    canonical serializer for the same shape -- sat with no callers at all. The
+    two had already drifted on key order (`_case` put `settings` right after
+    `frozen`, `to_json` puts it after `query`), and `cases.json` is
+    byte-compared by `test_cases_file_is_canonically_formatted`, so the
+    divergence would surface as key-reorder churn the first time a sampled case
+    carried a `settings` block.
+    """
+    emitted = _case(
+        "case-a",
+        "artist_song",
+        "a note",
+        {"artist": "Stereolab", "song": "Peng!"},
+        suspect=True,
+        settings={"lml_resolve_nonlibrary_release": True},
+        requires_discogs=True,
+        requires_rows=[["Stereolab", "Peng!"]],
+    )
+
+    expected = corpus.Case(
+        id="case-a",
+        shape="artist_song",
+        note="a note",
+        query={"artist": "Stereolab", "song": "Peng!"},
+        suspect=True,
+        settings={"lml_resolve_nonlibrary_release": True},
+        requires_discogs=True,
+        requires_rows=(("Stereolab", "Peng!"),),
+        expect=None,
+    ).to_json()
+
+    assert emitted == expected
+    assert list(emitted) == list(expected), (
+        "key ORDER must match too -- cases.json is byte-compared"
+    )
+
+
+def test_case_rejects_a_misspelled_guard_rather_than_dropping_it():
+    """A typo used to be swallowed in silence.
+
+    `_case` took `**extra: Any` and filtered it by string key, so
+    `requires_row=[...]` -- singular -- was discarded without a word. The
+    output is a checked-in fixture, so the loss surfaced much later as a case
+    that passes vacuously, which is the exact failure `requires_rows` exists
+    to prevent.
+    """
+    with pytest.raises(TypeError):
+        _case(
+            "case-a",
+            "artist_song",
+            "a note",
+            {"artist": "Stereolab"},
+            requires_row=[["Stereolab", "Peng!"]],  # type: ignore[call-arg]
+        )

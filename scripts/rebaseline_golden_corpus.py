@@ -43,46 +43,62 @@ if str(REPO_ROOT) not in sys.path:  # pragma: no cover - import bootstrap
 logger = logging.getLogger("rebaseline_golden_corpus")
 
 
-async def _run_case(case: Any, library_path: Path, discogs_fixture: dict[str, Any]) -> Any:
+async def _run_case(case: Any, library_path: Path, discogs_universe: Any) -> Any:
     """Drive one case through the real app, the same way the test tier does."""
     import os
 
-    from httpx import ASGITransport, AsyncClient
-
     from config.settings import get_settings
-    from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
     from library.db import LibraryDB, clear_library_caches
-    from main import app
     from tests.e2e.golden import corpus
 
-    # Same pins, same order, as `tests/e2e/golden/conftest.py`. If these two
-    # ever diverge the tool records a verdict the test tier cannot reproduce,
-    # so the pin set lives in `corpus.pinned_environment` and both call it.
+    # Same pins AND same wiring as `tests/e2e/golden/conftest.py`: the pin set
+    # is `corpus.pinned_environment` and the app wiring is
+    # `corpus.golden_app_client`, both called from here and from the fixtures.
+    # If the two ever diverged the tool would record a verdict the test tier
+    # cannot reproduce, and a comment is not a mechanism.
     previous_env = dict(os.environ)
     os.environ.update(corpus.pinned_environment(case.settings))
     get_settings.cache_clear()
     clear_library_caches()
     database = LibraryDB(library_path)
     await database.connect()
-    app.dependency_overrides[get_library_db] = lambda: database
-    app.dependency_overrides[get_discogs_service] = lambda: corpus.FakeDiscogsService(
-        discogs_fixture
-    )
-    app.dependency_overrides[get_posthog_client] = lambda: None
+    fake = corpus.FakeDiscogsService(discogs_universe)
     try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://golden"
-        ) as client:
+        async with corpus.golden_app_client(database, fake) as client:
             response = await client.post("/api/v1/lookup", json=case.request_body())
         response.raise_for_status()
+        _assert_routes_served(case, fake)
         return corpus.verdict_from_payload(response.json())
     finally:
-        app.dependency_overrides.clear()
         await database.close()
         os.environ.clear()
         os.environ.update(previous_env)
         get_settings.cache_clear()
         clear_library_caches()
+
+
+def _assert_routes_served(case: Any, fake: Any) -> None:
+    """Refuse to record a verdict produced under a drifted fixture route.
+
+    The test tier runs these two checks before it compares a verdict
+    (`tests/e2e/golden/test_golden_corpus.py`); the recorder did not, so a case
+    whose route key had drifted would be measuring an empty-upstream fallback,
+    and this tool would write that down as the new baseline. The drift then
+    surfaced on the *next* test run -- after the commit.
+    """
+    missing = sorted(set(case.requires_routes) - fake.served_keys)
+    if missing:
+        raise RuntimeError(
+            f"{case.id} requires fixture route(s) {missing} to have served a candidate, "
+            f"and they did not (served: {sorted(fake.served_keys)}). The route drifted; "
+            "refusing to record a verdict for a case that is no longer exercising its path."
+        )
+    if case.requires_discogs and not fake.served_candidates:
+        raise RuntimeError(
+            f"{case.id} declares requires_discogs but no Discogs search returned a "
+            "candidate. A route key drifted; refusing to record a verdict measured "
+            "against an empty upstream."
+        )
 
 
 def classify_case_result(case: Any, previous: Any, actual: Any) -> str:
@@ -135,23 +151,26 @@ async def _main_async(args: argparse.Namespace) -> int:
         library_path = corpus.build_library_db(
             Path(tmp_dir) / "library.db", corpus.load_library_rows()
         )
-        discogs_fixture = corpus.load_discogs_fixture()
+        discogs_universe = corpus.load_discogs_universe()
 
-        changed: list[tuple[Any, Any]] = []
-        frozen_drift: list[tuple[Any, Any]] = []
+        # Triples, not pairs: `previous` is derived once, where it is first
+        # needed, and travels with the case. It used to be re-derived in each
+        # of the two report loops below -- three copies of one two-line
+        # derivation that had to agree, and the third had quietly dropped the
+        # `is not None` guard the other two carried.
+        changed: list[tuple[Any, Any, Any]] = []
+        frozen_drift: list[tuple[Any, Any, Any]] = []
         for case in cases:
-            actual = await _run_case(case, library_path, discogs_fixture)
+            actual = await _run_case(case, library_path, discogs_universe)
             recorded = by_id[case.id].get("expect")
             previous = corpus.Verdict.from_json(recorded) if recorded is not None else None
             outcome = classify_case_result(case, previous, actual)
             if outcome == "frozen_drift":
-                frozen_drift.append((case, actual))
+                frozen_drift.append((case, previous, actual))
             elif outcome == "changed":
-                changed.append((case, actual))
+                changed.append((case, previous, actual))
 
-    for case, actual in changed:
-        recorded = by_id[case.id].get("expect")
-        previous = corpus.Verdict.from_json(recorded) if recorded is not None else None
+    for case, previous, actual in changed:
         logger.info("%s (%s)", case.id, case.shape)
         for line in _describe("was", previous) + _describe("now", actual):
             logger.info("%s", line)
@@ -159,13 +178,10 @@ async def _main_async(args: argparse.Namespace) -> int:
     if frozen_drift:
         logger.error("")
         logger.error("%d FROZEN case(s) changed. Nothing was written.", len(frozen_drift))
-        for case, actual in frozen_drift:
+        for case, previous, actual in frozen_drift:
             logger.error("%s -- pins %s", case.id, case.issue)
             logger.error("  %s", case.note)
-            recorded = by_id[case.id].get("expect")
-            for line in _describe("recorded", corpus.Verdict.from_json(recorded)) + _describe(
-                "actual", actual
-            ):
+            for line in _describe("recorded", previous) + _describe("actual", actual):
                 logger.error("%s", line)
         logger.error(
             "A frozen case pins a failure that already reached production once. If the new "
@@ -182,7 +198,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         logger.info("--dry-run: %d expectation(s) would be rewritten", len(changed))
         return 0
 
-    for case, actual in changed:
+    for case, _previous, actual in changed:
         by_id[case.id]["expect"] = actual.to_json()
     corpus.CASES_PATH.write_text(corpus.dump_cases(raw_cases), encoding="utf-8")
     logger.info("rewrote %d expectation(s) in %s", len(changed), corpus.CASES_PATH)

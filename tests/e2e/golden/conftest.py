@@ -26,12 +26,10 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
 from config.settings import get_settings
-from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
 from library.db import LibraryDB, clear_library_caches
-from main import app
 from tests.e2e.golden import corpus
 
 
@@ -63,14 +61,28 @@ def golden_library_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="session")
 def golden_discogs_fixture() -> dict[str, Any]:
-    """Parsed `discogs.json`, read once per worker. Never mutated."""
+    """Raw parsed `discogs.json`, read once per worker. Never mutated.
+
+    Kept for the tests that need the raw shape (route tables as plain dicts);
+    the per-case fake takes the parsed `DiscogsUniverse` instead.
+    """
     return corpus.load_discogs_fixture()
 
 
+@pytest.fixture(scope="session")
+def golden_discogs_universe() -> corpus.DiscogsUniverse:
+    """`discogs.json` parsed into models once per worker. Never mutated."""
+    return corpus.load_discogs_universe()
+
+
 @pytest.fixture
-def golden_discogs(golden_discogs_fixture: dict[str, Any]) -> corpus.FakeDiscogsService:
-    """A fresh fake per case, so its call log describes only that case."""
-    return corpus.FakeDiscogsService(golden_discogs_fixture)
+def golden_discogs(golden_discogs_universe: corpus.DiscogsUniverse) -> corpus.FakeDiscogsService:
+    """A fresh fake per case, so its call log describes only that case.
+
+    Fresh fake, shared universe: the call log is what has to be per-case, and
+    the 583 parsed models behind it are identical for every one.
+    """
+    return corpus.FakeDiscogsService(golden_discogs_universe)
 
 
 @pytest.fixture(autouse=True)
@@ -119,18 +131,9 @@ async def golden_client(
 ) -> AsyncIterator[AsyncClient]:
     """The real FastAPI app, wired to the fixture catalog and the fake Discogs.
 
-    `get_settings` is deliberately *not* overridden here: settings come from
-    the env pins above, which is the only channel the whole pipeline reads
-    (see `corpus.pinned_environment`). Overriding the dependency as well would
-    give the router one `Settings` and everything under it another.
+    The wiring itself lives in `corpus.golden_app_client`, shared with
+    `scripts/rebaseline_golden_corpus.py` so the tool that *records* a verdict
+    and the tier that *asserts* it cannot drift apart in what they wire up.
     """
-    app.dependency_overrides[get_library_db] = lambda: golden_library_db
-    app.dependency_overrides[get_discogs_service] = lambda: golden_discogs
-    app.dependency_overrides[get_posthog_client] = lambda: None
-    try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://golden"
-        ) as client:
-            yield client
-    finally:
-        app.dependency_overrides.clear()
+    async with corpus.golden_app_client(golden_library_db, golden_discogs) as client:
+        yield client

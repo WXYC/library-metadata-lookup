@@ -49,6 +49,8 @@ from typing import Any
 
 from wxyc_etl.schema import library_columns
 
+from tests.e2e.golden import corpus
+
 logger = logging.getLogger("build_golden_corpus")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -364,9 +366,9 @@ class Fixture:
         }
 
 
-def route_key(*parts: str | None) -> str:
-    """Must stay byte-identical to `tests/e2e/golden/corpus.py::_route_key`."""
-    return "|".join((p or "").strip().lower() for p in parts)
+#: The key format is the contract between this generator and the fake that
+#: reads the routes back, so it is imported from the fake rather than restated.
+route_key = corpus.route_key
 
 
 # ---------------------------------------------------------------------------
@@ -630,19 +632,39 @@ def _case(
     shape: str,
     note: str,
     query: dict[str, str],
-    **extra: Any,
+    *,
+    suspect: bool = False,
+    settings: dict[str, Any] | None = None,
+    requires_discogs: bool = False,
+    requires_routes: list[str] | None = None,
+    requires_rows: list[list[str]] | None = None,
+    requires_absent_artists: list[str] | None = None,
 ) -> dict[str, Any]:
-    case: dict[str, Any] = {"id": case_id, "shape": shape, "frozen": False}
-    case.update({k: v for k, v in extra.items() if k in ("issue", "settings")})
-    if extra.get("suspect"):
-        case["suspect"] = True
-    case["note"] = note
-    case["query"] = query
-    for key in ("requires_discogs", "requires_routes", "requires_rows", "requires_absent_artists"):
-        if extra.get(key):
-            case[key] = extra[key]
-    case["expect"] = None
-    return case
+    """Emit one sampled case, through the corpus's own serializer.
+
+    Two things this deliberately does not do any more. It does not hand-build
+    the dict -- `corpus.Case.to_json` is the canonical encoding of this shape,
+    and a second copy had already drifted from it on key order (`settings`
+    landed in a different slot), which `cases.json` being byte-compared would
+    eventually have surfaced as churn. And it does not take `**extra: Any`
+    filtered by string key, which silently discarded a misspelled guard --
+    `requires_row=` for `requires_rows=` -- in a generator whose output is a
+    checked-in fixture, so the loss showed up later as a case passing
+    vacuously. Keyword-only parameters make that a `TypeError` at the call.
+    """
+    return corpus.Case(
+        id=case_id,
+        shape=shape,
+        note=note,
+        query=query,
+        suspect=suspect,
+        settings=settings or {},
+        requires_discogs=requires_discogs,
+        requires_routes=tuple(requires_routes or ()),
+        requires_rows=tuple((pair[0], pair[1]) for pair in (requires_rows or ())),
+        requires_absent_artists=tuple(requires_absent_artists or ()),
+        expect=None,
+    ).to_json()
 
 
 #: Track titles too generic to identify a release. A case built on one of
@@ -1197,7 +1219,17 @@ def main(argv: list[str] | None = None) -> int:
 
     write_json(args.out_dir / "library.json", rows)
     write_json(args.out_dir / "discogs.json", fixture.to_json())
-    write_json(args.out_dir / "cases.json", cases)
+    # Through the corpus's canonical writer, not this module's generic
+    # `write_json`: `corpus.dump_cases` bills itself as "one writer, shared by
+    # the rebaseline tool and the formatting guard", and
+    # `test_cases_file_is_canonically_formatted` byte-compares against it. The
+    # two agreed only by coincidence of both passing `indent=2,
+    # ensure_ascii=False`, so a change to `dump_cases` would have made this
+    # script's own output fail that guard.
+    cases_path = args.out_dir / "cases.json"
+    cases_path.parent.mkdir(parents=True, exist_ok=True)
+    cases_path.write_text(corpus.dump_cases(cases), encoding="utf-8")
+    logger.info("wrote %s", cases_path)
     unrecorded = [case["id"] for case in cases if case["expect"] is None]
     logger.info("corpus: %d cases, %d awaiting a recorded verdict", len(cases), len(unrecorded))
     if unrecorded:
