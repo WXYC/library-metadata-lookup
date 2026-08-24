@@ -544,24 +544,7 @@ async def run(args: argparse.Namespace) -> None:
 
         # Retry misses: reset not_found to pending for another pass
         if args.retry_misses:
-            db = results_db._db
-            assert db is not None
-            async with results_db._write_lock:
-                cursor = await db.execute("""UPDATE albums SET deezer_status = 'pending',
-                       deezer_url = NULL, deezer_confidence = NULL,
-                       deezer_matched_artist = NULL, deezer_matched_title = NULL,
-                       deezer_checked_at = NULL
-                       WHERE deezer_status = 'not_found'""")
-                dz_reset = cursor.rowcount
-                # Reset Spotify only for albums that were auto-skipped due to Deezer miss
-                cursor = await db.execute("""UPDATE albums SET spotify_status = 'pending',
-                       spotify_url = NULL, spotify_id = NULL, spotify_confidence = NULL,
-                       spotify_matched_artist = NULL, spotify_matched_title = NULL,
-                       spotify_checked_at = NULL
-                       WHERE spotify_status = 'not_found'
-                       AND deezer_status = 'pending'""")
-                sp_reset = cursor.rowcount
-                await db.commit()
+            dz_reset, sp_reset = await results_db.reset_misses_to_pending()
             logger.info(
                 "Retry misses: reset %d Deezer, %d Spotify not_found to pending", dz_reset, sp_reset
             )

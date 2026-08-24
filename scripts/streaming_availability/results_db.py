@@ -309,6 +309,40 @@ class ResultsDB:
                 )
             await self._db.commit()
 
+    async def reset_misses_to_pending(self) -> tuple[int, int]:
+        """Reset ``not_found`` rows to ``pending`` so a re-pass re-queries them.
+
+        Backs ``--retry-misses``. Returns ``(deezer_reset, spotify_reset)``
+        row counts.
+
+        Only ever touches ``not_found``. A ``found`` row cost a rate-limited
+        API round trip to obtain, so re-collecting one is strictly a loss --
+        that is the line this ``WHERE`` clause holds, and the reason the reset
+        lives here rather than as ad-hoc SQL at the call site reaching through
+        ``_db`` and ``_write_lock``.
+
+        Every column the answer was written into is cleared alongside the
+        status. Leaving a stale URL or timestamp on a ``pending`` row would
+        make a discarded answer read as a fresh one.
+        """
+        assert self._db is not None
+        async with self._write_lock:
+            cursor = await self._db.execute("""UPDATE albums SET deezer_status = 'pending',
+                   deezer_url = NULL, deezer_confidence = NULL,
+                   deezer_matched_artist = NULL, deezer_matched_title = NULL,
+                   deezer_checked_at = NULL
+                   WHERE deezer_status = 'not_found'""")
+            deezer_reset = cursor.rowcount
+            cursor = await self._db.execute("""UPDATE albums SET spotify_status = 'pending',
+                   spotify_url = NULL, spotify_id = NULL, spotify_confidence = NULL,
+                   spotify_matched_artist = NULL, spotify_matched_title = NULL,
+                   spotify_checked_at = NULL
+                   WHERE spotify_status = 'not_found'
+                   AND deezer_status = 'pending'""")
+            spotify_reset = cursor.rowcount
+            await self._db.commit()
+        return deezer_reset, spotify_reset
+
     async def get_stats(self) -> dict:
         """Return counts by status for each service."""
         assert self._db is not None
