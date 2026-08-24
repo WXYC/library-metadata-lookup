@@ -24,9 +24,11 @@ provisioning would not run per-PR.
 """
 
 import json
+from collections import Counter
 
 import pytest
 
+from discogs.models import ReleaseMetadataResponse, TrackItem
 from tests.e2e.golden import corpus
 
 # ---------------------------------------------------------------------------
@@ -61,7 +63,10 @@ def test_corpus_is_not_vacuous():
 def test_case_ids_are_unique():
     """Duplicate ids would make one case's expectation shadow another's in a rebaseline."""
     ids = [c.id for c in corpus.load_cases()]
-    duplicates = sorted({i for i in ids if ids.count(i) > 1})
+    # Counter, not `ids.count(i)` per element: MIN_CASES is 120 and the corpus
+    # is designed to grow, so the naive form scales quadratically with exactly
+    # the thing it guards.
+    duplicates = sorted(i for i, n in Counter(ids).items() if n > 1)
     assert not duplicates, f"duplicate case ids: {duplicates}"
 
 
@@ -207,17 +212,16 @@ def test_expectations_are_well_formed():
         # Hit-vs-any-miss, not clean-vs-not-clean: `verdict_from_payload` derives
         # `miss_timeout` and `miss_degraded` from an empty `results` list too
         # (corpus.py), so a case expecting either of those with no results is
-        # well-formed, not a contradiction (LML#1233 review).
-        if case.expect.miss_kind == corpus.OUTCOME_HIT:
-            assert case.expect.results, (
-                f"{case.id} expects a hit but lists no results -- contradictory"
-            )
-        else:
-            assert not case.expect.results, (
-                f"{case.id} expects a miss but also lists results -- contradictory"
-            )
+        # well-formed, not a contradiction (LML#1233 review). The rule itself
+        # lives in `verdict_shape_is_consistent`, and is asserted by calling it
+        # -- an inline copy followed by "and the helper agrees" is a tautology
+        # that can never fail independently, while making the invariant two
+        # places a future change has to move together. The helper's own
+        # behaviour across all four miss kinds is pinned in isolation by
+        # `test_verdict_shape_is_consistent_for_every_miss_kind`.
         assert corpus.verdict_shape_is_consistent(case.expect), (
-            f"{case.id}: verdict_shape_is_consistent disagrees with the check above"
+            f"{case.id} expects {case.expect.miss_kind} with "
+            f"{len(case.expect.results)} result(s) -- contradictory"
         )
         assert len(case.expect.results) <= corpus.MAX_RECORDED_RESULTS, (
             f"{case.id} records {len(case.expect.results)} results, above the "
@@ -311,6 +315,40 @@ def test_pinned_environment_covers_non_settings_search_knobs():
         assert name in env, f"{name} is read at request time but not pinned by corpus.py"
 
 
+def test_every_credential_the_repo_scrubs_is_pinned_here_too():
+    """The corpus must blank every credential the unit tier blanks.
+
+    `_PINNED_ENV` hand-listed six credentials; the repo's maintained roster is
+    `tests/unit/conftest.py::CREDENTIAL_ENV_VARS`, which is CI-enforced
+    complete in both directions by `tests/unit/test_env_hermeticity.py`. That
+    session scrub is scoped to `tests/unit/`, so it does not reach this tier --
+    and the gap is not inert. `/api/v1/lookup` injects the Apple Music and
+    Spotify clients (`lookup/router.py`), and `streaming/dependencies.py`
+    constructs a REAL client whenever the corresponding settings are non-empty.
+    The golden conftest overrides only library, Discogs and PostHog, so on any
+    machine with a populated `.env` the corpus was building live streaming
+    clients -- exactly the host-dependent verdict `_PINNED_ENV` exists to
+    prevent.
+
+    Seeding from the roster rather than re-listing means a credential added to
+    the repo is blanked here the same day, instead of the next time someone
+    notices.
+    """
+    from tests.unit.conftest import CREDENTIAL_ENV_VARS
+
+    env = corpus.pinned_environment()
+    missing = sorted(name for name in CREDENTIAL_ENV_VARS if name not in env)
+
+    assert not missing, (
+        f"credential(s) scrubbed by the unit tier but not pinned by the corpus: {missing}. "
+        "Seed _PINNED_ENV from CREDENTIAL_ENV_VARS rather than re-listing."
+    )
+    assert all(env[name] == "" for name in CREDENTIAL_ENV_VARS), (
+        "every credential must be pinned to the empty string, so the factories in "
+        "streaming/dependencies.py take their credentials-missing branch"
+    )
+
+
 @pytest.mark.asyncio
 async def test_fake_discogs_service_search_respects_limit():
     """`FakeDiscogsService.search` must truncate to `limit`, like its siblings.
@@ -337,6 +375,50 @@ async def test_fake_discogs_service_search_respects_limit():
 
     assert len(response.results) == 2
     assert response.total == 3
+
+
+@pytest.mark.asyncio
+async def test_fake_track_credit_matches_the_production_rule():
+    """The fake must recover the credit production recovers, character for character.
+
+    `get_track_credit_on_release` used to hand-roll the match: exact lowercased
+    title equality, and credits joined with `", "`. Production
+    (`_scan_tracklist_for_credit`) uses the bidirectional-substring title rule
+    and joins with `" "` -- and that separator is load-bearing, not cosmetic.
+    `discogs/service.py` documents the space-joined form as the one
+    `_scan_tracklist_for_match`'s LML#210 fuzzy fallback re-validates against,
+    and this credit is the artist anchor for the row-less resolve the LML#1184
+    frozen cases exercise. A fake that hands the pipeline a comma-joined anchor
+    feeds it a string production never produces, so the corpus would be pinning
+    behaviour downstream of an input that cannot occur.
+
+    Both halves are pinned here: the separator, and the title rule that decides
+    whether a credit is found at all.
+    """
+    from discogs.service import _scan_tracklist_for_credit
+
+    release_id = 90001
+    release = ReleaseMetadataResponse(
+        release_id=release_id,
+        release_url=f"https://www.discogs.com/release/{release_id}",
+        title="Peng!",
+        artist="Stereolab",
+        tracklist=[
+            TrackItem(
+                position="A1", title="Super Falling Star", artists=["Laetitia Sadier", "Tim Gane"]
+            ),
+        ],
+    )
+    fake = corpus.FakeDiscogsService({"releases": [], "compilations": []})
+    fake._releases[release_id] = release
+
+    exact = await fake.get_track_credit_on_release(release_id, "Super Falling Star")
+    substring = await fake.get_track_credit_on_release(release_id, "Super Falling")
+
+    assert exact == _scan_tracklist_for_credit(release, "Super Falling Star")
+    assert exact == "Laetitia Sadier Tim Gane", "credits must be space-joined, as production joins"
+    assert substring == _scan_tracklist_for_credit(release, "Super Falling")
+    assert substring == exact, "the bidirectional-substring title rule must apply, not equality"
 
 
 def test_build_library_db_raises_on_a_row_missing_a_column(tmp_path):

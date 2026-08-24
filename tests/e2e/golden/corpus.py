@@ -39,11 +39,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from wxyc_etl.schema import library_columns
+from wxyc_etl.schema import library_columns, library_ddl
 
 from core.dependencies import _DISCOGS_POOL_MAX_SIZE_DEFAULT, _DISCOGS_POOL_MAX_SIZE_ENV_VAR
 from core.search import (
@@ -69,13 +73,21 @@ from lookup.admission import (
     DEFAULT_ADMISSION_LOOP_LAG_SHED_MS,
 )
 from lookup.matching import MAX_SEARCH_RESULTS
-from lookup.miss_kind import MISS_CLEAN, MISS_DEGRADED, MISS_TIMEOUT, OUTCOME_HIT
+from lookup.miss_kind import (
+    MISS_CLEAN,
+    MISS_DEGRADED,
+    MISS_TIMEOUT,
+    OUTCOME_HIT,
+    derive_miss_kind,
+)
+from lookup.models import LookupResponse
 from lookup.timeouts import (
     _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S,
     _BANDCAMP_LIVE_PROBE_TIMEOUT_DEFAULT_S,
     APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
     BANDCAMP_LIVE_PROBE_TIMEOUT_ENV_VAR,
 )
+from tests.unit.conftest import CREDENTIAL_ENV_VARS
 
 GOLDEN_DIR = Path(__file__).resolve().parent
 LIBRARY_PATH = GOLDEN_DIR / "library.json"
@@ -147,12 +159,19 @@ ROWLESS_MARKER = "row-less: "
 #: hand -- never silently, by a knob moving without the corresponding pin
 #: moving too.
 _PINNED_ENV: dict[str, str] = {
-    "DISCOGS_TOKEN": "",
-    "DISCOGS_API_KEY": "",
-    "DISCOGS_API_SECRET": "",
-    "DATABASE_URL_DISCOGS": "",
-    "POSTHOG_API_KEY": "",
-    "SENTRY_DSN": "",
+    # Every credential the repo scrubs, seeded from the roster that owns the
+    # list rather than re-listed here. `tests/unit/conftest.py` blanks these
+    # session-wide for the unit tier and `tests/unit/test_env_hermeticity.py`
+    # keeps the roster complete in both directions -- but that scrub is scoped
+    # to `tests/unit/`, so this tier has to opt in explicitly. It matters:
+    # `/api/v1/lookup` injects the Apple Music and Spotify clients, and
+    # `streaming/dependencies.py` builds a REAL client whenever the matching
+    # settings are non-empty, while `tests/e2e/golden/conftest.py` overrides
+    # only library, Discogs and PostHog. A hand-listed subset (this was six of
+    # eighteen) meant a populated `.env` put live streaming clients behind a
+    # corpus case -- the host-dependent verdict this whole block exists to
+    # prevent.
+    **dict.fromkeys(CREDENTIAL_ENV_VARS, ""),
     # Not a default (it ships True): telemetry is pinned off so a corpus run
     # can never emit a `lookup_completed` event into a real project.
     "ENABLE_TELEMETRY": "false",
@@ -370,14 +389,33 @@ def _read_json(path: Path) -> Any:
         return json.load(fh)
 
 
+@lru_cache(maxsize=1)
 def load_library_rows() -> list[dict[str, Any]]:
-    """The seeded catalog, as plain dicts in `wxyc_etl.schema.library_columns()` order."""
+    """The seeded catalog, as plain dicts in `wxyc_etl.schema.library_columns()` order.
+
+    Parsed once per process. Callers read it to seed a SQLite file or to check
+    a case's `requires_rows`; none mutates it.
+    """
     return _read_json(LIBRARY_PATH)
 
 
+@lru_cache(maxsize=1)
 def load_discogs_fixture() -> dict[str, Any]:
-    """Releases plus the search routing tables."""
+    """Releases plus the search routing tables. Parsed once; NEVER mutated.
+
+    Cached because the guard tests call this alongside the session fixture, so
+    the 5,400-line file was being parsed four times a session. The
+    never-mutate contract the `golden_discogs_fixture` fixture already states
+    is what makes sharing one parsed copy safe; the one test that needs a
+    different route table builds a `{**fixture, ...}` copy rather than editing
+    this one.
+    """
     return _read_json(DISCOGS_PATH)
+
+
+@lru_cache(maxsize=1)
+def _load_cases_cached() -> tuple[Case, ...]:
+    return tuple(Case.from_json(raw) for raw in _read_json(CASES_PATH))
 
 
 def load_cases() -> list[Case]:
@@ -385,15 +423,20 @@ def load_cases() -> list[Case]:
 
     Collected at import time by the parameterized test, so this must stay
     cheap and must not touch anything an xdist worker could contend on.
+
+    Parsed once per process and re-listed per call: eleven call sites (ten
+    guard tests plus the `parametrize`) were each re-reading the 93 KB file and
+    rebuilding 143 `Case` + 143 `Verdict` objects. `Case` is a frozen
+    dataclass, so sharing the instances is safe; the fresh `list` keeps callers
+    free to sort or filter their own copy. The cache lives on the loader rather
+    than in a module-scoped fixture because `parametrize` runs at collection
+    time, before any fixture exists.
     """
-    return [Case.from_json(raw) for raw in _read_json(CASES_PATH)]
+    return list(_load_cases_cached())
 
 
 def count_by_shape(cases: list[Case]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for case in cases:
-        counts[case.shape] = counts.get(case.shape, 0) + 1
-    return counts
+    return Counter(case.shape for case in cases)
 
 
 def dump_cases(cases: list[dict[str, Any]]) -> str:
@@ -476,27 +519,65 @@ def result_identity(result: dict[str, Any]) -> str:
 def verdict_from_payload(payload: dict[str, Any]) -> Verdict:
     """Project a `/lookup` response body down to the asserted verdict.
 
-    `miss_kind` is re-derived here from the same three fields
-    `lookup.miss_kind.derive_miss_kind` reads, rather than imported from the
-    response: the wire response does not carry `miss_kind` (it is a telemetry
-    property, not a contract field), and reading `results`/`timeout`/`degraded`
-    off the JSON keeps the corpus asserting what a *caller* sees.
+    `miss_kind` is not on the wire -- it is a telemetry property, not a
+    contract field -- so it is derived here. It is derived by *calling*
+    `lookup.miss_kind.derive_miss_kind`, not by restating its rules: the
+    corpus's whole claim is that a failing case and a production alert
+    describe the same thing, and a second copy of the hit/timeout/degraded/
+    clean precedence chain is the one place that claim would quietly stop
+    being true. LML#1236 may yet change what sets `degraded`; when it does,
+    both move together or neither does.
+
+    Validating the payload back into `LookupResponse` on the way is not a
+    detour to reach that function -- it is a free extra assertion that the
+    body the caller received still parses as the response contract.
     """
     results = payload.get("results") or []
-    if results:
-        miss_kind = OUTCOME_HIT
-    elif payload.get("timeout"):
-        miss_kind = MISS_TIMEOUT
-    elif payload.get("degraded"):
-        miss_kind = MISS_DEGRADED
-    else:
-        miss_kind = MISS_CLEAN
+    miss_kind = derive_miss_kind(LookupResponse.model_validate(payload))
     return Verdict(
         miss_kind=miss_kind,
         song_not_found=bool(payload.get("song_not_found")),
         found_on_compilation=bool(payload.get("found_on_compilation")),
         results=tuple(result_identity(r) for r in results),
     )
+
+
+@asynccontextmanager
+async def golden_app_client(library_db: Any, discogs: Any) -> AsyncIterator[Any]:
+    """The real FastAPI app, wired to a fixture catalog and a fake Discogs.
+
+    The single definition of "how a corpus case reaches the app", shared by the
+    test tier (`tests/e2e/golden/conftest.py::golden_client`) and the recording
+    tool (`scripts/rebaseline_golden_corpus.py`). Those two had hand-synced
+    copies of this block, under a comment naming the exact hazard -- if they
+    diverge, the tool records a verdict the test tier cannot reproduce -- and
+    prose was the only thing holding them together. Adding a fourth override in
+    one place and forgetting the other would mean the tool ran against a real
+    dependency while CI compared its output against a fake.
+
+    `get_settings` is deliberately *not* overridden: settings come from the env
+    pins (`pinned_environment`), which is the only channel the whole pipeline
+    reads. Overriding the dependency as well would give the router one
+    `Settings` and everything under it another.
+
+    Imports are deferred to the call so importing this module for its pure
+    helpers does not drag in the FastAPI app.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+    from main import app
+
+    app.dependency_overrides[get_library_db] = lambda: library_db
+    app.dependency_overrides[get_discogs_service] = lambda: discogs
+    app.dependency_overrides[get_posthog_client] = lambda: None
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://golden"
+        ) as client:
+            yield client
+    finally:
+        app.dependency_overrides.clear()
 
 
 def verdict_shape_is_consistent(verdict: Verdict) -> bool:
@@ -527,19 +608,6 @@ def verdict_shape_is_consistent(verdict: Verdict) -> bool:
 #: review).
 LIBRARY_COLUMNS = tuple(library_columns())
 
-_CREATE_LIBRARY_SQL = """
-    CREATE TABLE library (
-        id INTEGER PRIMARY KEY,
-        title TEXT,
-        artist TEXT,
-        call_letters TEXT,
-        artist_call_number INTEGER,
-        release_call_number INTEGER,
-        genre TEXT,
-        format TEXT,
-        alternate_artist_name TEXT
-    )
-"""
 
 #: Present but empty. `LibraryDB.connect()` probes for this table and skips the
 #: streaming-status step entirely when it is missing, so creating it keeps that
@@ -572,7 +640,10 @@ def build_library_db(path: Path, rows: list[dict[str, Any]]) -> Path:
     """
     conn = sqlite3.connect(path)
     try:
-        conn.execute(_CREATE_LIBRARY_SQL)
+        # The crate owns the shape, the same way LIBRARY_FTS_CREATE_SQL and
+        # LIBRARY_COLUMNS below do -- a hand-copied CREATE TABLE would drift from
+        # the schema the code under test reads.
+        conn.execute(library_ddl())
         conn.execute(LIBRARY_FTS_CREATE_SQL)
         conn.execute(_CREATE_STREAMING_LINKS_SQL)
         conn.execute("CREATE INDEX idx_artist ON library(artist)")
@@ -600,28 +671,44 @@ def build_library_db(path: Path, rows: list[dict[str, Any]]) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _route_key(*parts: str | None) -> str:
+def route_key(*parts: str | None) -> str:
+    """The fixture routing key for a search.
+
+    Public because `scripts/build_golden_corpus.py` mints the keys this reads
+    back. That script used to carry a byte-identical copy under a comment
+    saying it must stay byte-identical -- which is what an import is for: the
+    key format is the contract between the generator and the fake, and a
+    contract with two implementations has none.
+    """
     return "|".join((p or "").strip().lower() for p in parts)
 
 
-class FakeDiscogsService:
-    """A `DiscogsService` stand-in that serves `discogs.json` and nothing else.
+#: Internal alias; the callers below predate the rename.
+_route_key = route_key
 
-    A concrete class rather than an `AsyncMock`: an `AsyncMock` invents a
-    coroutine for any attribute touched, so a pipeline change that starts
-    calling a new upstream method would keep passing while silently receiving
-    a `MagicMock`. Here it raises `AttributeError`, and the corpus goes red on
-    the commit that introduced the call -- which is the whole point of the
-    tier.
 
-    Every method is a lookup, never a matcher, with one deliberate exception:
-    :meth:`validate_track_on_release` runs the real tracklist-match kernel.
-    See this module's docstring.
+@dataclass(frozen=True)
+class DiscogsUniverse:
+    """The parsed, read-only half of `discogs.json`.
+
+    Split out from `FakeDiscogsService` because it is the same for every case
+    while the call log is not. Parsing it per fake meant 39
+    `ReleaseMetadataResponse` + 544 `TrackItem` validations rebuilt 144 times a
+    session for data nothing mutates. Holding it as its own object lets each
+    case still get a fresh fake -- which is what keeps one case's call log out
+    of another's -- without also rebuilding the universe behind it.
     """
 
-    def __init__(self, fixture: dict[str, Any]):
-        self._releases: dict[int, ReleaseMetadataResponse] = {}
-        self._compilations: set[int] = set()
+    releases: dict[int, ReleaseMetadataResponse]
+    compilations: set[int]
+    track_searches: dict[str, list[int]]
+    album_searches: dict[str, list[int]]
+    album_title_searches: dict[str, list[int]]
+
+    @classmethod
+    def from_fixture(cls, fixture: dict[str, Any]) -> DiscogsUniverse:
+        releases: dict[int, ReleaseMetadataResponse] = {}
+        compilations: set[int] = set()
         for raw in fixture.get("releases", []):
             release = ReleaseMetadataResponse(
                 release_id=raw["release_id"],
@@ -639,12 +726,54 @@ class FakeDiscogsService:
                     for t in raw.get("tracklist", [])
                 ],
             )
-            self._releases[release.release_id] = release
+            releases[release.release_id] = release
             if raw.get("is_compilation"):
-                self._compilations.add(release.release_id)
-        self._track_searches: dict[str, list[int]] = fixture.get("track_searches", {})
-        self._album_searches: dict[str, list[int]] = fixture.get("album_searches", {})
-        self._album_title_searches: dict[str, list[int]] = fixture.get("album_title_searches", {})
+                compilations.add(release.release_id)
+        return cls(
+            releases=releases,
+            compilations=compilations,
+            track_searches=fixture.get("track_searches", {}),
+            album_searches=fixture.get("album_searches", {}),
+            album_title_searches=fixture.get("album_title_searches", {}),
+        )
+
+
+@lru_cache(maxsize=1)
+def load_discogs_universe() -> DiscogsUniverse:
+    """The checked-in universe, parsed once per process."""
+    return DiscogsUniverse.from_fixture(load_discogs_fixture())
+
+
+class FakeDiscogsService:
+    """A `DiscogsService` stand-in that serves `discogs.json` and nothing else.
+
+    A concrete class rather than an `AsyncMock`: an `AsyncMock` invents a
+    coroutine for any attribute touched, so a pipeline change that starts
+    calling a new upstream method would keep passing while silently receiving
+    a `MagicMock`. Here it raises `AttributeError`, and the corpus goes red on
+    the commit that introduced the call -- which is the whole point of the
+    tier.
+
+    Every method is a lookup, never a matcher, with one deliberate exception:
+    :meth:`validate_track_on_release` runs the real tracklist-match kernel.
+    See this module's docstring.
+    """
+
+    def __init__(self, fixture: dict[str, Any] | DiscogsUniverse):
+        universe = (
+            fixture
+            if isinstance(fixture, DiscogsUniverse)
+            else DiscogsUniverse.from_fixture(fixture)
+        )
+        # Bound by reference, never copied: the universe is read-only, and
+        # rebuilding it per case cost 583 pydantic validations x 144 cases.
+        # Only the three call-log fields below are per-case state, which is
+        # what a fresh fake actually exists to give each case.
+        self._releases = universe.releases
+        self._compilations = universe.compilations
+        self._track_searches = universe.track_searches
+        self._album_searches = universe.album_searches
+        self._album_title_searches = universe.album_title_searches
         self.calls: list[str] = []
         self.served_candidates = False
         self.served_keys: set[str] = set()
@@ -765,14 +894,26 @@ class FakeDiscogsService:
         return _scan_tracklist_for_match(release, release_id, track, artist)
 
     async def get_track_credit_on_release(self, release_id: int, track: str) -> str | None:
+        """The second method that is not a lookup, and for the same reason.
+
+        Delegates to the production `_scan_tracklist_for_credit` -- which is
+        the entire body of the real `get_track_credit_on_release` after
+        `get_release` -- so the bidirectional-substring title rule and the
+        space-joined credit form both come from the code under test. Neither
+        is cosmetic: `discogs/service.py` documents the space-joined form as
+        the one `_scan_tracklist_for_match`'s LML#210 fuzzy fallback
+        re-validates against, and this credit is the artist anchor for the
+        row-less resolve the LML#1184 frozen cases exercise. Hand-rolling it
+        (exact title equality, `", ".join`) handed the pipeline an anchor
+        production never produces.
+        """
+        from discogs.service import _scan_tracklist_for_credit
+
         release = self._releases.get(release_id)
         self._record(f"track_credit:{release_id}", release is not None)
         if release is None:
             return None
-        for item in release.tracklist or []:
-            if item.title.lower() == track.strip().lower() and item.artists:
-                return ", ".join(item.artists)
-        return None
+        return _scan_tracklist_for_credit(release, track)
 
     async def get_release_artist_variations(self, release_id: int) -> set[str]:
         self._record(f"artist_variations:{release_id}", False)
