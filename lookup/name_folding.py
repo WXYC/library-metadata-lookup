@@ -204,8 +204,14 @@ def folded_hit(candidate: str, query: str, *, exact: bool) -> bool:
 # whether a two-character stem may continue AT ALL, one rung wider than the
 # one-character wildcard #1250 asks about, and it would silently take the
 # open-prefix continuation away from every future two-character stem on the
-# strength of one snapshot. It belongs in that residual's own ticket, with its
-# own measurement, not smuggled in as a constant here.
+# strength of one snapshot. That residual is LML#1262, which owns it and
+# lists "do not raise #1250's floor" as a constraint, so this stays at 2.
+#
+# Note #1262 justifies that constraint with "it breaks 'The Who' before it
+# fixes 'The Ex'", which is true of floor 4 and not of floor 3 -- "who" is
+# three characters and clears a floor of 3. The constraint is honored here
+# either way; the correction is recorded so a future reader weighing floor 3
+# knows the tradeoff is real rather than already foreclosed.
 _ARTICLE_STEM_MIN_LENGTH = 2
 
 
