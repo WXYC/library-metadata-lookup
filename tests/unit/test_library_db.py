@@ -2563,6 +2563,24 @@ class TestArtistCorrectionMarginGuard:
         finally:
             await db.close()
 
+    @pytest.mark.asyncio
+    async def test_a_rival_seven_points_back_still_suppresses_the_correction(self, tmp_path):
+        """The margin is 8, tuned on the CTA-bearing prod catalog -- not 6.
+
+        A real observed misroute from the condition-1 discharge run: the
+        out-of-library query "Johnny Mitchell" scores 92.9 against
+        'John Mitchell' with 'Joni Mitchell' 7.1 points back -- three
+        genuinely different artists. At margin 6 the correction fires and
+        routes the LML#626 library channel into John Mitchell's catalog; a
+        rival inside 8 points means the neighbourhood is too dense to pick.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["John Mitchell", "Joni Mitchell", "Sessa"])
+        try:
+            assert await db.find_similar_artist("Johnny Mitchell") is None
+        finally:
+            await db.close()
+
     def test_scan_duplicate_entries_of_one_artist_neither_zero_nor_bypass_the_margin(self):
         """Scan-level pin, independent of the pool build's own dedupe layer.
 

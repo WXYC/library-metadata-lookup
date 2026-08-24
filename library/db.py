@@ -17,7 +17,7 @@ from library.models import LibraryItem
 
 logger = logging.getLogger(__name__)
 
-ARTIST_CORRECTION_MARGIN_POINTS = 6
+ARTIST_CORRECTION_MARGIN_POINTS = 8
 """How far ``find_similar_artist``'s winner must outscore its nearest rival.
 
 LML#1245. The winner must beat the best *distinct* runner-up by this many
@@ -27,24 +27,25 @@ which are the densest region of the catalog -- are exactly where a full-pool
 scan is most dangerous, because that is where it reaches rivals the old
 anchored prefilter never surfaced. The margin fires there and nowhere else.
 
-Measured on the ``prod-20260719`` catalog with the committed harness
-(``scripts/measure_artist_correction.py``, seed 1245): ``main``'s LIKE
-prefilter sits at 18.0 false corrections per 1,000 lookups with 70.7%
-synthetic single-edit typo recall; this margin plus the edit cap below
-lands at 14.7 per 1,000 at 93.1% -- better on both axes, so it is not a
-trade. (An earlier figure of 17.7-vs-22.0, quoted from the ticket's
-comment 4, was measured on a two-column catalog and does not reproduce
-here; do not quote it.)
+8, tuned on the CTA-bearing production catalog (``prod-20260823``, 79,337
+distinct names incl. 58k compilation-track credits) with the committed
+harness (``scripts/measure_artist_correction.py``, seed 1245). Against
+``main``'s LIKE prefilter at 35.7 false corrections per 1,000 lookups /
+47.7% synthetic single-edit typo recall, the margin sweep at len/12 reads
+(margin 0 -> 4 -> 6 -> 8 -> 10): 45.0 -> 39.3 -> 35.0 -> 30.3 -> 22.7
+false/1k against 95.3 -> 94.3 -> 91.7 -> 90.4 -> 86.0% recall. Margin 6's
+precision edge over main (35.0 vs 35.7, i.e. two events in 3,000 probes)
+is noise; **8 beats main outside noise on both axes** (30.3/90.4) while
+costing only 1.3 recall points over 6, and 10 is where recall starts
+paying seriously (-4.4 points). On the CTA-less ``prod-20260719`` catalog
+the same setting reads 14.0/92.3 against main's 18.0/70.7 -- dominant on
+both catalogs. The canonical shape it refuses: out-of-library
+"Johnny Mitchell" scoring 92.9 on 'John Mitchell' with 'Joni Mitchell'
+7.1 back -- three different artists, too dense to pick.
 
-Unlike the divisor below, the margin is a genuine trade, and the sweep
-shows a shallow one: at len/12, margin 0 -> 4 -> 6 -> 8 -> 10 reads 18.3 ->
-15.0 -> 14.7 -> 14.0 -> 14.0 false/1k against 94.7 -> 94.0 -> 93.1 -> 92.3
--> 91.5% recall. Most of the precision arrives by 4-6 and nothing arrives
-after 8, so 6 sits at the knee's far edge; it is kept over 4 because the
-margin is the one guard that fires on rival *density* rather than on the
-winner's own error budget, and the CTA-bearing production pool (whose V/A
-shelf credits are the densest neighbourhoods, unmeasured here) stresses
-exactly that.
+(Figures of 17.7-vs-22.0 and 14.7/93.1-vs-18.0/70.7 quoted earlier in the
+ticket and in prior revisions were measured on 2- and 3-column catalogs
+respectively; the CTA-bearing rows above supersede them.)
 """
 
 ARTIST_CORRECTION_EDIT_CAP_DIVISOR = 12
@@ -52,18 +53,18 @@ ARTIST_CORRECTION_EDIT_CAP_DIVISOR = 12
 
 12, not the 8 the ticket proposed. 8 was explicitly a round number chosen to
 demonstrate the shape, and LML#1245's pre-merge condition 3 asks for a sweep;
-this is its answer. On the ``prod-20260719`` catalog, holding margin at 6 and
-measuring with :data:`_ARTIST_CORRECTION_DISTANCE`:
+this is its answer. On the CTA-bearing ``prod-20260823`` catalog, holding
+margin at 8 and measuring with :data:`_ARTIST_CORRECTION_DISTANCE`:
 
-    len/6   20.7 false/1k   93.1% recall
-    len/8   19.0            93.1%
-    len/10  18.0            93.1%
-    len/12  14.7            93.1%
+    len/6   44.3 false/1k   90.4% recall
+    len/8   38.3            90.4%
+    len/10  34.3            90.4%
+    len/12  30.3            90.4%
 
 Recall is flat across the whole range and only precision moves, so the choice
 is free -- but only because the distance metric counts a transposition as one
-edit. Under plain Levenshtein the same sweep reads 91.1% / 85.5% / 79.5% as
-the cap tightens, and the divisor becomes a real trade. See
+edit. Under plain Levenshtein the recall column becomes cap-dependent and
+falls as the cap tightens, and the divisor becomes a real trade. See
 :data:`_ARTIST_CORRECTION_DISTANCE`.
 """
 
@@ -1154,14 +1155,14 @@ class LibraryDB:
         won comfortably; it was simply never shown.
 
         Scoring the full pool alone is not acceptable, and the first version
-        of this change proved it: unguarded, false corrections rise from the
-        prefilter's 18.0 to 30.7 per 1,000 lookups (recall 94.7%), and the
-        new failures land on genuinely different artists -- 'The Strokes' ->
-        'The Strike', 'Steve Coleman' -> 'Steve Lehman'. A false correction
-        is silent -- it rewrites ``parsed.library_artist``, routes the
-        LML#626 library channel into another artist's catalog, and returns
-        that artist's rows as a successful lookup, so it never appears in
-        the LML#1233 miss rate.
+        of this change proved it: unguarded on the CTA-bearing prod catalog,
+        false corrections nearly triple the prefilter's rate (35.7 -> 97.0
+        per 1,000 lookups), and the new failures land on genuinely different
+        artists -- 'The Strokes' -> 'The Strike', 'Steve Coleman' ->
+        'Steve Lehman'. A false correction is silent -- it rewrites
+        ``parsed.library_artist``, routes the LML#626 library channel into
+        another artist's catalog, and returns that artist's rows as a
+        successful lookup, so it never appears in the LML#1233 miss rate.
 
         Two guards make the change strictly better than the prefilter rather
         than a trade:
@@ -1172,10 +1173,12 @@ class LibraryDB:
           nearest *distinct* rival, which is what makes a dense neighbourhood
           refuse to resolve instead of picking.
 
-        Measured together on the ``prod-20260719`` catalog with the
-        committed harness: **14.7 false corrections per 1,000 at 93.1%
-        synthetic single-edit typo recall, against main's 18.0 and 70.7%.**
-        Better on both axes.
+        Measured together with the committed harness, against ``main`` on
+        the same catalog and corpus: **30.3 false corrections per 1,000 at
+        90.4% synthetic single-edit typo recall vs main's 35.7 and 47.7%**
+        on the CTA-bearing ``prod-20260823`` catalog, and 14.0/92.3% vs
+        18.0/70.7% on the CTA-less ``prod-20260719``. Better on both axes,
+        on both catalogs.
 
         The short-name ``effective_threshold`` below predates this change and
         is deliberately untouched -- it is what keeps "Plug" off "Plugz"
