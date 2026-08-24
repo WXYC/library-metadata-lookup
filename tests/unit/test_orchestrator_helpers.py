@@ -700,6 +700,41 @@ class TestArtistMatchesItem:
         item = make_library_item(id=1, artist=wrong_artist, title="Album")
         assert artist_matches_item(item, query) is False
 
+    @pytest.mark.parametrize(
+        "query, catalog_artist",
+        [
+            ("F.U.", "The F.U.'s"),
+            ("F.U", "The F.U.'s"),
+        ],
+    )
+    def test_punctuation_after_the_stem_is_a_boundary(self, query, catalog_artist):
+        """The boundary counts CONTENT the same way the floor does (LML#1250 review).
+
+        Companion to the floor's fidelity fix above, and the same defect read
+        from the other end. That fix taught the *floor* to discount
+        punctuation; the *boundary* was still asking for a literal space. The
+        two then disagreed at exactly one shape: a query whose stem clears the
+        floor on content characters but whose catalog continuation is
+        punctuation rather than a space.
+
+        "F.U." strips to "f.u.", which is two content characters and clears
+        the floor. Rung 2's candidate is unfolded, so "the f.u.'s" strips to
+        "f.u.'s" and continues with an apostrophe -- not the space rung 2
+        demanded. Rungs 3 and 4 cannot cover for it either: the query ends in
+        punctuation, so ``ends_in_punctuation`` sets ``folded_exact`` and
+        collapses both to equality. No rung matched, and a real shelved record
+        (The F.U.'s, Boston hardcore) became unreachable by its own name.
+
+        A punctuation continuation is a token boundary -- that is the premise
+        the fold is built on and what rung 4 already assumes, since folding
+        turns that apostrophe into the very space rung 2 was looking for.
+        Requiring a *literal* space made rung 2 the only rung that disagreed.
+        The repo already spells this boundary at ``_va_series_title_match``
+        (``matching.py``), for the same reason and in the same shape.
+        """
+        item = make_library_item(id=1, artist=catalog_artist, title="Album")
+        assert artist_matches_item(item, query) is True
+
     def test_short_article_stem_still_matches_the_query_side_article(self):
         """The guards narrow the open-prefix continuation, never the rung: a
         query carrying an article still reaches the bare catalog name it
