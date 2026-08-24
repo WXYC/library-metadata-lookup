@@ -670,6 +670,34 @@ class TestArtistMatchesItem:
         item = make_library_item(id=2, artist="E", title="Album")
         assert artist_matches_item(item, "A E") is True
 
+    @pytest.mark.parametrize(
+        "query, reached_artist",
+        [
+            ("The Ex", "Ex Cops"),
+            ("The Go", "Go Back Snowball"),
+        ],
+    )
+    def test_two_character_common_word_stem_still_continues(self, query, reached_artist):
+        """Accepted residue, pinned rather than fixed (LML#1250).
+
+        A two-character stem left over after stripping an article clears both
+        guards -- it is long enough for the floor, and the catalog name really
+        does continue after a space. That is the *identical* mechanism #364's
+        own worked example needs ("The Black Dog" -> "Black Dog Productions"),
+        so no syntactic rule separates them at this rung.
+
+        Raising :data:`_ARTICLE_STEM_MIN_LENGTH` to 3 would close these -- 20
+        catalog pairs across "The Ex", "The Go" and "The AM", all of them
+        wrong-artist admissions on inspection. That is deliberately NOT done
+        here: it is a policy decision one rung wider than the one-character
+        wildcard #1250 asks about, and it belongs in that residual's own
+        ticket with its own measurement. This test is the tripwire -- if it
+        starts failing, the floor moved, and that has to be a decision rather
+        than a side effect.
+        """
+        item = make_library_item(id=1, artist=reached_artist, title="Album")
+        assert artist_matches_item(item, query) is True
+
 
 # ---------------------------------------------------------------------------
 # Tests: build_context_message
