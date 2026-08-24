@@ -221,21 +221,22 @@ def article_stem_hit(candidate: str, query: str, *, exact: bool) -> bool:
     Two guards on :func:`folded_hit`'s open-prefix-or-equality shape, both
     scoped to the open-prefix branch -- an exact match at any length still
     passes, since equality can never wildcard. Neither closes the gap alone,
-    which is why both are here. A **token boundary**
-    (``startswith(query + " ")``) closes the *within-word* failure: "A Ha"
-    strips to "ha", which open-prefixed "Habib Koite", while "black dog"
-    still reaches "Black Dog Productions" (#364) because "productions"
-    starts after a real space. A **content-length floor** closes what the
-    boundary cannot -- folding punctuation manufactures a *genuine* boundary
-    around a one-character stem, since "A E" strips to "e" and "E-40" folds
-    to "e 40". :data:`_ARTICLE_STEM_MIN_LENGTH` skips the open-prefix branch
-    below the floor, and carries the measured population, the 2-vs-3 call,
-    and why the floor counts content rather than raw characters.
+    which is why both are here. A **token boundary** closes the *within-word*
+    failure: "A Ha" strips to "ha", which open-prefixed "Habib Koite", while
+    "black dog" still reaches "Black Dog Productions" (#364). Any
+    non-alphanumeric continuation counts, not only a space -- rung 4's
+    candidate is folded, so punctuation already *is* a space by the time it
+    looks, and demanding a literal one made the two rungs disagree about
+    "The F.U.'s". Same shape as ``_va_series_title_match``. A **content-length
+    floor** closes what the boundary cannot -- folding manufactures a genuine
+    boundary around a one-character stem, since "A E" strips to "e" and
+    "E-40" folds to "e 40". :data:`_ARTICLE_STEM_MIN_LENGTH` carries the
+    measured population, the 2-vs-3 call, and why both guards count content
+    rather than raw characters.
 
     Shaped like :func:`folded_hit` but deliberately not calling it: that
     would pass a literal ``exact=True`` from inside a function that has its
-    own ``exact``, and hand ``query + " "`` to a parameter documented as the
-    query. The shared signature is what keeps the two aligned.
+    own ``exact``. The shared signature is what keeps the two aligned.
     """
     if candidate == query:
         return True
@@ -243,4 +244,7 @@ def article_stem_hit(candidate: str, query: str, *, exact: bool) -> bool:
         return False
     if len(_PUNCTUATION_RE.sub("", query)) < _ARTICLE_STEM_MIN_LENGTH:
         return False
-    return candidate.startswith(query + " ")
+    if not candidate.startswith(query):
+        return False
+    tail = candidate[len(query) :]
+    return bool(tail) and not tail[0].isalnum()
