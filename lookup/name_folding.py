@@ -183,9 +183,16 @@ def folded_hit(candidate: str, query: str, *, exact: bool) -> bool:
     return candidate == query if exact else candidate.startswith(query)
 
 
-# Minimum length (in characters) an article-stripped stem must retain before
-# :func:`article_stem_hit` will open-prefix a candidate on it (LML#1250).
-# Below this floor, only an exact match is admitted.
+# Minimum number of CONTENT characters an article-stripped stem must retain
+# before :func:`article_stem_hit` will open-prefix a candidate on it
+# (LML#1250). Below this floor, only an exact match is admitted.
+#
+# Content, not raw length, because the two rungs pass different fidelities --
+# rung 4's stem is punctuation-folded and rung 2's is not, so a raw `len()`
+# measures different things at the two call sites. "The J." strips to "j." on
+# rung 2: two raw characters, clearing a raw floor, letting "j. dilla"
+# open-prefix on "j. " -- while "The J" was correctly blocked. Punctuation
+# alone decided whether a single letter could wildcard (LML#1250 review).
 #
 # THE POPULATION, stated once here so no other site restates it (this branch
 # shipped three divergent copies before a production re-measure caught them).
@@ -198,14 +205,12 @@ def folded_hit(candidate: str, query: str, *, exact: bool) -> bool:
 #     "e"   (from "A E", or "A&E" on the candidate side)       874 -> 1
 #
 # WHY 2 AND NOT 3: 2 is the smaller value that closes both, excluding only a
-# bare one-character stem. They are not equivalent catalog-wide -- floor 3
-# also rejects 22 pairs, all from "The Ex" / "The Go" / "The AM" / "SF" and
-# all looking like wrong-artist admissions -- so floor 3 is declined, not
-# refuted. It decides whether a two-character stem may continue at all, a rung
-# wider than #1250 asks, and LML#1262 owns that residual with "do not raise
-# #1250's floor" as its constraint. Caveat recorded there: #1262 justifies
-# that with "it breaks 'The Who' before it fixes 'The Ex'", true of floor 4
-# but not 3, since "who" is three characters.
+# one-character stem. Not equivalent catalog-wide, though -- floor 3 also
+# rejects 22 pairs, all from "The Ex" / "The Go" / "The AM" / "SF" and all
+# looking like wrong-artist admissions -- so floor 3 is declined, not refuted.
+# It decides whether a two-character stem may continue at all, a rung wider
+# than #1250 asks, and LML#1262 owns that residual under a "do not raise
+# #1250's floor" constraint whose stated rationale is corrected there.
 _ARTICLE_STEM_MIN_LENGTH = 2
 
 
@@ -220,11 +225,12 @@ def article_stem_hit(candidate: str, query: str, *, exact: bool) -> bool:
     (``startswith(query + " ")``) closes the *within-word* failure: "A Ha"
     strips to "ha", which open-prefixed "Habib Koite", while "black dog"
     still reaches "Black Dog Productions" (#364) because "productions"
-    starts after a real space. A **length floor** closes what the boundary
-    cannot -- folding punctuation manufactures a *genuine* boundary around a
-    one-character stem, since "A E" strips to "e" and "E-40" folds to
-    "e 40". :data:`_ARTICLE_STEM_MIN_LENGTH` skips the open-prefix branch
-    below the floor, and carries the measured population and the 2-vs-3 call.
+    starts after a real space. A **content-length floor** closes what the
+    boundary cannot -- folding punctuation manufactures a *genuine* boundary
+    around a one-character stem, since "A E" strips to "e" and "E-40" folds
+    to "e 40". :data:`_ARTICLE_STEM_MIN_LENGTH` skips the open-prefix branch
+    below the floor, and carries the measured population, the 2-vs-3 call,
+    and why the floor counts content rather than raw characters.
 
     Shaped like :func:`folded_hit` but deliberately not calling it: that
     would pass a literal ``exact=True`` from inside a function that has its
@@ -235,6 +241,6 @@ def article_stem_hit(candidate: str, query: str, *, exact: bool) -> bool:
         return True
     if exact:
         return False
-    if len(query) < _ARTICLE_STEM_MIN_LENGTH:
+    if len(_PUNCTUATION_RE.sub("", query)) < _ARTICLE_STEM_MIN_LENGTH:
         return False
     return candidate.startswith(query + " ")

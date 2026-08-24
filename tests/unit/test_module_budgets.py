@@ -221,7 +221,7 @@ MODULE_BUDGETS: dict[str, int] = {
     # files would manufacture exactly the drift LML#1244 and LML#1257 exist
     # to prevent. Sized per the calibration convention: 1.3x150 -> 200.
     #
-    # Raised by LML#1250 (200 -> 250, measured 240). Worth being precise about
+    # Raised by LML#1250 (200 -> 250, measured 246). Worth being precise about
     # WHY, because the obvious justification -- "same reason as the LML#1257
     # entry above" -- does not actually transfer. #1257's anti-split argument
     # is that the two fidelities share `_PUNCTUATION_CHAR`; the comparison
