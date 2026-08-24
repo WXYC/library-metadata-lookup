@@ -27,15 +27,29 @@ wrong thing for the 96% of failures (measured on prod, LML#1237) where the
 bound release's own cover was simply never checked. #1242 shipped that
 re-ask first; this module only ever sees a release whose own-cover answer is
 already live-authoritative, so a coverless ``release`` argument here means
-Discogs was actually asked and said no (or the caller opted out via
-``allow_release_resolution_fallback=False``, in which case the release's
-never-asked state is preserved on purpose and this rung is equally right not
-to paper over it with an unrelated pressing's cover).
+Discogs was actually asked and said no.
+
+That guarantee is *why* ``allow_release_resolution_fallback=False`` gates the
+WHOLE rung, both legs, at the top of the function rather than only its live
+leg. With the switch off the cover rung asks
+``get_release(require_artwork_answer=False)``, so LML#542's arm-2 predicate
+treats a bulk-loaded row bearing a tracklist as a PG hit even when
+``artwork_checked_at IS NULL`` -- the release arrives here coverless without
+Discogs ever having been asked. Running even the cheap cache leg on that
+input would bind an unrelated pressing's art onto a release whose own cover
+was never checked, which is exactly PR#1240's review finding 2 surviving on
+the bulk path. A never-asked release stays never-asked; this rung is right
+not to paper over it with a sibling's cover, and gating both legs is what
+makes that true rather than merely stated. (An earlier draft of this module
+gated only the live leg and claimed this property anyway -- LML#1281 review.)
 
 **Cost, in the order this function pays it:**
 
 1. **Cache leg** (``DiscogsCacheService.get_sibling_release_artwork``) --
-   a local PG read, no Discogs round-trip. Answers only from
+   a local PG read, no Discogs round-trip, and reached only when
+   ``allow_release_resolution_fallback`` is on (see above -- correctness,
+   not cost, though it also spares the LML#1020 drain a per-row PG
+   transaction across 58k+ credits). Answers only from
    ``artwork_url IS NOT NULL AND NOT not_found`` rows: a sibling that was
    never live-checked for artwork (``artwork_checked_at IS NULL``) or one
    that Discogs 404'd (the LML#510 tombstone, whose UPSERT deliberately
@@ -139,6 +153,7 @@ index, is what should decide the flip.
 
 import logging
 
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import CacheSchemaSkewError, CacheUnavailableError
 from discogs.models import ReleaseMetadataResponse
 from discogs.service import DiscogsService
@@ -166,7 +181,7 @@ async def resolve_sibling_artwork(
     same row. See the module docstring for the full cost and ordering
     rationale.
     """
-    if not release.master_id:
+    if not release.master_id or not allow_release_resolution_fallback:
         return None
 
     cache = discogs_service.cache_service
@@ -183,16 +198,28 @@ async def resolve_sibling_artwork(
         if sibling_artwork:
             return sibling_artwork
 
-    if not allow_release_resolution_fallback:
+    try:
+        master = await discogs_service.get_master(release.master_id)
+        if master is None or not master.main_release_id:
+            return None
+        if master.main_release_id == release.release_id:
+            return None
+        main_release = await discogs_service.get_release(
+            master.main_release_id, require_artwork_answer=True
+        )
+    except DiscogsBreakerOpenError:
+        # LML#1118: kept narrow. ``get_release`` and ``get_master`` re-raise a
+        # saturation shed on purpose (LML#755) so a *validation* caller can
+        # tell "couldn't ask" from "asked, no" -- artwork is not such a
+        # caller. Uncaught, it propagates into
+        # ``fetch_artwork_for_items.fetch_one``, whose ``except Exception``
+        # discards the whole item: an otherwise-good Discogs match thrown
+        # away, and the artist rung that would have answered never reached.
+        # Degrade to None so the cascade continues, exactly as the next rung
+        # down already does (``get_artist_image``, LML#1049).
+        logger.debug(
+            f"Discogs saturation breaker shed the sibling live leg for "
+            f"master {release.master_id}; degrading to the next rung"
+        )
         return None
-
-    master = await discogs_service.get_master(release.master_id)
-    if master is None or not master.main_release_id:
-        return None
-    if master.main_release_id == release.release_id:
-        return None
-
-    main_release = await discogs_service.get_release(
-        master.main_release_id, require_artwork_answer=True
-    )
     return main_release.artwork_url if main_release else None
