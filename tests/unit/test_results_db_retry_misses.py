@@ -72,6 +72,37 @@ class TestResetMissesToPending:
         assert (await _statuses(db))["skipped"] == ("pending", "pending")
         assert (dz_reset, sp_reset) == (1, 1)
 
+    async def test_real_spotify_misses_are_reset_too(self, db):
+        """The case the original clause could not reach.
+
+        Two rows arrive at ``spotify_status = 'not_found'`` by different
+        routes. One was *auto-skipped*: Deezer missed, so Spotify was never
+        asked, and its ``not_found`` is a placeholder. The other is a **real
+        miss**: Deezer found the album, Spotify was asked about it, and the
+        matcher failed to pair them.
+
+        The original clause reset Spotify only ``AND deezer_status =
+        'pending'``, which is true of the first row and false of the second.
+        Since matching improvements are exactly what makes a re-pass worth
+        running, the rows a better matcher would newly resolve were the ones
+        ``--retry-misses`` structurally refused to revisit -- the flag could
+        not retry the misses it was named for.
+        """
+        await _seed(
+            db,
+            [
+                ("auto_skipped", "not_found", "not_found"),
+                ("real_miss", "found", "not_found"),
+            ],
+        )
+
+        _, sp_reset = await db.reset_misses_to_pending()
+
+        statuses = await _statuses(db)
+        assert statuses["auto_skipped"] == ("pending", "pending")
+        assert statuses["real_miss"] == ("found", "pending")
+        assert sp_reset == 2
+
     async def test_reset_clears_the_stale_answer_columns(self, db):
         """Status alone is not the whole row: a reset that left the previous
         URL and timestamp behind would leave a 'pending' row carrying a

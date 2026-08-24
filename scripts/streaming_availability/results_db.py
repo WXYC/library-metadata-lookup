@@ -324,6 +324,13 @@ class ResultsDB:
         Every column the answer was written into is cleared alongside the
         status. Leaving a stale URL or timestamp on a ``pending`` row would
         make a discarded answer read as a fresh one.
+
+        Both routes to ``spotify_status = 'not_found'`` are reset: the
+        auto-skipped row Spotify was never asked about (Deezer missed first)
+        and the real miss it was asked about and failed to match. Only the
+        second kind can be resolved by better matching, which is what a
+        re-pass is usually for, so restricting the reset to the first made
+        ``--retry-misses`` unable to retry the misses it is named for.
         """
         assert self._db is not None
         async with self._write_lock:
@@ -337,8 +344,7 @@ class ResultsDB:
                    spotify_url = NULL, spotify_id = NULL, spotify_confidence = NULL,
                    spotify_matched_artist = NULL, spotify_matched_title = NULL,
                    spotify_checked_at = NULL
-                   WHERE spotify_status = 'not_found'
-                   AND deezer_status = 'pending'""")
+                   WHERE spotify_status = 'not_found'""")
             spotify_reset = cursor.rowcount
             await self._db.commit()
         return deezer_reset, spotify_reset
