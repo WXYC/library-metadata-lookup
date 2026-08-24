@@ -580,10 +580,21 @@ class TestArtistMatchesItem:
         Pinned rather than fixed (LML#1244 review). It lands on same-artist
         recoveries -- a listener typing "A E" should reach "A&E" -- and the
         candidate is the side being prefix-matched, so a shorter stem admits
-        fewer queries, not more. Both cases here still pass after LML#1250:
-        they land on the article rung's EQUALITY branch (query and candidate
-        reduce to the identical stem), which LML#1250's minimum-length floor
-        never gates -- only the open-prefix continuation branch is floored.
+        fewer queries, not more. Both cases still pass after LML#1250, but by
+        DIFFERENT rungs, and the difference is worth stating because a reader
+        looking for proof that the article rung's recovery survived will
+        otherwise take the wrong one (LML#1250 review):
+
+        - "M Sixty"/"A.M. Sixty" resolves on the article rung's equality
+          branch. Rung 3 misses it ("a m sixty" does not start with
+          "m sixty"), so this is the case that genuinely covers the claim.
+        - "A E"/"A&E" resolves one rung earlier, on the plain folded rung:
+          both sides fold to "a e" and rung 3 returns before either article
+          rung is consulted. It would stay green with rung 4 deleted
+          entirely, so it is NOT evidence about the article rung.
+
+        Neither is gated by the minimum-length floor, which narrows only the
+        open-prefix continuation branch.
         """
         item = make_library_item(id=1, artist=catalog_artist, title="Album")
         assert artist_matches_item(item, query) is True
@@ -658,13 +669,52 @@ class TestArtistMatchesItem:
         item = make_library_item(id=1, artist="A Minor Forest", title="Album")
         assert artist_matches_item(item, "M") is False
 
-    def test_short_article_stem_still_matches_its_own_name(self):
-        """The floor narrows the open-prefix continuation, not the rung --
-        an exact match at a short stem still works, in both directions."""
-        item = make_library_item(id=1, artist="Ha", title="Album")
-        assert artist_matches_item(item, "A Ha") is True
-        item = make_library_item(id=2, artist="E", title="Album")
-        assert artist_matches_item(item, "A E") is True
+    @pytest.mark.parametrize(
+        "query, wrong_artist",
+        [
+            ("The J.", "J. Dilla"),
+            ("A J.", "J. Mascis"),
+            ("The T.", "T. Rex"),
+            ("The M.", "M. Ward"),
+        ],
+    )
+    def test_punctuation_does_not_inflate_a_one_letter_stem_past_the_floor(
+        self, query, wrong_artist
+    ):
+        """The floor counts CONTENT characters, not raw ones (LML#1250 review).
+
+        The two article rungs pass stems at different fidelities -- rung 4's
+        is punctuation-folded, rung 2's is not -- so a raw-length floor is
+        measuring different things at the two call sites. "The J." strips to
+        "j." on rung 2: two raw characters, which cleared a raw floor of 2,
+        and "j. dilla" really does start with "j. ". The same query without
+        the period ("The J" -> "j") was correctly blocked, so punctuation
+        alone decided whether a single letter could wildcard.
+
+        That contradicted the guard's own stated invariant -- a one-character
+        stem is a wildcard however it is delimited -- and it bit hardest
+        exactly where the rest of the guard is thinnest: a punctuation-
+        terminated query sets ``folded_exact``, which collapses rung 4 to an
+        equality and leaves rung 2's inflated stem as the only open prefix.
+        """
+        item = make_library_item(id=1, artist=wrong_artist, title="Album")
+        assert artist_matches_item(item, query) is False
+
+    def test_short_article_stem_still_matches_the_query_side_article(self):
+        """The guards narrow the open-prefix continuation, never the rung: a
+        query carrying an article still reaches the bare catalog name it
+        strips to, at a stem far below the floor."""
+        assert artist_matches_item(make_library_item(id=1, artist="Ha"), "A Ha") is True
+        assert artist_matches_item(make_library_item(id=2, artist="E"), "A E") is True
+
+    def test_short_article_stem_still_matches_the_candidate_side_article(self):
+        """The reverse direction, which the query-side test above does not
+        exercise: the article is on the CATALOG side and the query is the
+        bare stem. This is #364's "Beatles"/"The Beatles" recovery at a stem
+        short enough to be floored, and it survives because the rung reaches
+        it by equality rather than by open prefix."""
+        assert artist_matches_item(make_library_item(id=1, artist="The Ha"), "Ha") is True
+        assert artist_matches_item(make_library_item(id=2, artist="A E"), "E") is True
 
     @pytest.mark.parametrize(
         "query, reached_artist",
@@ -684,9 +734,13 @@ class TestArtistMatchesItem:
 
         Left admitted deliberately: LML#1262 owns this residual and constrains
         against raising the floor to close it. The numbers behind that call
-        are on ``_ARTICLE_STEM_MIN_LENGTH``. This test is the tripwire -- if
-        it starts failing, the floor moved, and that has to be a decision
-        rather than a side effect.
+        are on ``_ARTICLE_STEM_MIN_LENGTH``.
+
+        This test is a tripwire, not an invariant. It fails on any change to
+        the two-character stem's treatment, which includes the *sanctioned*
+        fix -- if LML#1262 lands, expect this red and delete it as part of
+        that work. What it is here to catch is the unsanctioned version: the
+        floor moving as a side effect of something else.
         """
         item = make_library_item(id=1, artist=reached_artist, title="Album")
         assert artist_matches_item(item, query) is True

@@ -157,11 +157,15 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
 
     Both article-stripped rungs (this one and its folded counterpart below)
     route their open-prefix comparison through :func:`article_stem_hit`
-    rather than a bare ``startswith`` (LML#1250) — a query stripping down to
-    a 1-2 character stem open-prefixed hundreds of unrelated rows on main,
-    regardless of which side of the article/punctuation asymmetry produced
-    the short stem, so both rungs take the same guard. See that function's
-    docstring for why a token boundary alone does not close the gap.
+    (LML#1250) — a query stripping down to a **one-character** stem
+    open-prefixed hundreds of unrelated rows, regardless of which side of
+    the article/punctuation asymmetry produced it, so both rungs take the
+    same guard. What they replaced differs: this rung was a bare
+    ``startswith``, while the folded rung below was already ``folded_hit``,
+    an equality whenever the query ends in punctuation. A two-character stem
+    is deliberately still an open prefix — see LML#1262 and
+    :func:`article_stem_hit`'s docstring, which also covers why a token
+    boundary alone does not close the gap.
 
     The other two rungs are **exempt on purpose, not by omission**. The line
     is who authored the short stem: rungs 2 and 4 compare a stem a transform
