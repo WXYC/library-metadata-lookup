@@ -187,31 +187,25 @@ def folded_hit(candidate: str, query: str, *, exact: bool) -> bool:
 # :func:`article_stem_hit` will open-prefix a candidate on it (LML#1250).
 # Below this floor, only an exact match is admitted.
 #
-# Measured against the 2026-08-23 PRODUCTION library.db snapshot (23,886
-# distinct artists, and the only snapshot carrying `cross_reference_names`,
-# the third candidate axis ``artist_matches_item`` consumes): floor 2 and
-# floor 3 close the ticket's two reproducers identically, and 2 is the smaller
-# sufficient value -- it excludes only a bare one-character stem, the shortest
-# a fold can ever manufacture.
+# THE POPULATION, stated once here so no other site restates it (this branch
+# shipped three divergent copies before a production re-measure caught them).
+# Distinct artists an article-stripped stem reaches through the two article
+# rungs, before and after, on the 2026-08-23 production snapshot -- 23,886
+# artists, the only one carrying `cross_reference_names`. The survivor in each
+# case is the artist the query names:
 #
-# They are NOT equivalent catalog-wide, and the difference is worth stating
-# precisely rather than rounding to "equivalent": floor 3 additionally rejects
-# 22 pairs, every one of them from four queries -- "The Ex" (-> Ex Cops, Ex
-# Hex, Ex-Models, ...), "The Go" (-> Go West, Go Sailor, ...), "The AM"
-# (-> AM Radio, AM Syndicate) and "SF". That is exactly the two-character
-# common-word stem this fix declares out of scope, and all 22 do look like
-# wrong-artist admissions, so floor 3 is a live option -- but it is about
-# whether a two-character stem may continue AT ALL, one rung wider than the
-# one-character wildcard #1250 asks about, and it would silently take the
-# open-prefix continuation away from every future two-character stem on the
-# strength of one snapshot. That residual is LML#1262, which owns it and
-# lists "do not raise #1250's floor" as a constraint, so this stays at 2.
+#     "ha"  (from "A Ha", or "A-Ha" under a fold-first order)  275 -> 1
+#     "e"   (from "A E", or "A&E" on the candidate side)       874 -> 1
 #
-# Note #1262 justifies that constraint with "it breaks 'The Who' before it
-# fixes 'The Ex'", which is true of floor 4 and not of floor 3 -- "who" is
-# three characters and clears a floor of 3. The constraint is honored here
-# either way; the correction is recorded so a future reader weighing floor 3
-# knows the tradeoff is real rather than already foreclosed.
+# WHY 2 AND NOT 3: 2 is the smaller value that closes both, excluding only a
+# bare one-character stem. They are not equivalent catalog-wide -- floor 3
+# also rejects 22 pairs, all from "The Ex" / "The Go" / "The AM" / "SF" and
+# all looking like wrong-artist admissions -- so floor 3 is declined, not
+# refuted. It decides whether a two-character stem may continue at all, a rung
+# wider than #1250 asks, and LML#1262 owns that residual with "do not raise
+# #1250's floor" as its constraint. Caveat recorded there: #1262 justifies
+# that with "it breaks 'The Who' before it fixes 'The Ex'", true of floor 4
+# but not 3, since "who" is three characters.
 _ARTICLE_STEM_MIN_LENGTH = 2
 
 
@@ -219,19 +213,23 @@ def article_stem_hit(candidate: str, query: str, *, exact: bool) -> bool:
     """Does the article-stripped ``candidate`` satisfy the article-stripped
     ``query`` (LML#1250)?
 
-    Two guards on top of :func:`folded_hit`'s open-prefix-or-equality shape,
-    both scoped to the open-prefix branch -- an exact match at any length
-    still passes, since equality can never wildcard. A token boundary
-    (``startswith(query + " ")`` rather than a bare ``startswith``) closes
-    the *within-word* failure: "A Ha" strips to "ha", which open-prefix-
-    matched "Habib Koite" and 242 others before this fix, while "black dog"
-    still reaches "Black Dog Productions" (#364) since "productions" starts
-    after a real space. The boundary alone is not enough: folding
-    punctuation can manufacture a *genuine* boundary around a one-character
-    stem -- "A E" strips to "e", and "E-40" folds to "e 40", which really
-    does start with "e ". :data:`_ARTICLE_STEM_MIN_LENGTH` closes that
-    residual by skipping the open-prefix branch outright below the floor,
-    since a one-character stem is a wildcard no matter how it is delimited.
+    Two guards on :func:`folded_hit`'s open-prefix-or-equality shape, both
+    scoped to the open-prefix branch -- an exact match at any length still
+    passes, since equality can never wildcard. Neither closes the gap alone,
+    which is why both are here. A **token boundary**
+    (``startswith(query + " ")``) closes the *within-word* failure: "A Ha"
+    strips to "ha", which open-prefixed "Habib Koite", while "black dog"
+    still reaches "Black Dog Productions" (#364) because "productions"
+    starts after a real space. A **length floor** closes what the boundary
+    cannot -- folding punctuation manufactures a *genuine* boundary around a
+    one-character stem, since "A E" strips to "e" and "E-40" folds to
+    "e 40". :data:`_ARTICLE_STEM_MIN_LENGTH` skips the open-prefix branch
+    below the floor, and carries the measured population and the 2-vs-3 call.
+
+    Shaped like :func:`folded_hit` but deliberately not calling it: that
+    would pass a literal ``exact=True`` from inside a function that has its
+    own ``exact``, and hand ``query + " "`` to a parameter documented as the
+    query. The shared signature is what keeps the two aligned.
     """
     if candidate == query:
         return True

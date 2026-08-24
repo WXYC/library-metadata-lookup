@@ -621,23 +621,18 @@ class TestArtistMatchesItem:
     # ------------------------------------------------------------------
     # Short article-stem wildcard guard (LML#1250).
     #
-    # The leading-article rung (#364) and its folded counterpart (#1244)
-    # strip an article and then open-prefix whatever stem remains, with no
-    # floor on how short that stem may be. "A Ha" strips to "ha", which
-    # prefix-matched 243 unrelated catalog artists on main; "A E" strips to
-    # "e", which prefix-matched 796. Measured against the library.db
-    # snapshot, neither lever alone closes this: a token-boundary rule
-    # ("ha" must be followed by a space, not just any character) resolves
-    # the within-word case ("ha" into "habib") but not the one-character
-    # case -- folding punctuation can manufacture a *genuine* token
-    # boundary around a single letter ("E-40" folds to "e 40", and "e 40"
-    # really does start with "e "), so boundary alone still let "A E"
-    # reach "E-40". A minimum stem length (>=2 characters) is what closes
-    # that residual gap; floor alone (no boundary) leaves "A Ha" -> "ha"
-    # untouched, since 2 characters cleared a 2-char floor. Both rules gate
-    # only the open-prefix continuation branch, never an exact match -- a
-    # genuinely short catalog artist is still reachable by typing it
-    # verbatim (see test_short_article_stem_still_matches_its_own_name).
+    # Why both a token boundary AND a length floor -- and the measured
+    # populations -- live on `lookup.name_folding.article_stem_hit` and its
+    # `_ARTICLE_STEM_MIN_LENGTH` constant. Do not restate either here: this
+    # branch shipped three divergent copies of one population count before
+    # the production re-measure caught them.
+    #
+    # What is local to these tests: the first two cases are the ticket's own
+    # reproducers, one per lever (neither lever alone closes both). The third
+    # came out of the catalog-wide sweep rather than the ticket. The fourth
+    # is the positive counterpart -- the guards narrow the open-prefix
+    # continuation, never the equality, so a genuinely short catalog artist
+    # stays reachable verbatim.
     # ------------------------------------------------------------------
 
     @pytest.mark.parametrize(
@@ -653,12 +648,13 @@ class TestArtistMatchesItem:
         assert artist_matches_item(item, query) is False
 
     def test_single_letter_query_does_not_wildcard_an_article_prefixed_candidate(self):
-        """Every catalog artist filed with a leading article strips down to a
-        candidate the query's stem then open-prefixes -- 'A Minor Forest'
-        strips to 'minor forest', which a bare single-letter query 'M' must
-        not open-prefix. A single-letter query reaches dozens of catalog
-        artists this way; found via the catalog-wide sweep this ticket
-        requires, not one of the two named repro cases."""
+        """A single-letter query reaches artists it shares no letter-two with,
+        because the CANDIDATE's article is stripped too: 'A Minor Forest'
+        becomes 'minor forest', which a bare 'M' then open-prefixes.
+
+        Not one of the ticket's two named reproducers -- this came out of the
+        catalog-wide sweep, and it is the case that survives a live request:
+        a production query for 'M' admitted 'A.M. Dre' through this path."""
         item = make_library_item(id=1, artist="A Minor Forest", title="Album")
         assert artist_matches_item(item, "M") is False
 
@@ -686,13 +682,11 @@ class TestArtistMatchesItem:
         own worked example needs ("The Black Dog" -> "Black Dog Productions"),
         so no syntactic rule separates them at this rung.
 
-        Raising :data:`_ARTICLE_STEM_MIN_LENGTH` to 3 would close these -- 22
-        catalog pairs across "The Ex", "The Go", "The AM" and "SF", all of
-        them wrong-artist admissions on inspection. That is deliberately NOT
-        done here: LML#1262 owns this residual and lists "do not raise
-        #1250's floor" as a constraint. This test is the tripwire -- if it
-        starts failing, the floor moved, and that has to be a decision rather
-        than a side effect.
+        Left admitted deliberately: LML#1262 owns this residual and constrains
+        against raising the floor to close it. The numbers behind that call
+        are on ``_ARTICLE_STEM_MIN_LENGTH``. This test is the tripwire -- if
+        it starts failing, the floor moved, and that has to be a decision
+        rather than a side effect.
         """
         item = make_library_item(id=1, artist=reached_artist, title="Album")
         assert artist_matches_item(item, query) is True

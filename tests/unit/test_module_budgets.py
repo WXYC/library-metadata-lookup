@@ -221,20 +221,25 @@ MODULE_BUDGETS: dict[str, int] = {
     # files would manufacture exactly the drift LML#1244 and LML#1257 exist
     # to prevent. Sized per the calibration convention: 1.3x150 -> 200.
     #
-    # Raised again by LML#1250 (200 -> 250, measured 222) for the same reason
-    # the LML#1257 entry above declines to extract, now applied to the
-    # comparison predicates rather than the two fidelities. `article_stem_hit`
-    # is defined against `folded_hit` -- it is that function's open-prefix-or-
-    # equality shape plus two guards, both scoped to the open-prefix branch --
-    # and the two are consumed side by side by the same four rungs of
-    # `artist_matches_item`. Splitting them into two files would let a future
-    # change to what "exact" means reach one and not the other, which is the
-    # drift this module exists to prevent, and the added lines are the
-    # rationale for the guards rather than a second concern accumulating.
+    # Raised by LML#1250 (200 -> 250, measured 240). Worth being precise about
+    # WHY, because the obvious justification -- "same reason as the LML#1257
+    # entry above" -- does not actually transfer. #1257's anti-split argument
+    # is that the two fidelities share `_PUNCTUATION_CHAR`; the comparison
+    # predicates `folded_hit` and `article_stem_hit` share nothing with the
+    # fold, so a `name_matching.py` holding both would preserve their coupling
+    # just as well. The honest reasons to keep them here are smaller and
+    # sufficient: of the ~60 added lines only 8 are executable, which is not a
+    # module; and `lookup/rowless.py` already imports the fold and a predicate
+    # from this file together, so a split would fan one import into two for no
+    # gain in separation.
+    #
     # Sized as a minimal-headroom grant (smallest multiple of 50 at or above
     # the measured size, no 1.3x multiplier), the same under-grant
-    # `lookup/enrichment/__init__.py` above took: this absorbs one bounded,
-    # reviewed addition without licensing another 100 lines of it.
+    # `lookup/enrichment/__init__.py` above took, rather than the 350 a fresh
+    # 1.3x grant would license. The under-grant is already load-bearing: this
+    # PR's review round overran its own first grant on comment prose and had
+    # to trim back to fit rather than raise again, which is exactly the
+    # pressure the guardrail is for.
     "lookup/name_folding.py": 250,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
     # transparent-fold calibration): the location-union task is now threaded

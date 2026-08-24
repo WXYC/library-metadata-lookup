@@ -140,10 +140,13 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     them in a deliberate order that differs by side. The **query** strips
     the article first and folds second: folding first would let
     ``strip_leading_article`` mistake an initial the fold had just separated
-    ("A-Ha" → "a ha" → "ha") for an article, and that stem open-prefixes
-    Habib Koite and 240 other rows. The **candidate** folds first and strips
-    second, which is what keeps a cataloger's "The.Black Dog" reachable from
-    a query "Black Dog".
+    ("A-Ha" → "a ha" → "ha") for an article, and treat part of the name as
+    an article. The **candidate** folds first and strips second, which is
+    what keeps a cataloger's "The.Black Dog" reachable from a query "Black
+    Dog". (LML#1250 has since defanged the *specific* over-reach this order
+    was measured against — the "ha" stem now reaches only A-Ha itself, not
+    the 275 artists it once did. The order stands on its own terms and is
+    pinned by test, but do not read the old number as the current cost.)
 
     That candidate-side order has a cost worth naming: it can manufacture an
     article on the catalog side too, since folding separates an initial the
@@ -159,6 +162,15 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     regardless of which side of the article/punctuation asymmetry produced
     the short stem, so both rungs take the same guard. See that function's
     docstring for why a token boundary alone does not close the gap.
+
+    The other two rungs are **exempt on purpose, not by omission**. The line
+    is who authored the short stem: rungs 2 and 4 compare a stem a transform
+    *manufactured*, and a wildcard the user never typed is never what they
+    asked for. Rungs 1 and 3 compare the query as typed, where a short
+    prefix is a short query — a listener typing "M" for the catalog artist
+    "M" should reach "M Ward" the same way "Stereolab" reaches "Stereolab
+    and Friends". Whether that is nonetheless too loose is LML#1262's class
+    2, measured there rather than pre-empted here.
 
     The folded rungs demand **equality** when the query itself ends in
     punctuation, and stay an open prefix otherwise. A trailing "." or "!"
@@ -180,10 +192,11 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     artist_folded = fold_punctuation_for_comparison(artist_normalized)
     # Strip THEN fold on the query side. Folding first would let
     # ``strip_leading_article`` see an initial the fold had just separated --
-    # "A-Ha" -> "a ha" -> "ha" -- and that two-character stem open-prefixes
-    # Habib Koite and 240 others. The "A" in "A-Ha" or "A.C. Newman" is part
+    # "A-Ha" -> "a ha" -> "ha". The "A" in "A-Ha" or "A.C. Newman" is part
     # of the name. This is the order ``wxyc_etl``'s own
-    # ``to_identity_match_form_with_punctuation`` uses.
+    # ``to_identity_match_form_with_punctuation`` uses. See the docstring for
+    # why LML#1250 lowered the cost of getting this order wrong without
+    # making it right.
     artist_folded_no_article = fold_punctuation_for_comparison(artist_no_article)
     folded_exact = ends_in_punctuation(artist_normalized)
 
