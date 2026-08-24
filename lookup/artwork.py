@@ -75,27 +75,23 @@ async def _resolve_fallback_artwork(
        onto a release that was never itself asked would look like a fix
        while getting the 96% case wrong, exactly the ordering bug LML#1241's
        review caught in the original PR#1240. Gated off by default via
-       ``settings.lml_resolve_sibling_pressing_artwork``. Its index blocker
-       (WXYC/discogs-etl#412) is discharged; what holds the flag off now is
-       that the rung measures 0.97% recovery against the known-failed
-       population, a ceiling owned by the cache's dedup ranking
-       (WXYC/discogs-etl#413) rather than by this code. See that flag's
-       description and ``lookup/sibling_artwork.py``'s module docstring for
-       the full cost/gating rationale.
+       ``settings.lml_resolve_sibling_pressing_artwork`` -- on measured value,
+       not viability. That flag's description and
+       ``lookup/sibling_artwork.py``'s module docstring are the canonical
+       copies of the cost/gating rationale; do not restate the numbers here.
 
-    ``allow_release_resolution_fallback`` (default ``True``, the normal
-    ``/lookup`` path) is the SAME bulk kill switch ``fetch_artwork_for_items``
-    threads through for the resolution fan-out (LML#671/#652): ``/lookup/bulk``
-    passes ``False`` so a never-asked slice can't stampede the shared Discogs
-    rate bucket (#879). Off, step 1 reads whatever PG has instead of
-    re-asking, and step 2's live leg (``get_master`` + ``get_release``) is
-    skipped the same way -- only its cheap local cache leg can still run. A
-    caller that omits this keyword silently gets ``True`` (opts into live
-    re-asking on both steps); that is right for ``/lookup`` but a trap for a
-    new batch caller -- see the LML#1020 drain's call site for the pattern to
-    follow. Any caller walking more than a handful of releases against a live
-    ``DiscogsService`` outside one interactive ``/lookup`` request MUST pass
-    ``False`` explicitly.
+    ``allow_release_resolution_fallback`` (default ``True``) is the bulk kill
+    switch ``fetch_artwork_for_items`` documents above; two things are specific
+    to this function. Off, step 1 reads whatever PG has instead of re-asking
+    and step 2 is skipped ENTIRELY -- cache leg included, because step 1 not
+    asking Discogs means a never-asked release reaches step 2 looking coverless
+    without having been asked, and binding a sibling's cover onto it there is
+    the very ordering bug this cascade is ordered to avoid (LML#1281 review).
+    And a caller omitting the keyword silently gets ``True``, opting into live
+    re-asking on both steps -- right for ``/lookup``, a trap for a new batch
+    caller: anything walking more than a handful of releases outside one
+    interactive request MUST pass ``False`` explicitly (see the LML#1020
+    drain's call site).
 
     Structurally invalid ids (``release_id <= 0``) short-circuit before the
     Discogs round-trip — the LML#401 synthesis pattern produces a

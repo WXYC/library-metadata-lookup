@@ -3334,6 +3334,12 @@ class TestResolveFallbackArtworkNeverAskedReask:
 # ---------------------------------------------------------------------------
 
 
+def _raise(exc):
+    """Raise from inside a lambda -- for ``side_effect`` funcs that must raise
+    for one argument and return for another."""
+    raise exc
+
+
 def _coverless_release(release_id: int = 28138, master_id: int | None = 15678, **overrides):
     """A bound release with no ``images[0]`` cover -- the state that reaches the
     sibling rung. Defaults to Autechre -- *Confield* (release 28138, master
@@ -3646,28 +3652,24 @@ class TestResolveFallbackArtworkSiblingPressing:
         mock_discogs_service.get_release.assert_any_await(1573110, require_artwork_answer=True)
 
     @pytest.mark.asyncio
-    async def test_bulk_kill_switch_suppresses_the_live_master_lookup(
+    async def test_bulk_kill_switch_suppresses_the_cache_leg_too(
         self, mock_discogs_service, enable_sibling_pressing_artwork
     ):
-        """allow_release_resolution_fallback=False must suppress the sibling
-        rung's live leg (get_master / get_release) exactly as it suppresses
-        the cover rung's re-ask (LML#1241 review finding: the union must not
-        hand the /lookup/bulk drain new guaranteed live Discogs calls just
-        because the sibling flag is on). The cache leg -- a local PG read,
-        no Discogs round-trip -- still runs; only the fall-through to
-        get_master is gated."""
-        release = ReleaseMetadataResponse(
-            release_id=28138,
-            master_id=15678,
-            title="Confield",
-            artist="Autechre",
-            artist_id=77,
-            release_url="https://www.discogs.com/release/28138",
-        )
-        mock_discogs_service.get_release.return_value = release
+        """A never-asked bulk release must not be handed a sibling's cover.
+
+        With ``allow_release_resolution_fallback=False`` the cover rung asks
+        ``get_release(require_artwork_answer=False)``, so LML#542's arm-2
+        predicate treats a bulk-loaded row bearing a tracklist as a PG hit
+        even though ``artwork_checked_at IS NULL`` -- it arrives at this rung
+        coverless *without Discogs ever having been asked*. If the cache leg
+        runs anyway it binds an unrelated pressing's art onto a release whose
+        own cover was never checked, which is precisely PR#1240 review
+        finding 2 surviving on the bulk path. The switch must gate the whole
+        rung, not only its live leg."""
+        mock_discogs_service.get_release.return_value = _coverless_release()
         mock_discogs_service.cache_service = AsyncMock()
         mock_discogs_service.cache_service.get_sibling_release_artwork = AsyncMock(
-            return_value=None
+            return_value="https://i.discogs.com/R-1573110.jpeg"
         )
         mock_discogs_service.get_artist_image.return_value = (
             "https://i.discogs.com/artist-photo.jpg"
@@ -3678,13 +3680,52 @@ class TestResolveFallbackArtworkSiblingPressing:
         )
 
         assert result == "https://i.discogs.com/artist-photo.jpg"
-        mock_discogs_service.cache_service.get_sibling_release_artwork.assert_awaited_once_with(
-            15678, exclude_release_id=28138
-        )
+        mock_discogs_service.cache_service.get_sibling_release_artwork.assert_not_called()
         mock_discogs_service.get_master.assert_not_called()
         mock_discogs_service.get_release.assert_awaited_once_with(
             28138, require_artwork_answer=False
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shedding_call", ["get_master", "get_release"])
+    async def test_a_breaker_shed_on_the_live_leg_degrades_to_the_artist_rung(
+        self, mock_discogs_service, enable_sibling_pressing_artwork, shedding_call
+    ):
+        """A saturation shed on this best-effort rung must not kill the item.
+
+        ``get_release`` and ``get_master`` deliberately re-raise
+        ``DiscogsBreakerOpenError`` (LML#755) so a validation caller can tell
+        "couldn't ask" from "asked, no". Artwork is not such a caller: the
+        very next rung, ``get_artist_image``, catches it and degrades to
+        ``None`` for exactly this reason (LML#1049/#1118). Left uncaught here
+        it propagates into ``fetch_artwork_for_items.fetch_one``, whose
+        ``except Exception`` discards the WHOLE item -- throwing away an
+        otherwise-good Discogs match, and skipping the artist rung that would
+        have answered."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        release = _coverless_release()
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.get_sibling_release_artwork = AsyncMock(
+            return_value=None
+        )
+        if shedding_call == "get_master":
+            mock_discogs_service.get_release.return_value = release
+            mock_discogs_service.get_master.side_effect = DiscogsBreakerOpenError("shed")
+        else:
+            mock_discogs_service.get_release.side_effect = lambda rid, **kwargs: (
+                release if rid == 28138 else _raise(DiscogsBreakerOpenError("shed"))
+            )
+            mock_discogs_service.get_master.return_value = MasterRelease(
+                master_id=15678, title="Confield", main_release_id=1573110
+            )
+        mock_discogs_service.get_artist_image.return_value = (
+            "https://i.discogs.com/artist-photo.jpg"
+        )
+
+        result = await _resolve_fallback_artwork(mock_discogs_service, 28138)
+
+        assert result == "https://i.discogs.com/artist-photo.jpg"
 
 
 # ---------------------------------------------------------------------------
@@ -3804,8 +3845,11 @@ class TestArtworkRungOrderingReaskBeforeSibling:
             release_url="https://www.discogs.com/release/28138",
         )
         mock_discogs_service.cache_service = AsyncMock()
+        # A sibling cover IS available. The claim under test is that it is not
+        # used -- stubbing None here would make the assertion vacuous, which is
+        # what this test did before (LML#1281 review).
         mock_discogs_service.cache_service.get_sibling_release_artwork = AsyncMock(
-            return_value=None
+            return_value="https://i.discogs.com/R-1573110.jpeg"
         )
         mock_discogs_service.get_artist_image.return_value = None
 
