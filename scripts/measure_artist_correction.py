@@ -206,13 +206,37 @@ def _make_typo(name: str, rng: random.Random) -> str | None:
     return "".join(chars)
 
 
+async def _connect_for_measurement(db_path: Path) -> LibraryDB:
+    """Connect, and refuse to measure a pool that did not fully build.
+
+    An unusable pool suppresses fuzzy correction entirely, and this script
+    runs at ``logging.ERROR``, so the build's warning never prints. Left
+    unchecked, a schema drift in ``_write_catalog`` or
+    ``LibraryDB._artist_name_sources`` reads as 0.0 false corrections at
+    0.0% typo recall on every grid row -- perfect-looking garbage a reviewer
+    re-deriving the PR's numbers has no way to spot. A degraded pool aborts
+    the run instead. Pre-pool checkouts have no ``_artist_name_pool_usable``
+    attribute and connect unchecked, which is also correct: their LIKE path
+    never reads a pool.
+    """
+    clear_library_caches()
+    db = LibraryDB(db_path=db_path)
+    await db.connect()
+    if getattr(db, "_artist_name_pool_usable", True) is False:
+        await db.close()
+        raise RuntimeError(
+            "artist-name pool failed to build against the measurement catalog; "
+            "every figure this run printed would be 0.0. Fix the catalog schema "
+            "(or _artist_name_sources drift) before measuring."
+        )
+    return db
+
+
 async def _measure(
     db_path: Path, probes: list[str], expect_correction: bool
 ) -> tuple[AxisResult, list[tuple[str, str]]]:
     """Run ``probes`` through the real correction path; count the outcomes."""
-    clear_library_caches()
-    db = LibraryDB(db_path=db_path)
-    await db.connect()
+    db = await _connect_for_measurement(db_path)
     try:
         hits = 0
         examples: list[tuple[str, str]] = []
@@ -236,9 +260,7 @@ async def _run_variant(
     typo_probes: list[tuple[str, str]],
 ) -> tuple[AxisResult, AxisResult, list[tuple[str, str]]]:
     precision, examples = await _measure(pool_db, holdout_probes, expect_correction=False)
-    clear_library_caches()
-    db = LibraryDB(db_path=pool_db)
-    await db.connect()
+    db = await _connect_for_measurement(pool_db)
     try:
         recovered = 0
         for typo, truth in typo_probes:
