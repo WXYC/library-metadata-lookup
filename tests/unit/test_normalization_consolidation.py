@@ -185,8 +185,10 @@ class TestStripThePrefixNarrowerThanCrate:
 # core/text.py fold-in: strip_leading_article was byte-identical to the
 # crate's version, so core/text.py is deleted outright (not ported) and
 # every consumer imports wxyc_etl.text.strip_leading_article directly.
-# LEADING_ARTICLES (the frozenset, distinct from the strip function) has no
-# crate equivalent and moves to library/db.py, its sole consumer.
+# LEADING_ARTICLES (the frozenset, distinct from the strip function) moved
+# to library/db.py with the candidate search-term selection that consumed
+# it, then was deleted along with that selection when LML#1245 replaced the
+# LIKE prefilter with the full-pool scan.
 # ---------------------------------------------------------------------------
 
 

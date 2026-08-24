@@ -14,6 +14,7 @@ from library.db import (
     LibraryDB,
     _artist_correction_edit_cap,
     _fts_normalize,
+    _scan_artist_name_pool,
     _to_fts_match_query,
     clear_library_caches,
 )
@@ -2541,6 +2542,67 @@ class TestArtistCorrectionMarginGuard:
         finally:
             await db.close()
 
+    @pytest.mark.asyncio
+    async def test_case_variant_spellings_cannot_hide_a_real_rival(self, tmp_path):
+        """Duplicate casings of the winner must not crowd the rival out of the scan.
+
+        The same neighbourhood as test_two_close_catalog_names_suppress_the_
+        correction, plus two extra casings of the winner. If spellings that
+        fold to the same lowercase form occupy separate pool entries, they
+        fill the scan's top slots on both axes, the distinct-runner-up search
+        finds nothing, ``runner_up_score`` stays 0.0, and the margin guard
+        silently passes a correction the single-casing catalog refuses.
+        """
+        clear_library_caches()
+        db = await _connected_db(
+            tmp_path,
+            ["Juana Molina", "JUANA MOLINA", "Juana molina", "Juan Molina"],
+        )
+        try:
+            assert await db.find_similar_artist("Juana Molino") is None
+        finally:
+            await db.close()
+
+    def test_scan_duplicate_entries_of_one_artist_neither_zero_nor_bypass_the_margin(self):
+        """Scan-level pin, independent of the pool build's own dedupe layer.
+
+        Duplicate entries of one artist -- however they reach the pool -- are
+        one identity to the margin: not rivals to each other (which would
+        zero the margin), and not able to crowd the genuine rival out of the
+        retained set (which would report ``runner_up_score`` 0.0 and bypass
+        the guard entirely -- the top-3 extraction's confirmed failure).
+        """
+        pool_lower = ["juana molina", "juana molina", "juana molina", "juan molina"]
+        winner_index, score, runner_up = _scan_artist_name_pool(
+            "juana molino", "juana molino", pool_lower, pool_lower, 79.0
+        )
+        assert pool_lower[winner_index] == "juana molina"
+        assert score == pytest.approx(91.67, abs=0.01)
+        assert runner_up == pytest.approx(86.96, abs=0.01)  # the genuine rival, never 0.0
+
+    @pytest.mark.asyncio
+    async def test_an_artists_own_article_pair_filing_is_not_its_rival(self, tmp_path):
+        """An artist filed both with and without a leading article still corrects.
+
+        "Black Dog" and "The Black Dog" are one artist filed twice -- the real
+        catalog holds 59 such pairs across artist/alternate_artist_name. On
+        the article-stripped axis the two filings score identically, so a
+        runner-up rule keyed on lowercase equality counts the artist as its
+        own rival, zeroes the margin, and permanently suppresses every
+        correction toward it -- a recall regression against the LIKE-era
+        code, which corrected these. Rivalry is keyed on the article-stripped
+        form instead; the raw axis then picks whichever filing sits closest
+        to the query's own shape, which is why the two probes below land on
+        different filings of the same artist.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Black Dog", "The Black Dog", "Sessa"])
+        try:
+            assert await db.find_similar_artist("Black Dogg") == "Black Dog"
+            assert await db.find_similar_artist("The Bleack Dog") == "The Black Dog"
+        finally:
+            await db.close()
+
 
 class TestArtistCorrectionEditCap:
     """An absolute edit budget scaled to query length.
@@ -2684,6 +2746,34 @@ class TestArtistCorrectionPoolDegradation:
         try:
             db._artist_name_pool_usable = False
             assert await db._artist_exists_exactly("stereolab", "stereolab") is True
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_hot_swap_landing_mid_scan_does_not_crash_the_lookup(self, tmp_path):
+        """``close()`` during an in-flight scan must not turn the lookup into a 500.
+
+        The LML#706/#834 hot-swap path calls ``close_library_db()`` while a
+        ``/lookup`` can be parked inside the off-loop scan. The scan thread
+        holds the old lists safely; what broke was the resume, which indexed
+        the instance attributes ``close()`` had just emptied. The correction
+        path must read the same snapshot it scanned.
+        """
+        clear_library_caches()
+        db = await _connected_db(tmp_path, ["Stereolab", "Sessa"])
+        # Captured before patching: `library.db.asyncio` IS the asyncio
+        # module, so the patch below replaces the global attribute and a
+        # wrapper calling `asyncio.to_thread` would recurse into itself.
+        real_to_thread = asyncio.to_thread
+
+        async def _to_thread_then_hot_swap(fn, *args):
+            result = await real_to_thread(fn, *args)
+            await db.close()  # lands while the request is still mid-correction
+            return result
+
+        try:
+            with patch("library.db.asyncio.to_thread", side_effect=_to_thread_then_hot_swap):
+                assert await db.find_similar_artist("Stereolb") == "Stereolab"
         finally:
             await db.close()
 
