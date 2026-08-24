@@ -47,19 +47,48 @@ to paper over it with an unrelated pressing's cover).
 2. **Live leg** (``get_master`` + ``get_release``) -- at most one of each,
    gated by ``allow_release_resolution_fallback`` (the same LML#671/#652
    bulk kill switch ``_resolve_fallback_artwork`` already threads through
-   for the never-asked re-ask). ``get_master`` has no PG cache leg of its
+   for the never-asked re-ask). The ``get_release`` here passes
+   ``require_artwork_answer=True`` for the same reason the cover rung does,
+   and it is load-bearing rather than defensive: without it, LML#542's arm-2
+   predicate reads a never-asked main release that happens to carry a
+   tracklist as a PG hit and returns ``artwork_url=None`` -- the exact value
+   the cache leg one step earlier already rejected for every row under this
+   master. The ``get_master`` call would then have been spent on a follow-up
+   read that *cannot* answer. Arm 3 still short-circuits an already-asked
+   row, so this adds nothing on the common path; it only stops the expensive
+   branch from being provably unproductive. ``get_master`` has no PG cache leg of its
    own (an ``@async_cached`` L1 TTL in front of an unconditional HTTP call,
    per LML#1241 review finding 3) -- every miss with a ``master_id`` and no
    cached sibling is a guaranteed live Discogs call when this leg runs.
    That is a known, declared cost, not a fixed one: giving ``get_master`` a
    PG fallthrough leg is real follow-up work, tracked on LML#1241, not
    folded into this change. Gating the live leg on
-   ``allow_release_resolution_fallback`` means the bulk kill switch already
-   removes the exposure for the one caller that would otherwise pay it at
-   scale (the LML#1020-style drains), which is also why LML#1241 review
-   finding 4 (the drain not setting low-priority on the shared rate gate)
-   does not need a separate fix here -- the drain never reaches this leg at
-   all with the switch off.
+   ``allow_release_resolution_fallback`` is why LML#1241 review finding 4
+   (the drain not setting low-priority on the shared rate gate) needs no
+   separate fix here: the LML#1020-style drains pass the switch off
+   explicitly, so they never reach this leg at all. State that as what it
+   is, though -- a property of what those callers pass, NOT a guarantee the
+   switch enforces. Since LML#920 it is a caller-settable query param
+   (``/lookup/bulk?allow_release_resolution_fallback=true``, declared at
+   ``lookup/router.py:913``), a supported mode that advertises PG-backed
+   *release resolution*; a caller opting into it would now also buy an
+   uncached live ``/masters/{id}`` per coverless item, a different cost
+   class than what the parameter's name promises. The durable fixes are a PG
+   leg for ``get_master`` (tracked on #1241) or additionally gating this leg
+   on ``not is_discogs_low_priority()``, the repo's actual background-caller
+   signal (see ``lookup/location_union.py``).
+
+**The cost does not amortize, unlike the rung above it.** The cover rung
+writes a successful live ask back to PG, so it is at most one live call per
+release, ever. This rung's ``get_master`` is backed only by a per-process
+4-hour ``MASTER_CACHE`` TTL, and the cover it recovers belongs to the
+*sibling's* row -- there is nowhere to write it that would help the bound
+release next time, because stamping a sibling's cover onto the bound
+release's row would poison every other reader of that row. So the same bound
+release re-pays every 4 hours, per replica, indefinitely. A memo table keyed
+on the bound release is the real fix and is follow-up work, not folded in
+here; the asymmetry is named because "at most one of each" above is a
+per-call bound and would otherwise read as a lifetime one.
 
 **Sibling pick.** The cache leg is ``ORDER BY id LIMIT 1`` -- deterministic
 and repeat-stable, but the lowest cached release id is not necessarily the
@@ -163,5 +192,7 @@ async def resolve_sibling_artwork(
     if master.main_release_id == release.release_id:
         return None
 
-    main_release = await discogs_service.get_release(master.main_release_id)
+    main_release = await discogs_service.get_release(
+        master.main_release_id, require_artwork_answer=True
+    )
     return main_release.artwork_url if main_release else None

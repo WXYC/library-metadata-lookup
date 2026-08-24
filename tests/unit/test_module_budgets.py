@@ -296,9 +296,13 @@ MODULE_BUDGETS: dict[str, int] = {
     # release _resolve_fallback_artwork already fetched. Most of the module
     # is docstring -- the cost/ordering/gating rationale is load-bearing
     # context for why this rung runs where it does and defaults off (LML#1241
-    # review, WXYC/discogs-etl#412). 1.3x its 143-line measured size (185.9)
-    # -> smallest multiple of 50 at or above that.
-    "lookup/sibling_artwork.py": 200,
+    # review). 1.3x its 198-line measured size (257.4) -> smallest multiple of
+    # 50 at or above that. The first draft of this entry said 200, from a
+    # 143-line measurement taken before the review round that corrected the
+    # gating rationale; a budget derived from a stale count grants a third of
+    # the headroom the policy intends, which is how a guardrail turns into the
+    # drive-by ceiling bump its own docstring forbids.
+    "lookup/sibling_artwork.py": 300,
     "lookup/server_timing_legs.py": 100,
     "lookup/spine_deadline.py": 250,
     "lookup/strategies/__init__.py": 150,
