@@ -897,37 +897,30 @@ class TestGetSiblingReleaseArtwork:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_excludes_the_bound_release_and_requires_artwork(
+    async def test_query_shape_excludes_bound_release_tombstones_and_null_artwork(
         self, cache_service, mock_asyncpg_pool
     ):
-        """The SQL must never return the release being resolved as its own
-        sibling, and must only ever answer from rows that actually carry a
-        cover -- a sibling that was never live-checked for artwork
-        (``artwork_checked_at IS NULL``, the "never asked" state, LML#1237) is
-        not proof the album lacks one, so it must not be selectable here."""
+        """One SQL-shape test for the three predicates that make an answer valid.
+
+        Grouped rather than split per predicate (the neighbouring
+        ``test_query_includes_track_artist_join`` sets the same precedent):
+        the arrangement is identical for all three, so three copies would be
+        three places to update when the query changes."""
         mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
 
         await cache_service.get_sibling_release_artwork(9999, exclude_release_id=28138)
 
-        sql = mock_asyncpg_pool._mock_conn.fetch.call_args[0][0]
-        assert "master_id" in sql
-        assert "artwork_url IS NOT NULL" in sql
-        assert "id != $2" in sql or "id <> $2" in sql
-
-    @pytest.mark.asyncio
-    async def test_excludes_not_found_tombstones(self, cache_service, mock_asyncpg_pool):
-        """LML#1241 review finding 1: the LML#510 tombstone UPSERT deliberately
-        preserves a release's last-known ``artwork_url`` when Discogs later
-        404s it, so an unfiltered ``artwork_url IS NOT NULL`` read here could
-        hand back a Discogs-confirmed-gone sibling's stale cover -- bypassing
-        the tombstone contract every other release read in this service
-        honors. The query must exclude ``not_found`` rows explicitly."""
-        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
-
-        await cache_service.get_sibling_release_artwork(9999, exclude_release_id=28138)
-
-        sql = mock_asyncpg_pool._mock_conn.fetch.call_args[0][0]
-        assert "not_found" in sql
+        query = mock_asyncpg_pool._mock_conn.fetch.call_args[0][0]
+        assert "master_id = $1" in query, "must not cross masters"
+        assert "id != $2" in query, "must not answer with the bound release itself"
+        assert "artwork_url IS NOT NULL" in query, (
+            "a never-asked or checked-imageless sibling is not an answer"
+        )
+        assert "NOT not_found" in query, (
+            "LML#1241 review finding 1: the LML#510 tombstone UPSERT deliberately "
+            "preserves a stale artwork_url, so a Discogs-404'd release must not be "
+            "read as proof the album has a cover"
+        )
 
     @pytest.mark.asyncio
     async def test_error_raises(self, cache_service, mock_asyncpg_pool):

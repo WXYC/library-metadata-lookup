@@ -45,7 +45,23 @@ MODULE_BUDGETS: dict[str, int] = {
     # projection + orchestration). 1.3x its ~152-line measured size -> 200.
     "lookup/admission.py": 200,
     "lookup/artist_resolution.py": 550,
-    "lookup/artwork.py": 500,
+    # LML#1281: raised 500 -> 550 for the cascade-boundary breaker guard. The
+    # growth is structural, not prose: `_resolve_fallback_artwork` now wraps
+    # its rungs in one `except DiscogsBreakerOpenError` (split into
+    # `_artwork_rungs` so the guard has a body to wrap) instead of each rung
+    # carrying its own catch -- which also closed a pre-existing hole where a
+    # shed on the COVER rung's `get_release` discarded the entire built
+    # DiscogsSearchResult via `fetch_one`'s `except Exception`.
+    #
+    # DELIBERATELY UNDER-GRANTED. The stated 1.3x rule would give 700 for the
+    # 524-line measurement; 550 is ~1.05x, enough for this change and little
+    # else, because the honest fix at the next growth is an extraction rather
+    # than another bump: the concern boundary is `_resolve_fallback_artwork`
+    # plus its rungs as one module ("given a release id, produce the best
+    # artwork URL"), leaving this file owning "for these items, search and
+    # bind Discogs results". Three call sites, no import cycle. Do that
+    # instead of raising this again.
+    "lookup/artwork.py": 550,
     "lookup/caller_reason.py": 100,
     "lookup/candidate_memo.py": 150,
     "lookup/concurrency.py": 200,
