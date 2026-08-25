@@ -125,6 +125,7 @@ async def _run(
         # the withhold-seam test, which passes a non-None store to exercise it.
         apple_music=None,
         bandcamp=bandcamp,
+        youtube_music=None,
         discogs_cache_pg=pg,
         entity_store=entity_store,
         spine_deadline=spine_deadline,
@@ -707,6 +708,7 @@ class TestRunBandcampLiveProbeGatesDirect:
             "apple_music": None,
             "spotify": None,
             "bandcamp": AsyncMock(spec=BandcampClient),
+            "youtube_music": None,
             "entity_store": None,
             "discogs_cache_pg": AsyncMock(spec=PgSource),
             "library_db": None,

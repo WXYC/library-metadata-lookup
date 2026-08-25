@@ -4,8 +4,8 @@ album's status in ``library.db``.
 
 Generalizes the Apple-Music-specific ``lookup/apple_music_postprocess.py``
 (LML#571) across every service in ``STREAMING_URL_CACHE_CONFIG`` (Apple +
-Spotify + Bandcamp). Called by ``lookup/enrichment``'s per-item enrichment
-after the existing per-item enrichment has assembled the ``update`` dict.
+Spotify + Bandcamp + YouTube Music). Called by ``lookup/enrichment``'s per-item
+enrichment after it has assembled the ``update`` dict.
 
 **Cache-read on the hot path, live probe off it (LML#706).** The response path
 does NO synchronous external HTTP. For each configured service whose
@@ -97,26 +97,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
-from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
 import sentry_sdk
 
-from clients.streaming.base import BaseStreamingClient
+from clients.streaming.base import AlbumMatchClient
 from entity.sources import PgSource
 from entity.store import EntityStore
-from entity.streaming_url_cache import DEFAULT_MISS_TTL, peek_cached_streaming_url
+from entity.streaming_url_cache import peek_cached_streaming_url
 from generated.api_models import StreamingResolutionStatus
 from lookup import streaming_warm_admission
+
+# DELIBERATE RE-EXPORT (LML#1103): the registry moved to its own module for the
+# line budget, but this module is its historical home and how every call site
+# and test still imports it. Keeping the names bound here makes that move
+# invisible at the boundary -- see ``lookup/streaming_url_registry.py``.
+from lookup.streaming_url_registry import (
+    STREAMING_URL_CACHE_CONFIG as STREAMING_URL_CACHE_CONFIG,
+)
+from lookup.streaming_url_registry import (
+    StreamingUrlCacheConfig as StreamingUrlCacheConfig,
+)
 from lookup.streaming_warm import _enqueue_streaming_warm
-from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
-from release.apple_music_url_parser import apple_album_id_from_url
-from release.bandcamp_url_parser import bandcamp_album_id_from_url
-from release.spotify_url_parser import spotify_album_id_from_url
-from streaming.service import ALBUM_CACHE_KEYS, ALBUM_CACHED_SERVICES, StreamingService
+from streaming.service import ALBUM_CACHE_KEYS, StreamingService
 
 if TYPE_CHECKING:
     from config.settings import Settings
@@ -225,113 +229,10 @@ def _bulk_rowless_warm_exempt(
     return flag is not None and bool(getattr(settings, flag, False))
 
 
-# Default per-service wall-clock ceiling for a single live probe in the
-# background warm (LML#706 moved the probe off the response path; this now
-# bounds how long a warm task may hold its semaphore slot, not request latency).
-# Carried per-entry on the registry so each service can diverge (Bandcamp runs
-# looser). A service whose entry also sets ``timeout_env_var`` can be retuned at
-# request time via that env var (see _effective_probe_timeout_s).
-_DEFAULT_PROBE_TIMEOUT_S = 4.0
-
-# Bandcamp runs looser than the 4s default: its 1 req/s rate limit (and 2-way
-# concurrency cap) makes burst queue waits — not the HTTP round-trip — the
-# dominant cost, so a tight ceiling would time out healthy probes under load.
-# Ships at 9.0 without the offline pre-warmer; drops to ``_DEFAULT_PROBE_TIMEOUT_S``
-# once #548's warmer populates the cache ahead of the warm path
-# (WXYC/library-metadata-lookup#573).
-_BANDCAMP_PROBE_TIMEOUT_S = 9.0
-
-
-@dataclass(frozen=True)
-class StreamingUrlCacheConfig:
-    """Per-service cache + post-process dispatch.
-
-    Holds *only* cache/postprocess concerns — disjoint from
-    ``identity.release_validation.ReleaseSourceConfig`` (identity-mint
-    concerns) so neither registry carries Optional fields for the other's
-    members. ``flag_setting`` names the per-service ``Settings`` attribute;
-    ``url_to_external_id`` extracts the mintable ID from a resolved URL
-    (``None`` → surface URL, skip mint). The registry *key* (a
-    ``StreamingService`` member, LML#1037) doubles as the client-dispatch
-    lookup (``service.catalog_key`` into the ``clients`` dict / the returned
-    ``statuses`` dict) and, via ``streaming.service.ALBUM_CACHE_KEYS``, the
-    mint source (a key into ``RELEASE_SOURCE_CONFIG``) — the post-process
-    derives both from the key rather than carrying a ``client_attr`` field
-    that would just restate ``service.catalog_key``.
-
-    ``probe_timeout_s`` is the static per-service wall-clock ceiling.
-    ``timeout_env_var`` (optional) names an integer-ms env var that overrides
-    it at request time — set for Apple to preserve the LML#449/#450
-    ``LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS`` knob that the pre-LML#573 Apple
-    post-process honored; ``None`` (the default, e.g. Spotify) means the
-    static ceiling is authoritative.
-    """
-
-    miss_ttl: timedelta
-    probe_timeout_s: float
-    url_to_external_id: Callable[[str], str | None]
-    url_field: str
-    flag_setting: str
-    timeout_env_var: str | None = None
-
-
-# Cache + post-process registry (LML#1037: keyed by ``StreamingService``
-# instead of a free-floating album-cache-key string — the same
-# ``ALBUM_CACHED_SERVICES`` ordering ``entity/streaming_url_cache.py``'s
-# ``_SERVICES`` derives from, so this dict's iteration order and that table's
-# CHECK-constraint literal order stay in lockstep). Deliberately a SUBSET of
-# ``identity.release_validation.RELEASE_SOURCE_CONFIG`` (5 entries): Discogs
-# release/master are identity-only (never resolved from a live streaming
-# probe). Apple + Spotify (PR-1) and Bandcamp (PR-3) are all
-# minted-from-live-probe AND URL-cached. The parity test asserts these keys'
-# ``ALBUM_CACHE_KEYS`` images ⊆ RELEASE_SOURCE_CONFIG keys; the completeness
-# guard in the test suite pins the exact key set. A future PR adds Deezer here
-# (extending ``streaming.service.ALBUM_CACHE_KEYS``) and ALTERs the table's
-# named CHECK constraint to match.
-STREAMING_URL_CACHE_CONFIG: dict[StreamingService, StreamingUrlCacheConfig] = {
-    StreamingService.APPLE_MUSIC: StreamingUrlCacheConfig(
-        miss_ttl=DEFAULT_MISS_TTL,
-        probe_timeout_s=_DEFAULT_PROBE_TIMEOUT_S,
-        url_to_external_id=apple_album_id_from_url,
-        url_field="apple_music_url",
-        flag_setting="lml_persist_streaming_url_apple_music",
-        # Back-compat: the pre-LML#573 Apple post-process honored this env var
-        # (via apple_music_lookup_timeout_s); keep it tuning this leg too.
-        timeout_env_var=APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
-    ),
-    StreamingService.SPOTIFY: StreamingUrlCacheConfig(
-        miss_ttl=DEFAULT_MISS_TTL,
-        probe_timeout_s=_DEFAULT_PROBE_TIMEOUT_S,
-        url_to_external_id=spotify_album_id_from_url,
-        url_field="spotify_url",
-        flag_setting="lml_persist_streaming_url_spotify",
-    ),
-    StreamingService.BANDCAMP: StreamingUrlCacheConfig(
-        miss_ttl=DEFAULT_MISS_TTL,
-        # Looser ceiling than Apple/Spotify — see _BANDCAMP_PROBE_TIMEOUT_S.
-        probe_timeout_s=_BANDCAMP_PROBE_TIMEOUT_S,
-        # Bandcamp's external_id IS the canonical album URL (no opaque ID); the
-        # extractor returns the parser-canonical URL the validator expects.
-        url_to_external_id=bandcamp_album_id_from_url,
-        url_field="bandcamp_url",
-        flag_setting="lml_persist_streaming_url_bandcamp",
-    ),
-}
-# Explicit raise (not bare `assert`) so this drift guard survives `python -O` /
-# `PYTHONOPTIMIZE=1`, which compiles `assert` statements out and would silently
-# disable it in optimized production runs -- mirroring the same-class import-time
-# guard convention in streaming/orchestrator.py.
-if tuple(STREAMING_URL_CACHE_CONFIG) != ALBUM_CACHED_SERVICES:
-    raise RuntimeError(
-        "STREAMING_URL_CACHE_CONFIG's declaration order drifted from "
-        "streaming.service.ALBUM_CACHED_SERVICES"
-    )
-
-
 async def apply_streaming_url_postprocess(
     update: dict[str, Any],
     *,
-    clients: dict[str, BaseStreamingClient | None],
+    clients: dict[str, AlbumMatchClient | None],
     pg: PgSource | None,
     entity_store: EntityStore | None,
     request_artist: str | None,

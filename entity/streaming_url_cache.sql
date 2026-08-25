@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
     last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (service, artist_normalized, album_normalized),
     CONSTRAINT album_streaming_url_cache_service_valid CHECK (
-        service IN ('apple_music_album', 'spotify_album', 'bandcamp')
+        service IN ('apple_music_album', 'spotify_album', 'bandcamp', 'youtube_music_album')
     )
 );
 
@@ -68,7 +68,7 @@ DECLARE
     existing_services text[];
     rebuilt_array text;
     code_services text[] := ARRAY[
-        'apple_music_album', 'spotify_album', 'bandcamp'];
+        'apple_music_album', 'spotify_album', 'bandcamp', 'youtube_music_album'];
     merged_list text;
 BEGIN
     SELECT pg_get_constraintdef(oid) INTO existing_def

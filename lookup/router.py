@@ -20,6 +20,7 @@ from wxyc_fastapi.observability import (
 from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
+from clients.streaming.youtube_music import YouTubeMusicClient
 from config.settings import Settings, get_settings
 from core.build_info import COMMIT_SHA_PATH, resolve_commit_sha
 from core.bulk_body import parse_bulk_body
@@ -103,6 +104,7 @@ from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
     get_spotify_client,
+    get_youtube_music_client,
 )
 
 if TYPE_CHECKING:
@@ -551,6 +553,7 @@ async def handle_lookup(
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     spotify: SpotifyClient | None = Depends(get_spotify_client),
     bandcamp: BandcampClient | None = Depends(get_bandcamp_client),
+    youtube_music: YouTubeMusicClient | None = Depends(get_youtube_music_client),
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
         default=None,
@@ -770,6 +773,7 @@ async def handle_lookup(
                     apple_music=apple_music,
                     spotify=spotify,
                     bandcamp=bandcamp,
+                    youtube_music=youtube_music,
                     discogs_cache_pg=discogs_cache_pg,
                     caller_budget_ms=x_caller_budget_ms,
                 )
@@ -908,6 +912,7 @@ async def handle_bulk_lookup(
     # pinned to None at the call site below, exactly as before. See the call
     # site for the flag-gate + rate-limit rationale.
     bandcamp: BandcampClient | None = Depends(get_bandcamp_client),
+    youtube_music: YouTubeMusicClient | None = Depends(get_youtube_music_client),
     settings: Settings = Depends(get_settings),
     skip_cache: bool = False,
     allow_release_resolution_fallback: bool = Query(
@@ -1116,6 +1121,11 @@ async def handle_bulk_lookup(
                             )
                             else None
                         ),
+                        # LML#1103: unconditional, unlike Bandcamp above. YTM has
+                        # no bulk-warm exemption flag, so the client's only effect
+                        # here is cache READ-FILL; pinning it to None would forfeit
+                        # that for no load saved.
+                        youtube_music=youtube_music,
                         discogs_cache_pg=discogs_cache_pg,
                         caller_budget_ms=x_caller_budget_ms,
                         # Caller-controlled since LML#920 (default False, the

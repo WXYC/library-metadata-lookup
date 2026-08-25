@@ -107,7 +107,7 @@ from typing import Any, Literal
 
 from wxyc_etl.text import to_match_form
 
-from clients.streaming.base import BaseStreamingClient
+from clients.streaming.base import AlbumMatchClient
 from core.search import resolve_positive_int_env
 from entity.cache_toolkit import DEFAULT_MISS_TTL, swallowing_execute, swallowing_fetch
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
@@ -604,7 +604,7 @@ class ResolveOutcome:
 
 async def resolve_streaming_url_with_cache(
     pg: PgSource,
-    client: BaseStreamingClient,
+    client: AlbumMatchClient,
     *,
     service: str,
     artist: str,
@@ -651,7 +651,7 @@ async def resolve_streaming_url_with_cache(
     ``client.find_album_match`` ONLY when set -- the default call keeps its
     pre-#1106 exact shape (``find_album_match(artist, album)``, no kwarg) so
     a client whose ``find_album_match`` doesn't accept ``fail_fast`` (every
-    non-Bandcamp ``BaseStreamingClient`` subclass today) is unaffected.
+    non-Bandcamp client today) is unaffected.
     Setting it changes exactly one other thing here: a live-call exception is
     RE-RAISED rather than swallowed to ``live_error``, so a caller that wants
     sharp failure semantics (the LML#1098 breaker-aware live probe,
@@ -688,9 +688,9 @@ async def resolve_streaming_url_with_cache(
         if fail_fast:
             # ``fail_fast`` is a Bandcamp-specific extension (LML#1106,
             # ``clients/bandcamp.py``), not part of the shared
-            # ``BaseStreamingClient.find_album_match`` interface every other
+            # ``AlbumMatchClient.find_album_match`` interface every other
             # service client implements -- so this is a static type error
-            # against the parameter's declared ``BaseStreamingClient`` type.
+            # against the parameter's declared ``AlbumMatchClient`` type.
             # It is the CALLER's responsibility to only request
             # ``fail_fast=True`` for a client that supports it -- the LML#1098
             # inline Bandcamp live probe (``lookup/enrichment/

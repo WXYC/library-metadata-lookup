@@ -18,6 +18,7 @@ from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.matching import strip_discogs_disambig
 from clients.streaming.spotify import SpotifyClient
+from clients.streaming.youtube_music import YouTubeMusicClient
 from discogs.cache_service import DiscogsCacheService
 from discogs.markup_parser import (
     CachedOnlyResolver,
@@ -85,6 +86,7 @@ async def enrich_artwork_results(
     apple_music: AppleMusicClient | None = None,
     spotify: SpotifyClient | None = None,
     bandcamp: BandcampClient | None = None,
+    youtube_music: YouTubeMusicClient | None = None,
     entity_store: EntityStore | None = None,
     discogs_cache_pg: PgSource | None = None,
     found_on_compilation: bool = False,
@@ -209,6 +211,7 @@ async def enrich_artwork_results(
         apple_music=apple_music,
         spotify=spotify,
         bandcamp=bandcamp,
+        youtube_music=youtube_music,
         entity_store=entity_store,
         discogs_cache_pg=discogs_cache_pg,
         library_db=library_db,
