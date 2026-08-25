@@ -197,21 +197,26 @@ class TestKeyTypesInterop:
 
 
 class TestResolutionProvingSlotsExcludeSearchUrlServices:
-    """LML#1101 review: the "just add a key" recipe is a trap for YTM/SoundCloud.
+    """LML#1101 review: the "just add a key" recipe is a trap for a search-URL slot.
 
-    ``enrich_one`` fills ``youtube_music_url`` / ``soundcloud_url`` with
-    templated ``build_streaming_search_url`` fallbacks BEFORE it calls
-    ``resolve_streaming_status`` — they have no album-cache tier, so unlike
-    Bandcamp (whose fallback LML#573 PR-3 defers past the call) their slots are
-    already populated with a generic search page. Keying them into
-    ``verified_urls`` would report that search page as ``verified``, and BS/iOS
-    would render an available-badge for a link that resolves nothing.
+    ``enrich_one`` fills ``soundcloud_url`` with a templated
+    ``build_streaming_search_url`` fallback BEFORE it calls
+    ``resolve_streaming_status`` — SoundCloud has no album-cache tier, so
+    unlike Bandcamp (whose fallback LML#573 PR-3 defers past the call) its slot
+    is already populated with a generic search page. Keying it into
+    ``verified_urls`` would report that search page as ``verified``, and
+    BS/iOS would render an available-badge for a link that resolves nothing.
 
-    This is the tripwire. If it fails because someone added YouTube Music, the
-    fix is NOT to update the expected set: defer the YTM search-URL fallback
-    past the ``resolve_streaming_status`` call first (write
-    ``update["youtube_music_url"]`` afterwards, the way Bandcamp already
-    does), and only then add the key.
+    This is the tripwire. If it fails because someone added SoundCloud, the fix
+    is NOT to update the expected set: defer its search-URL fallback past the
+    ``resolve_streaming_status`` call first (write ``update["soundcloud_url"]``
+    afterwards, the way Bandcamp and — since LML#1103 — YouTube Music both do),
+    and only then add the key.
+
+    YouTube Music passed through exactly that door: LML#1103 gave it an
+    album-cache tier and deferred its fallback, which is what earned it a place
+    in the expected set below. Its presence here is proof the recipe works, not
+    an exception to it.
     """
 
     def test_only_slots_that_cannot_hold_a_search_url_are_resolution_proving(self):
@@ -221,16 +226,16 @@ class TestResolutionProvingSlotsExcludeSearchUrlServices:
             StreamingService.APPLE_MUSIC,
             StreamingService.SPOTIFY,
             StreamingService.BANDCAMP,
+            StreamingService.YOUTUBE_MUSIC,
         }
 
     def test_search_url_services_are_excluded(self):
         from lookup.enrichment.item import _RESOLUTION_PROVING_URL_SERVICES
 
-        for service in (StreamingService.YOUTUBE_MUSIC, StreamingService.SOUNDCLOUD):
-            assert service not in _RESOLUTION_PROVING_URL_SERVICES, (
-                f"{service} holds a templated search URL by the time "
-                "resolve_streaming_status is called — see the constant's docstring"
-            )
+        assert StreamingService.SOUNDCLOUD not in _RESOLUTION_PROVING_URL_SERVICES, (
+            "soundcloud holds a templated search URL by the time "
+            "resolve_streaming_status is called — see the constant's docstring"
+        )
 
     def test_a_search_url_would_be_reported_verified_if_keyed(self):
         # Demonstrates the failure mode the exclusion prevents, using a service

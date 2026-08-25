@@ -33,6 +33,7 @@ import pytest_asyncio
 import entity.ddl as ddl
 from clients.streaming.base import BaseStreamingClient
 from entity.streaming_url_cache import (
+    _SERVICES,
     get_cached_streaming_url,
     peek_cached_streaming_url,
     resolve_streaming_url_with_cache,
@@ -47,7 +48,34 @@ _SERVICE_CASES = [
     ("apple_music_album", "https://music.apple.com/us/album/aluminum-tunes/1234567890"),
     ("spotify_album", "https://open.spotify.com/album/1A2GTWGt0LBTGQAyA3OKAf"),
     ("bandcamp", "https://juanamolina.bandcamp.com/album/doga"),
+    # LML#1103. Every test parameterized over this list now also proves the
+    # youtube_music_album storage key round-trips through the real table --
+    # a seeded row is written, read back, and coexists with the other
+    # services under the same normalized (artist, album), against the live
+    # CHECK constraint that the boot's widen step had to admit it to.
+    ("youtube_music_album", "https://music.youtube.com/browse/MPREb_wxNq3H7ZxOOd0"),
 ]
+
+
+def _service_in_list(*extra: str) -> str:
+    """The CHECK constraint's IN-list, derived from the CURRENT service set.
+
+    Two tests below hand-write a ``CREATE TABLE`` / ``ALTER TABLE`` carrying
+    this constraint, and each depends on standing in a specific relation to
+    what ``set_up_streaming_url_cache_schema`` will do: one needs the widen
+    step to be a NO-OP (so an ACCESS SHARE blocker isolates the ``ADD COLUMN``
+    ALTER without also tripping the widen's own exclusive lock), the other
+    needs a strict SUPERSET (so boot has nothing to add and must leave the
+    constraint's oid untouched).
+
+    Both were hardcoded to ``('apple_music_album', 'spotify_album',
+    'bandcamp')`` and both silently lost that relation the moment LML#1103
+    added a fourth service -- the first started racing a real widen, the
+    second stopped being a superset. Deriving from ``_SERVICES`` restores the
+    invariant permanently: a future service is picked up here for free.
+    """
+    return ", ".join(f"'{s}'" for s in (*_SERVICES, *extra))
+
 
 _SERVICE_CHECK_OID = (
     "SELECT oid FROM pg_constraint "
@@ -240,7 +268,7 @@ class TestSchemaBootstrap:
                 "  last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
                 "  PRIMARY KEY (service, artist_normalized, album_normalized),"
                 "  CONSTRAINT album_streaming_url_cache_service_valid CHECK ("
-                "    service IN ('apple_music_album', 'spotify_album', 'bandcamp')"
+                f"    service IN ({_service_in_list()})"
                 "  )"
                 ")"
             )
@@ -317,7 +345,7 @@ class TestSchemaBootstrap:
                 "ALTER TABLE lml_cache.album_streaming_url_cache "
                 "DROP CONSTRAINT album_streaming_url_cache_service_valid, "
                 "ADD CONSTRAINT album_streaming_url_cache_service_valid CHECK ("
-                "  service IN ('apple_music_album', 'spotify_album', 'bandcamp', 'deezer_album')"
+                f"  service IN ({_service_in_list('deezer_album')})"
                 ")"
             )
             await conn.execute(
@@ -364,7 +392,15 @@ class TestStreamingServiceCheckParity:
         deployed = set(re.findall(r"'([^']+)'", constraint_def))
         expected = {s.album_cache_key for s in StreamingService if s.album_cache_key is not None}
         assert deployed == expected
-        assert deployed == {"apple_music_album", "spotify_album", "bandcamp"}
+        assert deployed == {
+            "apple_music_album",
+            "spotify_album",
+            "bandcamp",
+            # LML#1103. Unlike the two assertions above (which compare two
+            # derived sets and so would both move together on a rename), this
+            # literal is the independent anchor -- keep it hand-written.
+            "youtube_music_album",
+        }
 
 
 @pytest.mark.pg

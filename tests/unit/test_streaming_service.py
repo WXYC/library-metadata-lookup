@@ -90,10 +90,10 @@ class TestAlbumCacheKey:
         assert StreamingService.BANDCAMP.album_cache_key == "bandcamp"
 
     def test_services_with_no_album_cache_tier_map_to_none(self):
+        # YouTube Music left this set in LML#1103, when it gained a cache tier.
         for service in (
             StreamingService.DEEZER,
             StreamingService.TIDAL,
-            StreamingService.YOUTUBE_MUSIC,
             StreamingService.SOUNDCLOUD,
         ):
             assert service.album_cache_key is None
@@ -102,11 +102,12 @@ class TestAlbumCacheKey:
         for service in StreamingService:
             assert ALBUM_CACHE_KEYS.get(service) == service.album_cache_key
 
-    def test_album_cache_keys_dict_has_exactly_three_entries(self):
+    def test_album_cache_keys_dict_has_exactly_four_entries(self):
         assert set(ALBUM_CACHE_KEYS) == {
             StreamingService.APPLE_MUSIC,
             StreamingService.SPOTIFY,
             StreamingService.BANDCAMP,
+            StreamingService.YOUTUBE_MUSIC,
         }
 
     def test_reverse_lookup_round_trips(self):
@@ -153,10 +154,14 @@ class TestCanonicalOrderingTuples:
         )
 
     def test_album_cached_services_matches_streaming_url_cache_config_order(self):
+        # Order is the CHECK-constraint literal's order, so LML#1103 APPENDED
+        # YouTube Music rather than inserting it -- keeping the existing DDL
+        # text byte-identical and the widen a pure addition.
         assert ALBUM_CACHED_SERVICES == (
             StreamingService.APPLE_MUSIC,
             StreamingService.SPOTIFY,
             StreamingService.BANDCAMP,
+            StreamingService.YOUTUBE_MUSIC,
         )
 
     def test_track_cached_services_is_apple_music_only(self):

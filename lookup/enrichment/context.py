@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
+from clients.streaming.youtube_music import YouTubeMusicClient
 from discogs.service import DiscogsService
 from entity.sources import PgSource, PgSourceProtocol
 from entity.store import EntityStore
@@ -62,6 +63,12 @@ class EnrichmentContext:
 
     bandcamp: BandcampClient | None
     """Bandcamp client for the streaming-URL post-process (LML#573)."""
+
+    youtube_music: YouTubeMusicClient | None
+    """YouTube Music client for the streaming-URL post-process (LML#1103).
+
+    Warm-only: unlike ``bandcamp`` there is no inline-probe consumer, so this
+    handle is read at exactly one site -- ``enrich_one``'s ``clients`` dict."""
 
     entity_store: EntityStore | None
     """Release-identity mint target for live streaming-URL resolutions."""

@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 from wxyc_etl.text import to_match_form
 
-from clients.streaming.base import BaseStreamingClient, reset_probe_deadline, set_probe_deadline
+from clients.streaming.base import AlbumMatchClient, reset_probe_deadline, set_probe_deadline
 from core.search import resolve_positive_int_env
 from entity.sources import PgSource
 from entity.store import EntityStore
@@ -142,7 +142,7 @@ def _streaming_warm_queue_depth_bound() -> int:
 def _enqueue_streaming_warm(
     service_key: str,
     cfg: StreamingUrlCacheConfig,
-    client: BaseStreamingClient,
+    client: AlbumMatchClient,
     pg: PgSource,
     entity_store: EntityStore,
     request_artist: str,
@@ -210,7 +210,7 @@ def _enqueue_streaming_warm(
 async def _warm_streaming_url_cache(
     service_key: str,
     cfg: StreamingUrlCacheConfig,
-    client: BaseStreamingClient,
+    client: AlbumMatchClient,
     pg: PgSource,
     entity_store: EntityStore,
     request_artist: str,
@@ -327,6 +327,15 @@ async def _mint_identity(
     validation rejection, PG outage) is logged and swallowed — the user-visible
     URL has already been surfaced.
 
+    A service whose registry entry sets ``url_to_external_id=None`` (LML#1103's
+    YouTube Music) mints NOTHING: it returns before touching ``entity_store``,
+    and — unlike every other early return here — this one is not a degraded
+    path but the configured steady state, so it is deliberately silent rather
+    than logged. Without the guard the call below would raise ``TypeError:
+    'NoneType' object is not callable`` on every successful YouTube Music warm;
+    the fire-and-forget task swallows it, so the failure mode would be an
+    invisible one — the URL still cached, the log line silently never emitted.
+
     Also imported by name into ``lookup/enrichment/bandcamp_probe.py``
     (LML#1106 review, FIX 4): the inline Bandcamp live probe reaches its own
     ``live_resolved`` outside this module's ``_warm_streaming_url_cache``, and
@@ -337,6 +346,9 @@ async def _mint_identity(
     check (no ``SLF001``) to violate, and an explicit ``from ... import
     _mint_identity`` is unambiguous at the call site either way.
     """
+    if cfg.url_to_external_id is None:
+        # Non-minting service by configuration — the URL is the deliverable.
+        return
     external_id = cfg.url_to_external_id(url)
     if external_id is None:
         # URL we can't parse for an external_id — surface the URL but don't

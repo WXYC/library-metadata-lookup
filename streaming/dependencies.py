@@ -10,17 +10,23 @@ from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.deezer import DeezerClient
 from clients.streaming.spotify import SpotifyClient
+from clients.streaming.youtube_music import YouTubeMusicClient
 from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-# All four streaming clients are wired through `wxyc_fastapi.http.async_singleton`
-# (LML#451 for Apple Music; LML#457 for Spotify, Deezer, Bandcamp). The closure-
-# owned state plus an explicit closer guarantees one-instance-per-process even
-# under concurrent cold-start callers from FastAPI's threadpool. Each client
-# inherits BaseStreamingClient (AsyncLimiter + asyncio.Semaphore at construction),
+# All five streaming clients are wired through `wxyc_fastapi.http.async_singleton`
+# (LML#451 for Apple Music; LML#457 for Spotify, Deezer, Bandcamp; LML#1103 for
+# YouTube Music). The closure-owned state plus an explicit closer guarantees
+# one-instance-per-process even under concurrent cold-start callers from
+# FastAPI's threadpool. Every client owns an AsyncLimiter (the first four via
+# BaseStreamingClient, which adds an asyncio.Semaphore; YouTube Music
+# constructs its own -- it is deliberately not a subclass, see that module),
 # so an orphaned instance would silently halve the effective per-service rate
 # budget; Spotify additionally would re-trigger its OAuth bearer-token fetch.
+# The YouTube Music client has no close()/aclose() -- ytmusicapi is synchronous
+# and holds no async resource -- which async_singleton's closer tolerates: it
+# just clears the cached instance.
 
 
 async def _build_spotify_client() -> SpotifyClient | None:
@@ -138,6 +144,35 @@ async def get_bandcamp_client() -> BandcampClient:
     return await _get_bandcamp_client()
 
 
+async def _build_youtube_music_client() -> YouTubeMusicClient:
+    """Build the YouTube Music client. No auth required.
+
+    ``YTMusic()`` is constructed lazily inside the client on first search, so
+    this is cheap and cannot fail here even if ytmusicapi is unreachable.
+    """
+    client = YouTubeMusicClient()
+    logger.info("YouTube Music client initialized")
+    return client
+
+
+_get_youtube_music_client, _close_youtube_music_client = async_singleton(
+    _build_youtube_music_client
+)
+
+
+async def get_youtube_music_client() -> YouTubeMusicClient:
+    """Get YouTube Music client. No auth required.
+
+    Concurrent cold-start callers share a single instance via
+    ``async_singleton`` (LML#457), which matters more here than for the httpx
+    clients: the process-global singleton is what lets the LML#1103 background
+    warm keep using the client after the request that scheduled it returned,
+    and ``YouTubeMusicClient`` owns an ``AsyncLimiter`` that a second instance
+    would silently double.
+    """
+    return await _get_youtube_music_client()
+
+
 async def close_streaming_clients() -> None:
     """Close all streaming clients. Called during application shutdown.
 
@@ -148,3 +183,4 @@ async def close_streaming_clients() -> None:
     await _close_deezer_client()
     await _close_apple_music_client()
     await _close_bandcamp_client()
+    await _close_youtube_music_client()

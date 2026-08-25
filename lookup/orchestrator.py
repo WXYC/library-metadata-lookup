@@ -27,6 +27,7 @@ from wxyc_fastapi.observability import (
 from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
+from clients.streaming.youtube_music import YouTubeMusicClient
 from config.settings import get_settings
 from core.event_loop_lag import get_event_loop_lag_ms
 from core.exceptions import BreakerOpenError
@@ -394,6 +395,9 @@ class LookupServices:
 
     bandcamp: BandcampClient | None
     """Bandcamp client for enrichment's streaming-URL assignment."""
+
+    youtube_music: YouTubeMusicClient | None
+    """YouTube Music client for enrichment's streaming-URL assignment (LML#1103)."""
 
     discogs_cache_pg: PgSource | None
     """Discogs-cache PG source: the #632 row-less resolution cache threaded
@@ -942,6 +946,7 @@ async def _step_enrich_metadata(
                 apple_music=services.apple_music,
                 spotify=services.spotify,
                 bandcamp=services.bandcamp,
+                youtube_music=services.youtube_music,
                 entity_store=services.entity_store,
                 discogs_cache_pg=services.discogs_cache_pg,
                 found_on_compilation=state.found_on_compilation,
@@ -1116,6 +1121,7 @@ async def perform_lookup(
     apple_music: AppleMusicClient | None = None,
     spotify: SpotifyClient | None = None,
     bandcamp: BandcampClient | None = None,
+    youtube_music: YouTubeMusicClient | None = None,
     discogs_cache_pg: PgSource | None = None,
     caller_budget_ms: int | None = None,
     allow_release_resolution_fallback: bool = True,
@@ -1160,6 +1166,7 @@ async def perform_lookup(
         apple_music=apple_music,
         spotify=spotify,
         bandcamp=bandcamp,
+        youtube_music=youtube_music,
         discogs_cache_pg=discogs_cache_pg,
         caller_budget_ms=caller_budget_ms,
         spine_deadline=spine_deadline,
