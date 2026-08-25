@@ -40,6 +40,8 @@ _CHECKED_IMAGELESS_RELEASE_ID = 900002  # live-checked, confirmed no cover
 _TOMBSTONED_WITH_STALE_ARTWORK_ID = 900003  # not_found=TRUE, artwork_url preserved (LML#510)
 _SIBLING_WITH_COVER_ID = 1573110  # the ticket's real sibling pressing
 _UNRELATED_MASTER_ID = 99999
+_UNRELATED_RELEASE_ID = 700001
+_UNRELATED_ARTWORK = "https://i.discogs.com/unrelated.jpeg"
 
 _TOMBSTONE_MASTER_ID = 22334
 _TOMBSTONE_BOUND_RELEASE_ID = 44001
@@ -83,9 +85,9 @@ async def seeded_release(pg_pool):
                     False,
                 ),
                 (
-                    700001,
+                    _UNRELATED_RELEASE_ID,
                     _UNRELATED_MASTER_ID,
-                    "https://i.discogs.com/unrelated.jpeg",
+                    _UNRELATED_ARTWORK,
                     None,
                     False,
                 ),
@@ -137,24 +139,27 @@ class TestGetSiblingReleaseArtworkPg:
     @pytest.mark.asyncio
     async def test_tombstoned_sibling_with_stale_artwork_is_not_an_answer(self, seeded_release):
         """LML#1241 review finding 1: the LML#510 tombstone UPSERT preserves a
-        release's last-known ``artwork_url`` when Discogs later 404s it, so a
-        naive ``artwork_url IS NOT NULL`` read would hand back a stale cover
-        for a pressing Discogs has confirmed no longer exists. Isolated pair
-        (``_TOMBSTONE_MASTER_ID``): the ONLY sibling candidate under this
-        master is a ``not_found = TRUE`` row carrying a stale artwork_url, so
-        an unfiltered query is caught unambiguously rather than masked by a
-        second, genuinely-covered candidate answering correctly instead."""
+        release's last-known ``artwork_url`` when Discogs later 404s it -- see
+        the seed comment on ``_TOMBSTONE_MASTER_ID`` for why that pair is
+        isolated."""
         result = await seeded_release.get_sibling_release_artwork(
             _TOMBSTONE_MASTER_ID, exclude_release_id=_TOMBSTONE_BOUND_RELEASE_ID
         )
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_unrelated_master_is_never_returned(self, seeded_release):
+    async def test_unrelated_master_row_is_reachable_under_its_own_master(self, seeded_release):
+        """The cross-master guard is what hides row 700001 from the
+        ``_MASTER_ID`` queries -- not the row being unreachable.
+
+        Asserted positively on purpose. Querying ``_UNRELATED_MASTER_ID``
+        while *excluding* its only row proves nothing
+        ``test_unknown_master_returns_none`` doesn't: the candidate set is
+        empty by construction either way (LML#1281 review)."""
         result = await seeded_release.get_sibling_release_artwork(
-            _UNRELATED_MASTER_ID, exclude_release_id=700001
+            _UNRELATED_MASTER_ID, exclude_release_id=_BOUND_RELEASE_ID
         )
-        assert result is None
+        assert result == _UNRELATED_ARTWORK
 
     @pytest.mark.asyncio
     async def test_unknown_master_returns_none(self, seeded_release):

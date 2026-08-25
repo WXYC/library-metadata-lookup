@@ -15,6 +15,7 @@ from wxyc_etl.text import is_compilation_artist
 
 from clients.streaming.matching import find_best_typed_match
 from config.settings import get_settings
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
 from discogs.service import DiscogsService
 from library.models import LibraryItem
@@ -101,6 +102,35 @@ async def _resolve_fallback_artwork(
     """
     if release_id <= 0:
         return None
+    try:
+        return await _artwork_rungs(
+            discogs_service,
+            release_id,
+            allow_release_resolution_fallback=allow_release_resolution_fallback,
+        )
+    except DiscogsBreakerOpenError:
+        # LML#1118: narrow, and at the CASCADE boundary rather than per-rung.
+        # ``get_release`` re-raises a shed on purpose (LML#755 FIX 1) so a
+        # *validation* caller can tell "couldn't ask" from "asked, no";
+        # artwork is not such a caller. Uncaught it reaches
+        # ``fetch_artwork_for_items.fetch_one``, whose ``except Exception``
+        # discards the WHOLE item -- and this runs after ``result`` is built,
+        # so that throws away a complete DiscogsSearchResult (release URL,
+        # title, tracklist), not just the artwork. One boundary covers every
+        # rung with no per-rung opt-in to forget, the posture
+        # ``docs/architecture.md`` records for the breaker-fanning strategies.
+        # ``get_master`` needs no coverage: it swallows a shed into ``None``.
+        logger.debug(f"Breaker shed artwork resolution for release {release_id}")
+        return None
+
+
+async def _artwork_rungs(
+    discogs_service: DiscogsService,
+    release_id: int,
+    *,
+    allow_release_resolution_fallback: bool,
+) -> str | None:
+    """Rung cascade for :func:`_resolve_fallback_artwork`; see its docstring."""
     release = await discogs_service.get_release(
         release_id, require_artwork_answer=allow_release_resolution_fallback
     )

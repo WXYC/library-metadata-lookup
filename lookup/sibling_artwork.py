@@ -40,8 +40,7 @@ input would bind an unrelated pressing's art onto a release whose own cover
 was never checked, which is exactly PR#1240's review finding 2 surviving on
 the bulk path. A never-asked release stays never-asked; this rung is right
 not to paper over it with a sibling's cover, and gating both legs is what
-makes that true rather than merely stated. (An earlier draft of this module
-gated only the live leg and claimed this property anyway -- LML#1281 review.)
+makes that true rather than merely stated.
 
 **Cost, in the order this function pays it:**
 
@@ -77,20 +76,30 @@ gated only the live leg and claimed this property anyway -- LML#1281 review.)
    That is a known, declared cost, not a fixed one: giving ``get_master`` a
    PG fallthrough leg is real follow-up work, tracked on LML#1241, not
    folded into this change. Gating the live leg on
-   ``allow_release_resolution_fallback`` is why LML#1241 review finding 4
-   (the drain not setting low-priority on the shared rate gate) needs no
-   separate fix here: the LML#1020-style drains pass the switch off
-   explicitly, so they never reach this leg at all. State that as what it
-   is, though -- a property of what those callers pass, NOT a guarantee the
-   switch enforces. Since LML#920 it is a caller-settable query param
-   (``/lookup/bulk?allow_release_resolution_fallback=true``, declared at
-   ``lookup/router.py:913``), a supported mode that advertises PG-backed
-   *release resolution*; a caller opting into it would now also buy an
-   uncached live ``/masters/{id}`` per coverless item, a different cost
-   class than what the parameter's name promises. The durable fixes are a PG
-   leg for ``get_master`` (tracked on #1241) or additionally gating this leg
-   on ``not is_discogs_low_priority()``, the repo's actual background-caller
-   signal (see ``lookup/location_union.py``).
+   ``allow_release_resolution_fallback``. **Who can reach the live leg.**
+   The switch alone does not keep background callers off it, and LML#1241
+   review finding 4 (the drain not setting low-priority on the shared rate
+   gate) should not be answered with "the drains pass the switch off" --
+   that is a property of what those callers happen to pass, not a guarantee.
+   Since LML#920 the switch is a caller-settable query param
+   (``/lookup/bulk?allow_release_resolution_fallback=true``), a supported
+   mode advertising PG-backed *release resolution*, which would otherwise
+   also buy an uncached live ``/masters/{id}`` per coverless item -- a
+   different cost class than the parameter's name promises. So the live leg
+   is additionally gated on ``not is_discogs_low_priority()``:
+   ``/lookup/bulk`` sets that contextvar unconditionally (LML#927 -- "no
+   ``X-Caller-Class`` value can escalate a bulk caller out of it"), so
+   unlike the switch it is a gate the caller cannot escape. Same structural
+   guard the location union uses for the same purpose (LML#1026). The cheap
+   cache leg stays available to those callers; it costs the bucket nothing.
+
+   **A breaker shed is NOT handled here.** ``get_release`` re-raises one
+   (LML#755 FIX 1) and the guard lives at the cascade boundary in
+   ``lookup.artwork._resolve_fallback_artwork``, so every rung is covered by
+   one catch rather than each remembering its own. ``get_master`` needs no
+   coverage at all: it swallows a shed into ``None`` via a bare
+   ``except Exception`` -- the asymmetry ``scripts/drain_master_api_tail.py``
+   documents when it has to infer a shed from ``breaker_is_open`` instead.
 
 **The cost does not amortize, unlike the rung above it.** The cover rung
 writes a successful live ask back to PG, so it is at most one live call per
@@ -153,9 +162,9 @@ index, is what should decide the flip.
 
 import logging
 
-from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import CacheSchemaSkewError, CacheUnavailableError
 from discogs.models import ReleaseMetadataResponse
+from discogs.ratelimit import is_discogs_low_priority
 from discogs.service import DiscogsService
 
 logger = logging.getLogger(__name__)
@@ -190,36 +199,32 @@ async def resolve_sibling_artwork(
             sibling_artwork = await cache.get_sibling_release_artwork(
                 release.master_id, exclude_release_id=release.release_id
             )
+            if sibling_artwork:
+                return sibling_artwork
         except (CacheUnavailableError, CacheSchemaSkewError) as e:
             logger.warning(
                 f"Sibling artwork cache lookup failed for master {release.master_id}: {e}"
             )
-            sibling_artwork = None
-        if sibling_artwork:
-            return sibling_artwork
 
-    try:
-        master = await discogs_service.get_master(release.master_id)
-        if master is None or not master.main_release_id:
-            return None
-        if master.main_release_id == release.release_id:
-            return None
-        main_release = await discogs_service.get_release(
-            master.main_release_id, require_artwork_answer=True
-        )
-    except DiscogsBreakerOpenError:
-        # LML#1118: kept narrow. ``get_release`` and ``get_master`` re-raise a
-        # saturation shed on purpose (LML#755) so a *validation* caller can
-        # tell "couldn't ask" from "asked, no" -- artwork is not such a
-        # caller. Uncaught, it propagates into
-        # ``fetch_artwork_for_items.fetch_one``, whose ``except Exception``
-        # discards the whole item: an otherwise-good Discogs match thrown
-        # away, and the artist rung that would have answered never reached.
-        # Degrade to None so the cascade continues, exactly as the next rung
-        # down already does (``get_artist_image``, LML#1049).
-        logger.debug(
-            f"Discogs saturation breaker shed the sibling live leg for "
-            f"master {release.master_id}; degrading to the next rung"
-        )
+    # The cheap cache leg above is a local PG read and costs the shared Discogs
+    # bucket nothing, so a background caller may have it. The live leg is a
+    # different matter -- see the module docstring's "who can reach the live
+    # leg" note for why this gate and not the switch alone.
+    if is_discogs_low_priority():
         return None
+
+    master = await discogs_service.get_master(release.master_id)
+    if master is None or not master.main_release_id:
+        return None
+    if master.main_release_id == release.release_id:
+        return None
+
+    # ``lean``: only ``.artwork_url`` is read off this result, and the lean
+    # shape carries it, so the non-lean N+1 child hydration is pure waste here
+    # (same reasoning as ``lookup/enrichment/top1.py``). It composes with
+    # ``require_artwork_answer``, which lives in ``is_pg_hit`` rather than in
+    # the ``pg_read`` selection, so the artwork-authoritative narrowing holds.
+    main_release = await discogs_service.get_release(
+        master.main_release_id, lean=True, require_artwork_answer=True
+    )
     return main_release.artwork_url if main_release else None
