@@ -39,6 +39,22 @@ dependencies = [
     # Docker image installs runtime deps only — a dev-only boto3 would ImportError
     # at boot. See WXYC/library-metadata-lookup#835 (volume-eviction PR 1).
     "boto3>=1.34.0",
+    # ytmusicapi became a RUNTIME dep in LML#1103, for the same reason boto3
+    # above is one: the Docker image installs runtime deps only, and the
+    # YouTube Music client is now reachable from /lookup (the streaming-URL
+    # cache warm, behind LML_PERSIST_STREAMING_URL_YOUTUBE_MUSIC). It was a
+    # `drain` extra while the offline coverage drain (LML#1056) was the only
+    # caller. The import is still lazy, so an extra-only version fails not at
+    # boot but on the first request that reaches the warm -- and every warm
+    # after it, since the warm path deliberately retries through a fresh error
+    # row. `tests/unit/test_packaging_manifest.py` now fails on that shape.
+    #
+    # Pinned exactly (not >=) because it is a reverse-engineered web client
+    # whose internal API Google changes periodically; bumps should be
+    # deliberate, changelog-reviewed PRs. The pin now carries production
+    # weight, not just the drain's: a broken bump is a live outage of the YTM
+    # leg rather than a drain rerun.
+    "ytmusicapi==1.12.1",
 ]
 
 [project.optional-dependencies]
@@ -65,16 +81,13 @@ dev = [
     # marker needed — it patches botocore's HTTP layer, so no network or service.
     "moto[s3]>=5.0.0",
 ]
-# ytmusicapi backs the offline YouTube Music coverage drain (LML#1056). It is an
-# *extra*, not a runtime dependency: the client's import is lazy and the service
-# never resolves YouTube Music on the /lookup hot path, so the deploy image stays
-# lean. Pinned exactly (not >=) because it is a reverse-engineered web client
-# whose internal API Google changes periodically — a silent minor bump could
-# break the drain mid-run; bumps should be deliberate, changelog-reviewed PRs.
-# Run the drain with `uv run --extra drain python -m scripts.ytm_coverage_drain`.
-drain = [
-    "ytmusicapi==1.12.1",
-]
+# The `drain` extra is retained as a stable name for the offline YouTube Music
+# coverage drain (LML#1056) — `uv run --extra drain python -m
+# scripts.ytm_coverage_drain` keeps working — but it is now empty: ytmusicapi
+# moved into [project].dependencies in LML#1103 when the client became
+# reachable from /lookup. See its comment there for why an extra was the wrong
+# home once that happened.
+drain = []
 
 [build-system]
 requires = ["setuptools>=77.0", "wheel"]

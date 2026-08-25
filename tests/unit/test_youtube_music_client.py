@@ -9,6 +9,8 @@ sync library.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from clients.streaming.youtube_music import YouTubeMusicClient, build_browse_url
@@ -102,9 +104,51 @@ class TestSearchAlbum:
         assert [r["browseId"] for r in rows] == ["MPREb_ok"]
 
     @pytest.mark.asyncio
-    async def test_returns_empty_list_when_search_raises(self):
+    async def test_a_search_failure_propagates_instead_of_reading_as_no_match(self):
+        # REPLACES test_returns_empty_list_when_search_raises (LML#1103 review).
+        # That test pinned a swallow that was correct while the drain was the
+        # only caller -- there a raise and a miss both just skip the row. On
+        # the /lookup warm path the two are opposite claims: `[]` means
+        # "asked YouTube Music, it does not have this album", which
+        # resolve_streaming_url_with_cache negative-caches for miss_ttl (7
+        # days) and later reports as a SOURCED `absent`. Ten minutes of
+        # YouTube blocking the egress IP would freeze a week of false
+        # negatives for every album probed in that window, with no warm
+        # scheduled to heal them.
+        #
+        # Propagating instead routes into the LML#1121 contract: the resolver
+        # degrades to `live_error` and writes NO row, so the next lookup
+        # re-asks. The drain is unaffected -- scripts/ytm_coverage_drain.py
+        # already wraps find_album_match in `except Exception` and records a
+        # miss, which is what made the swallow here redundant even for it.
         def boom(query: str, filter: str, limit: int) -> list[dict]:  # noqa: A002
             raise RuntimeError("ytmusicapi transport error")
 
         client = YouTubeMusicClient(search_fn=boom)
-        assert await client.search_album("Stereolab", "Aluminum Tunes") == []
+        with pytest.raises(RuntimeError, match="ytmusicapi transport error"):
+            await client.search_album("Stereolab", "Aluminum Tunes")
+
+    @pytest.mark.asyncio
+    async def test_the_lazy_searcher_is_constructed_off_the_event_loop(self):
+        # `_get_search_fn` imports ytmusicapi and constructs `YTMusic()`, which
+        # is synchronous and does network I/O for the visitor id. Building it
+        # on the loop stalls every concurrent /lookup on that worker behind the
+        # first YTM warm -- the exact blocking the to_thread offload exists to
+        # avoid, skipped by sitting one line above it.
+        loop_thread = threading.get_ident()
+        built_on: list[int] = []
+
+        def fake_get_search_fn():
+            built_on.append(threading.get_ident())
+            return lambda query, filter, limit: []  # noqa: A002
+
+        client = YouTubeMusicClient()
+        client._get_search_fn = fake_get_search_fn  # type: ignore[method-assign]
+
+        await client.search_album("Stereolab", "Aluminum Tunes")
+
+        assert built_on, "the searcher was never constructed"
+        assert built_on[0] != loop_thread, (
+            "the ytmusicapi import + YTMusic() construction ran on the event "
+            "loop thread; it belongs inside the asyncio.to_thread offload"
+        )

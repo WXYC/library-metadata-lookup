@@ -27,7 +27,6 @@ touch the network.
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -35,8 +34,6 @@ from aiolimiter import AsyncLimiter
 
 from clients.streaming.matching import find_best_source_match
 from streaming.models import SourceMatch
-
-logger = logging.getLogger(__name__)
 
 # ytmusicapi's ``search(query, filter, limit)`` — kept as a narrow injectable
 # type so tests can pass any callable of this shape.
@@ -85,12 +82,23 @@ class YouTubeMusicClient:
     def _get_search_fn(self) -> SearchFn:
         """Return the searcher, lazily constructing the real ytmusicapi client.
 
-        The import is deferred so that unit tests injecting ``search_fn`` never
-        need ytmusicapi installed, and the service image never pays the import
-        unless the client is actually used.
+        The import is deferred so the module stays importable — and every test
+        that injects ``search_fn`` stays runnable — without ytmusicapi, and so
+        a process that never resolves YouTube Music never pays the import or
+        the ``YTMusic()`` visitor-id fetch.
+
+        Deferred, NOT optional: ytmusicapi is a runtime dependency as of
+        LML#1103 (see its comment in ``pyproject.toml``). Laziness here buys
+        startup time, not the ability to ship without it — ``search_album``
+        calls this on the first warm, and a missing distribution would surface
+        as a per-request failure rather than a boot failure.
+
+        Callers get this from inside ``search_album``'s ``asyncio.to_thread``,
+        never on the event loop: the import chain pulls in ``requests`` and
+        ``YTMusic()`` does synchronous network I/O.
         """
         if self._search_fn is None:
-            from ytmusicapi import YTMusic  # lazy: keep the dep off the test/import path
+            from ytmusicapi import YTMusic  # lazy: keeps import + visitor-id fetch off boot
 
             yt = YTMusic()
 
@@ -98,9 +106,11 @@ class YouTubeMusicClient:
                 # ytmusicapi types `filter` as a Literal of allowed strings; our
                 # injectable SearchFn seam widens it to `str`. The only caller
                 # (`search_album`) always passes `_ALBUMS_FILTER` ("albums"), a
-                # valid member, so this narrowing is safe. The ignore is inert in
-                # CI (ytmusicapi is a `drain` extra, absent under `.[dev]`, so the
-                # module is Any) and only bites when the extra is installed.
+                # valid member, so this narrowing is safe. The ignore is LIVE in
+                # CI as of LML#1103 — ytmusicapi is a runtime dependency now, so
+                # it is installed under `.[dev]` and mypy sees the real Literal
+                # rather than Any. It was inert while the package was a `drain`
+                # extra.
                 return yt.search(query, filter=filter, limit=limit)  # type: ignore[arg-type]
 
             self._search_fn = search
@@ -109,21 +119,45 @@ class YouTubeMusicClient:
     async def search_album(self, artist: str, title: str) -> list[dict[str, Any]]:
         """Search YouTube Music for ``(artist, title)`` album candidates.
 
-        Runs the synchronous ytmusicapi call in a worker thread so the coroutine
-        never blocks the event loop. Returns candidate rows filtered to those
-        carrying both a ``browseId`` and a ``title`` — dropping browse-less rows
-        here guarantees a winning candidate can never yield a
-        ``.../browse/None`` URL. Returns ``[]`` on any search error (the drain
-        treats a raise as a skip, not a fatal).
+        Returns candidate rows filtered to those carrying both a ``browseId``
+        and a ``title`` — dropping browse-less rows here guarantees a winning
+        candidate can never yield a ``.../browse/None`` URL.
+
+        **A search failure raises rather than returning ``[]``** (LML#1103
+        review). The two are opposite claims once this client is on the
+        ``/lookup`` warm path: ``[]`` means "asked YouTube Music, it does not
+        carry this album", which ``resolve_streaming_url_with_cache`` records
+        as a confirmed miss and negative-caches for ``miss_ttl`` (7 days),
+        later reporting a *sourced* ``absent``. A transport error is
+        "couldn't ask" — ten minutes of YouTube blocking the egress IP would
+        otherwise freeze a week of false negatives across every album probed
+        in that window, with no warm scheduled to heal them. Propagating
+        routes into the LML#1121 contract instead: the resolver degrades to
+        ``live_error`` and writes NO row, so the next lookup re-asks. Mirrors
+        why ``SpotifyRetryBudgetExceededError`` re-raises past
+        ``SpotifyClient.search_album``'s own broad handler.
+
+        The swallow this replaces was correct for its original and only
+        caller: ``scripts/ytm_coverage_drain.py`` treats a raise and a miss
+        alike (it skips the row either way), and it already wraps
+        ``find_album_match`` in its own ``except Exception``, so it never
+        needed the ``[]`` and is unaffected by this change.
+
+        Both the synchronous ytmusicapi call AND the lazy construction of the
+        searcher run in a worker thread. Constructing on the loop was the
+        subtler half of the same bug: ``_get_search_fn`` imports ytmusicapi
+        (plus ``requests``) and builds ``YTMusic()``, which fetches a visitor
+        id over the network, so the first YTM warm in a worker process stalled
+        every concurrent ``/lookup`` on that loop — precisely the blocking the
+        offload exists to prevent, skipped by sitting one line above it.
         """
         query = f"{artist} {title}".strip()
-        search = self._get_search_fn()
         await self._rate_limiter.acquire()
-        try:
-            results = await asyncio.to_thread(search, query, _ALBUMS_FILTER, self._limit)
-        except Exception:
-            logger.exception("YouTube Music search failed for %s - %s", artist, title)
-            return []
+
+        def _search() -> list[dict[str, Any]]:
+            return self._get_search_fn()(query, _ALBUMS_FILTER, self._limit)
+
+        results = await asyncio.to_thread(_search)
         return [r for r in results if r.get("browseId") and r.get("title")]
 
     async def find_album_match(self, artist: str, title: str) -> SourceMatch | None:
