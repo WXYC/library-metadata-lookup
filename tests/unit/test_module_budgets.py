@@ -128,12 +128,19 @@ MODULE_BUDGETS: dict[str, int] = {
     # fallback and the per-row album gate; recording why each is right took the
     # file from 85 lines to exactly 150 — sitting on its own ceiling with no
     # headroom, the state LML#1101 called out for streaming_status.py below.
-    # Deliberately TIGHTER than the 1.3x rule (213.2 -> 250): all of the growth
-    # is docstring pinning three measured defect classes, and the executable
-    # body is still 9 lines across three functions, so 250 would be room for a
-    # whole new concern rather than for maintenance. At 200 the next concern
-    # extracts, which is the answer this guardrail wants.
-    "lookup/enrichment/search_urls.py": 200,
+    # That first pass set 200 — deliberately tighter than the 1.3x rule, on the
+    # reasoning that the growth was all docstring and 250 would be room for a
+    # new concern. It did not survive the same PR: a second review round found
+    # the module docstring's premise about what alternate_artist_name holds was
+    # wrong (it is release-level billing, not the Discogs legal name), and
+    # correcting it plus recording the accepted Was-(Not-Was) over-strip took
+    # the file to 199 — back on the ceiling within one commit. Raised to 250:
+    # still under the strict 1.3x (258.7 -> 300), on the same reading LML#1250
+    # used below when it took a docstring-heavy file to the next multiple of 50
+    # above its measured size rather than to 1.3x. The executable body is 9
+    # lines across three functions and every line of the growth is measured
+    # fact about the catalog; if the BODY grows, extract rather than raise.
+    "lookup/enrichment/search_urls.py": 250,
     # LML#1053: the per-service streaming-status merge, extracted out of
     # item.py to stay under its own ceiling above — a pure function with no
     # dependency on enrich_one's control flow. 1.3x its ~70-line measured
