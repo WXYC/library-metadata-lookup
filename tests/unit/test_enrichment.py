@@ -4913,6 +4913,152 @@ async def _enrich_search_url_row(item, *, song, album):
     return (await _enrich_search_url_rows([item], song=song, album=album))[0][1]
 
 
+class TestYouTubeMusicDeferredSearchUrlFallback:
+    """LML#1103: YouTube Music's fallback moves past the post-process.
+
+    Before this ticket YTM had no album-cache tier, so ``enrich_one`` filled
+    ``youtube_music_url`` with a ``music.youtube.com/search?q=`` template
+    INLINE — before ``apply_streaming_url_postprocess`` ran. The post-process's
+    active-filter only fires on a service whose URL field is ``None``, so even
+    once YTM joined the registry a pre-filled search URL would have silently
+    disabled the whole leg: a cached ``music.youtube.com/browse/<MPREb_…>``
+    album page could never have won its own slot.
+
+    Deferring it past the call restores the Bandcamp (#573 PR-3) priority
+    ladder — direct link > cache/warm > search URL — and is the precondition
+    ``_RESOLUTION_PROVING_URL_SERVICES`` names for admitting YTM to the
+    ``verified`` verdict at all (see ``tests/unit/test_streaming_status_map.py``).
+    """
+
+    @pytest.mark.asyncio
+    async def test_postprocess_sees_youtube_music_url_none_then_browse_url_wins(self):
+        # The ordering invariant, pinned at call time: if this regresses, the
+        # YTM leg goes silently dead rather than failing loudly -- the field
+        # would simply never be None, so the active-filter would skip it and
+        # every response would carry the search URL it does today.
+        item = make_library_item(artist="OK EG", title="Prismatic Spring")
+        browse_url = "https://music.youtube.com/browse/MPREb_wxNq3H7ZxOOd0"
+        captured = {}
+
+        async def _resolve(update, **kwargs):
+            captured["youtube_music_url_at_call"] = update["youtube_music_url"]
+            update["youtube_music_url"] = browse_url
+            return {}
+
+        with patch(
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
+            new=AsyncMock(side_effect=_resolve),
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="Triple Point",
+                album="Prismatic Spring",
+            )
+
+        assert captured["youtube_music_url_at_call"] is None
+        _, enriched = results[0]
+        assert enriched.youtube_music_url == browse_url
+
+    @pytest.mark.asyncio
+    async def test_search_fallback_applies_when_postprocess_leaves_url_none(self):
+        # The other half of the ladder: a leg that yields nothing must still
+        # leave the listener a search page, exactly as before this ticket.
+        item = make_library_item(artist="OK EG", title="Prismatic Spring")
+
+        with patch(
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
+            new=AsyncMock(return_value={}),
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="Triple Point",
+                album="Prismatic Spring",
+            )
+
+        _, enriched = results[0]
+        # Still track-scoped (YTM searches tracks; only Bandcamp is album-keyed
+        # -- LML#1284) and still built from the performing name.
+        assert enriched.youtube_music_url == (
+            "https://music.youtube.com/search?q=OK%20EG%20Triple%20Point"
+        )
+
+    @pytest.mark.asyncio
+    async def test_librarian_override_still_beats_the_search_fallback(self):
+        # Tier 1 of the ladder is unchanged by the deferral: a curated
+        # streaming_links row wins outright, and no search URL overwrites it.
+        item = make_library_item(id=42, artist="OK EG", title="Prismatic Spring")
+        override = "https://music.youtube.com/playlist?list=OLAK5uy_curated"
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": None,
+                "apple_music_url": None,
+                "youtube_music_url": override,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        with patch(
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
+            new=AsyncMock(return_value={}),
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="Triple Point",
+                album="Prismatic Spring",
+                library_db=library_db,
+            )
+
+        _, enriched = results[0]
+        assert enriched.youtube_music_url == override
+
+    @pytest.mark.asyncio
+    async def test_empty_string_youtube_music_link_normalized_to_none_for_postprocess(self):
+        # The normalization the deferred pattern requires. library.db returns
+        # the streaming_links column verbatim (no '' -> None coercion), and ''
+        # is falsy-but-not-None: without this, the post-process active-filter
+        # (`is None`) would skip the leg while the deferred fallback (`not …`)
+        # would still fire -- a search URL shipped for an album whose cache was
+        # never consulted. Bandcamp and Spotify already normalize for exactly
+        # this reason; YTM needed it only once its fallback became deferred.
+        item = make_library_item(id=42, artist="OK EG", title="Prismatic Spring")
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": None,
+                "apple_music_url": None,
+                "youtube_music_url": "",
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+        captured = {}
+
+        async def _capture(update, **kwargs):
+            captured["youtube_music_url_at_call"] = update["youtube_music_url"]
+            return {}
+
+        with patch(
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
+            new=AsyncMock(side_effect=_capture),
+        ):
+            await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="Triple Point",
+                album="Prismatic Spring",
+                library_db=library_db,
+            )
+
+        assert captured["youtube_music_url_at_call"] is None
+
+
 class TestSearchUrlFallbackQueryShape:
     """LML#1284: what the templated search-URL fallbacks actually search for.
 

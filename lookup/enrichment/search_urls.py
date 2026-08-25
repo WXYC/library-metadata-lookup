@@ -63,6 +63,7 @@ Each function below carries the measurement for its own case.
 
 from __future__ import annotations
 
+from typing import Any
 from urllib.parse import quote
 
 from clients.streaming.matching import strip_discogs_disambig_preserving
@@ -200,3 +201,47 @@ def bandcamp_search_term(
     if requested_album_describes_row and requested_album:
         return requested_album
     return item.title or ""
+
+
+def apply_deferred_search_url_fallbacks(
+    update: dict[str, Any],
+    *,
+    search_artist: str,
+    search_term: str,
+    bandcamp_term: str,
+) -> None:
+    """Fill the DEFERRED search-URL slots, in place, for services still empty.
+
+    Bandcamp (LML#573 PR-3) and YouTube Music (LML#1103) both defer their
+    templated fallback until after ``apply_streaming_url_postprocess`` and
+    ``resolve_streaming_status`` have run. Two things depend on that ordering,
+    and both fail silently rather than loudly if it regresses:
+
+    * The post-process's active-filter only fires for a service whose URL field
+      is ``None``, so a pre-filled search URL would disable that service's
+      cache/warm leg entirely -- a resolved album page could never win its own
+      slot.
+    * ``_RESOLUTION_PROVING_URL_SERVICES`` reads these slots to decide which
+      may report ``verified``. A search URL present at that point would be
+      reported as a confirmed streaming match.
+
+    Hence one function for both services: the deferral is a shared invariant,
+    not two coincidentally similar lines, and the next service to earn a cache
+    tier should join here rather than grow a third copy. SoundCloud is
+    deliberately absent -- it has no cache tier, so its fallback still applies
+    inline in ``enrich_one`` and it stays out of the resolution-proving set.
+
+    Scoping differs by service and is the LML#1284 result: Bandcamp is
+    album-keyed (``bandcamp_term``), YouTube Music is track-searchable
+    (``search_term``). Both use the performing artist.
+    """
+    if not search_artist:
+        return
+    if bandcamp_term and not update["bandcamp_url"]:
+        update["bandcamp_url"] = build_streaming_search_url(
+            "https://bandcamp.com/search?q=", search_artist, bandcamp_term
+        )
+    if search_term and not update["youtube_music_url"]:
+        update["youtube_music_url"] = build_streaming_search_url(
+            "https://music.youtube.com/search?q=", search_artist, search_term
+        )

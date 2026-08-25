@@ -291,7 +291,16 @@ MODULE_BUDGETS: dict[str, int] = {
     # 50 at or above the new measured 1664, not a re-derived 1.3x. This is the
     # FOURTH consecutive recalibration — the extraction debt named directly
     # above is now overdue and tracked at LML#1142.
-    "lookup/orchestrator.py": 1700,
+    # Bumped 1700 -> 1710 by LML#1103. Not appended-to in the sense this
+    # guardrail exists to catch: adding a streaming service to a pipeline
+    # that threads one handle per service costs a fixed ~6 lines here
+    # (import, LookupServices field + docstring, perform_lookup param,
+    # two forwards) that no extraction can absorb -- the lines ARE the
+    # seam between the DI layer and the enrichment layer. The ticket's
+    # actual logic all landed in streaming_url_registry.py (new) and
+    # search_urls.py. Headroom deliberately small: a second service would
+    # fit, a third should force the per-service handles into a bundle.
+    "lookup/orchestrator.py": 1710,
     "lookup/release_resolution.py": 550,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line
@@ -332,6 +341,13 @@ MODULE_BUDGETS: dict[str, int] = {
     # lines of headroom), matching this table's own recalibration convention
     # (see e.g. track_on_compilation.py above): 600.
     "lookup/streaming_url_postprocess.py": 600,
+    # LML#1103 extracted the registry (config only -- the dataclass, the
+    # per-service entries, the timeout constants, the drift guard) out of
+    # streaming_url_postprocess.py when the YouTube Music entry pushed it
+    # over. 200 = the 1.3x-and-round-up-to-50 convention over its 154
+    # measured lines, same sizing apple_probe.py / bandcamp_probe.py /
+    # search_urls.py got. A new service is ~15 lines, so this holds three.
+    "lookup/streaming_url_registry.py": 200,
     # LML#1121 review: the warm *executor* — the concurrency semaphore, the
     # in-flight dedup set, the background-task registry, the enqueue, the warm
     # coroutine itself and its release-identity mint — extracted out of

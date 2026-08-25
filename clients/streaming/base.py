@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar, Token
+from typing import Protocol, runtime_checkable
 
 import httpx
 from aiolimiter import AsyncLimiter
@@ -63,6 +64,36 @@ def get_probe_deadline() -> float | None:
     """The active background-warm-probe deadline (an absolute
     ``time.monotonic()`` value), or ``None`` when no probe deadline is active."""
     return _probe_deadline_var.get()
+
+
+@runtime_checkable
+class AlbumMatchClient(Protocol):
+    """The single method the streaming-URL cache + warm machinery needs.
+
+    ``entity.streaming_url_cache.resolve_streaming_url_with_cache``,
+    ``lookup.streaming_url_postprocess``, and ``lookup.streaming_warm`` call
+    exactly one method on a client — ``find_album_match`` — but annotated it as
+    ``BaseStreamingClient``, which over-constrains: it demands an httpx
+    lifecycle, an ``AsyncLimiter``, and an ``asyncio.Semaphore`` that none of
+    those call sites touch.
+
+    LML#1103 made that over-constraint load-bearing. ``YouTubeMusicClient``
+    honors the ``find_album_match`` contract but is deliberately NOT a
+    ``BaseStreamingClient`` subclass: ``ytmusicapi`` is a *synchronous*,
+    ``requests``-based library, so the httpx lifecycle the base class manages
+    does not apply and it runs its own ``AsyncLimiter`` + thread offload
+    instead. Widening these annotations to this Protocol was the alternative to
+    forcing an inheritance that would have carried an unused httpx client into
+    every process — structural typing describing what the cache layer actually
+    requires, rather than nominal typing describing where a class came from.
+
+    ``BaseStreamingClient`` satisfies this structurally, so every existing
+    call site type-checks unchanged with no edit to the base class itself.
+    """
+
+    async def find_album_match(self, artist: str, title: str) -> SourceMatch | None:
+        """Search this service for an album match; see the base class docstring."""
+        ...
 
 
 class BaseStreamingClient:

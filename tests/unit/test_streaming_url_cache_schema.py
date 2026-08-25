@@ -201,10 +201,18 @@ class TestStreamingServiceParity:
             s.album_cache_key for s in StreamingService if s.album_cache_key is not None
         }
 
-    def test_services_is_exactly_apple_spotify_bandcamp(self):
+    def test_services_is_exactly_apple_spotify_bandcamp_and_youtube_music(self):
         from entity.streaming_url_cache import _SERVICES
 
-        assert set(_SERVICES) == {"apple_music_album", "spotify_album", "bandcamp"}
+        assert set(_SERVICES) == {
+            "apple_music_album",
+            "spotify_album",
+            "bandcamp",
+            # LML#1103. ``widen_service_check`` widens the DEPLOYED constraint
+            # to this set on schema-ensure, merging rather than narrowing, so
+            # the addition needs no hand-written migration.
+            "youtube_music_album",
+        }
 
 
 @pytest.mark.asyncio

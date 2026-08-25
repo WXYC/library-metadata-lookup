@@ -687,6 +687,31 @@ class Settings(BaseSettings):
             "supplies True. New in PR-3. See WXYC/library-metadata-lookup#573."
         ),
     )
+    lml_persist_streaming_url_youtube_music: bool = Field(
+        default=False,
+        description=(
+            "Per-service flag for YouTube Music in the streaming-URL cache "
+            "post-process. A service persists only when this AND "
+            "LML_PERSIST_STREAMING_URLS are both True. Default False; Railway "
+            "supplies True. When on, a cold (artist, album) schedules the same "
+            "bounded, off-response-path background warm the other services use, "
+            "resolving a DIRECT music.youtube.com/browse/<MPREb_...> album page "
+            "via the unauthenticated ytmusicapi client and caching it in "
+            "lml_cache.album_streaming_url_cache so the NEXT lookup read-fills "
+            "it synchronously; until then the response carries the templated "
+            "music.youtube.com/search?q= fallback it does today. Warm-only: "
+            "unlike Bandcamp there is deliberately NO inline probe tier "
+            "(LML_BANDCAMP_LIVE_PROBE has no YouTube Music counterpart), "
+            "because ytmusicapi is reverse-engineered and breakage-prone "
+            "(#833's fragility assessment) -- a synchronous tier would need "
+            "Bandcamp-class breaker guardrails first (#1098). Uniquely among "
+            "the four services this one mints NO release identity: the browse "
+            "ID has no entity.release_identity column, by design (#1103). Do "
+            "not enable in prod until the BS#642 backfill drain completes -- "
+            "same gate as #1052/#1098. See "
+            "WXYC/library-metadata-lookup#1103."
+        ),
+    )
     lml_bandcamp_live_probe: bool = Field(
         default=False,
         description=(

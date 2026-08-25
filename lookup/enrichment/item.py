@@ -39,6 +39,7 @@ from lookup.enrichment.apple_probe import run_apple_music_probe
 from lookup.enrichment.bandcamp_probe import probe_owns_bandcamp_leg, run_bandcamp_live_probe
 from lookup.enrichment.context import EnrichmentContext
 from lookup.enrichment.search_urls import (
+    apply_deferred_search_url_fallbacks,
     bandcamp_search_term,
     build_streaming_search_url,
     search_artist_for,
@@ -64,23 +65,24 @@ logger = logging.getLogger(__name__)
 #: ``build_streaming_search_url`` fallback yet". Apple and Spotify qualify
 #: because their slots hold only a librarian ``streaming_links`` override at
 #: that point; Bandcamp qualifies because LML#573 PR-3 deliberately DEFERS its
-#: search-URL fallback until after the status call.
+#: search-URL fallback until after the status call, and YouTube Music because
+#: LML#1103 did the same for its fallback when it gave YTM an album-cache tier.
 #:
-#: **YouTube Music and SoundCloud are excluded, and adding them here without
-#: more work would be a bug.** They have no album-cache tier, so their
-#: search-URL fallbacks are applied INLINE, before this call — by the time the
-#: status map is built, both slots are already populated with
-#: ``https://music.youtube.com/search?q=...`` / ``https://soundcloud.com/
-#: search?q=...``. Reporting those ``verified`` would tell BS and iOS that a
-#: generic search page is a confirmed streaming match, and render an
-#: available-badge for a link that resolves nothing. LML#1103 must first defer
-#: the YouTube Music fallback past this call the way Bandcamp's already is
-#: (write ``update["youtube_music_url"]`` afterwards), and only then add the
-#: key. ``tests/unit/test_streaming_status_map.py`` pins this exclusion.
+#: **SoundCloud is excluded, and adding it here without more work would be a
+#: bug.** It has no album-cache tier, so its search-URL fallback is applied
+#: INLINE, before this call — by the time the status map is built its slot is
+#: already populated with ``https://soundcloud.com/search?q=...``. Reporting
+#: that ``verified`` would tell BS and iOS that a generic search page is a
+#: confirmed streaming match, and render an available-badge for a link that
+#: resolves nothing. The prerequisite is the one YouTube Music already
+#: cleared: defer the fallback past this call (write
+#: ``update["soundcloud_url"]`` afterwards) first, and only then add the key.
+#: ``tests/unit/test_streaming_status_map.py`` pins this exclusion.
 _RESOLUTION_PROVING_URL_SERVICES: tuple[StreamingService, ...] = (
     StreamingService.APPLE_MUSIC,
     StreamingService.SPOTIFY,
     StreamingService.BANDCAMP,
+    StreamingService.YOUTUBE_MUSIC,
 )
 
 
@@ -443,21 +445,16 @@ async def enrich_one(
     # Spotify's templated fallback was deleted in LML#573 — the persistent
     # streaming-URL cache post-process below now backstops spotify_url with
     # a real album page (and mints the identity) instead of a generic search
-    # URL. Bandcamp's fallback is DEFERRED past the post-process (LML#573
-    # PR-3): the post-process only fires when its URL field is ``None``, so a
-    # pre-filled search URL would silently disable the Bandcamp leg — the
-    # search URL is applied below, only if the cache/probe leaves it None.
-    # YouTube Music / SoundCloud have no album-cache tier, so they keep
-    # their pre-post-process templated fallbacks.
-    if search_artist and search_term:
-        if not youtube_music_url:
-            youtube_music_url = build_streaming_search_url(
-                "https://music.youtube.com/search?q=", search_artist, search_term
-            )
-        if not soundcloud_url:
-            soundcloud_url = build_streaming_search_url(
-                "https://soundcloud.com/search?q=", search_artist, search_term
-            )
+    # URL. Bandcamp's (LML#573 PR-3) and YouTube Music's (LML#1103) fallbacks
+    # are both DEFERRED past the post-process: it only fires when its URL field
+    # is ``None``, so a pre-filled search URL would silently disable that
+    # service's leg — those two are applied below, each only if the
+    # cache/warm leaves its slot None. SoundCloud has no album-cache tier, so
+    # it keeps its pre-post-process templated fallback.
+    if search_artist and search_term and not soundcloud_url:
+        soundcloud_url = build_streaming_search_url(
+            "https://soundcloud.com/search?q=", search_artist, search_term
+        )
 
     update: dict[str, Any] = {
         "release_year": year_result,
@@ -471,11 +468,14 @@ async def enrich_one(
         # Without this, "" skips the cache/probe leg AND either surfaces
         # straight to the client (spotify has no fallback) or gets a search
         # URL while the leg was skipped (bandcamp's deferred `not …`
-        # fallback). youtube / soundcloud aren't post-process services and
-        # overwrite "" with a search URL above, so they need no normalization.
+        # fallback). LML#1103 put youtube_music_url in exactly that class —
+        # it became a post-process service with a deferred fallback, so it
+        # needs the same normalization. soundcloud alone still isn't a
+        # post-process service and overwrites "" with a search URL above, so
+        # it needs none.
         "spotify_url": spotify_url or None,
         "apple_music_url": apple_music_override or apple_music_url or None,
-        "youtube_music_url": youtube_music_url,
+        "youtube_music_url": youtube_music_url or None,
         "bandcamp_url": bandcamp_url or None,
         "soundcloud_url": soundcloud_url,
     }
@@ -500,6 +500,10 @@ async def enrich_one(
             "spotify": ctx.spotify,
             # LML#1098: withhold only on a SOURCED verdict (FIX 3, LML#1106 review).
             "bandcamp": None if probe_owns_bandcamp_leg(bandcamp_status) else ctx.bandcamp,
+            # LML#1103. No withholding counterpart to Bandcamp's above: YTM is
+            # warm-only (no inline probe tier), so nothing upstream can already
+            # own its leg.
+            "youtube_music": ctx.youtube_music,
         },
         pg=ctx.discogs_cache_pg,
         entity_store=ctx.entity_store,
@@ -552,15 +556,17 @@ async def enrich_one(
         postprocess_status=postprocess_status,
     )
 
-    # Bandcamp's templated search-URL fallback, deferred past the
-    # post-process (LML#573 PR-3): apply it only if the cache/probe (and any
-    # librarian-curated streaming_links override) left bandcamp_url empty, so
-    # a resolved album page / direct link always wins over the generic search
-    # link. Priority: direct link > cache/probe > search URL.
-    if search_artist and bandcamp_term and not update["bandcamp_url"]:
-        update["bandcamp_url"] = build_streaming_search_url(
-            "https://bandcamp.com/search?q=", search_artist, bandcamp_term
-        )
+    # Bandcamp's (LML#573 PR-3) and YouTube Music's (LML#1103) templated
+    # search-URL fallbacks, both deferred past the post-process and the status
+    # call so a resolved album page always wins its own slot. Priority: direct
+    # link > cache/probe > search URL. Why they share one call site, and why
+    # SoundCloud's stays inline above, is on the helper.
+    apply_deferred_search_url_fallbacks(
+        update,
+        search_artist=search_artist,
+        search_term=search_term,
+        bandcamp_term=bandcamp_term,
+    )
 
     # Extended fields land on the top-1 result only and require artwork
     # (same positional + artwork gating as the album-derived scalars).

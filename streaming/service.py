@@ -9,14 +9,17 @@ between them, "do not conflate them"):
   ``streaming/models.py``'s ``StreamingCheckSources`` field names,
   ``streaming/orchestrator.py``'s client-dispatch table + kwargs, and
   ``entity/streaming_catalog.py``'s offline-catalog service axis (7 services,
-  including Tidal / YouTube Music / SoundCloud, which have no cache tier
-  below).
+  including Tidal / SoundCloud, which have no cache tier below).
 * **Album-cache-key granularity** (``entity/streaming_url_cache.py``'s
   ``_SERVICES`` / ``lookup/streaming_url_postprocess.STREAMING_URL_CACHE_CONFIG``)
   -- the storage key in ``lml_cache.album_streaming_url_cache``. Apple and
   Spotify carry an ``_album`` suffix (they also have a distinct track-cache
   granularity below); Bandcamp does not (it has no track granularity, so its
-  storage key is its bare catalog key).
+  storage key is its bare catalog key). YouTube Music (LML#1103) takes the
+  ``_album`` suffix despite having no track tier today -- the album/track
+  distinction is real for it (YTM indexes both), so the suffix keeps the key
+  unambiguous if a track tier is ever added, rather than forcing a rename the
+  "map, never rename" rule would then forbid.
 * **Track-cache-key granularity** (``entity/track_streaming_url_cache.py``) --
   the storage key in ``lml_cache.track_streaming_url_cache``. Today only Apple
   Music ships a track-scoped cache tier (LML#893, lever L1).
@@ -88,10 +91,15 @@ class StreamingService(StrEnum):
         """Storage key in ``lml_cache.album_streaming_url_cache``.
 
         Also the mint-source key into
-        ``identity.release_validation.RELEASE_SOURCE_CONFIG`` for the three
-        services that are both URL-cached and identity-mintable.
-        ``None`` for a service with no persistent album-URL cache tier
-        (today: Deezer, Tidal, YouTube Music, SoundCloud).
+        ``identity.release_validation.RELEASE_SOURCE_CONFIG`` for the services
+        that are both URL-cached and identity-mintable. Being URL-cached does
+        NOT imply mintable: YouTube Music (LML#1103) has a cache tier but no
+        identity source, because minting opaque ``MPREb_…`` browse IDs would
+        need the wxyc-shared enum -> discogs-cache alembic -> LML three-repo
+        dance. Its registry entry carries ``url_to_external_id=None``
+        accordingly. ``None`` here means something different and narrower: no
+        persistent album-URL cache tier at all (today: Deezer, Tidal,
+        SoundCloud).
         """
         return ALBUM_CACHE_KEYS.get(self)
 
@@ -105,16 +113,21 @@ class StreamingService(StrEnum):
         return TRACK_CACHE_KEYS.get(self)
 
 
-# Album-cache storage keys -- verbatim from the pre-refactor
+# Album-cache storage keys. The first three are verbatim from the pre-refactor
 # ``entity/streaming_url_cache.py`` ``_SERVICES`` tuple
-# (``("apple_music_album", "spotify_album", "bandcamp")``). Only the three
-# services with a persistent ``lml_cache.album_streaming_url_cache`` tier
-# appear here; every other ``StreamingService`` member is absent (so
-# ``.get()`` -- the property's lookup -- correctly returns ``None`` for them).
+# (``("apple_music_album", "spotify_album", "bandcamp")``); ``youtube_music_album``
+# is NEW in LML#1103 (an addition, not a rename -- see the module docstring's
+# "map, never rename" constraint, which forbids changing an existing value and
+# is silent on appending, exactly the case ``entity/ddl.py``'s widen-only DO
+# block is built to absorb). Only the services with a persistent
+# ``lml_cache.album_streaming_url_cache`` tier appear here; every other
+# ``StreamingService`` member is absent (so ``.get()`` -- the property's lookup
+# -- correctly returns ``None`` for them).
 ALBUM_CACHE_KEYS: dict[StreamingService, str] = {
     StreamingService.APPLE_MUSIC: "apple_music_album",
     StreamingService.SPOTIFY: "spotify_album",
     StreamingService.BANDCAMP: "bandcamp",
+    StreamingService.YOUTUBE_MUSIC: "youtube_music_album",
 }
 
 # Track-cache storage keys -- verbatim from the pre-refactor
@@ -157,6 +170,10 @@ ALBUM_CACHED_SERVICES: tuple[StreamingService, ...] = (
     StreamingService.APPLE_MUSIC,
     StreamingService.SPOTIFY,
     StreamingService.BANDCAMP,
+    # LML#1103. Appended, never inserted: this tuple's ORDER is the declaration
+    # order of the table's CHECK-constraint literal, so a new service goes on
+    # the end to keep the existing DDL text byte-identical.
+    StreamingService.YOUTUBE_MUSIC,
 )
 
 # entity/track_streaming_url_cache.py's _SERVICES.

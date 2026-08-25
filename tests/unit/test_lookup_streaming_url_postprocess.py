@@ -130,7 +130,32 @@ _CASES: dict[str, dict] = {
         # host) so the URL surfaces but the mint is skipped.
         "unmintable_but_parseable_url": "https://example.com/album/doga",
     },
+    "youtube_music_album": {
+        "url_field": "youtube_music_url",
+        "client_attr": "youtube_music",
+        "flag_setting": "lml_persist_streaming_url_youtube_music",
+        "probe_timeout_s": 4.0,
+        "resolved_url": "https://music.youtube.com/browse/MPREb_wxNq3H7ZxOOd0",
+        # LML#1103: the ONLY non-minting entry in the registry
+        # (``url_to_external_id=None``). YouTube Music is deliberately absent
+        # from ``RELEASE_SOURCE_CONFIG`` -- minting browse IDs into
+        # ``entity.release_identity`` would need the wxyc-shared enum ->
+        # discogs-cache alembic -> LML three-repo dance, and is an explicit
+        # later decision (see #830). ``external_id`` is therefore absent and
+        # ``mints`` pins the contract every mint assertion below branches on.
+        "mints": False,
+        # No extractor runs at all, so there is no "parses but fails the
+        # validator" state to exercise -- every resolved URL surfaces unminted.
+        "unmintable_but_parseable_url": "https://music.youtube.com/browse/MPREb_nope",
+    },
 }
+
+#: Services whose registry entry carries a ``url_to_external_id`` extractor and
+#: so mint into ``entity.release_identity`` on a ``live_resolved`` warm. Every
+#: entry mints EXCEPT YouTube Music (LML#1103) -- the parity tests below and
+#: the mint assertions read this rather than re-listing the services, so a
+#: future non-minting service is one ``"mints": False`` away.
+_MINTING_SERVICES = [s for s, case in _CASES.items() if case.get("mints", True)]
 
 _FLAG_BY_SERVICE = {service: case["flag_setting"] for service, case in _CASES.items()}
 _URL_FIELDS = [case["url_field"] for case in _CASES.values()]
@@ -186,6 +211,7 @@ def _settings(
         "lml_persist_streaming_url_apple_music": False,
         "lml_persist_streaming_url_spotify": False,
         "lml_persist_streaming_url_bandcamp": False,
+        "lml_persist_streaming_url_youtube_music": False,
         "lml_bulk_bandcamp_streaming_warm": bulk_bandcamp_warm,
         "lml_bulk_spotify_streaming_warm": bulk_spotify_warm,
     }
@@ -214,6 +240,25 @@ def _entity_store() -> MagicMock:
     store = MagicMock(spec=EntityStore)
     store.mint_or_get_release_identity = AsyncMock(return_value=(7, True))
     return store
+
+
+def _assert_minted(entity_store: MagicMock, case: dict, service: str) -> None:
+    """Assert the per-service mint contract for a ``live_resolved`` warm.
+
+    A minting service (``url_to_external_id`` set) mints exactly once with the
+    URL's parsed external_id. A NON-minting service (LML#1103's YouTube Music,
+    ``url_to_external_id=None``) must reach the same ``live_resolved`` branch
+    and mint NOTHING -- the URL is surfaced and cached, but nothing is written
+    to ``entity.release_identity``. Asserting "not called" rather than skipping
+    the check is the point: the skip-mint mode is a contract, not an absence of
+    coverage.
+    """
+    if case.get("mints", True):
+        entity_store.mint_or_get_release_identity.assert_awaited_once_with(
+            source=service, external_id=case["external_id"]
+        )
+    else:
+        entity_store.mint_or_get_release_identity.assert_not_called()
 
 
 def _sentry_scope():
@@ -519,9 +564,7 @@ class TestFreshErrorRowMiss:
         # The live call actually happened -- not a guaranteed short-circuit
         # on the same error row that triggered the warm.
         clients[case["client_attr"]].find_album_match.assert_awaited_once()
-        entity_store.mint_or_get_release_identity.assert_awaited_once_with(
-            source=service, external_id=case["external_id"]
-        )
+        _assert_minted(entity_store, case, service)
         assert update[case["url_field"]] is None
         assert not warm_mod._background_tasks
         assert not warm_mod._streaming_warm_in_flight
@@ -714,9 +757,7 @@ class TestCacheMissEnqueuesBackgroundWarm:
         assert kwargs["service"] == service
         assert kwargs["artist"] == _ARTIST
         assert kwargs["album"] == _ALBUM
-        entity_store.mint_or_get_release_identity.assert_awaited_once_with(
-            source=service, external_id=case["external_id"]
-        )
+        _assert_minted(entity_store, case, service)
 
     @pytest.mark.parametrize("source", ["cache_miss_recent", "live_miss", "live_error"])
     async def test_background_warm_no_url_outcomes_do_not_mint(self, source):
@@ -1767,21 +1808,49 @@ class TestRegistryInvariants:
     def test_parametrize_keys_match_cache_config(self):
         assert set(_CASES) == {ALBUM_CACHE_KEYS[s] for s in STREAMING_URL_CACHE_CONFIG}
 
-    def test_cache_config_is_subset_of_release_source_config(self):
-        assert {ALBUM_CACHE_KEYS[s] for s in STREAMING_URL_CACHE_CONFIG} <= set(
-            RELEASE_SOURCE_CONFIG.keys()
-        )
+    def test_minting_cache_config_is_subset_of_release_source_config(self):
+        """Every MINTING entry has a matching identity-registry source.
+
+        Narrowed from "every entry" by LML#1103: a ``url_to_external_id=None``
+        entry (YouTube Music) surfaces its URL and skips the mint by design, so
+        it has no ``RELEASE_SOURCE_CONFIG`` source and never will unless
+        browse-ID minting gets its own three-repo ticket. Deriving the left
+        side from ``url_to_external_id`` rather than an explicit exclusion list
+        keeps the guard honest: an entry that gains an extractor is
+        automatically re-subjected to it.
+        """
+        minting = {
+            ALBUM_CACHE_KEYS[s]
+            for s, cfg in STREAMING_URL_CACHE_CONFIG.items()
+            if cfg.url_to_external_id is not None
+        }
+        assert minting <= set(RELEASE_SOURCE_CONFIG.keys())
+
+    def test_non_minting_entries_are_exactly_the_test_datas_non_minters(self):
+        """The registry's skip-mint set matches ``_CASES``' ``mints`` flags.
+
+        Pins both directions, so neither the registry nor this file's test data
+        can quietly acquire (or lose) a non-minting service without the other
+        following.
+        """
+        registry_non_minting = {
+            ALBUM_CACHE_KEYS[s]
+            for s, cfg in STREAMING_URL_CACHE_CONFIG.items()
+            if cfg.url_to_external_id is None
+        }
+        assert registry_non_minting == set(_CASES) - set(_MINTING_SERVICES)
 
     def test_cache_config_matches_table_check_constraint_allowlist(self):
         from entity.streaming_url_cache import _SERVICES
 
         assert {ALBUM_CACHE_KEYS[s] for s in STREAMING_URL_CACHE_CONFIG} == set(_SERVICES)
 
-    def test_cache_config_ships_apple_spotify_and_bandcamp(self):
+    def test_cache_config_ships_apple_spotify_bandcamp_and_youtube_music(self):
         assert set(STREAMING_URL_CACHE_CONFIG.keys()) == {
             StreamingService.APPLE_MUSIC,
             StreamingService.SPOTIFY,
             StreamingService.BANDCAMP,
+            StreamingService.YOUTUBE_MUSIC,
         }
 
     @pytest.mark.parametrize("service", list(_CASES))
@@ -1793,7 +1862,10 @@ class TestRegistryInvariants:
         assert enum_service.catalog_key == case["client_attr"]
         assert cfg.flag_setting == case["flag_setting"]
         assert cfg.probe_timeout_s == case["probe_timeout_s"]
-        assert service in RELEASE_SOURCE_CONFIG
+        # A non-minting entry (LML#1103) is deliberately absent from the
+        # identity registry -- see test_minting_cache_config_is_subset_of_...
+        assert (cfg.url_to_external_id is not None) == case.get("mints", True)
+        assert (service in RELEASE_SOURCE_CONFIG) == case.get("mints", True)
 
     def test_every_flag_setting_is_a_real_settings_attribute(self):
         from config.settings import Settings

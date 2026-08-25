@@ -63,6 +63,7 @@ def _ctx(
         apple_music=apple_music,
         spotify=None,
         bandcamp=None,
+        youtube_music=None,
         entity_store=None,
         discogs_cache_pg=pg,
         library_db=None,
