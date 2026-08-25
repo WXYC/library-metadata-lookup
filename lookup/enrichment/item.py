@@ -166,11 +166,8 @@ async def enrich_one(
     row_artist = item.alternate_artist_name or item.artist or ""
     search_term = ctx.song or item.title or ""
 
-    # LML#1284: the consumer-facing search-URL artist. Deliberately NOT
-    # ``row_artist`` above -- that leads with the Discogs canonical name,
-    # which does not find the record on a streaming service's search page.
-    # Rationale, the measurement, the compilation-row inversion, and the
-    # YouTube-Music/SoundCloud asymmetry live on
+    # LML#1284: the consumer-facing search-URL artist, deliberately NOT
+    # ``row_artist`` above. Every rationale lives on
     # ``lookup/enrichment/search_urls.py``.
     search_artist = search_artist_for(item)
 
@@ -195,10 +192,8 @@ async def enrich_one(
     # release but the row's curated ``streaming_links`` (gated on the same flag
     # below, PR#481) onto a mismatched-album request.
 
-    # LML#1284: Bandcamp's search term, computed HERE rather than beside
-    # ``search_artist`` above because it needs the gate. ``ctx.album`` is
-    # request-scoped and this runs per result row, so the requested album may
-    # only be spoken of a row it actually describes -- see the helper.
+    # LML#1284: computed HERE rather than beside ``search_artist`` above
+    # because it needs the gate just resolved -- see the helper for why.
     bandcamp_term = bandcamp_search_term(
         ctx.album, item, requested_album_describes_row=row_title_matches_requested_album
     )

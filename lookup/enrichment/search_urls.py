@@ -116,10 +116,11 @@ def search_artist_for(item: LibraryItem) -> str:
     **never allowed to empty the name**: on ``(etre)`` (a real row -- id
     58112, the only one of 64,737 the broad strip empties) the whole name
     parses as a disambiguator, and an empty result does not merely degrade
-    this fallback but disables all three: ``enrich_one`` guards the inline
-    YouTube-Music/SoundCloud pair and, separately, the deferred Bandcamp
-    write on the same ``if search_artist and ...``. A name the stripper
-    cannot improve falls back to itself.
+    one fallback but disables all three: ``enrich_one`` guards SoundCloud's
+    inline write on ``if search_artist and ...``, and
+    ``apply_deferred_search_url_fallbacks`` below returns early on the same
+    condition for Bandcamp and YouTube Music. A name the stripper cannot
+    improve falls back to itself.
 
     **Emptying is not the only way the broad strip over-reaches**, and the
     empty guard above does not cover the rest. ``item.artist`` is cataloger
