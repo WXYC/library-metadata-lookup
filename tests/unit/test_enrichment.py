@@ -4332,7 +4332,7 @@ class TestSiblingOverrideProbeDivergence:
         # ``apple_music_override or apple_music_url or None`` order.
         assert enriched.apple_music_url == probe_url
         # YouTube Music / Bandcamp / SoundCloud downgrade to search-URL
-        # placeholders, NOT no-link (`_build_streaming_search_url` fills any
+        # placeholders, NOT no-link (`build_streaming_search_url` fills any
         # unset service when artist+song are non-empty).
         assert enriched.youtube_music_url is not None
         assert "search" in enriched.youtube_music_url.lower()
@@ -5011,6 +5011,113 @@ class TestSearchUrlFallbackQueryShape:
         enriched = await self._enrich(item, song="la paradoja", album=None)
 
         assert enriched.bandcamp_url == "https://bandcamp.com/search?q=Juana%20Molina%20DOGA"
+
+
+class TestSearchUrlFallbackQueryShapeReviewFixes:
+    """LML#1284 review follow-ups: three ways the fix above overshot.
+
+    Each is a case where the corrected inputs are *worse* than what shipped
+    before, so each test is a regression guard in the literal sense -- it
+    pins behavior LML#1284 took away and this change gives back.
+    """
+
+    @staticmethod
+    async def _enrich_all(items, *, song, album):
+        """Like the sibling class's ``_enrich``, but keeps every result row.
+
+        The per-row Bandcamp scoping below is only observable on a response
+        with a non-top-1 row, so this helper returns the whole list rather
+        than ``[0]``.
+        """
+        with patch(
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
+            new=AsyncMock(return_value={}),
+        ):
+            return await enrich_artwork_results(
+                [(item, None) for item in items], AsyncMock(), song=song, album=album
+            )
+
+    @classmethod
+    async def _enrich(cls, item, *, song, album):
+        return (await cls._enrich_all([item], song=song, album=album))[0][1]
+
+    @pytest.mark.asyncio
+    async def test_an_artist_the_stripper_empties_still_gets_search_urls(self):
+        # `(etre)` is a real catalog row (id 58112, the only one of 64,737
+        # whose name the broad stripper empties): the whole name is a
+        # parenthetical, so `strip_discogs_disambig` returns "". That made
+        # `search_artist` falsy, and the falsy check guards ALL THREE
+        # fallbacks -- so the row shipped no streaming URLs whatsoever, where
+        # before LML#1284 it shipped three. A name the stripper cannot
+        # improve must fall back to the name itself, never to nothing.
+        item = make_library_item(artist="(etre)", title="Sound de Sept")
+
+        enriched = await self._enrich(item, song="Cascade", album="Sound de Sept")
+
+        assert enriched.bandcamp_url == (
+            "https://bandcamp.com/search?q=%28etre%29%20Sound%20de%20Sept"
+        )
+        assert enriched.youtube_music_url == (
+            "https://music.youtube.com/search?q=%28etre%29%20Cascade"
+        )
+        assert enriched.soundcloud_url == ("https://soundcloud.com/search?q=%28etre%29%20Cascade")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "filed,alternate,expected",
+        [
+            # 126 rows across 37 shelf headings in the 2026-08-23 prod
+            # library.db carry this shape.
+            ("Various Artists - Africa", "mulatu astatke", "mulatu astatke"),
+            ("Soundtracks - G", "Belle & Sebastian", "Belle & Sebastian"),
+            ("various", "Boozoo Bajou", "Boozoo Bajou"),
+            # A compilation row with nothing better still yields a query
+            # rather than dropping the field.
+            ("Various Artists - Blues", "", "Various Artists - Blues"),
+            # The flip is compilation-only: a normal row keeps the filed
+            # (performing) name that LML#1284 correctly moved to first place.
+            ("skee mask", "Bryan Muller", "skee mask"),
+        ],
+    )
+    async def test_a_compilation_shelf_heading_yields_to_the_alternate(
+        self, filed, alternate, expected
+    ):
+        # `item.artist` on a compilation row is a SHELF HEADING, not a
+        # performer -- "Various Artists - Africa Ethiopiques 4" finds nothing
+        # on any service. The performer is in `alternate_artist_name`, which
+        # is where the pre-LML#1284 `alternate or artist` order found it.
+        # lookup/artwork.py:357 reads the pair the same way for the same
+        # reason.
+        item = make_library_item(
+            artist=filed, title="Ethiopiques 4", alternate_artist_name=alternate
+        )
+
+        enriched = await self._enrich(item, song="Yekermo Sew", album="Ethiopiques 4")
+
+        assert enriched.bandcamp_url == (
+            f"https://bandcamp.com/search?q={quote(expected + ' Ethiopiques 4')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bandcamp_term_is_per_row_not_per_request(self):
+        # `ctx.album` is request-scoped but the fallback runs per result row.
+        # A row whose own title does not match the requested album is a
+        # DIFFERENT album, so advertising the requested one against that
+        # row's artist mislabels it -- and Backend-Service freezes the result
+        # onto that row's album_metadata (BS#1747), so the mislabel sticks.
+        top1 = make_library_item(artist="Jessica Pratt", title="On Your Own Love Again")
+        other = make_library_item(artist="Jessica Pratt", title="Quiet Signs")
+
+        results = await self._enrich_all(
+            [top1, other], song="Back, Baby", album="On Your Own Love Again"
+        )
+
+        assert results[0][1].bandcamp_url == (
+            "https://bandcamp.com/search?q=Jessica%20Pratt%20On%20Your%20Own%20Love%20Again"
+        )
+        assert results[1][1].bandcamp_url == (
+            "https://bandcamp.com/search?q=Jessica%20Pratt%20Quiet%20Signs"
+        )
 
 
 class TestWikipediaPreferredBioSwap:

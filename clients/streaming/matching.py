@@ -389,6 +389,17 @@ def strip_discogs_disambig(name: str) -> str:
     cache, never a persisted PG cache key, so this narrowing is safe —
     it only means a malformed (space-after-paren) disambiguator is left
     alone rather than stripped, which is the more conservative direction.
+
+    **One call site breaks that pattern** (LML#1284):
+    ``lookup/enrichment/search_urls.py``'s ``search_artist_for`` puts the
+    output in a consumer-facing search URL, which Backend-Service then freezes
+    onto an album-keyed ``album_metadata`` row and never re-asks (BS#1747). So
+    a wrong strip there is durable rather than per-request, and the two ways
+    this function can be wrong land differently: leaving a suffix on is merely
+    a bad query, while over-stripping can EMPTY the name (``"(etre)"`` -> ``""``
+    — one real catalog row). That call site therefore falls back to the
+    unstripped name rather than trusting an empty result. A new consumer that
+    persists this output should do the same.
     """
     return strip_discogs_disambiguation(name, True)
 
