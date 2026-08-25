@@ -37,11 +37,26 @@ every sampled release Bandcamp actually carries.
 
 YouTube Music and SoundCloud stay **track**-scoped: both are track-searchable,
 so only the artist half of the fix applies to them.
+
+Review of that fix then found three places it overshot, each corrected here
+and each pinned by ``TestSearchUrlFallbackQueryShapeReviewFixes``:
+
+* **The strip could empty the name**, and an empty artist disables all three
+  fallbacks rather than just degrading one.
+* **A compilation row's filed artist is a shelf heading**, so preferring it
+  over the alternate is right everywhere except the one class where the
+  alternate holds the performer.
+* **The album was request-scoped against a per-row fallback**, so a non-top-1
+  row advertised an album it isn't.
+
+Each function below carries the measurement for its own case.
 """
 
 from __future__ import annotations
 
 from urllib.parse import quote
+
+from wxyc_etl.text import is_compilation_artist
 
 from clients.streaming.matching import strip_discogs_disambig
 from library.models import LibraryItem
@@ -63,23 +78,73 @@ def search_artist_for(item: LibraryItem) -> str:
     the alternate is kept as a second preference rather than dropped, so a row
     carrying only one of the two still yields a query.
 
+    **A compilation row inverts that order**, because there ``item.artist`` is
+    a SHELF HEADING rather than a performer -- ``Various Artists - Africa``,
+    ``Soundtracks - G``, ``various``. 126 rows across 37 such headings in the
+    2026-08-23 prod ``library.db`` carry the actual performer in
+    ``alternate_artist_name`` (``mulatu astatke``, ``Belle & Sebastian``), and
+    ``Various Artists - Africa Ethiopiques 4`` finds nothing on any service
+    while ``mulatu astatke Ethiopiques 4`` finds the record. This is the one
+    class where the pre-LML#1284 ``alternate or artist`` order was right, so
+    it is restored for exactly that class. ``lookup/artwork.py``'s
+    ``alternate_artist_name or artist`` reads the pair the same way for the
+    same reason.
+
     The Discogs disambiguation suffix is structural metadata rather than part
     of how an artist is billed, so it is stripped with the shared LML#1206
-    helper -- ``Ear (11)`` searched literally returns nothing.
+    helper -- ``Ear (11)`` searched literally returns nothing. The strip is
+    **never allowed to empty the name**: on ``(etre)`` (a real row -- id
+    58112, the only one of 64,737 the broad strip empties) the whole name
+    parses as a disambiguator, and an empty result does not merely degrade
+    this fallback but disables all three, since ``enrich_one`` and
+    ``apply_deferred_search_url_fallbacks`` both guard on the artist being
+    truthy. A name the stripper cannot improve falls back to itself.
+
+    Note for future call sites: unlike ``strip_discogs_disambig``'s other
+    consumers -- which use the output for in-request fuzzy scoring and a
+    process-local cache, per its own docstring -- this output is
+    consumer-facing and Backend-Service freezes it onto an album-keyed
+    ``album_metadata`` row (BS#1747). A bad strip here is durable.
 
     ``row_artist`` keeps its own meaning untouched: the LML#504 identity gate
     and the probe call sites still score against it.
     """
-    return strip_discogs_disambig(item.artist or item.alternate_artist_name or "")
+    filed = item.artist or ""
+    alternate = item.alternate_artist_name or ""
+    raw = (alternate or filed) if is_compilation_artist(filed) else (filed or alternate)
+    return strip_discogs_disambig(raw) or raw
 
 
-def bandcamp_search_term(requested_album: str | None, item: LibraryItem) -> str:
+def bandcamp_search_term(
+    requested_album: str | None,
+    item: LibraryItem,
+    *,
+    requested_album_describes_row: bool,
+) -> str:
     """The album title to search Bandcamp for.
 
-    Prefers the requested album so this fallback and the LML#1098 live probe
-    key on the same ``(artist, album)`` pair -- a later probe hit is then a
-    like-for-like upgrade of the same query rather than a different question.
-    Falls back to the catalog row's title so a free-form playcut with no
+    Prefers the requested album so this fallback keys on the same ALBUM the
+    LML#1098 live probe does -- a later probe hit is then a like-for-like
+    upgrade rather than an answer to a different question. Only the album half
+    is shared: the probe scores the REQUEST artist (``ctx.artist``) while this
+    pairs the ROW's artist, so on a row surfaced by title alone the two name
+    different performers. That is deliberate -- a search URL advertises the
+    row it is attached to, and the row's own artist is the honest label for
+    it. Falls back to the catalog row's title so a free-form playcut with no
     parsed album still produces a query instead of dropping the field.
+
+    ``requested_album_describes_row`` is required rather than defaulted
+    because getting it wrong is silent: ``ctx.album`` is REQUEST-scoped while
+    this fallback runs once per RESULT ROW, so on a multi-row response the
+    non-top-1 rows are different albums and pairing their artist with the
+    requested album mislabels them outright. Backend-Service then freezes that
+    pairing onto the row's own album-keyed ``album_metadata`` and never
+    re-asks (BS#1747), so the mislabel is durable. ``enrich_one`` passes
+    LML#477's ``row_title_matches_requested_album`` -- the same predicate that
+    decides whether to trust the row's Discogs binding, asked here of the
+    query text; it is ``True`` when no album was requested, which is what
+    keeps the row-title fallback above reachable.
     """
-    return requested_album or item.title or ""
+    if requested_album_describes_row and requested_album:
+        return requested_album
+    return item.title or requested_album or ""
