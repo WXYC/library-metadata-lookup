@@ -20,7 +20,7 @@ from discogs.models import (
 from entity.artist_wikipedia_bio import WikipediaBioHit
 from entity.cache_toolkit import CachedValue
 from lookup.enrichment import enrich_artwork_results
-from lookup.enrichment.search_urls import build_streaming_search_url
+from lookup.enrichment.search_urls import bandcamp_search_term, build_streaming_search_url
 from lookup.enrichment.wikipedia_bio import (
     CACHE_MISS_WARM_SCHEDULED_STAT_KEY,
     FALLBACK_DISCOGS_STAT_KEY,
@@ -5118,6 +5118,35 @@ class TestSearchUrlFallbackQueryShapeReviewFixes:
         assert results[1][1].bandcamp_url == (
             "https://bandcamp.com/search?q=Jessica%20Pratt%20Quiet%20Signs"
         )
+
+    def test_a_closed_gate_never_leaks_the_requested_album(self):
+        # The gate above is enforced by ``bandcamp_search_term``'s FIRST
+        # branch only; the fallback chain then reaches for
+        # ``requested_album`` again, so a row with no title of its own gets
+        # the requested album back even though the gate said the album does
+        # not describe it. Unreachable from ``enrich_one`` today -- only
+        # because ``compute_row_title_matches_requested_album`` happens to
+        # return True whenever ``item.title`` is falsy, in a different module
+        # -- but this function's docstring makes the gate its contract, and
+        # the whole reason the parameter is required rather than defaulted is
+        # that violating it is silent and, per BS#1747, durable. Hold the
+        # invariant here rather than borrowing it from the caller.
+        titleless = make_library_item(artist="Jessica Pratt", title="")
+
+        assert (
+            bandcamp_search_term(
+                "On Your Own Love Again", titleless, requested_album_describes_row=False
+            )
+            == ""
+        )
+
+    def test_an_open_gate_still_falls_back_to_the_row_title(self):
+        # The other direction of the same branch: an open gate with no
+        # requested album must keep reaching for the row's own title, which
+        # is what keeps the free-form-playcut fallback reachable.
+        item = make_library_item(artist="Juana Molina", title="DOGA")
+
+        assert bandcamp_search_term(None, item, requested_album_describes_row=True) == "DOGA"
 
 
 class TestWikipediaPreferredBioSwap:

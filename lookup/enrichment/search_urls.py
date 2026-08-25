@@ -87,8 +87,11 @@ def search_artist_for(item: LibraryItem) -> str:
     while ``mulatu astatke Ethiopiques 4`` finds the record. This is the one
     class where the pre-LML#1284 ``alternate or artist`` order was right, so
     it is restored for exactly that class. ``lookup/artwork.py``'s
-    ``alternate_artist_name or artist`` reads the pair the same way for the
-    same reason.
+    ``track_artist`` reads the alternate as the same thing -- its comment
+    calls it "the *track* artist (pre-compilation-form mutation)" -- though
+    it leads with the alternate unconditionally and then swaps a compilation
+    credit for ``COMPILATION_ARTIST_SEARCH_FORM``, because it is probing
+    Discogs rather than labelling a consumer-facing search URL.
 
     The Discogs disambiguation suffix is structural metadata rather than part
     of how an artist is billed, so it is stripped with the shared LML#1206
@@ -96,9 +99,10 @@ def search_artist_for(item: LibraryItem) -> str:
     **never allowed to empty the name**: on ``(etre)`` (a real row -- id
     58112, the only one of 64,737 the broad strip empties) the whole name
     parses as a disambiguator, and an empty result does not merely degrade
-    this fallback but disables all three, since ``enrich_one`` and
-    ``apply_deferred_search_url_fallbacks`` both guard on the artist being
-    truthy. A name the stripper cannot improve falls back to itself.
+    this fallback but disables all three: ``enrich_one`` guards the inline
+    YouTube-Music/SoundCloud pair and, separately, the deferred Bandcamp
+    write on the same ``if search_artist and ...``. A name the stripper
+    cannot improve falls back to itself.
 
     Note for future call sites: unlike ``strip_discogs_disambig``'s other
     consumers -- which use the output for in-request fuzzy scoring and a
@@ -144,7 +148,17 @@ def bandcamp_search_term(
     decides whether to trust the row's Discogs binding, asked here of the
     query text; it is ``True`` when no album was requested, which is what
     keeps the row-title fallback above reachable.
+
+    A CLOSED gate returns the row title or nothing -- never the requested
+    album by another route. The branches are written so that reaching the
+    requested album is impossible once the gate is closed, rather than merely
+    unlikely: the earlier ``item.title or requested_album or ""`` chain handed
+    the requested album back to a titleless row, and was inert only because
+    ``compute_row_title_matches_requested_album`` happens to return ``True``
+    whenever ``item.title`` is falsy. That is an invariant living in a
+    different module, which is precisely the arrangement the required
+    parameter above exists to avoid.
     """
-    if requested_album_describes_row and requested_album:
-        return requested_album
-    return item.title or requested_album or ""
+    if not requested_album_describes_row:
+        return item.title or ""
+    return requested_album or item.title or ""

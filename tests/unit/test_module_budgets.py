@@ -123,7 +123,17 @@ MODULE_BUDGETS: dict[str, int] = {
     # streaming_status.py for LML#1053. Pure functions of the request scalars
     # and the library row, with no dependency on enrich_one's control flow.
     # 1.3x its 85-line measured size (110.5) -> 150.
-    "lookup/enrichment/search_urls.py": 150,
+    # Recalibrated in the same PR (150 -> 200, measured 164). LML#1284's review
+    # round landed the compilation-shelf-heading inversion, the empty-strip
+    # fallback and the per-row album gate; recording why each is right took the
+    # file from 85 lines to exactly 150 — sitting on its own ceiling with no
+    # headroom, the state LML#1101 called out for streaming_status.py below.
+    # Deliberately TIGHTER than the 1.3x rule (213.2 -> 250): all of the growth
+    # is docstring pinning three measured defect classes, and the executable
+    # body is still 9 lines across three functions, so 250 would be room for a
+    # whole new concern rather than for maintenance. At 200 the next concern
+    # extracts, which is the answer this guardrail wants.
+    "lookup/enrichment/search_urls.py": 200,
     # LML#1053: the per-service streaming-status merge, extracted out of
     # item.py to stay under its own ceiling above — a pure function with no
     # dependency on enrich_one's control flow. 1.3x its ~70-line measured
