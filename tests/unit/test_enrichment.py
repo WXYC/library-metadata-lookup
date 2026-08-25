@@ -2,6 +2,7 @@
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import quote
 
 import pytest
 from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
@@ -19,7 +20,7 @@ from discogs.models import (
 from entity.artist_wikipedia_bio import WikipediaBioHit
 from entity.cache_toolkit import CachedValue
 from lookup.enrichment import enrich_artwork_results
-from lookup.enrichment.item import _build_streaming_search_url
+from lookup.enrichment.search_urls import build_streaming_search_url
 from lookup.enrichment.wikipedia_bio import (
     CACHE_MISS_WARM_SCHEDULED_STAT_KEY,
     FALLBACK_DISCOGS_STAT_KEY,
@@ -31,17 +32,17 @@ from tests.factories import make_discogs_result, make_library_item
 
 class TestBuildStreamingSearchUrl:
     def test_builds_encoded_url(self):
-        url = _build_streaming_search_url(
+        url = build_streaming_search_url(
             "https://open.spotify.com/search/", "Autechre", "VI Scose Poise"
         )
         assert url == "https://open.spotify.com/search/Autechre%20VI%20Scose%20Poise"
 
     def test_artist_only(self):
-        url = _build_streaming_search_url("https://bandcamp.com/search?q=", "Juana Molina", "")
+        url = build_streaming_search_url("https://bandcamp.com/search?q=", "Juana Molina", "")
         assert "Juana%20Molina" in url
 
     def test_encodes_special_characters(self):
-        url = _build_streaming_search_url(
+        url = build_streaming_search_url(
             "https://soundcloud.com/search?q=", "Bj\u00f6rk", "J\u00f3ga"
         )
         assert "Bj%C3%B6rk" in url
@@ -4884,6 +4885,132 @@ class TestBandcampStreamingUrlPostprocessWiring:
         # test's assertion (LML#1192 review round 6, pass 3, B5) if the
         # exact-URL-shape check is what you're looking for.
         assert enriched.bandcamp_url is not None
+
+
+class TestSearchUrlFallbackQueryShape:
+    """LML#1284: what the templated search-URL fallbacks actually search for.
+
+    Three defects, measured 2026-08-24 over the 100 most recent playcuts: of
+    the 87 rows carrying a Bandcamp search fallback, only 16 had the artist +
+    album shape a Bandcamp deep link needs. The fallback was built from
+    ``ctx.song`` (the played track) and from ``item.alternate_artist_name``
+    (the Discogs canonical name, disambiguation suffix included), so queries
+    like ``Bryan Muller Pool`` and ``Ear (11) Threads`` shipped for plays of
+    ``skee mask - Pool`` and ``ear - Rumspringa``. Neither finds the record.
+
+    Bandcamp is album-keyed, so its fallback is album-scoped; YouTube Music
+    and SoundCloud are track-searchable and stay track-scoped. The artist,
+    though, is wrong for all three, so the performing-name fix applies across
+    the board.
+    """
+
+    @staticmethod
+    async def _enrich(item, *, song, album):
+        with patch(
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
+            new=AsyncMock(return_value={}),
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)], AsyncMock(), song=song, album=album
+            )
+        return results[0][1]
+
+    @pytest.mark.asyncio
+    async def test_bandcamp_fallback_is_album_scoped_not_track_scoped(self):
+        # Bandcamp deep links are album-level -- the same reason the LML#1098
+        # live probe gates on a resolved ctx.album. Searching the track drops
+        # the listener on a page that need not contain the release at all.
+        item = make_library_item(artist="OK EG", title="Prismatic Spring")
+
+        enriched = await self._enrich(item, song="Triple Point", album="Prismatic Spring")
+
+        assert enriched.bandcamp_url == (
+            "https://bandcamp.com/search?q=OK%20EG%20Prismatic%20Spring"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bandcamp_fallback_prefers_the_performing_name(self):
+        # alternate_artist_name carries the Discogs canonical/legal name for
+        # ~8% of catalog rows (it is '' on 59,816 of 64,676). Bandcamp indexes
+        # the performing name, so "Bryan Muller Pool" finds nothing while
+        # "skee mask Pool" finds the album.
+        item = make_library_item(
+            artist="skee mask", title="Pool", alternate_artist_name="Bryan Muller"
+        )
+
+        enriched = await self._enrich(item, song="nvivo", album="Pool")
+
+        assert enriched.bandcamp_url == "https://bandcamp.com/search?q=skee%20mask%20Pool"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "artist,expected",
+        [
+            ("Ear (11)", "Ear"),
+            ("Mia (106)", "Mia"),
+            ("Stereolab (UK)", "Stereolab"),
+            ("Sade (band)", "Sade"),
+            ("Juana Molina", "Juana Molina"),
+        ],
+    )
+    async def test_search_fallbacks_strip_the_discogs_disambiguation_suffix(self, artist, expected):
+        # A Discogs disambiguation suffix is structural metadata, never part
+        # of how the artist is billed -- reuse the LML#1206 stripper rather
+        # than shipping "(11)" into a consumer-facing query.
+        item = make_library_item(artist=artist, title="Rumspringa")
+
+        enriched = await self._enrich(item, song="Threads", album="Rumspringa")
+
+        # Exact equality, not substring containment: "Mia" is trivially a
+        # substring of "Mia%20%28106%29", so a containment check passes on
+        # precisely the input this test exists to reject.
+        assert enriched.bandcamp_url == (
+            f"https://bandcamp.com/search?q={quote(expected + ' Rumspringa')}"
+        )
+        assert enriched.youtube_music_url == (
+            f"https://music.youtube.com/search?q={quote(expected + ' Threads')}"
+        )
+        assert enriched.soundcloud_url == (
+            f"https://soundcloud.com/search?q={quote(expected + ' Threads')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_youtube_and_soundcloud_stay_track_scoped(self):
+        # Regression guard on the deliberate asymmetry: both are
+        # track-searchable, so the album-scoping fix is Bandcamp-only.
+        item = make_library_item(artist="OK EG", title="Prismatic Spring")
+
+        enriched = await self._enrich(item, song="Triple Point", album="Prismatic Spring")
+
+        assert enriched.youtube_music_url == (
+            "https://music.youtube.com/search?q=OK%20EG%20Triple%20Point"
+        )
+        assert enriched.soundcloud_url == (
+            "https://soundcloud.com/search?q=OK%20EG%20Triple%20Point"
+        )
+
+    @pytest.mark.asyncio
+    async def test_youtube_and_soundcloud_also_use_the_performing_name(self):
+        item = make_library_item(
+            artist="skee mask", title="Pool", alternate_artist_name="Bryan Muller"
+        )
+
+        enriched = await self._enrich(item, song="nvivo", album="Pool")
+
+        assert "skee%20mask" in enriched.youtube_music_url
+        assert "Bryan" not in enriched.youtube_music_url
+        assert "skee%20mask" in enriched.soundcloud_url
+        assert "Bryan" not in enriched.soundcloud_url
+
+    @pytest.mark.asyncio
+    async def test_bandcamp_falls_back_to_the_row_title_when_no_album_requested(self):
+        # A free-form playcut with no parsed album still has the catalog row's
+        # title; keying on ctx.album alone would drop the fallback entirely.
+        item = make_library_item(artist="Juana Molina", title="DOGA")
+
+        enriched = await self._enrich(item, song="la paradoja", album=None)
+
+        assert enriched.bandcamp_url == "https://bandcamp.com/search?q=Juana%20Molina%20DOGA"
 
 
 class TestWikipediaPreferredBioSwap:

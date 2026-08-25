@@ -200,7 +200,7 @@ class TestResolutionProvingSlotsExcludeSearchUrlServices:
     """LML#1101 review: the "just add a key" recipe is a trap for YTM/SoundCloud.
 
     ``enrich_one`` fills ``youtube_music_url`` / ``soundcloud_url`` with
-    templated ``_build_streaming_search_url`` fallbacks BEFORE it calls
+    templated ``build_streaming_search_url`` fallbacks BEFORE it calls
     ``resolve_streaming_status`` — they have no album-cache tier, so unlike
     Bandcamp (whose fallback LML#573 PR-3 defers past the call) their slots are
     already populated with a generic search page. Keying them into
