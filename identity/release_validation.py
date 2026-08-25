@@ -195,9 +195,16 @@ def _validate_spotify_album_id(source: str, external_id: str) -> str:
 # ``streaming.service.StreamingService`` enum — it mixes two Discogs
 # identity-only sources into an otherwise streaming-service-shaped key set,
 # which is exactly the kind of asymmetric membership the enum's three
-# vocabularies don't have). The parity test asserts the image of
-# ``STREAMING_URL_CACHE_CONFIG``'s enum keys under
+# vocabularies don't have). The parity test asserts the image of the MINTING
+# subset of ``STREAMING_URL_CACHE_CONFIG`` — entries whose
+# ``url_to_external_id`` is not None — under
 # ``streaming.service.ALBUM_CACHE_KEYS`` ⊆ ``RELEASE_SOURCE_CONFIG.keys()``.
+# It covered every cache entry until LML#1103, which added the registry's
+# first deliberately non-minting service: YouTube Music is URL-cached but has
+# no identity source (minting opaque ``MPREb_…`` browse ids would need the
+# wxyc-shared enum → discogs-cache alembic → LML three-repo dance), so being
+# in the cache registry no longer implies being mintable. See
+# ``StreamingUrlCacheConfig.url_to_external_id``'s contract.
 # ``musicbrainz_release`` is intentionally absent — it is read-only today
 # (no write helper / sentinel rule), readable via the store's
 # ``_RELEASE_IDENTITY_COLUMN_TO_SOURCE`` tuple but not mintable here.

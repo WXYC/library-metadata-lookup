@@ -94,10 +94,14 @@ def resolve_streaming_status(
     ``postprocess_status`` key left ``status_map`` non-empty and produced an
     all-null ``StreamingResolution()`` (pydantic's ``extra='ignore'`` swallowed
     the kwarg), which serializes as ``streaming_status: {}`` rather than an
-    omitted key. Unreachable today — ``apply_streaming_url_postprocess`` only
-    emits the three ``STREAMING_URL_CACHE_CONFIG`` catalog keys — but the
-    omitted-key shape is the correct one for a field whose contract is
-    "absence means never-consulted".
+    omitted key. **Reachable as of LML#1103**: ``apply_streaming_url_postprocess``
+    now emits four ``STREAMING_URL_CACHE_CONFIG`` catalog keys, and
+    ``youtube_music`` is not yet a ``StreamingResolution`` field. With only
+    ``lml_persist_streaming_url_youtube_music`` enabled, the sole verdict is
+    that unmodelled key, ``_MODELLED_SERVICES`` drops it, and ``status_map``
+    lands empty — so this branch is what keeps that configuration returning an
+    omitted key rather than ``{}``. The omitted-key shape is the correct one
+    for a field whose contract is "absence means never-consulted".
     """
     status_map: dict[str, StreamingResolutionStatus] = {}
     for service in _MODELLED_SERVICES:
