@@ -28,6 +28,28 @@ class LibraryItem(BaseModel):
     release_call_number: int | None = None
     genre: str | None = None
     format: str | None = None
+    # The cataloger's SECOND name for this release's artist, and not a
+    # synonym for ``artist`` -- ``artist`` is the name the record is FILED
+    # under, this is how THIS release is billed. Empty on ~92% of catalog
+    # rows. When present it is usually a collaboration or cross-reference
+    # credit ("Marvin Gaye" -> "Marvin Gaye and Tammi Terrell", "The Ex" ->
+    # "The Ex with Brader Musiki"), sometimes a spelling variant ("B.J.
+    # Thomas" -> "bj thomas"), and sometimes the Discogs canonical or legal
+    # name with its disambiguation suffix ("skee mask" -> "Bryan Muller",
+    # "Ear (11)"). On a compilation row it inverts: ``artist`` is a shelf
+    # heading ("Various Artists - Africa", "Soundtracks - G") and this holds
+    # the performer.
+    #
+    # Consequence: which of the two a reader wants depends on the QUESTION,
+    # and the three current readers deliberately disagree.
+    # ``lookup/enrichment/item.py``'s ``row_artist`` and ``lookup/artwork.py``'s
+    # ``track_artist`` lead with this one (they score against Discogs, which
+    # indexes billing credits); ``lookup/enrichment/search_urls.py``'s
+    # ``search_artist_for`` leads with ``artist`` and inverts only on
+    # compilations, because a streaming service indexes the performing name.
+    # Each carries its own rationale; this note is the shared substrate so a
+    # correction to what the FIELD holds has one home. LML#1284 had to make
+    # exactly that correction mid-PR.
     alternate_artist_name: str | None = None
     label: str | None = None
     # Pipe-joined (" | ") PRESENTATION_NAMEs of any WXYC catalog LIBRARY_CODEs

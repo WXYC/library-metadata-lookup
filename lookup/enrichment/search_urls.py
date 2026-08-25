@@ -65,10 +65,9 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
-from wxyc_etl.text import is_compilation_artist
-
-from clients.streaming.matching import strip_discogs_disambig
+from clients.streaming.matching import strip_discogs_disambig_preserving
 from library.models import LibraryItem
+from lookup.artist_resolution import _is_compilation_alias
 
 
 def build_streaming_search_url(base: str, artist: str, term: str) -> str:
@@ -139,19 +138,23 @@ def search_artist_for(item: LibraryItem) -> str:
     does not expose, so the fix belongs in ``wxyc-etl``, not in a
     per-call-site heuristic here.
 
-    Note for future call sites: unlike ``strip_discogs_disambig``'s other
-    consumers -- which use the output for in-request fuzzy scoring and a
-    process-local cache, per its own docstring -- this output is
-    consumer-facing and Backend-Service freezes it onto an album-keyed
-    ``album_metadata`` row (BS#1747). A bad strip here is durable.
+    Both the compilation test and the strip go through the wrapped entry
+    points rather than the raw crate primitives:
+    ``_is_compilation_alias`` normalizes first, per the NORMALIZATION CONTRACT
+    on ``clients/streaming/matching.py``'s ``artist_pair_is_compilation`` (the
+    raw predicate is leading-anchored, so ``Vàrious Artists``, doubled
+    whitespace and a wrapped ``(V/A)`` all read as real artist names -- the
+    LML#1252 hole), and ``strip_discogs_disambig_preserving`` is where the
+    never-empty rule above actually lives, shared with the one other call site
+    that needs it.
 
     ``row_artist`` keeps its own meaning untouched: the LML#504 identity gate
     and the probe call sites still score against it.
     """
     filed = item.artist or ""
     alternate = item.alternate_artist_name or ""
-    raw = (alternate or filed) if is_compilation_artist(filed) else (filed or alternate)
-    return strip_discogs_disambig(raw) or raw
+    raw = (alternate or filed) if _is_compilation_alias(filed) else (filed or alternate)
+    return strip_discogs_disambig_preserving(raw)
 
 
 def bandcamp_search_term(
@@ -185,15 +188,15 @@ def bandcamp_search_term(
     keeps the row-title fallback above reachable.
 
     A CLOSED gate returns the row title or nothing -- never the requested
-    album by another route. The branches are written so that reaching the
-    requested album is impossible once the gate is closed, rather than merely
-    unlikely: the earlier ``item.title or requested_album or ""`` chain handed
-    the requested album back to a titleless row, and was inert only because
-    ``compute_row_title_matches_requested_album`` happens to return ``True``
-    whenever ``item.title`` is falsy. That is an invariant living in a
-    different module, which is precisely the arrangement the required
+    album by another route. ``requested_album`` appears exactly once below,
+    inside the branch the gate guards, so that is readable off the shape
+    rather than inferred: an earlier ``item.title or requested_album or ""``
+    fallback handed the requested album back to a titleless row, and was inert
+    only because ``compute_row_title_matches_requested_album`` happens to
+    return ``True`` whenever ``item.title`` is falsy -- an invariant living in
+    a different module, which is precisely the arrangement the required
     parameter above exists to avoid.
     """
-    if not requested_album_describes_row:
-        return item.title or ""
-    return requested_album or item.title or ""
+    if requested_album_describes_row and requested_album:
+        return requested_album
+    return item.title or ""

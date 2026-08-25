@@ -390,18 +390,50 @@ def strip_discogs_disambig(name: str) -> str:
     it only means a malformed (space-after-paren) disambiguator is left
     alone rather than stripped, which is the more conservative direction.
 
-    **One call site breaks that pattern** (LML#1284):
-    ``lookup/enrichment/search_urls.py``'s ``search_artist_for`` puts the
-    output in a consumer-facing search URL, which Backend-Service then freezes
-    onto an album-keyed ``album_metadata`` row and never re-asks (BS#1747). So
-    a wrong strip there is durable rather than per-request, and the two ways
-    this function can be wrong land differently: leaving a suffix on is merely
-    a bad query, while over-stripping can EMPTY the name (``"(etre)"`` -> ``""``
-    — one real catalog row). That call site therefore falls back to the
-    unstripped name rather than trusting an empty result. A new consumer that
-    persists this output should do the same.
+    **The two ways this can be wrong are not symmetric.** Leaving a suffix on
+    is merely a bad query; over-stripping can EMPTY the name outright
+    (``"(etre)"`` -> ``""``, one real catalog row), which callers that treat
+    an empty artist as "no signal" turn into a dropped field. Which of those
+    a caller can tolerate decides which of the two entry points it wants: this
+    one, or :func:`strip_discogs_disambig_preserving` below.
     """
     return strip_discogs_disambiguation(name, True)
+
+
+def strip_discogs_disambig_preserving(name: str) -> str:
+    """:func:`strip_discogs_disambig`, but never returns less than a name.
+
+    Falls back to the input when stripping would leave nothing — an artist
+    name that was *entirely* a disambiguator (``"(etre)"``). For a caller that
+    reads the result as a name, an empty string is strictly worse than an
+    unimproved one: it is indistinguishable from "this row has no artist".
+
+    Which entry point a call site wants follows from what it does with an
+    empty result, and the split is real in both directions:
+
+    * **Rejecting on empty is a feature** for the identity/verification rungs
+      (``lookup/artist_resolution.py``'s pair gate,
+      ``lookup/wikipedia_candidates.py``'s slug loop,
+      ``lookup/enrichment/__init__.py``'s release anchor). There an
+      all-disambiguator string genuinely carries no name to verify against,
+      and the empty check is the fast reject — ``"(Various Artists)"`` is
+      turned away by exactly this path. Those keep calling
+      :func:`strip_discogs_disambig` directly.
+    * **Preserving is required** wherever the output is a name shown to or
+      acted on by a person. ``lookup/enrichment/search_urls.py``'s
+      ``search_artist_for`` is the sharp case: its result lands in a
+      consumer-facing search URL that Backend-Service freezes onto an
+      album-keyed ``album_metadata`` row and never re-asks (BS#1747), and an
+      empty artist there does not degrade one field but suppresses all three
+      streaming-URL fallbacks at once.
+
+    Named rather than left as an ``or`` at each call site because the idiom
+    had already been written twice, in two spellings that agree only by luck:
+    the crate primitive happens to trim, so ``" (etre) "`` yields ``""``
+    rather than ``" "`` and a bare ``or`` and a ``.strip() or`` come out the
+    same. A crate change that returned whitespace would split them silently.
+    """
+    return strip_discogs_disambig(name).strip() or name
 
 
 def normalize_artist_credit(artist: str) -> list[str]:
