@@ -122,24 +122,16 @@ MODULE_BUDGETS: dict[str, int] = {
     # apple_probe.py took for LML#1101, bandcamp_probe.py for LML#1098, and
     # streaming_status.py for LML#1053. Pure functions of the request scalars
     # and the library row, with no dependency on enrich_one's control flow.
-    # 1.3x its 85-line measured size (110.5) -> 150.
-    # Recalibrated in the same PR (150 -> 200, measured 164). LML#1284's review
-    # round landed the compilation-shelf-heading inversion, the empty-strip
-    # fallback and the per-row album gate; recording why each is right took the
-    # file from 85 lines to exactly 150 — sitting on its own ceiling with no
-    # headroom, the state LML#1101 called out for streaming_status.py below.
-    # That first pass set 200 — deliberately tighter than the 1.3x rule, on the
-    # reasoning that the growth was all docstring and 250 would be room for a
-    # new concern. It did not survive the same PR: a second review round found
-    # the module docstring's premise about what alternate_artist_name holds was
-    # wrong (it is release-level billing, not the Discogs legal name), and
-    # correcting it plus recording the accepted Was-(Not-Was) over-strip took
-    # the file to 199 — back on the ceiling within one commit. Raised to 250:
-    # still under the strict 1.3x (258.7 -> 300), on the same reading LML#1250
-    # used below when it took a docstring-heavy file to the next multiple of 50
-    # above its measured size rather than to 1.3x. The executable body is 9
-    # lines across three functions and every line of the growth is measured
-    # fact about the catalog; if the BODY grows, extract rather than raise.
+    # Set at 250 against a measured ~200 — the next multiple of 50 above the
+    # measurement rather than the strict 1.3x (which would license 300), on
+    # the same reading LML#1250 used below for a docstring-heavy file.
+    # The ceiling moved twice inside LML#1284's own PR (150 -> 200 -> 250) as
+    # two review rounds landed, which is the fact worth keeping rather than
+    # the itinerary: this file's growth is documentation, and the budget
+    # mechanism cannot tell documentation from behavior. The executable body
+    # is 9 lines across three functions and every line of the growth is
+    # measured fact about the catalog, so the rule for the next person is
+    # about the BODY — if that grows, extract rather than raise again.
     "lookup/enrichment/search_urls.py": 250,
     # LML#1053: the per-service streaming-status merge, extracted out of
     # item.py to stay under its own ceiling above — a pure function with no

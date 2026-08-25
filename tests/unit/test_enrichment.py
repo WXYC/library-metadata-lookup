@@ -20,7 +20,11 @@ from discogs.models import (
 from entity.artist_wikipedia_bio import WikipediaBioHit
 from entity.cache_toolkit import CachedValue
 from lookup.enrichment import enrich_artwork_results
-from lookup.enrichment.search_urls import bandcamp_search_term, build_streaming_search_url
+from lookup.enrichment.search_urls import (
+    bandcamp_search_term,
+    build_streaming_search_url,
+    search_artist_for,
+)
 from lookup.enrichment.wikipedia_bio import (
     CACHE_MISS_WARM_SCHEDULED_STAT_KEY,
     FALLBACK_DISCOGS_STAT_KEY,
@@ -4887,6 +4891,28 @@ class TestBandcampStreamingUrlPostprocessWiring:
         assert enriched.bandcamp_url is not None
 
 
+async def _enrich_search_url_rows(items, *, song, album):
+    """Run ``enrich_artwork_results`` over ``items`` with the post-process stubbed.
+
+    Shared by both search-URL test classes below. The post-process is patched
+    out because these tests are about the TEMPLATED fallbacks -- the last tier
+    of the resolution ladder -- and a live post-process would fill the same
+    slots from the cache, hiding whichever fallback is under test.
+    """
+    with patch(
+        "lookup.enrichment.item.apply_streaming_url_postprocess",
+        new=AsyncMock(return_value={}),
+    ):
+        return await enrich_artwork_results(
+            [(item, None) for item in items], AsyncMock(), song=song, album=album
+        )
+
+
+async def _enrich_search_url_row(item, *, song, album):
+    """One row through :func:`_enrich_search_url_rows`, returning its artwork result."""
+    return (await _enrich_search_url_rows([item], song=song, album=album))[0][1]
+
+
 class TestSearchUrlFallbackQueryShape:
     """LML#1284: what the templated search-URL fallbacks actually search for.
 
@@ -4904,16 +4930,7 @@ class TestSearchUrlFallbackQueryShape:
     the board.
     """
 
-    @staticmethod
-    async def _enrich(item, *, song, album):
-        with patch(
-            "lookup.enrichment.item.apply_streaming_url_postprocess",
-            new=AsyncMock(return_value={}),
-        ):
-            results = await enrich_artwork_results(
-                [(item, None)], AsyncMock(), song=song, album=album
-            )
-        return results[0][1]
+    _enrich = staticmethod(_enrich_search_url_row)
 
     @pytest.mark.asyncio
     async def test_bandcamp_fallback_is_album_scoped_not_track_scoped(self):
@@ -5021,25 +5038,48 @@ class TestSearchUrlFallbackQueryShapeReviewFixes:
     pins behavior LML#1284 took away and this change gives back.
     """
 
-    @staticmethod
-    async def _enrich_all(items, *, song, album):
-        """Like the sibling class's ``_enrich``, but keeps every result row.
+    _enrich_all = staticmethod(_enrich_search_url_rows)
+    _enrich = staticmethod(_enrich_search_url_row)
 
-        The per-row Bandcamp scoping below is only observable on a response
-        with a non-top-1 row, so this helper returns the whole list rather
-        than ``[0]``.
-        """
-        with patch(
-            "lookup.enrichment.item.apply_streaming_url_postprocess",
-            new=AsyncMock(return_value={}),
-        ):
-            return await enrich_artwork_results(
-                [(item, None) for item in items], AsyncMock(), song=song, album=album
-            )
+    @pytest.mark.parametrize(
+        "heading",
+        [
+            # The raw crate predicate is leading-anchored on the unnormalized
+            # string, so every shape below reads as a real artist name to it
+            # -- diacritics and doubled whitespace from the org's mojibake
+            # workstream, wrapping punctuation from cataloger free text.
+            "Vàrious Artists",
+            "  Various   Artists",
+            "(V/A)",
+            "[Various Artists]",
+        ],
+    )
+    def test_a_non_canonical_compilation_heading_is_still_a_heading(self, heading):
+        # The normalization NORMALIZATION CONTRACT in clients/streaming/matching.py
+        # says callers owe is_compilation_artist a to_match_form string; asking
+        # it raw is the LML#1252 hole that lookup/artist_resolution.py's
+        # _is_compilation_alias exists to close. This output is consumer-facing
+        # and BS#1747 freezes it, so a heading that slips through here is a
+        # durable unsearchable URL.
+        item = make_library_item(
+            artist=heading, title="Ethiopiques 4", alternate_artist_name="mulatu astatke"
+        )
 
-    @classmethod
-    async def _enrich(cls, item, *, song, album):
-        return (await cls._enrich_all([item], song=song, album=album))[0][1]
+        assert search_artist_for(item) == "mulatu astatke"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # The crate primitive trims today, so these two agree by luck
+            # rather than by contract -- pin the contract.
+            " (etre) ",
+            "(etre)",
+        ],
+    )
+    def test_a_name_the_stripper_reduces_to_blank_falls_back_to_the_original(self, name):
+        item = make_library_item(artist=name, title="Sound de Sept")
+
+        assert search_artist_for(item) == name
 
     @pytest.mark.asyncio
     async def test_an_artist_the_stripper_empties_still_gets_search_urls(self):

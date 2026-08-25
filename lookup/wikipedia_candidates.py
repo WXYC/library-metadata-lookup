@@ -61,7 +61,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from urllib.parse import unquote
 
-from clients.streaming.matching import score_match, strip_discogs_disambig
+from clients.streaming.matching import (
+    score_match,
+    strip_discogs_disambig,
+    strip_discogs_disambig_preserving,
+)
 from clients.wikipedia import NON_ARTIST_PAGE_TYPES, RELEASE_NOUNS
 
 _WIKI_URL_RE = re.compile(r"^https?://([a-z0-9.-]+)\.wikipedia\.org/wiki/(.+)$", re.IGNORECASE)
@@ -266,9 +270,13 @@ def score_candidates(
     # "(N)"/"(UK)"/"(band)" disambiguator (e.g. "Sessa (2)"), and without
     # stripping it here, "Sessa" vs "Sessa (2)" scores 71.43 -- below the 80
     # floor -- so a disambiguated artist could never match its own correct
-    # Wikipedia page. Falls back to the original string if stripping would
-    # leave it empty (an artist name that was entirely a disambiguator).
-    artist_stripped = strip_discogs_disambig(artist_name).strip() or artist_name
+    # Wikipedia page. The _preserving entry point is the one that keeps a
+    # name that was ENTIRELY a disambiguator rather than reducing it to "" --
+    # this is the query side, where an empty name is no better than an
+    # unimproved one. (The candidate-slug strip below deliberately uses the
+    # plain entry point: there, empty means "no slug to score" and the
+    # `continue` is the intended fast reject.)
+    artist_stripped = strip_discogs_disambig_preserving(artist_name)
     scored: list[ScoredCandidate] = []
     for url in urls or ():
         if not isinstance(url, str):
