@@ -117,6 +117,13 @@ MODULE_BUDGETS: dict[str, int] = {
     # measured size, NOT a re-derived 1.3x — an extraction hands its headroom
     # back rather than banking it for the next concern to grow into.
     "lookup/enrichment/item.py": 750,
+    # LML#1284: the templated streaming search-URL fallbacks, extracted out of
+    # item.py to keep that file under its ceiling — the same posture
+    # apple_probe.py took for LML#1101, bandcamp_probe.py for LML#1098, and
+    # streaming_status.py for LML#1053. Pure functions of the request scalars
+    # and the library row, with no dependency on enrich_one's control flow.
+    # 1.3x its 85-line measured size (110.5) -> 150.
+    "lookup/enrichment/search_urls.py": 150,
     # LML#1053: the per-service streaming-status merge, extracted out of
     # item.py to stay under its own ceiling above — a pure function with no
     # dependency on enrich_one's control flow. 1.3x its ~70-line measured

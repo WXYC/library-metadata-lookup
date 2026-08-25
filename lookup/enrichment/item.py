@@ -12,7 +12,6 @@ verification flags) arrive as explicit keyword parameters.
 
 import logging
 from typing import Any
-from urllib.parse import quote
 
 from clients.streaming.matching import (
     SCORE_MATCH_ACCEPTANCE_FLOOR,
@@ -39,6 +38,11 @@ from lookup.artist_resolution import (
 from lookup.enrichment.apple_probe import run_apple_music_probe
 from lookup.enrichment.bandcamp_probe import probe_owns_bandcamp_leg, run_bandcamp_live_probe
 from lookup.enrichment.context import EnrichmentContext
+from lookup.enrichment.search_urls import (
+    bandcamp_search_term,
+    build_streaming_search_url,
+    search_artist_for,
+)
 from lookup.enrichment.streaming_status import resolve_streaming_status
 from lookup.rowless import (
     ROWLESS_LIBRARY_ID,
@@ -57,7 +61,7 @@ logger = logging.getLogger(__name__)
 #:
 #: The membership rule is not "every service with a URL field". It is "every
 #: service whose slot cannot contain a templated
-#: ``_build_streaming_search_url`` fallback yet". Apple and Spotify qualify
+#: ``build_streaming_search_url`` fallback yet". Apple and Spotify qualify
 #: because their slots hold only a librarian ``streaming_links`` override at
 #: that point; Bandcamp qualifies because LML#573 PR-3 deliberately DEFERS its
 #: search-URL fallback until after the status call.
@@ -78,12 +82,6 @@ _RESOLUTION_PROVING_URL_SERVICES: tuple[StreamingService, ...] = (
     StreamingService.SPOTIFY,
     StreamingService.BANDCAMP,
 )
-
-
-def _build_streaming_search_url(base: str, artist: str, term: str) -> str:
-    """Build a streaming service search URL from artist + song/album."""
-    query = f"{artist} {term}" if term else artist
-    return f"{base}{quote(query)}"
 
 
 def compute_row_title_matches_requested_album(
@@ -165,6 +163,15 @@ async def enrich_one(
     # reaches for the request-side value.
     row_artist = item.alternate_artist_name or item.artist or ""
     search_term = ctx.song or item.title or ""
+
+    # LML#1284: the consumer-facing search-URL inputs. Both are deliberately
+    # NOT ``row_artist`` / ``search_term`` above -- those lead with the
+    # Discogs canonical name and the played track, neither of which finds the
+    # record on a streaming service's search page. Rationale, the measurement,
+    # and the YouTube-Music/SoundCloud asymmetry live on
+    # ``lookup/enrichment/search_urls.py``.
+    search_artist = search_artist_for(item)
+    bandcamp_term = bandcamp_search_term(ctx.album, item)
 
     # LML#477: only trust the library row when its title plausibly matches
     # the requested album. Rationale + the ROWLESS_LIBRARY_ID / #684
@@ -286,7 +293,7 @@ async def enrich_one(
     # sibling, not the request. Clear them so the precedence at the
     # final ``update`` assignment lets the probe URL win the Apple
     # slot and the other four services downgrade to
-    # ``_build_streaming_search_url`` placeholders instead of
+    # ``build_streaming_search_url`` placeholders instead of
     # leaking the wrong release to iOS / dj-site.
     #
     # ``album_verified`` is the load-bearing guard: it excludes the
@@ -435,14 +442,14 @@ async def enrich_one(
     # search URL is applied below, only if the cache/probe leaves it None.
     # YouTube Music / SoundCloud have no album-cache tier, so they keep
     # their pre-post-process templated fallbacks.
-    if row_artist and search_term:
+    if search_artist and search_term:
         if not youtube_music_url:
-            youtube_music_url = _build_streaming_search_url(
-                "https://music.youtube.com/search?q=", row_artist, search_term
+            youtube_music_url = build_streaming_search_url(
+                "https://music.youtube.com/search?q=", search_artist, search_term
             )
         if not soundcloud_url:
-            soundcloud_url = _build_streaming_search_url(
-                "https://soundcloud.com/search?q=", row_artist, search_term
+            soundcloud_url = build_streaming_search_url(
+                "https://soundcloud.com/search?q=", search_artist, search_term
             )
 
     update: dict[str, Any] = {
@@ -543,9 +550,9 @@ async def enrich_one(
     # librarian-curated streaming_links override) left bandcamp_url empty, so
     # a resolved album page / direct link always wins over the generic search
     # link. Priority: direct link > cache/probe > search URL.
-    if row_artist and search_term and not update["bandcamp_url"]:
-        update["bandcamp_url"] = _build_streaming_search_url(
-            "https://bandcamp.com/search?q=", row_artist, search_term
+    if search_artist and bandcamp_term and not update["bandcamp_url"]:
+        update["bandcamp_url"] = build_streaming_search_url(
+            "https://bandcamp.com/search?q=", search_artist, bandcamp_term
         )
 
     # Extended fields land on the top-1 result only and require artwork
