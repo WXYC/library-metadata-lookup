@@ -175,8 +175,14 @@ def should_suppress_streaming_warm() -> bool:
 # service's rollout can never widen another's blast radius. A row here is NOT
 # sufficient to onboard a service: it is only ever consulted for services in
 # ``STREAMING_URL_CACHE_CONFIG`` whose ``url_field`` is still None at this point.
-# YouTube Music satisfies neither today (``item.py`` pre-fills a templated
-# search URL), so a row for it would be a silent no-op — see LML#1103.
+# YouTube Music satisfied neither before LML#1103 (it had no cache config, and
+# ``item.py`` pre-filled a templated search URL), so a row for it would have
+# been a silent no-op. **That is no longer true**: it is in
+# ``STREAMING_URL_CACHE_CONFIG`` and its fallback is now deferred, so its
+# ``url_field`` IS None at this point. A row for it here would be a LIVE bulk
+# warm switch. Left out deliberately — the bulk exemption is its own rollout
+# decision, per-service by design, and LML#1103 shipped the interactive path
+# only.
 _BULK_ROWLESS_WARM_FLAG_BY_SERVICE: dict[StreamingService, str] = {
     StreamingService.SPOTIFY: "lml_bulk_spotify_streaming_warm",
     StreamingService.BANDCAMP: "lml_bulk_bandcamp_streaming_warm",
