@@ -33,10 +33,17 @@ LML#1284 fixed two ways it didn't:
   than, the performer a listener is searching for.
 * **Bandcamp's term was the played track.** Bandcamp deep-links are
   album-level -- the same property that makes the LML#1098 live probe gate on
-  a resolved ``ctx.album``. Worse, Backend-Service persists the result on an
-  album-keyed ``album_metadata`` row and never re-asks
-  (WXYC/Backend-Service#1747), so whichever track first triggered enrichment
-  froze its name onto every later play of that album.
+  a resolved ``ctx.album``. Worse, whichever track first triggered enrichment
+  froze its name onto every later play of that album, for the reason below.
+
+**Why a bad value here is durable.** Backend-Service stops asking LML about an
+album once its ``album_metadata`` row carries a non-null ``artwork_url`` /
+``discogs_url`` (WXYC/Backend-Service#1747), so a streaming URL -- not itself
+load-bearing -- is written once and read for the life of the album. Bandcamp
+can still self-heal through BS#1915's bounded re-ask; **YouTube Music and
+SoundCloud cannot**, having no status column to re-open on. The full rule, its
+exceptions, and what they cost this module live in ``docs/architecture.md``'s
+"What Backend-Service does with what LML returns".
 
 Measured over the 100 most recent playcuts (2026-08-24): of the 87 rows
 carrying a Bandcamp search fallback, 16 had the artist + album shape; 0 of 6
@@ -47,18 +54,11 @@ every sampled release Bandcamp actually carries.
 YouTube Music and SoundCloud stay **track**-scoped: both are track-searchable,
 so only the artist half of the fix applies to them.
 
-Review of that fix then found three places it overshot, each corrected here
-and each pinned by ``TestSearchUrlFallbackQueryShapeReviewFixes``:
-
-* **The strip could empty the name**, and an empty artist disables all three
-  fallbacks rather than just degrading one.
-* **A compilation row's filed artist is a shelf heading**, so preferring it
-  over the alternate is right everywhere except the one class where the
-  alternate holds the performer.
-* **The album was request-scoped against a per-row fallback**, so a non-top-1
-  row advertised an album it isn't.
-
-Each function below carries the measurement for its own case.
+Review of that fix then found three places it overshot -- the strip could
+empty a name, a compilation row's filed artist is a shelf heading, and the
+album was request-scoped against a per-row fallback. All three are corrected
+here, pinned by ``TestSearchUrlFallbackQueryShapeReviewFixes``, and each
+function below carries the measurement for its own case.
 """
 
 from __future__ import annotations
@@ -181,9 +181,11 @@ def bandcamp_search_term(
     because getting it wrong is silent: ``ctx.album`` is REQUEST-scoped while
     this fallback runs once per RESULT ROW, so on a multi-row response the
     non-top-1 rows are different albums and pairing their artist with the
-    requested album mislabels them outright. Backend-Service then freezes that
-    pairing onto the row's own album-keyed ``album_metadata`` and never
-    re-asks (BS#1747), so the mislabel is durable. ``enrich_one`` passes
+    requested album mislabels them outright. Backend-Service then persists that
+    pairing on the row's own album-keyed ``album_metadata`` and stops asking
+    LML about the album once its artwork resolves (BS#1747 -- see the module
+    docstring for the exact gate and its bounded exceptions), so the mislabel
+    is durable rather than per-request. ``enrich_one`` passes
     LML#477's ``row_title_matches_requested_album`` -- the same predicate that
     decides whether to trust the row's Discogs binding, asked here of the
     query text; it is ``True`` when no album was requested, which is what

@@ -248,3 +248,21 @@ Precision is high. Of 113 hand-labeled strikes (the album-less and 50–79 album
 Given that, mapping a strike to `unresolved` buys three deterministic re-refusals against a blocked lane — BS#1915's sweep re-asks with the row's own metadata, and 97.6% of V/A flowsheet rows carry an album, always the *same* album. So the status mapping stays `absent`: it is the honest verdict (the probe ran to completion and found nothing adjudicable), and the recall is recovered upstream by LML#1147 rather than by re-asking. A zero-probe pre-check was also rejected — it cannot cover the LML#782 fallback path, which re-enters `_select_best_track_candidate` with `norm_album=None` on a request that *did* carry an album, and that path is 97% of strikes.
 
 One measurement trap worth keeping: `album_normalized` is `text NOT NULL` and part of that table's primary key, so an album-less request is stored as the **empty string**, never NULL — an `IS NULL` predicate silently reports zero album-less rows.
+
+## What Backend-Service does with what LML returns (BS#1747 / BS#1915)
+
+LML's answers are not re-asked on every play, and several decisions in this repo depend on knowing exactly when they stop being re-asked. The rule has been stated wrongly in a handful of docstrings ("BS never re-asks", "freezes permanently"), so it is written here once and cited from the call sites.
+
+**The gate.** Backend-Service's enrichment worker skips the LML call entirely for an album whose `album_metadata` row already carries a non-null **load-bearing** field — `artwork_url` or `discogs_url` (`hasLoadBearingAlbumMetadata` in `apps/enrichment-worker/precheck.ts`). The check exists to kill the per-play LML-call amplifier: a release played 50 times used to pay 50 cold lookups. It keys on the Discogs match because that is what a successful enrichment produces.
+
+**The consequence.** Every *other* field LML returns for that album — the streaming URLs, `artist_bio`, the release scalars — inherits that verdict. Once an album's artwork resolves, those fields stop being refreshed no matter what LML would now return. An LML-side improvement to a non-load-bearing field therefore reaches new albums and unresolved shells, but not the enriched back catalog.
+
+**The bounded exceptions.** This is durable, not permanent, and the difference is easy to get wrong in both directions:
+
+- **BS#1915** re-opens a row whose `spotify_status`, `apple_music_status` or `bandcamp_status` is `'unresolved'`, bounded by a per-album attempt cap (`streaming_reask_attempts`, not per-service). It fires both on the next play of the album and from an hourly sweep, so an album that is never played again still self-heals.
+- **`ENRICHMENT_BANDCAMP_REASK`** (default off) additionally de-freezes the legacy shape: `bandcamp_status IS NULL AND bandcamp_url LIKE '%bandcamp.com/search%'` — rows written before the status columns existed.
+- **`absent` is terminal.** The re-ask covers `unresolved` only; a service marked `absent` is never revisited, and neither is a NULL status. That asymmetry is why the probe modules map an unmodeled fault to `unresolved` rather than `absent`.
+
+**Two services have no escape at all.** The re-ask set is exactly those three status columns; `album_metadata` has none for YouTube Music or SoundCloud. Anything LML writes into those two slots is frozen for the life of the row once the album's artwork resolves. That is the practical ceiling on `LML_PERSIST_STREAMING_URL_YOUTUBE_MUSIC` (LML#1103) until a `youtube_music_status` column exists — which in turn needs `StreamingResolution.youtube_music` on the wire, since the status columns mirror LML's per-service verdict.
+
+**Where this bites in practice.** A wrong or low-quality value in a non-load-bearing field is not a per-request defect that the next lookup corrects; it is written once and read for the life of the album. That is the reason the templated search-URL fallbacks (`lookup/enrichment/search_urls.py`) are held to a higher bar than their "last tier of the ladder" position suggests, and the reason the Wikipedia bio drain (`scripts/warm_wikipedia_bios.py`) must complete before `LML_BIO_PREFER_WIKIPEDIA` flips.

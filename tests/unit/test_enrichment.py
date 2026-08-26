@@ -5205,8 +5205,9 @@ class TestSearchUrlFallbackQueryShapeReviewFixes:
         # says callers owe is_compilation_artist a to_match_form string; asking
         # it raw is the LML#1252 hole that lookup/artist_resolution.py's
         # _is_compilation_alias exists to close. This output is consumer-facing
-        # and BS#1747 freezes it, so a heading that slips through here is a
-        # durable unsearchable URL.
+        # and BS stops refreshing it once the album's artwork resolves
+        # (BS#1747), so a heading that slips through here is a durable
+        # unsearchable URL.
         item = make_library_item(
             artist=heading, title="Ethiopiques 4", alternate_artist_name="mulatu astatke"
         )

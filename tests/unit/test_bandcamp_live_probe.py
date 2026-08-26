@@ -675,7 +675,10 @@ class TestBandcampLiveProbe:
         an unmodeled Bandcamp fault, not one of the three named couldn't-ask
         exceptions -- must map to ``unresolved``. If it ever mapped to
         ``absent``, a transient fault would publish a confirmed "not on
-        Bandcamp" verdict, which BS then freezes permanently (BS#1747)."""
+        Bandcamp" verdict — and ``absent`` is the one verdict BS never
+        revisits: BS#1915's bounded re-ask reopens a row only for
+        ``unresolved``, so this mapping is the difference between a fault that
+        self-heals and one that is terminal."""
         item, artwork, bandcamp = _inputs()
         bandcamp.find_album_match = AsyncMock(side_effect=RuntimeError("boom"))
         pg = AsyncMock(spec=PgSource)

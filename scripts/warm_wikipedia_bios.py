@@ -3,10 +3,13 @@ Wikipedia-preferred-artist-bio program, ``docs/plans/lml-1192-wikipedia-artist-b
 LML#513/#1192) — **the primary population mechanism** for the existing
 catalog. The lazy background miss-warm (``lookup/enrichment/wikipedia_warm.py``)
 only extends coverage to artists newly entering the flowsheet going
-forward; BS#1747 freezes the first LML answer for an album permanently, so
-this drain must run to completion (or close to it) **before**
-``LML_BIO_PREFER_WIKIPEDIA`` flips in production, or a cold-cache first ask
-would freeze the Discogs fallback for that artist.
+forward. Per BS#1747, Backend-Service stops calling LML for an album once its
+``album_metadata`` row carries a non-null ``artwork_url``/``discogs_url``, and
+``artist_bio`` is not one of the fields that re-opens the row (BS#1915's
+bounded re-ask covers only the three streaming-status columns) — so for bios
+the freeze really is terminal. This drain must therefore run to completion (or
+close to it) **before** ``LML_BIO_PREFER_WIKIPEDIA`` flips in production, or a
+cold-cache first ask would freeze the Discogs fallback for that artist.
 
 Seed: distinct discogs-cache artist ids carrying at least one ``wikipedia.org``
 ``artist_url`` row, **intersected with WXYC library artists** (LML#1192
