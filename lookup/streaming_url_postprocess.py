@@ -220,8 +220,9 @@ def _bulk_rowless_warm_exempt(
     that same population unsuppressed (~7.6k identity mints/month) — so this
     reuses an already-hardened warm rather than adding a probe. Note what it does
     NOT fix: the warm is off the response path, so the triggering pass still
-    returns null and (per BS#1747) is never re-asked — the yield accrues to the
-    NEXT lookup of the same normalized ``(artist, album)``.
+    returns null, and per BS#1747 Backend-Service stops calling LML for an album
+    once its ``artwork_url``/``discogs_url`` is non-null — the yield accrues to
+    the NEXT lookup of the same normalized ``(artist, album)``.
 
     Rationale, Bandcamp (LML#1087): #1052's original scoping kept Bandcamp
     pinned off, citing #548's near-zero runtime identity-reconciliation yield.

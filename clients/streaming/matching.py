@@ -422,10 +422,11 @@ def strip_discogs_disambig_preserving(name: str) -> str:
     * **Preserving is required** wherever the output is a name shown to or
       acted on by a person. ``lookup/enrichment/search_urls.py``'s
       ``search_artist_for`` is the sharp case: its result lands in a
-      consumer-facing search URL that Backend-Service freezes onto an
-      album-keyed ``album_metadata`` row and never re-asks (BS#1747), and an
-      empty artist there does not degrade one field but suppresses all three
-      streaming-URL fallbacks at once.
+      consumer-facing search URL that Backend-Service persists on an
+      album-keyed ``album_metadata`` row and then stops refreshing once the
+      album's artwork resolves (BS#1747 -- that module's docstring has the
+      exact gate), and an empty artist there does not degrade one field but
+      suppresses all three streaming-URL fallbacks at once.
 
     Named rather than left as an ``or`` at each call site because the idiom
     had already been written twice, in two spellings that agree only by luck:
