@@ -4,7 +4,9 @@ YouTube Music has no album-ID extractor (LML#1103 — the registry's only
 non-minting entry, see ``lookup/streaming_url_registry.py``), so this module
 carries only the host predicate, added for the LML#1295 ``item.py``
 field-name/host invariant check that Spotify and Apple Music already had
-(LML#873).
+(LML#873). The predicate also accepts ``youtu.be`` so its vocabulary matches
+Backend-Service's boundary guard (BS#2351) — over-suppressing here is costly
+since YTM search-URL degradation is durable (BS#1747).
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ class TestUrlHasYoutubeMusicHost:
             "https://music.youtube.com/browse/MPREb_abc123",
             "https://www.youtube.com/watch?v=abc",
             "http://youtube.com/x",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "http://www.youtu.be/x",
         ],
     )
     def test_true_for_youtube_hosts(self, url):
@@ -32,6 +36,7 @@ class TestUrlHasYoutubeMusicHost:
             "https://open.spotify.com/album/abc",
             "https://music.apple.com/us/album/oyola/222",
             "https://youtube.com.evil.test/x",
+            "https://youtu.be.evil.test/x",
             "",
             "not a url",
         ],
