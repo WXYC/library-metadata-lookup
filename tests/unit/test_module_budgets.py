@@ -133,6 +133,11 @@ MODULE_BUDGETS: dict[str, int] = {
     # measured fact about the catalog, so the rule for the next person is
     # about the BODY — if that grows, extract rather than raise again.
     "lookup/enrichment/search_urls.py": 250,
+    # LML#1295: the streaming_links URL well-formedness/host validation, kept
+    # out of item.py from the start (same posture as search_urls.py above) --
+    # a pure function of the links dict with no dependency on enrich_one's
+    # control flow. 1.3x its ~63-line measured size -> 100.
+    "lookup/enrichment/streaming_link_validation.py": 100,
     # LML#1053: the per-service streaming-status merge, extracted out of
     # item.py to stay under its own ceiling above — a pure function with no
     # dependency on enrich_one's control flow. 1.3x its ~70-line measured

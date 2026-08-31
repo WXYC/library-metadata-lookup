@@ -2369,6 +2369,217 @@ class TestStreamingLinksHostInvariant:
         assert enriched.apple_music_url == verified_apple
 
 
+class TestStreamingLinksUrlValidation:
+    """LML#1295: extends ``TestStreamingLinksHostInvariant`` above (LML#873's
+    host-only check on ``spotify_url`` / ``apple_music_url``) to all five
+    ``streaming_links`` fields, plus a well-formedness floor (scheme-relative,
+    bare-host, embedded whitespace) neither the old check nor a bare host
+    check catches. A suppressed field falls through to the existing
+    templated search-URL fallback, so the response still carries a usable
+    (if unverified) URL rather than a corrupt one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_scheme_relative_youtube_music_url_falls_back_to_search_url(self):
+        item = make_library_item(id=1583, artist="Chuquimamani-Condori", title="Call Your Name")
+        artwork = make_discogs_result(release_id=4, artist="Chuquimamani-Condori", album="Edits")
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": None,
+                "apple_music_url": None,
+                "youtube_music_url": "//music.youtube.com/browse/MPREb_abc",
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=4,
+            title="Edits",
+            artist="Chuquimamani-Condori",
+            year=2021,
+            artist_id=None,
+            release_url="https://discogs.com/release/4",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Call Your Name",
+            album="Edits",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.youtube_music_url != "//music.youtube.com/browse/MPREb_abc"
+        assert enriched.youtube_music_url.startswith("https://music.youtube.com/search?q=")
+
+    @pytest.mark.asyncio
+    async def test_embedded_whitespace_bandcamp_url_falls_back_to_search_url(self):
+        item = make_library_item(id=1584, artist="Sessa", title="Pequena Vertigem de Amor")
+        artwork = make_discogs_result(
+            release_id=5, artist="Sessa", album="Pequena Vertigem de Amor"
+        )
+
+        corrupt_bandcamp = "https://sessa.bandcamp.com/album/pequena\tvertigem"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": None,
+                "apple_music_url": None,
+                "youtube_music_url": None,
+                "bandcamp_url": corrupt_bandcamp,
+                "soundcloud_url": None,
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=5,
+            title="Pequena Vertigem de Amor",
+            artist="Sessa",
+            year=2019,
+            artist_id=None,
+            release_url="https://discogs.com/release/5",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album="Pequena Vertigem de Amor",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.bandcamp_url != corrupt_bandcamp
+        assert enriched.bandcamp_url.startswith("https://bandcamp.com/search?q=")
+
+    @pytest.mark.asyncio
+    async def test_bare_host_soundcloud_url_falls_back_to_search_url(self):
+        item = make_library_item(id=1585, artist="Duke Ellington", title="In a Sentimental Mood")
+        artwork = make_discogs_result(release_id=6, artist="Duke Ellington", album="Impulse")
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": None,
+                "apple_music_url": None,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": "soundcloud.com/an-artist/a-track",
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=6,
+            title="Impulse",
+            artist="Duke Ellington",
+            year=1963,
+            artist_id=None,
+            release_url="https://discogs.com/release/6",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="In a Sentimental Mood",
+            album="Impulse",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.soundcloud_url != "soundcloud.com/an-artist/a-track"
+        assert enriched.soundcloud_url.startswith("https://soundcloud.com/search?q=")
+
+    @pytest.mark.asyncio
+    async def test_wrong_host_youtube_music_url_is_nulled(self):
+        item = make_library_item(id=1586, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=7, artist="Stereolab", album="Aluminum Tunes")
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": None,
+                "apple_music_url": None,
+                "youtube_music_url": "https://open.spotify.com/album/wrong-service",
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=7,
+            title="Aluminum Tunes",
+            artist="Stereolab",
+            year=1998,
+            artist_id=None,
+            release_url="https://discogs.com/release/7",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album="Aluminum Tunes",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.youtube_music_url != "https://open.spotify.com/album/wrong-service"
+
+    @pytest.mark.asyncio
+    async def test_keeps_genuine_urls_for_all_five_fields(self):
+        # Non-regression: a well-formed, correctly-hosted URL in every column
+        # (including the three LML#1295 added) still propagates untouched.
+        item = make_library_item(id=1587, artist="Cat Power", title="Moon Pix")
+        artwork = make_discogs_result(release_id=8, artist="Cat Power", album="Moon Pix")
+
+        verified = {
+            "spotify_url": "https://open.spotify.com/album/moonpix-id",
+            "apple_music_url": "https://music.apple.com/us/album/moon-pix/444444",
+            "youtube_music_url": "https://music.youtube.com/browse/MPREb_moonpix",
+            "bandcamp_url": "https://catpower.bandcamp.com/album/moon-pix",
+            "soundcloud_url": "https://soundcloud.com/cat-power/moon-pix",
+        }
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(return_value=dict(verified))
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=8,
+            title="Moon Pix",
+            artist="Cat Power",
+            year=1998,
+            artist_id=None,
+            release_url="https://discogs.com/release/8",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album="Moon Pix",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.spotify_url == verified["spotify_url"]
+        assert enriched.apple_music_url == verified["apple_music_url"]
+        assert enriched.youtube_music_url == verified["youtube_music_url"]
+        assert enriched.bandcamp_url == verified["bandcamp_url"]
+        assert enriched.soundcloud_url == verified["soundcloud_url"]
+
+
 class TestExternalArtworkProbe:
     """LML#487 / BS#1184: when the WXYC library catalog has no row whose title
     clears the LML#477 (PR #481) gate against the requested album, probe Apple

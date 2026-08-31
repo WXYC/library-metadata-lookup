@@ -47,3 +47,37 @@ def host_matcher(domain: str, *, doc: str | None = None) -> Callable[[str | None
     if doc is not None:
         matcher.__doc__ = doc
     return matcher
+
+
+#: Characters ``str.isspace()`` would flag inside a URL — none of them are
+#: valid unescaped, so any of them present means the value is corrupted
+#: (embedded tab/LF/space) rather than a URL a browser would accept as-is.
+_WHITESPACE_CHARS = " \t\n\r\v\f"
+
+
+def is_well_formed_web_url(url: str | None) -> bool:
+    """True if ``url`` is an absolute ``http``/``https`` URL with no embedded whitespace.
+
+    The host-agnostic floor every ``streaming_links`` URL field must clear
+    (LML#1295) before a per-service :func:`host_matcher` predicate runs on top
+    of it. ``host_matcher`` alone does not catch a scheme-relative URL
+    (``//host/path`` — ``urlparse`` still yields the right ``netloc``) or a
+    bare host (``host/path`` — no ``scheme``, no ``netloc``, but the "host" is
+    sitting right there in ``path``); both were observed in production
+    ``streaming_links`` values (WXYC/Backend-Service#1710) alongside
+    whitespace-corrupted URLs, and this function is the shared check for all
+    three, plus non-web schemes (``ftp:``, ``mailto:``).
+
+    Guards ``None``/empty input and a ``urlparse`` ``ValueError`` (malformed
+    URL) the same way :func:`host_matcher`'s predicate does — "malformed" and
+    "not present" both read as "not safe to surface".
+    """
+    if not url:
+        return False
+    if any(ch in url for ch in _WHITESPACE_CHARS):
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
