@@ -2371,12 +2371,16 @@ class TestStreamingLinksHostInvariant:
 
 class TestStreamingLinksUrlValidation:
     """LML#1295: extends ``TestStreamingLinksHostInvariant`` above (LML#873's
-    host-only check on ``spotify_url`` / ``apple_music_url``) to all five
-    ``streaming_links`` fields, plus a well-formedness floor (scheme-relative,
-    bare-host, embedded whitespace) neither the old check nor a bare host
-    check catches. A suppressed field falls through to the existing
-    templated search-URL fallback, so the response still carries a usable
-    (if unverified) URL rather than a corrupt one.
+    host-only check on ``spotify_url`` / ``apple_music_url``) with a per-service
+    host check on the three added fields (``youtube_music_url``,
+    ``bandcamp_url``, ``soundcloud_url``), plus a well-formedness floor
+    (scheme-relative, bare-host, embedded control character) those three get
+    that a host check alone does not catch. ``spotify_url`` / ``apple_music_url``
+    keep their exact pre-LML#1295 host-only validation — see
+    ``TestSpotifyAppleHostCheckSeamUnchangedByLml1295`` below. A suppressed
+    field among the three added ones falls through to the existing templated
+    search-URL fallback, so the response still carries a usable (if
+    unverified) URL rather than a corrupt one.
     """
 
     @pytest.mark.asyncio
@@ -2578,6 +2582,71 @@ class TestStreamingLinksUrlValidation:
         assert enriched.youtube_music_url == verified["youtube_music_url"]
         assert enriched.bandcamp_url == verified["bandcamp_url"]
         assert enriched.soundcloud_url == verified["soundcloud_url"]
+
+
+class TestSpotifyAppleHostCheckSeamUnchangedByLml1295:
+    """LML#1295 review: a well-formedness floor on ``spotify_url`` /
+    ``apple_music_url`` at this seam silently activates behavior well outside
+    this module. A ``spotify_url`` that comes out ``None`` here becomes
+    eligible for ``lookup/streaming_url_postprocess.py``'s cache-UPSERT /
+    ``entity.release_identity``-mint leg (it treats a ``None`` field as
+    eligible for the live-probe backstop); an ``apple_music_url`` that comes
+    out ``None`` flips ``skip_happy_probe`` off in
+    ``lookup/enrichment/item.py``, spending an Apple Music quota slot and
+    wall-clock on a live probe that an override would otherwise have made
+    unnecessary. Both are out-of-scope L1/cache-semantics changes, so these
+    two fields keep EXACTLY their pre-LML#1295 (LML#873) host-check-only
+    validation. Pinned at this end-to-end seam (rather than only in
+    ``test_streaming_link_validation.py``) because the regression is only
+    observable through these downstream effects, not the validator's return
+    value alone.
+    """
+
+    @pytest.mark.asyncio
+    async def test_scheme_relative_spotify_url_with_correct_host_survives_unchanged(self):
+        # host_matcher reads urlparse(...).netloc, which a scheme-relative
+        # URL still populates -- so url_has_spotify_host alone (no
+        # well-formedness floor) accepts this, exactly as it did before
+        # LML#1295. If a well-formedness floor were (wrongly) applied here,
+        # this URL would be nulled and the postprocess cache/mint leg would
+        # fire for an album that already has a librarian-curated URL.
+        item = make_library_item(id=1588, artist="Juana Molina", title="DOGA")
+        artwork = make_discogs_result(release_id=9, artist="Juana Molina", album="DOGA")
+
+        scheme_relative_spotify = "//open.spotify.com/album/doga-id"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": scheme_relative_spotify,
+                "apple_music_url": None,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=9,
+            title="DOGA",
+            artist="Juana Molina",
+            year=2017,
+            artist_id=None,
+            release_url="https://discogs.com/release/9",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album="DOGA",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        # Not suppressed, not rewritten -- byte-identical to the input.
+        assert enriched.spotify_url == scheme_relative_spotify
 
 
 class TestExternalArtworkProbe:

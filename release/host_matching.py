@@ -49,14 +49,21 @@ def host_matcher(domain: str, *, doc: str | None = None) -> Callable[[str | None
     return matcher
 
 
-#: Characters ``str.isspace()`` would flag inside a URL — none of them are
-#: valid unescaped, so any of them present means the value is corrupted
-#: (embedded tab/LF/space) rather than a URL a browser would accept as-is.
-_WHITESPACE_CHARS = " \t\n\r\v\f"
+#: The malformed-URL bar WXYC/Backend-Service#2351's wire contract uses: any
+#: C0 control code point (``0x00``-``0x1F``), the ASCII space (``0x20``), or
+#: DEL (``0x7F``). This is deliberately NOT "characters ``str.isspace()``
+#: would flag" — ``str.isspace()`` also flags Unicode whitespace this range
+#: check does not catch (NBSP ``U+00A0``, the line separator ``U+2028``, ...),
+#: and conversely this range already catches non-whitespace control bytes
+#: (NUL, BEL, ESC) that ``str.isspace()`` would not flag at all. Matching the
+#: wire contract's bar code-point-for-code-point is the point, not
+#: approximating Python's notion of whitespace.
+_MAX_DISALLOWED_CODE_POINT = 0x20
+_DEL = 0x7F
 
 
 def is_well_formed_web_url(url: str | None) -> bool:
-    """True if ``url`` is an absolute ``http``/``https`` URL with no embedded whitespace.
+    """True if ``url`` is an absolute ``http``/``https`` URL with no embedded control character.
 
     The host-agnostic floor every ``streaming_links`` URL field must clear
     (LML#1295) before a per-service :func:`host_matcher` predicate runs on top
@@ -65,8 +72,9 @@ def is_well_formed_web_url(url: str | None) -> bool:
     bare host (``host/path`` — no ``scheme``, no ``netloc``, but the "host" is
     sitting right there in ``path``); both were observed in production
     ``streaming_links`` values (WXYC/Backend-Service#1710) alongside
-    whitespace-corrupted URLs, and this function is the shared check for all
-    three, plus non-web schemes (``ftp:``, ``mailto:``).
+    control-character-corrupted URLs (embedded tab/LF/space among them), and
+    this function is the shared check for all three, plus non-web schemes
+    (``ftp:``, ``mailto:``).
 
     Guards ``None``/empty input and a ``urlparse`` ``ValueError`` (malformed
     URL) the same way :func:`host_matcher`'s predicate does — "malformed" and
@@ -74,7 +82,7 @@ def is_well_formed_web_url(url: str | None) -> bool:
     """
     if not url:
         return False
-    if any(ch in url for ch in _WHITESPACE_CHARS):
+    if any(ord(ch) <= _MAX_DISALLOWED_CODE_POINT or ord(ch) == _DEL for ch in url):
         return False
     try:
         parsed = urlparse(url)

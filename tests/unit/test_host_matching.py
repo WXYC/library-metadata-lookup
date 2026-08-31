@@ -11,8 +11,10 @@ exercises the shared factory directly.
 
 ``is_well_formed_web_url`` (LML#1295) is the sibling well-formedness floor: it
 catches the shapes a bare host-check misses (scheme-relative, bare-host,
-embedded whitespace, non-web scheme) before ``lookup/enrichment/item.py``
-applies a per-service host check on top.
+embedded control character, non-web scheme) before a per-service host check
+runs on top. The disallowed-character bar matches the BS#2351 wire contract
+(any code point <= ``0x20`` or ``0x7F``), not Python's ``str.isspace()`` —
+the two sets diverge in both directions, see the function's own docstring.
 """
 
 from __future__ import annotations
@@ -103,4 +105,20 @@ class TestIsWellFormedWebUrl:
         ],
     )
     def test_false_for_malformed_or_non_web_or_whitespace(self, url):
+        assert is_well_formed_web_url(url) is False
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Non-whitespace control bytes -- str.isspace() would NOT flag
+            # any of these, but the BS#2351 wire contract's bar (any code
+            # point <= 0x20) does.
+            "https://open.spotify.com/album/ab\x00c",
+            "https://open.spotify.com/album/ab\x07c",
+            "https://open.spotify.com/album/ab\x1bc",
+            # DEL (0x7F) -- also outside str.isspace(), also disallowed.
+            "https://open.spotify.com/album/ab\x7fc",
+        ],
+    )
+    def test_false_for_non_whitespace_control_characters(self, url):
         assert is_well_formed_web_url(url) is False

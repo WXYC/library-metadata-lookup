@@ -232,10 +232,14 @@ async def enrich_one(
         except Exception:
             links = None
         if links:
-            # LML#873 extended to all five fields + well-formedness by
-            # LML#1295: a mismatched host or a malformed shape (scheme-
-            # relative, bare-host, embedded whitespace) is treated the same
-            # as "no override", not surfaced under the wrong field or at all.
+            # LML#873's host check (spotify_url / apple_music_url only,
+            # unchanged by LML#1295 -- see streaming_link_validation.py's
+            # module docstring for why) now runs on all five fields, joined
+            # by a well-formedness floor (scheme-relative, bare-host,
+            # embedded control character) on the three LML#1295 added
+            # (youtube_music_url, bandcamp_url, soundcloud_url). Either
+            # check failing is treated the same as "no override", not
+            # surfaced under the wrong field or at all.
             validated = validate_streaming_link_urls(links)
             spotify_url = validated["spotify_url"]
             apple_music_override = validated["apple_music_url"]
@@ -448,18 +452,24 @@ async def enrich_one(
         "master_id": master_id_result,
         "artist_bio": artist_bio,
         "wikipedia_url": wikipedia_url,
-        # spotify_url / bandcamp_url are normalized to None (like
-        # apple_music_url) so an empty-string streaming_links override
-        # (library.db returns the column verbatim, no '' -> None coercion) is
-        # treated as "absent" by the post-process active-filter (`is None`).
-        # Without this, "" skips the cache/probe leg AND either surfaces
-        # straight to the client (spotify has no fallback) or gets a search
-        # URL while the leg was skipped (bandcamp's deferred `not …`
-        # fallback). LML#1103 put youtube_music_url in exactly that class —
-        # it became a post-process service with a deferred fallback, so it
-        # needs the same normalization. soundcloud alone still isn't a
-        # post-process service and overwrites "" with a search URL above, so
-        # it needs none.
+        # spotify_url / apple_music_url keep their '' -> None coercion here:
+        # their seam (validate_streaming_link_urls, above) stayed at LML#873's
+        # host-check-only by design (LML#1295 review), which leaves a falsy
+        # input untouched rather than nulling it, so an empty-string
+        # streaming_links override (library.db returns the column verbatim)
+        # still needs normalizing before the post-process active-filter
+        # (`is None`) sees it. bandcamp_url / youtube_music_url no longer need
+        # this for the OVERRIDE value -- LML#1295's well-formedness floor
+        # already treats '' as a missing key in validate_streaming_link_urls
+        # -- but bandcamp_url gets reassigned below by run_bandcamp_live_probe,
+        # which bypasses that validator, so the coercion stays as that path's
+        # backstop; youtube_music_url is never touched again post-validation,
+        # so its `or None` is now redundant, kept for symmetry with its
+        # post-process sibling. Without this, "" skips the cache/probe leg AND
+        # either surfaces straight to the client (spotify has no fallback) or
+        # gets a search URL while the leg was skipped (bandcamp's deferred
+        # `not …` fallback). soundcloud isn't a post-process service and
+        # overwrites "" with a search URL above, so it needs none.
         "spotify_url": spotify_url or None,
         "apple_music_url": apple_music_override or apple_music_url or None,
         "youtube_music_url": youtube_music_url or None,
