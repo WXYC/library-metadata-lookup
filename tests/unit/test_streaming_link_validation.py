@@ -55,6 +55,14 @@ _MALFORMED_SHAPES = {
     "embedded-lf": lambda url: url[:-1] + "\n" + url[-1],
     "embedded-space": lambda url: url[:-1] + " " + url[-1],
     "non-web-scheme": lambda url: "ftp://" + url.split("://", 1)[1],
+    # Attacker-first authority backslash (LML#1298): for the http(s) special
+    # schemes, WHATWG cuts the host off at the ``\`` and folds the rest --
+    # including the genuine host after "@" -- into the path, so a browser
+    # resolves this to host "evil.example" while urlparse's raw netloc still
+    # ends with the genuine host and would pass a bare host check.
+    "authority-backslash": lambda url: (
+        "https://evil.example" + chr(0x5C) + "@a." + url.split("://", 1)[1]
+    ),
 }
 
 
