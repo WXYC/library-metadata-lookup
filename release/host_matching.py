@@ -50,16 +50,25 @@ def host_matcher(domain: str, *, doc: str | None = None) -> Callable[[str | None
 
 
 #: The malformed-URL bar WXYC/Backend-Service#2351's wire contract uses: any
-#: C0 control code point (``0x00``-``0x1F``), the ASCII space (``0x20``), or
-#: DEL (``0x7F``). This is deliberately NOT "characters ``str.isspace()``
-#: would flag" — ``str.isspace()`` also flags Unicode whitespace this range
-#: check does not catch (NBSP ``U+00A0``, the line separator ``U+2028``, ...),
-#: and conversely this range already catches non-whitespace control bytes
-#: (NUL, BEL, ESC) that ``str.isspace()`` would not flag at all. Matching the
-#: wire contract's bar code-point-for-code-point is the point, not
-#: approximating Python's notion of whitespace.
+#: C0 control code point (``0x00``-``0x1F``), the ASCII space (``0x20``), DEL
+#: (``0x7F``), or backslash (``0x5C``). This is deliberately NOT "characters
+#: ``str.isspace()`` would flag" — ``str.isspace()`` also flags Unicode
+#: whitespace this range check does not catch (NBSP ``U+00A0``, the line
+#: separator ``U+2028``, ...), and conversely this range already catches
+#: non-whitespace control bytes (NUL, BEL, ESC) that ``str.isspace()`` would
+#: not flag at all. The backslash leg is separate from the control-code
+#: range and exists for a different reason: WHATWG URL parsing folds ``\`` to
+#: ``/`` for the ``http``/``https`` special schemes, so a client following
+#: WHATWG (a browser, or Backend-Service's URL handling) resolves
+#: ``https://host/path\@evil.example`` to hostname ``evil.example``, while
+#: RFC 3986 parsers (including this module's ``urlparse``-based checks) leave
+#: the backslash in the path and see hostname ``host``. WXYC/Backend-Service#1710
+#: is the parser differential this leg closes. Matching the wire contract's
+#: bar code-point-for-code-point is the point, not approximating Python's
+#: notion of whitespace.
 _MAX_DISALLOWED_CODE_POINT = 0x20
 _DEL = 0x7F
+_BACKSLASH = 0x5C
 
 
 def is_well_formed_web_url(url: str | None) -> bool:
@@ -82,7 +91,7 @@ def is_well_formed_web_url(url: str | None) -> bool:
     """
     if not url:
         return False
-    if any(ord(ch) <= _MAX_DISALLOWED_CODE_POINT or ord(ch) == _DEL for ch in url):
+    if any(ord(ch) <= _MAX_DISALLOWED_CODE_POINT or ord(ch) in (_DEL, _BACKSLASH) for ch in url):
         return False
     try:
         parsed = urlparse(url)

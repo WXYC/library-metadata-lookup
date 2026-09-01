@@ -122,3 +122,26 @@ class TestIsWellFormedWebUrl:
     )
     def test_false_for_non_whitespace_control_characters(self, url):
         assert is_well_formed_web_url(url) is False
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Authority-position backslash -- already rejected incidentally:
+            # urlparse doesn't fold ``\``, so the netloc comes out
+            # "bandcamp.com\\@evil.example" and the host check fails
+            # downstream. Included so the bar's own rejection is asserted
+            # directly, not just observed as a side effect elsewhere.
+            "https://bandcamp.com\\@evil.example/x",
+            # Path-position backslash -- the interesting case (LML#1298):
+            # WHATWG folds ``\`` to ``/`` for http(s), so a browser or a
+            # WHATWG-conformant client resolves this to host "evil.example",
+            # while Python's urlparse (RFC 3986) leaves it in the path and
+            # reports host "bandcamp.com". Without the 0x5c leg, this URL
+            # passed the well-formedness floor and a downstream host_matcher
+            # check alike (BS#2351, BS#1710).
+            "https://bandcamp.com/album\\@evil.example",
+            "https://music.youtube.com/browse\\@evil.example",
+        ],
+    )
+    def test_false_for_backslash(self, url):
+        assert is_well_formed_web_url(url) is False
