@@ -31,7 +31,16 @@ import re
 from wxyc_etl.text import is_compilation_artist
 
 from discogs.models import ArtistCredit, ReleaseMetadataResponse, WriterCredits
-from generated.api_models import Provenance
+
+# The writer-credits provenance enum (track/release) is an INLINE enum in
+# api.yaml, so datamodel-code-generator names it positionally: the digital
+# archive's own inline ``provenance`` (rotation_upload/cd_rip) appears first in
+# the spec and now owns the bare ``Provenance`` name, pushing this one to
+# ``Provenance1``. The alias keeps every call site on the semantic name. A
+# future inline provenance added ahead of it in the spec would shift the
+# number again — loudly (the member sets differ), not silently. Stable
+# contract-side names are WXYC/wxyc-shared#430.
+from generated.api_models import Provenance1 as Provenance
 
 # Normalized base writer roles. A Discogs role component is a writer credit iff,
 # after the qualifier strip + hyphen fold + lowercase below, it equals one of

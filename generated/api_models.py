@@ -27,6 +27,52 @@ class ApiErrorResponse(BaseModel):
     details: dict[str, Any] | None = None
 
 
+class FlowsheetJoinIntent(StrEnum):
+    """
+    What the caller means when a show they are not already an active member of is still open. Consulted ONLY in that case: with no open show, or with a show the caller already belongs to, the field is inert and a new show starts (or the existing membership is returned) exactly as before.
+
+    `join` is the historical behavior — the caller becomes a co-host of the open show and a `dj_join` marker is written. `takeover` closes the open show and starts a new one owned by the caller; it requires `expected_show_id`.
+
+    **Deliberately has no default.** Absence is a third state, not a synonym for `join`: it means the caller never made the choice, and the server answers it with the `ShowAlreadyOpenError` 409 on `POST /flowsheet/join` rather than picking one. A default here would let a generated client materialize a decision its user never made, which is the silent co-host attachment this field exists to end (WXYC/Backend-Service#2232 — one production show collected five DJs over ten hours while the public on-air name named only the first).
+
+    Neither value is role-gated. `takeover` is reachable by any caller holding `flowsheet: write`, deliberately: it is the escape hatch a DJ needs when the previous DJ walked out, and it restores a capability tubafrenzy's `EndShowServlet` gave every signed-on DJ. That is a deliberate asymmetry with `POST /flowsheet/shows/{id}/force-end`, which closes someone else's show only under `flowsheet: manage` plus an explicit `force=true`; see that endpoint's description for why the two gates differ.
+
+    Not yet live on the wire: Backend-Service gates the whole handshake behind `FLOWSHEET_TAKEOVER_ENABLED`, shipping OFF (WXYC/Backend-Service#2233). See that 409 for what changes at the flip, and why to start sending this field before it rather than after.
+
+    An explicit JSON `null` is folded into absence and answered with the same 409, not a 400. This is not pedantry: the field is optional with no default, and a Kotlin or Swift client that serializes unset optionals explicitly ( kotlinx.serialization with `encodeDefaults = true`, say) emits `"intent": null` for a DJ who simply has not chosen. Answering that with "your choice is invalid" would be the one response they cannot act on.
+
+    """
+
+    join = "join"
+    takeover = "takeover"
+
+
+class ShowAlreadyOpenErrorCode(StrEnum):
+    """
+    Discriminator for the `POST /flowsheet/join` 409. Named rather than left inline on `ShowAlreadyOpenError.code`, pairing with it the way `DeviceAuthCodeErrorCode` pairs with `DeviceAuthCodeError` — an inline enum under an anonymous parent generates as a top-level `Code` class in the Python module, which is both meaningless at the call site and a collision waiting to happen in a file that already carries a generic `Status` and `Show` from the same mechanism.
+
+    """
+
+    show_already_open = "show_already_open"
+
+
+class ShowAlreadyOpenShow(BaseModel):
+    """
+    Identity of the open show the caller collided with. A strict subset of `OpenShow`, whose rows `GET /flowsheet/open-shows` returns — same fields, same nullability, same BS#1371 resolution chain for `dj_name`.
+
+    """
+
+    id: int = Field(
+        ...,
+        description="`shows.id` of the open show. This is the value a follow-up `intent: takeover` must send as `expected_show_id`.\n",
+    )
+    dj_name: str | None = Field(
+        None,
+        description='The show OWNER\'s public handle, resolved through the same PII-safe chain as `OpenShow.dj_name` (BS#1371): per-show override -> the DJ\'s chosen handle -> the legacy tubafrenzy handle -> `null` when unresolvable.\n\n**Null is the common case, not the edge.** Essentially the whole open-show backlog this handshake exists to unstick reaches nothing through that chain (2,813 of production\'s 2,814 open shows carried a NULL `primary_dj_id` as of 2026-08-21), so a prompt that interpolates it unguarded renders "null is on air". Fall back to generic phrasing.\n\nFor an abandoned show this names the DJ who LEFT. A client showing "who is on air right now" should prefer `GET /flowsheet/djs-on-air`, whose active-membership answer is the one that disagrees with this field precisely when it matters.\n',
+    )
+    start_time: AwareDatetime
+
+
 class PaginationParams(BaseModel):
     page: conint(ge=1) | None = None
     limit: conint(ge=1, le=100) | None = None
@@ -148,7 +194,7 @@ class FlowsheetRangeShow(BaseModel):
     )
     dj_name: str | None = Field(
         None,
-        description="Resolved public display name of the show's DJ. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371): per-show override -> `user.djName` -> `shows.legacy_dj_name` (tubafrenzy's `DJ_HANDLE`) -> null. Never the real-name column.",
+        description="The DJ's public on-air handle, never the DJ's legal name. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371): per-show override -> the DJ's chosen handle (`user.djName`) -> the legacy tubafrenzy handle (`shows.legacy_dj_name`, tubafrenzy's `DJ_HANDLE`) -> `null`.",
     )
     specialty_id: int | None = None
     start_time: AwareDatetime = Field(..., description="When the DJ signed on (ISO 8601).")
@@ -184,7 +230,10 @@ class FlowsheetShowBlockEntry(FlowsheetEntryBase, DateTimeEntry):
     Show block entry (start or end of a DJ's show)
     """
 
-    dj_name: str
+    dj_name: str = Field(
+        ...,
+        description="The DJ's public on-air handle, never the DJ's legal name — same already-resolved `flowsheet.dj_name` value as `FlowsheetEntryFields.dj_name` (BS#1371). Not currently `$ref`'d by any operation in this document; kept accurate in case that changes.",
+    )
     isStart: bool
 
 
@@ -300,7 +349,10 @@ class PlaylistSearchResult(BaseModel):
     track_title: str
     album_title: str
     record_label: str
-    dj_name: str
+    dj_name: str = Field(
+        ...,
+        description="The DJ's public on-air handle, never the DJ's legal name. Read from the denormalized `flowsheet.dj_name` column, itself populated at entry-insert time via the PII-safe chain (BS#1371); `\"Unknown DJ\"` substitutes when that resolves to nothing.",
+    )
     show_id: int
 
 
@@ -351,7 +403,10 @@ class FlowsheetV2ShowStartEntry(FlowsheetV2Base):
     """
 
     entry_type: Literal["show_start"]
-    dj_name: str
+    dj_name: str = Field(
+        ...,
+        description="The DJ's public on-air handle at show start, never the DJ's legal name: per-show override, else the DJ's chosen handle (`user.djName`). The legacy-tubafrenzy-handle fallback in the full BS#1371 chain doesn't apply here — a new show has no legacy row yet.",
+    )
     timestamp: AwareDatetime
 
 
@@ -365,7 +420,10 @@ class FlowsheetV2ShowEndEntry(FlowsheetV2Base):
     """
 
     entry_type: Literal["show_end"]
-    dj_name: str
+    dj_name: str = Field(
+        ...,
+        description="The DJ's public on-air handle, never the DJ's legal name. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371).",
+    )
     timestamp: AwareDatetime
 
 
@@ -379,7 +437,10 @@ class FlowsheetV2DJJoinEntry(FlowsheetV2Base):
     """
 
     entry_type: Literal["dj_join"]
-    dj_name: str
+    dj_name: str = Field(
+        ...,
+        description="The public handle (`user.djName`) of the DJ who joined, never the DJ's legal name. Unlike the full BS#1371 chain, this does not consult a per-show override or the legacy tubafrenzy handle.",
+    )
 
 
 class EntryType5(StrEnum):
@@ -392,7 +453,10 @@ class FlowsheetV2DJLeaveEntry(FlowsheetV2Base):
     """
 
     entry_type: Literal["dj_leave"]
-    dj_name: str
+    dj_name: str = Field(
+        ...,
+        description="The public handle (`user.djName`) of the DJ who left, never the DJ's legal name. Unlike the full BS#1371 chain, this does not consult a per-show override or the legacy tubafrenzy handle.",
+    )
 
 
 class EntryType6(StrEnum):
@@ -443,7 +507,10 @@ class OnAirInfo(BaseModel):
     Minimal, name-only on-air DJ shape for the `on_air` field. Deliberately separate from `OnAirDJ`, which additionally carries an `id` (a nullable `auth_user.id` string) that the `on_air` banner has no use for.
     """
 
-    dj_name: str = Field(..., description="Display name of the DJ currently on air.")
+    dj_name: str = Field(
+        ...,
+        description="The DJ's public on-air handle, never the DJ's legal name. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371), except when unresolvable this substitutes the station name (\"WXYC\") rather than `null` — it's the enclosing `on_air` field that goes `null`, not this one.",
+    )
 
 
 class OnAirDJ(BaseModel):
@@ -451,7 +518,10 @@ class OnAirDJ(BaseModel):
         ...,
         description="The DJ's better-auth `auth_user.id` (an opaque `varchar(255)` string), or `null` for a legacy/tubafrenzy-mirrored show whose on-air DJ has no Backend-Service account (their identity is `legacy_dj_name`, surfaced on `/flowsheet/djs-on-air` with a null id). Historically mistyped as `integer`; corrected to the nullable string it is at runtime (BS#1547).",
     )
-    dj_name: str
+    dj_name: str = Field(
+        ...,
+        description="The DJ's public on-air handle, never the DJ's legal name. For a DJ with a Backend-Service account, the DJ's chosen handle (`user.djName`); for a legacy/tubafrenzy-mirrored show with no account, the full PII-safe chain (BS#1371) down to `shows.legacy_dj_name`.",
+    )
 
 
 class OnAirStatusResponse(BaseModel):
@@ -481,7 +551,7 @@ class OpenShow(BaseModel):
     )
     dj_name: str | None = Field(
         ...,
-        description="The public DJ handle, resolved through the standard chain (per-show override, then the linked account's handle, then the legacy tubafrenzy handle). Never a real name. NULL when unresolvable.\n",
+        description="The DJ's public on-air handle, never the DJ's legal name. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371): per-show override -> the DJ's chosen handle -> the legacy tubafrenzy handle -> `null` when unresolvable.\n",
     )
     show_name: str | None = Field(...)
     start_time: AwareDatetime
@@ -524,7 +594,10 @@ class ShowDJ(BaseModel):
 
 class Dj(BaseModel):
     dj_id: int | None = None
-    dj_name: str | None = None
+    dj_name: str | None = Field(
+        None,
+        description="The DJ's raw stored handle (`user.djName`), read directly via join with no per-show-override or legacy-handle resolution — may be blank or literally \"Anonymous\". Still never the DJ's legal name; this never reads `real_name`.",
+    )
 
 
 class Artist(BaseModel):
@@ -666,6 +739,73 @@ class CatalogExportRow(BaseModel):
     rotation_kill_date: date_aliased | None = Field(
         None,
         description="Date (YYYY-MM-DD; server ::text cast) the current rotation record expires, or null if it has none. Used with rotation_bin to evaluate live rotation client-side. Absent from AlbumSearchResult — a client that reuses AlbumSearchResult for this endpoint silently loses it.\n",
+    )
+    has_digital_audio: bool | None = Field(
+        None,
+        description="True when the digital archive (WXYC/Backend-Service#2320) has at least one asset bound to this album — the badge the archive player client uses to decide whether to offer playback before calling GET /digital-archive/albums/{id}/playback. OPTIONAL and OUT of `required`, same leniency as the BS#1965 producer fields above and for the same reason: a Backend that hasn't deployed #2320 yet does not emit this key at all, and a required key it doesn't emit would fail every NDJSON line. Absent means false — a client not yet regenerated against this field, or talking to a Backend that doesn't emit it, correctly treats every row as having no digital audio rather than crashing the decode.\n",
+    )
+
+
+class Provenance(StrEnum):
+    """
+    Where this track's owning digital asset came from. Per-track rather than per-manifest because a manifest may merge several bound assets for one album — see DigitalArchivePlaybackManifest.
+
+    """
+
+    rotation_upload = "rotation_upload"
+    cd_rip = "cd_rip"
+
+
+class Codec(StrEnum):
+    """
+    The five formats the archive actually holds, matching digital_asset_file.codec in Backend-Service's schema. The bulk is mp3; `library/freeform/` also carries FLAC, m4a and wav, and the enum lists them so a bound row can never be unrepresentable here.
+
+    """
+
+    mp3 = "mp3"
+    aac = "aac"
+    flac = "flac"
+    m4a = "m4a"
+    wav = "wav"
+
+
+class Rendition(BaseModel):
+    codec: Codec = Field(
+        ...,
+        description="The five formats the archive actually holds, matching digital_asset_file.codec in Backend-Service's schema. The bulk is mp3; `library/freeform/` also carries FLAC, m4a and wav, and the enum lists them so a bound row can never be unrepresentable here.\n",
+    )
+    bitrate_kbps: int | None = None
+    url: AnyUrl = Field(
+        ...,
+        description="Presigned GET. Opaque; a bearer credential until `expires_at` on the enclosing manifest.\n",
+    )
+
+
+class DigitalArchivePlaybackTrack(BaseModel):
+    """
+    One track of a DigitalArchivePlaybackManifest. The server orders `tracks` for the client; disc_number/track_number are informational and nullable rather than a client-side sort key, because partial albums and tag gaps exist in the archive.
+
+    """
+
+    file_id: int = Field(
+        ...,
+        description="digital_asset_file.id — stable across manifest refetches, for a future offline-cache key. NOT part of any URL; opaque to storage.\n",
+    )
+    provenance: Provenance = Field(
+        ...,
+        description="Where this track's owning digital asset came from. Per-track rather than per-manifest because a manifest may merge several bound assets for one album — see DigitalArchivePlaybackManifest.\n",
+    )
+    disc_number: int | None = None
+    track_number: int | None = None
+    title: str
+    duration_secs: float | None = None
+    content_hash: str | None = Field(
+        None,
+        description="MD5 from the store's ETag today; sha256 once CD rips land. Not guaranteed to be either algorithm going forward — treat as an opaque change-detection token, not a verified checksum.\n",
+    )
+    renditions: list[Rendition] = Field(
+        ...,
+        description="Every rendition the archive holds for this track, in no guaranteed order. Usually one; a track backfilled to a second format carries both. A client picks whichever codec it can play — do not assume an `mp3` entry is present.\n",
     )
 
 
@@ -963,7 +1103,10 @@ class BinLibraryDetails(BaseModel):
 class ScheduleShift(BaseModel):
     id: int
     dj_id: int
-    dj_name: str
+    dj_name: str = Field(
+        ...,
+        description="The DJ's public on-air handle, never the DJ's legal name. Per the declared/actual mismatch noted above (BS#2224), no current handler populates this from a verified `dj_name`-bearing source — this description states the intent for when that gap closes, not today's implemented behavior.",
+    )
     day: conint(ge=0, le=6) = Field(..., description="Day of the week 0 = Monday, 6 = Sunday")
     start_time: str = Field(..., description="Time in HH:MM format")
     end_time: str = Field(..., description="Time in HH:MM format")
@@ -1488,7 +1631,10 @@ class AuthUser(BaseModel):
         None, description="WXYC additionalField; defaults false at creation."
     )
     realName: str | None = None
-    djName: str | None = None
+    djName: str | None = Field(
+        None,
+        description='The DJ\'s chosen public on-air handle, set on their profile (`auth_user.dj_name`) — the raw, unfiltered source value that the PII-safe resolution chain (BS#1371) consults before falling back to the legacy tubafrenzy handle. May be `null`, blank, or literally "Anonymous"; not itself scrubbed. Distinct from `realName`: `djName` is the public handle and is safe to surface, `realName` is the legal name and never is.',
+    )
     appSkin: str | None = Field(
         None, description='WXYC additionalField; defaults "modern-light" at creation.'
     )
@@ -2582,7 +2728,7 @@ class DiscogsArtistCredit(BaseModel):
     )
 
 
-class Provenance(StrEnum):
+class Provenance1(StrEnum):
     """
     `track` = scoped to the resolved track's per-track credits (precise); `release` = a release-level credit applied to the whole release (approximate for an individual track, mirroring tubafrenzy's auto-fill-from-artist fallback). Populated as `release` in the initial rollout; `track` is added when per-track resolution lands.
 
@@ -2605,7 +2751,7 @@ class DiscogsWriterCredits(BaseModel):
         None,
         description='The verbatim Discogs role strings the names were drawn from (e.g. "Written-By", "Words By, Music By"), for auditability of the writer-role mapping.\n',
     )
-    provenance: Provenance = Field(
+    provenance: Provenance1 = Field(
         ...,
         description="`track` = scoped to the resolved track's per-track credits (precise); `release` = a release-level credit applied to the whole release (approximate for an individual track, mirroring tubafrenzy's auto-fill-from-artist fallback). Populated as `release` in the initial rollout; `track` is added when per-track resolution lands.\n",
     )
@@ -3333,6 +3479,15 @@ class AutoDJDeactivateResponse(BaseModel):
     deactivatedAt: AwareDatetime
 
 
+class ShowAlreadyOpenErrorDetails(BaseModel):
+    """
+    Wrapper matching `ApiErrorResponse`'s `details` position, so the 409 body stays shape-compatible with every other error on the service even though it is typed. Named for the same reason as the code enum above: inline, it generates as a top-level `Details` class.
+
+    """
+
+    show: ShowAlreadyOpenShow | None = None
+
+
 class FlowsheetEntryFields(BaseModel):
     """
     Every non-identity field of a v1 flowsheet row. Factored out of `FlowsheetEntryResponse` so `FlowsheetRangeEntry` can carry the identical field set while relaxing `show_id` to nullable — the two response shapes must not drift, because iOS V2 decodes both with one decoder (tubafrenzy-decommissioning plan §2.5, consumer #3). Not referenced directly by any path; compose it with an identity block instead.
@@ -3381,7 +3536,7 @@ class FlowsheetEntryFields(BaseModel):
     )
     dj_name: str | None = Field(
         None,
-        description="Resolved public display name of the DJ on the row's show. Nullable per the PII-safe resolution chain (BS#1371): user.djName -> shows.legacy_dj_name -> null; never the real-name PII column.",
+        description="The DJ's public on-air handle, never the DJ's legal name. Resolved through the PII-safe chain (BS#1371): per-show override -> the DJ's chosen handle (`user.djName`) -> the legacy tubafrenzy handle (`shows.legacy_dj_name`) -> `null`.",
     )
 
 
@@ -3581,6 +3736,25 @@ class AlbumSearchResult(BaseModel):
         None,
         description="Populated by Backend's catalog search when an artist-alias match (from `artist_search_alias`) drove this release into the results, per artist-search-alias plan PR 5. Sibling field to `matched_via` (which is track-title provenance). Empty or absent on normal artist/album hits. Backward-compatible — existing consumers ignore the field.\n",
     )
+
+
+class DigitalArchivePlaybackManifest(BaseModel):
+    """
+    Response body for GET /digital-archive/albums/{id}/playback (#417) — the auto-DJ archive player's client contract (epic WXYC/wxyc-dj-ios#135). Deliberately outlives every storage decision: no bucket, key, or store name appears anywhere in this shape, only opaque presigned URLs that die at `expires_at`.
+
+    `provenance` is per-track, not per-manifest: the digital_asset unique key is (library_id, provenance, disc_number), so one album can hold several bound assets — a multi-disc set today, and a cd_rip beside an existing rotation_upload once CD digitization starts. A manifest merges them, so a single manifest-level value would have had to pick a winner and misreport every track sourced from the others.
+
+    """
+
+    library_id: int = Field(
+        ...,
+        description="The album's wxyc_schema.library.id — the same key CatalogExportRow.id ships.",
+    )
+    expires_at: AwareDatetime = Field(
+        ...,
+        description="Every URL under `tracks` is dead after this instant — refetch this manifest rather than caching URLs past it.\n",
+    )
+    tracks: list[DigitalArchivePlaybackTrack]
 
 
 class AlbumDetail(BaseModel):
@@ -3853,6 +4027,17 @@ class LiveFsEvent(RootModel[LiveFsUpdateEvent | LiveFsRefetchEvent | LiveFsInser
         description="Discriminated union of events emitted on the `live-fs-topic`. Every event has the same `{ type, payload, timestamp }` envelope — pinned by `CONTRACTS.LIVE_FS_EVENT_ENVELOPE_SHAPE`.\n",
         discriminator="type",
     )
+
+
+class ShowAlreadyOpenError(BaseModel):
+    """
+    The `POST /flowsheet/join` 409 body. Purpose-built rather than a `$ref` to the shared `ApiErrorResponse`, following `AuthErrorResponse` and the `DeviceAuth*Error` family: `ApiErrorResponse.details` is `additionalProperties: true`, which reaches consumers as an untyped bag (`JSONValue` in Swift, `Record<string, unknown>` in TS), and `details.show.id` is not an incidental diagnostic here — a client is REQUIRED to read it and echo it back as `expected_show_id` to complete the takeover handshake. Typing it is what makes that a compare-and-set rather than four hand-written key-path digs.
+
+    """
+
+    message: str
+    code: ShowAlreadyOpenErrorCode | None = None
+    details: ShowAlreadyOpenErrorDetails | None = None
 
 
 class LibraryQueryResponse(BaseModel):
