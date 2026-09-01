@@ -134,22 +134,29 @@ class TestIsWellFormedWebUrl:
             # before any ``@``, the host is cut off right there and
             # "@a.bandcamp.com/x" folds into the path instead, so every
             # WHATWG client (a browser, Node, Backend-Service's own URL
-            # handling) resolves this to host "evil.example". Python's
-            # urlparse never splits the netloc at all -- it suffix-checks
-            # the raw netloc string, which is still
-            # "evil.example\\@a.bandcamp.com" verbatim and still ends with
-            # ".bandcamp.com", so without the 0x5c leg this URL passed both
+            # handling) resolves this to host "evil.example". This module's
+            # host_matcher never splits the netloc: it suffix-checks
+            # urlparse's raw ``.netloc``, not ``.hostname``, and that string
+            # is still "evil.example\\@a.bandcamp.com" verbatim and still ends
+            # with ".bandcamp.com", so without the 0x5c leg this URL passed both
             # the well-formedness floor and url_has_bandcamp_host. The same
             # shape spoofs youtube_music and soundcloud identically.
             "https://evil.example\\@a.bandcamp.com/x",
             "https://evil.example\\@music.youtube.com/x",
             "https://evil.example\\@a.soundcloud.com/x",
-            # Victim-first authority-position backslash -- not a host spoof:
-            # urlparse's raw netloc comes out "bandcamp.com\\@evil.example",
-            # which doesn't end with ".bandcamp.com", so url_has_bandcamp_host
-            # already returns False here even without this leg. Kept as a
-            # parity assertion that the bar itself also rejects this
-            # orientation, not just the attacker-first one above.
+            # Victim-first authority-position backslash -- not a spoof that
+            # reaches this seam: urlparse's raw netloc comes out
+            # "bandcamp.com\\@evil.example", which doesn't end with
+            # ".bandcamp.com", so url_has_bandcamp_host already returns False
+            # here even without this leg. It is the host check that stops it,
+            # not the shape being harmless -- this is the orientation
+            # Backend-Service documents as ITS differential
+            # (album-metadata-projection.ts uses
+            # "https://www.discogs.com\\@evil.example/release/1"), because
+            # Foundation/RFC 3986 resolve it to "evil.example" while WHATWG
+            # reports "www.discogs.com". Kept as a parity assertion that the
+            # bar itself also rejects this orientation, not just the
+            # attacker-first one above.
             "https://bandcamp.com\\@evil.example/x",
             # Path-position backslash -- both parsers agree on the host here
             # ("bandcamp.com" / "music.youtube.com"); WHATWG only folds the
