@@ -11,10 +11,11 @@ exercises the shared factory directly.
 
 ``is_well_formed_web_url`` (LML#1295) is the sibling well-formedness floor: it
 catches the shapes a bare host-check misses (scheme-relative, bare-host,
-embedded control character, non-web scheme) before a per-service host check
-runs on top. The disallowed-character bar matches the BS#2351 wire contract
-(any code point <= ``0x20`` or ``0x7F``), not Python's ``str.isspace()`` —
-the two sets diverge in both directions, see the function's own docstring.
+embedded control character, non-web scheme, embedded backslash) before a
+per-service host check runs on top. The disallowed-character bar matches the
+BS#2351 wire contract (any code point <= ``0x20``, ``0x7F``, or ``0x5C``),
+not Python's ``str.isspace()`` — the two sets diverge in both directions, see
+the function's own docstring.
 """
 
 from __future__ import annotations
@@ -126,19 +127,37 @@ class TestIsWellFormedWebUrl:
     @pytest.mark.parametrize(
         "url",
         [
-            # Authority-position backslash -- already rejected incidentally:
-            # urlparse doesn't fold ``\``, so the netloc comes out
-            # "bandcamp.com\\@evil.example" and the host check fails
-            # downstream. Included so the bar's own rejection is asserted
-            # directly, not just observed as a side effect elsewhere.
+            # Attacker-first authority-position backslash (LML#1298) -- the
+            # real host spoof, and the reason this leg exists. For the
+            # http(s) special schemes, WHATWG treats ``\`` as an
+            # authority/host terminator (same as ``/``); since it lands here
+            # before any ``@``, the host is cut off right there and
+            # "@a.bandcamp.com/x" folds into the path instead, so every
+            # WHATWG client (a browser, Node, Backend-Service's own URL
+            # handling) resolves this to host "evil.example". Python's
+            # urlparse never splits the netloc at all -- it suffix-checks
+            # the raw netloc string, which is still
+            # "evil.example\\@a.bandcamp.com" verbatim and still ends with
+            # ".bandcamp.com", so without the 0x5c leg this URL passed both
+            # the well-formedness floor and url_has_bandcamp_host. The same
+            # shape spoofs youtube_music and soundcloud identically.
+            "https://evil.example\\@a.bandcamp.com/x",
+            "https://evil.example\\@music.youtube.com/x",
+            "https://evil.example\\@a.soundcloud.com/x",
+            # Victim-first authority-position backslash -- not a host spoof:
+            # urlparse's raw netloc comes out "bandcamp.com\\@evil.example",
+            # which doesn't end with ".bandcamp.com", so url_has_bandcamp_host
+            # already returns False here even without this leg. Kept as a
+            # parity assertion that the bar itself also rejects this
+            # orientation, not just the attacker-first one above.
             "https://bandcamp.com\\@evil.example/x",
-            # Path-position backslash -- the interesting case (LML#1298):
-            # WHATWG folds ``\`` to ``/`` for http(s), so a browser or a
-            # WHATWG-conformant client resolves this to host "evil.example",
-            # while Python's urlparse (RFC 3986) leaves it in the path and
-            # reports host "bandcamp.com". Without the 0x5c leg, this URL
-            # passed the well-formedness floor and a downstream host_matcher
-            # check alike (BS#2351, BS#1710).
+            # Path-position backslash -- both parsers agree on the host here
+            # ("bandcamp.com" / "music.youtube.com"); WHATWG only folds the
+            # ``\`` to ``/`` inside the path itself
+            # (".../album\\@evil.example" becomes ".../album/@evil.example"),
+            # which is a path-shape difference, not a spoof. Rejecting it
+            # anyway is plain code-point parity with the BS#2351 wire
+            # contract (BS#1710).
             "https://bandcamp.com/album\\@evil.example",
             "https://music.youtube.com/browse\\@evil.example",
         ],
