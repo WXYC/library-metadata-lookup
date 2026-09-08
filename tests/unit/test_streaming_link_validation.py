@@ -59,7 +59,14 @@ _MALFORMED_SHAPES = {
     # schemes, WHATWG cuts the host off at the ``\`` and folds the rest --
     # including the genuine host after "@" -- into the path, so a browser
     # resolves this to host "evil.example" while urlparse's raw netloc still
-    # ends with the genuine host and would pass a bare host check.
+    # ends with the genuine host and would pass a bare host check. The "a."
+    # prefix is load-bearing for that last clause: soundcloud_url's genuine
+    # host IS the bare registrable domain, so without it the netloc ends
+    # "@soundcloud.com" -- no dot before the domain -- and host_matcher's
+    # ".soundcloud.com" suffix test rejects the shape on its own. Dropping
+    # the "a." leaves this entry still passing (the 0x5c leg rejects it
+    # either way) while silently costing it the "a host check alone would
+    # have passed this" property it exists to model.
     "authority-backslash": lambda url: (
         "https://evil.example" + chr(0x5C) + "@a." + url.split("://", 1)[1]
     ),
