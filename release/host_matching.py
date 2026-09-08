@@ -77,7 +77,7 @@ def host_matcher(domain: str, *, doc: str | None = None) -> Callable[[str | None
 #: code-point-for-code-point keeps this module in parity with
 #: Backend-Service either way, which is the point — not approximating
 #: Python's notion of whitespace.
-_MAX_DISALLOWED_CODE_POINT = 0x20
+_MAX_C0_OR_SPACE_CODE_POINT = 0x20
 _DEL = 0x7F
 _BACKSLASH = 0x5C
 
@@ -95,7 +95,7 @@ def is_well_formed_web_url(url: str | None) -> bool:
     (WXYC/Backend-Service#1710) alongside control-character-corrupted URLs
     (embedded tab/LF/space among them); the backslash leg closes a WHATWG-vs-
     RFC-3986 host-parsing differential in the authority position (see the
-    module-level comment above :data:`_MAX_DISALLOWED_CODE_POINT` for the
+    module-level comment above :data:`_MAX_C0_OR_SPACE_CODE_POINT` for the
     concrete spoof). This function is the shared check for all of the above,
     plus non-web schemes (``ftp:``, ``mailto:``).
 
@@ -105,7 +105,7 @@ def is_well_formed_web_url(url: str | None) -> bool:
     """
     if not url:
         return False
-    if any(ord(ch) <= _MAX_DISALLOWED_CODE_POINT or ord(ch) in (_DEL, _BACKSLASH) for ch in url):
+    if any(ord(ch) <= _MAX_C0_OR_SPACE_CODE_POINT or ord(ch) in (_DEL, _BACKSLASH) for ch in url):
         return False
     try:
         parsed = urlparse(url)
