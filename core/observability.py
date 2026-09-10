@@ -216,10 +216,49 @@ def project_capped(
 
 # asyncpg issues exactly this statement every time a pooled connection is
 # returned to the pool, and sentry-sdk's asyncpg instrumentation records each
-# one as a `db` span. Matched EXACTLY, never as a substring: `RESET ALL` and
-# `CLOSE ALL` are legal fragments of application SQL, and a loose match here
-# would silently delete real query spans.
-ASYNCPG_POOL_RESET_STATEMENT = "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;"
+# one as a `db` span.
+#
+# The join is a NEWLINE because that is what goes on the wire:
+# `asyncpg.connection.Connection.get_reset_query` assembles the statements
+# with `"\n".join(...)`, and sentry-sdk's AsyncPGIntegration passes the query
+# through to `record_sql_queries` verbatim. Sentry's UI renders SQL with its
+# whitespace collapsed, so the rendered form reads as one space-joined line --
+# and a constant transcribed from that rendering (as this one was, from
+# 2026-08-10 to 2026-09-09) matches nothing at all. That regression cost ~114K
+# spans/day, ~20% of the whole WXYC Sentry org's budget, for a month, while
+# every test still passed. Never source a match string from a dashboard.
+ASYNCPG_POOL_RESET_STATEMENTS = (
+    "SELECT pg_advisory_unlock_all();",
+    "CLOSE ALL;",
+    "UNLISTEN *;",
+    "RESET ALL;",
+)
+ASYNCPG_POOL_RESET_STATEMENT = "\n".join(ASYNCPG_POOL_RESET_STATEMENTS)
+
+
+def _normalize_sql_whitespace(sql: str) -> str:
+    """Collapse every run of whitespace to one space and strip the ends.
+
+    Applied to BOTH sides of the comparison so the filter survives a change in
+    how asyncpg joins the statements (or an SDK that reformats the query)
+    without going quietly blind again. It deliberately does NOT loosen the
+    match in any other direction -- the comparison stays whole-string equality,
+    never a substring test, because `RESET ALL;` and `CLOSE ALL;` are legal
+    application SQL on their own and a substring match would silently delete
+    real query spans.
+    """
+    return " ".join(sql.split())
+
+
+_POOL_RESET_NORMALIZED = _normalize_sql_whitespace(ASYNCPG_POOL_RESET_STATEMENT)
+
+
+def _is_pool_reset_description(description: Any) -> bool:
+    """True when ``description`` is the pool-reset statement, whitespace aside."""
+    if not isinstance(description, str):
+        return False
+    return _normalize_sql_whitespace(description) == _POOL_RESET_NORMALIZED
+
 
 # Reset spans at or above this floor are KEPT. The statement itself is trivial,
 # so its duration is almost entirely time spent waiting on the pool -- a slow
@@ -275,7 +314,7 @@ def _is_fast_pool_reset(span: Any) -> bool:
     """
     if not isinstance(span, dict):
         return False
-    if span.get("description") != ASYNCPG_POOL_RESET_STATEMENT:
+    if not _is_pool_reset_description(span.get("description")):
         return False
     duration_ms = _span_duration_ms(span)
     if duration_ms is None:
