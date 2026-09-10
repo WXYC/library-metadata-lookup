@@ -179,12 +179,37 @@ class Settings(BaseSettings):
         Runs in ``mode="before"`` so it sees the raw env-var string ahead of
         pydantic's own float coercion, which would otherwise raise on a
         non-numeric value before this validator ever ran.
+
+        **The fallback announces itself (LML#1306).** It used to be silent, and
+        a telemetry misconfiguration has no symptom except span volume -- which
+        is the very signal you are trying to control -- so "the value was
+        rejected" and "you configured full-rate deliberately" looked identical.
+        That cost an hour of misdiagnosis on 2026-09-09, chasing a typo that
+        did not exist. ``25`` (an operator meaning 25%) is the canonical shape:
+        out of range, silently full-rate.
+
+        The warning fires before ``setup_logging`` runs -- ``main.py`` builds
+        settings at import, several lines ahead of it -- so it is emitted at
+        WARNING deliberately: Python's handler of last resort writes WARNING and
+        above to stderr even with no handler configured, which is what puts it
+        in the Railway log. An INFO line here would be swallowed.
         """
         try:
             parsed = float(v)  # type: ignore[arg-type]
         except (TypeError, ValueError):
+            logger.warning(
+                "SENTRY_TRACES_SAMPLE_RATE=%r is not a number; falling back to 1.0 "
+                "(full-rate tracing). Set a fraction between 0 and 1, e.g. 0.25.",
+                v,
+            )
             return 1.0
         if not (0.0 <= parsed <= 1.0):
+            logger.warning(
+                "SENTRY_TRACES_SAMPLE_RATE=%r is outside [0, 1]; falling back to 1.0 "
+                "(full-rate tracing). It is a fraction, not a percentage -- "
+                "write 0.25, not 25.",
+                v,
+            )
             return 1.0
         return parsed
 

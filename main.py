@@ -84,6 +84,17 @@ setup_logging(level=settings.log_level, log_file=log_file)
 
 logger = logging.getLogger(__name__)
 
+# State the tracing rate actually in force, every boot (LML#1306). Sentry's
+# sample rate is otherwise unobservable from outside the process -- /health does
+# not carry it, and a Railway variable change does not move `commit_sha` -- so
+# the only way to tell a working config from a rejected one was to measure span
+# volume against an unsampled denominator. That took an hour on 2026-09-09. One
+# line here answers it from the deploy log instead.
+logger.info(
+    "Sentry tracing: traces_sample_rate=%s (SENTRY_TRACES_SAMPLE_RATE)",
+    settings.sentry_traces_sample_rate,
+)
+
 # LML#706 multi-worker startup guard. One session-scoped advisory lock
 # serializes the lml_cache.* bootstraps across worker processes so N uvicorn
 # workers don't race the CREATE ... IF NOT EXISTS DDL on boot. Key 747706 =
