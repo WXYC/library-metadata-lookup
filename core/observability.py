@@ -273,14 +273,35 @@ def _is_pool_reset_description(description: Any) -> bool:
 POOL_RESET_FLOOR_MS = 50.0
 
 
+def _parse_iso8601(value: str) -> datetime | None:
+    """Parse an SDK-serialized timestamp, or ``None`` if it is not one.
+
+    ``datetime.fromisoformat`` accepts the trailing ``Z`` from Python 3.11 on,
+    but the replacement is kept so a future interpreter downgrade degrades to
+    "unmeasurable, therefore kept" rather than raising inside the hook.
+    """
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
 def _span_duration_ms(span: dict[str, Any]) -> float | None:
     """Duration of a serialized span in milliseconds, or ``None`` if unknowable.
 
-    ``sentry_sdk.tracing.Span.to_json()`` emits ``start_timestamp`` and
-    ``timestamp`` and **no** pre-computed duration, so the subtraction is on
-    us. Datetimes are the shape the SDK produces today; epoch floats are
-    accepted because some serialization paths use them and a silently
-    unmeasurable span would quietly defeat the floor.
+    **ISO-8601 strings are the shape production actually delivers.**
+    ``Span.to_json()`` emits ``datetime`` objects, but ``before_send_transaction``
+    does not run on ``to_json()`` output — it runs after the SDK's
+    ``prepare_event`` pipeline, which serializes both fields to strings like
+    ``'2026-09-10T02:31:21.824370Z'``. Handling only datetimes made this
+    function return ``None`` on every real payload, and the caller's fail-open
+    branch then kept every span — LML#1301's fix looked correct, passed its
+    tests, deployed to production, and dropped nothing (LML#1303).
+
+    All three shapes are accepted: strings (production), datetimes (what
+    ``to_json()`` returns, and what every hand-built test fixture uses), and
+    epoch floats (other serialization paths). A silently unmeasurable span
+    quietly defeats the floor, so the parsing is deliberately permissive.
 
     Subtraction failures are contained **here**, not at the event level: a
     naive/aware datetime pair raises ``TypeError``, and letting that escape
@@ -290,6 +311,12 @@ def _span_duration_ms(span: dict[str, Any]) -> float | None:
     start = span.get("start_timestamp")
     end = span.get("timestamp")
     try:
+        if isinstance(start, str) and isinstance(end, str):
+            parsed_start = _parse_iso8601(start)
+            parsed_end = _parse_iso8601(end)
+            if parsed_start is None or parsed_end is None:
+                return None
+            return (parsed_end - parsed_start).total_seconds() * 1000.0
         if isinstance(start, datetime) and isinstance(end, datetime):
             return (end - start).total_seconds() * 1000.0
         if (

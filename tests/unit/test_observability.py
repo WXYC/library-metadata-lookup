@@ -666,6 +666,93 @@ class TestPoolResetStatementProvenance:
         assert drop_fast_pool_reset_spans(event, None)["spans"] == []
 
 
+class TestPoolResetSpanRoundTrip:
+    """The only test here that sees what production actually hands the hook.
+
+    Every other test in this file — including ``TestPoolResetSpanShapeGuard``,
+    which exists to catch exactly this — builds its span from
+    ``Span.to_json()`` or by hand, and then wraps it in an event dict itself.
+    That skips the SDK's ``prepare_event`` pipeline, and the pipeline is where
+    the span dict stops looking like the one those tests assert on:
+    ``Span.to_json()`` emits ``datetime`` timestamps, but by the time
+    ``before_send_transaction`` runs they have been serialized to **ISO-8601
+    strings**.
+
+    That difference silently defeated the filter a second time (LML#1303).
+    LML#1301 fixed the description mismatch and the reset span kept shipping,
+    because ``_span_duration_ms`` understood datetimes and floats but not
+    strings, returned ``None``, and the fail-open branch kept every span.
+    Two independent no-ops in one predicate, both invisible to a suite that
+    constructs its own fixtures.
+
+    So this drives a real transaction through a real ``sentry_sdk.init`` and
+    captures the span dict from inside an actual ``before_send_transaction``
+    call. Nothing here is hand-assembled.
+    """
+
+    @staticmethod
+    def _capture_reset_span() -> dict[str, Any]:
+        """Return the pool-reset span exactly as the hook receives it."""
+        import sentry_sdk
+        from sentry_sdk.tracing_utils import record_sql_queries
+
+        from tests.unit.test_observability import TestPoolResetStatementProvenance as P
+
+        captured: dict[str, Any] = {}
+
+        def hook(event: Any, hint: Any) -> None:
+            for span in event.get("spans", []):
+                if "pg_advisory_unlock_all" in str(span.get("description")):
+                    captured["span"] = span
+            return None  # never actually transmit
+
+        global_scope = sentry_sdk.get_global_scope()
+        previous_client = global_scope.client
+        try:
+            sentry_sdk.init(
+                dsn="https://public@o0.ingest.sentry.io/0",
+                traces_sample_rate=1.0,
+                before_send_transaction=hook,
+            )
+            with sentry_sdk.start_transaction(name="/api/v1/lookup", op="http.server"):
+                with record_sql_queries(
+                    cursor=None,
+                    query=P._asyncpg_reset_query(),
+                    params_list=None,
+                    paramstyle=None,
+                    executemany=False,
+                ):
+                    pass
+            sentry_sdk.flush(2000)
+        finally:
+            global_scope.set_client(previous_client)
+
+        assert "span" in captured, "before_send_transaction never saw the pool-reset span"
+        return captured["span"]
+
+    def test_the_hook_receives_iso_string_timestamps_not_datetimes(self):
+        """Pins the shape that broke it. If the SDK ever reverts to datetimes
+        this fails loudly rather than degrading to fail-open again.
+        """
+        span = self._capture_reset_span()
+
+        assert isinstance(span["start_timestamp"], str)
+        assert isinstance(span["timestamp"], str)
+
+    def test_the_real_hook_payload_is_dropped(self):
+        """The acceptance criterion, stated against production's own data."""
+        from core.observability import _span_duration_ms, drop_fast_pool_reset_spans
+
+        span = self._capture_reset_span()
+
+        assert _span_duration_ms(span) is not None, (
+            "duration unmeasurable on the real payload -- the filter will fail open"
+        )
+
+        event: Any = {"type": "transaction", "spans": [span]}
+        assert drop_fast_pool_reset_spans(event, None)["spans"] == []
+
+
 class TestSentryInitWiring:
     """``main.py`` must actually hand the filter to ``init_sentry``.
 
