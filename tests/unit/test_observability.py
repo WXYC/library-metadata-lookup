@@ -273,7 +273,11 @@ class TestDropFastPoolResetSpans:
     tail.
     """
 
-    RESET = "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;"
+    # The WIRE form -- newline-joined, as `asyncpg.Connection.get_reset_query`
+    # emits it. Writing the Sentry-UI rendering here (space-joined) is what
+    # made the filter a no-op for a month; `TestPoolResetStatementProvenance`
+    # pins this against asyncpg itself.
+    RESET = "SELECT pg_advisory_unlock_all();\nCLOSE ALL;\nUNLISTEN *;\nRESET ALL;"
 
     @staticmethod
     def _span(description: str, duration_ms: float | None = 2.0, op: str = "db") -> dict[str, Any]:
@@ -365,7 +369,6 @@ class TestDropFastPoolResetSpans:
             "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL",
             "RESET ALL;",
             "SELECT foo FROM bar; RESET ALL;",
-            "  SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;  ",
             "CLOSE ALL;",
         ],
     )
@@ -380,6 +383,39 @@ class TestDropFastPoolResetSpans:
         event: Any = {"type": "transaction", "spans": [span]}
 
         assert drop_fast_pool_reset_spans(event, None)["spans"] == [span]
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "SELECT pg_advisory_unlock_all();\nCLOSE ALL;\nUNLISTEN *;\nRESET ALL;",
+            "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;",
+            "  SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;  ",
+            "SELECT pg_advisory_unlock_all();\n\tCLOSE ALL;   UNLISTEN *;\nRESET ALL;",
+        ],
+        ids=["wire-newline-joined", "sentry-ui-rendering", "padded", "mixed-whitespace"],
+    )
+    def test_whitespace_variants_of_the_reset_statement_are_dropped(self, description: str):
+        """Whitespace is not identity, and treating it as identity WAS the bug.
+
+        The first case is what asyncpg puts on the wire; the second is how
+        Sentry renders that same statement, which is where the original
+        constant was (incorrectly) copied from. The filter has to recognise
+        both as the same statement, or the next person who reads a description
+        off a dashboard reintroduces LML#1175 verbatim.
+
+        The padded case is a deliberate behaviour change: it used to be pinned
+        as KEPT by ``test_matches_the_statement_exactly_never_a_substring``.
+        That assertion encoded "any whitespace difference means a different
+        statement", which is exactly the belief that made the filter blind.
+        Substring safety is unaffected and still pinned above -- normalization
+        collapses whitespace, it never relaxes whole-string equality.
+        """
+        from core.observability import drop_fast_pool_reset_spans
+
+        span = self._span(description)
+        event: Any = {"type": "transaction", "spans": [span]}
+
+        assert drop_fast_pool_reset_spans(event, None)["spans"] == []
 
     def test_keeps_a_reset_span_whose_duration_cannot_be_computed(self):
         """Fail open. An unclassifiable span costs one span of budget; dropping
@@ -530,6 +566,103 @@ class TestPoolResetSpanShapeGuard:
         )
 
         event = {"type": "transaction", "spans": [serialized]}
+        assert drop_fast_pool_reset_spans(event, None)["spans"] == []
+
+
+class TestPoolResetStatementProvenance:
+    """Pins the match string against **asyncpg**, not against ourselves.
+
+    ``TestPoolResetSpanShapeGuard`` above builds its span from
+    ``ASYNCPG_POOL_RESET_STATEMENT`` -- it hands the constant back to the
+    constant, so it can prove the SDK still serializes ``description``, but it
+    can prove nothing about whether that string is what asyncpg actually puts
+    on the wire. It did not, for a month (LML#1175 regression, found
+    2026-09-09): the constant had been transcribed out of the Sentry UI, which
+    renders SQL with its whitespace collapsed, while
+    ``Connection.get_reset_query`` joins its statements with ``chr(10)``. The
+    equality test never once fired in production and ~114K spans/day shipped
+    at full rate.
+
+    So these tests derive the description from asyncpg's own code and drive it
+    through sentry-sdk's own instrumentation helper. If asyncpg changes how it
+    assembles the reset query, this fails here rather than silently in the
+    bill.
+    """
+
+    @staticmethod
+    def _asyncpg_reset_query() -> str:
+        """The reset query asyncpg emits, built by asyncpg's own method.
+
+        ``get_reset_query`` reads only ``_reset_query`` (its memo) and
+        ``_server_caps``, so an unbound call against a stub exercises the real
+        assembly without needing a live connection. All five caps are True on
+        any real PostgreSQL; they are False only on wire-compatible engines
+        (CockroachDB, Redshift) that this service does not talk to.
+        """
+        from asyncpg.connection import Connection, ServerCapabilities
+
+        caps = ServerCapabilities(
+            advisory_locks=True,
+            notifications=True,
+            plpgsql=True,
+            sql_reset=True,
+            sql_close_all=True,
+            sql_copy_from_where=True,
+            jit=True,
+        )
+        return Connection.get_reset_query(
+            SimpleNamespace(_reset_query=None, _server_caps=caps)  # type: ignore[arg-type]
+        )
+
+    def test_the_constant_is_what_asyncpg_actually_emits(self):
+        """The regression itself, stated directly."""
+        from core.observability import ASYNCPG_POOL_RESET_STATEMENT
+
+        assert ASYNCPG_POOL_RESET_STATEMENT == self._asyncpg_reset_query()
+
+    def test_asyncpg_reset_query_through_the_real_sdk_path_is_dropped(self):
+        """End to end over the seam that actually failed.
+
+        asyncpg's query string -> ``record_sql_queries`` (what sentry-sdk's
+        AsyncPGIntegration calls) -> ``Span.to_json()`` -> our filter. Every
+        hop here is library code except the assertion.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        import sentry_sdk
+        from sentry_sdk.tracing_utils import record_sql_queries
+
+        from core.observability import drop_fast_pool_reset_spans
+
+        # `sentry_sdk.init` installs a client on the GLOBAL scope. Left in
+        # place it leaks into every later test in the session -- it made three
+        # unrelated suites fail on first run here. Restore the prior client.
+        global_scope = sentry_sdk.get_global_scope()
+        previous_client = global_scope.client
+        try:
+            sentry_sdk.init(dsn=None, traces_sample_rate=1.0)
+            with sentry_sdk.start_transaction(name="provenance"):
+                with record_sql_queries(
+                    cursor=None,
+                    query=self._asyncpg_reset_query(),
+                    params_list=None,
+                    paramstyle=None,
+                    executemany=False,
+                ) as span:
+                    pass
+        finally:
+            global_scope.set_client(previous_client)
+
+        span.start_timestamp = datetime(2026, 9, 9, 12, 0, 0, tzinfo=UTC)
+        span.timestamp = span.start_timestamp + timedelta(milliseconds=2.3)
+        serialized = span.to_json()
+
+        assert "\n" in serialized["description"], (
+            "asyncpg no longer newline-joins its reset statements -- re-derive "
+            "ASYNCPG_POOL_RESET_STATEMENT before relaxing this"
+        )
+
+        event: Any = {"type": "transaction", "spans": [serialized]}
         assert drop_fast_pool_reset_spans(event, None)["spans"] == []
 
 
