@@ -463,9 +463,9 @@ def _project_cache_stats_to_transaction(stats: dict | None) -> None:
       reads back as "Unknown attribute"), so it cannot back a metric alert.
       Measurements are aggregatable (avg/percentile/threshold) and are what the
       LML#683 row-less-flag degradation alerts query (e.g. the Discogs call-rate
-      guard on ``lml.cache.api_calls``). traces_sample_rate is 1.0 (see
-      ``init_sentry`` in ``main.py``), so the measurement series covers every
-      request, not a sampled fraction.
+      guard on ``lml.cache.api_calls``). **It is a SAMPLE, not a census**:
+      ``traces_sample_rate`` is an operator knob (LML#1174) -- read ``Settings``,
+      not a number here. Averages survive sampling, counts do not; see #683.
 
     No-op when there is no active transaction (Sentry not initialized, or call
     happening outside a request span).
