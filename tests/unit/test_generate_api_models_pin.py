@@ -159,16 +159,34 @@ def _run(tmp_path: Path, script: Path) -> subprocess.CompletedProcess:
     )
 
 
-def _annotations(output: Path) -> dict[str, str]:
-    """Every annotated class attribute in the generated file, by field name."""
+def _annotations(output: Path) -> list[tuple[str, str, str]]:
+    """Every annotated class attribute as ``(class, field, annotation source)``.
+
+    Deliberately not a ``{field: annotation}`` dict. Each of the five pinned
+    names is defined in *five* different classes in the committed snapshot
+    (``AlbumMetadata``, ``StreamingLinks``, ``FlowsheetEntryFields``,
+    ``FlowsheetV2TrackEntry``, ``DiscogsMatchResult``), and a dict keyed on the
+    bare name keeps only the last one parsed — so a snapshot where
+    ``AlbumMetadata.spotify_url`` carried ``AnyUrl`` while the last-defined
+    class did not would read green (LML#1312 review). The production
+    post-condition collects every occurrence; so does this.
+    """
     import ast
 
     tree = ast.parse(output.read_text(), filename=str(output))
-    found: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            found[node.target.id] = ast.unparse(node.annotation)
+    found: list[tuple[str, str, str]] = []
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        for node in cls.body:
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                found.append((cls.name, node.target.id, ast.unparse(node.annotation)))
     return found
+
+
+def _annotations_for(output: Path, field: str) -> list[tuple[str, str]]:
+    """``(class, annotation)`` for every definition of ``field``."""
+    return [(cls, ann) for cls, name, ann in _annotations(output) if name == field]
 
 
 def test_pin_holds_the_five_streaming_url_fields_at_str(tmp_path):
@@ -183,10 +201,13 @@ def test_pin_holds_the_five_streaming_url_fields_at_str(tmp_path):
     result = _run(tmp_path, script)
 
     assert result.returncode == 0, result.stderr
-    annotations = _annotations(script.parents[1] / "generated" / "api_models.py")
+    output = script.parents[1] / "generated" / "api_models.py"
     for field in PINNED_FIELDS:
-        assert "AnyUrl" not in annotations[field], field
-        assert "str" in annotations[field], field
+        occurrences = _annotations_for(output, field)
+        assert occurrences, field
+        for cls, annotation in occurrences:
+            assert "AnyUrl" not in annotation, f"{cls}.{field}"
+            assert "str" in annotation, f"{cls}.{field}"
 
 
 def test_pin_leaves_unrelated_uri_fields_alone(tmp_path):
@@ -200,9 +221,12 @@ def test_pin_leaves_unrelated_uri_fields_alone(tmp_path):
     result = _run(tmp_path, script)
 
     assert result.returncode == 0, result.stderr
-    annotations = _annotations(script.parents[1] / "generated" / "api_models.py")
+    output = script.parents[1] / "generated" / "api_models.py"
     for field in UNPINNED_URI_FIELDS:
-        assert "AnyUrl" in annotations[field], field
+        occurrences = _annotations_for(output, field)
+        assert occurrences, field
+        for cls, annotation in occurrences:
+            assert "AnyUrl" in annotation, f"{cls}.{field}"
 
 
 def test_annotated_shape_defeats_the_substitution_and_fails_loudly(tmp_path):
@@ -256,5 +280,91 @@ def test_committed_snapshot_carries_the_pin(field):
     on it directly, not only on the script that produces it. A regen run without
     the pin would land here and nowhere else."""
     committed = Path(__file__).resolve().parents[2] / "generated" / "api_models.py"
-    annotations = _annotations(committed)
-    assert "AnyUrl" not in annotations[field]
+    occurrences = _annotations_for(committed, field)
+    # Every class that declares it, not just the last one parsed.
+    assert len(occurrences) >= 1
+    for cls, annotation in occurrences:
+        assert "AnyUrl" not in annotation, f"{cls}.{field}"
+
+
+_ROOTMODEL_SHAPE = """\
+from pydantic import AnyUrl, BaseModel, Field, RootModel
+
+
+class StreamingUrl(RootModel[AnyUrl]):
+    root: AnyUrl
+
+
+class StreamingLinks(BaseModel):
+{pinned}
+
+
+class DeviceCodeResponse(BaseModel):
+{unpinned}
+"""
+
+
+def _install_rootmodel_stub(tmp_path: Path) -> None:
+    """Stub the generator into the named-``$ref`` shape: a RootModel wrapper.
+
+    The five fields never mention ``AnyUrl`` themselves — they reference a
+    generated wrapper class that does.
+    """
+    pinned = "\n".join(f"    {f}: StreamingUrl | None = None" for f in PINNED_FIELDS)
+    unpinned = "\n".join(f"    {f}: AnyUrl | None = None" for f in UNPINNED_URI_FIELDS)
+    _install_stub_toolchain(tmp_path, annotated=False)
+    (tmp_path / "bin" / "generated_source.py.txt").write_text(
+        _ROOTMODEL_SHAPE.format(pinned=pinned, unpinned=unpinned)
+    )
+
+
+def test_named_rootmodel_wrapper_does_not_slip_past_the_post_condition(tmp_path):
+    """The indirection a denylist cannot see (LML#1312 review).
+
+    Give a field a named ``$ref`` schema and the generator emits
+    ``class StreamingUrl(RootModel[AnyUrl])`` plus ``field: StreamingUrl | None``.
+    The sed does not match, and the token ``AnyUrl`` is absent from the field's
+    own annotation — so a check asking "is AnyUrl present here" passes while all
+    five fields validate URLs at decode time regardless, which is the entire
+    failure the pin exists to prevent.
+
+    Not hypothetical: this generator emits ``RootModel`` wrappers for named
+    schemas today (the regen this pin unblocked landed ``class Url(RootModel[...])``),
+    and ``AlbumMetadata``'s own docstring says these five fields "will be migrated
+    to use `$ref` in a future version". Asserting the annotation IS ``str``,
+    rather than is-not-``AnyUrl``, is what closes it.
+    """
+    _install_rootmodel_stub(tmp_path)
+    script = _set_up_repo(tmp_path)
+
+    result = _run(tmp_path, script)
+
+    assert result.returncode != 0
+    assert "#428 pin did not apply" in result.stderr
+    for field in PINNED_FIELDS:
+        assert field in result.stderr, field
+
+
+def test_a_renamed_field_fails_loudly_instead_of_pinning_fewer(tmp_path):
+    """An offenders-only check is vacuous under a rename.
+
+    Drop one pinned field from the generator's output — what an upstream rename
+    looks like from here. The sed no-ops on the missing name and the walk finds
+    nothing wrong, so a check that only ever reports offenders exits 0 having
+    pinned four of five, silently. The post-condition asserts every field was
+    found, so the rename surfaces as a diagnosable failure naming the field.
+    """
+    _install_stub_toolchain(tmp_path, annotated=False)
+    dropped, *kept = PINNED_FIELDS
+    pinned = "\n".join(f"    {f}: AnyUrl | None = None" for f in kept)
+    unpinned = "\n".join(f"    {f}: AnyUrl | None = None" for f in UNPINNED_URI_FIELDS)
+    (tmp_path / "bin" / "generated_source.py.txt").write_text(
+        _PLAIN_SHAPE.format(pinned=pinned, unpinned=unpinned)
+    )
+    script = _set_up_repo(tmp_path)
+
+    result = _run(tmp_path, script)
+
+    assert result.returncode != 0
+    assert "were not found" in result.stderr
+    assert dropped in result.stderr
