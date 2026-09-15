@@ -68,8 +68,11 @@ def _install_env_recording_stub(tmp_path: Path, name: str) -> None:
     reads it back between codegen and ruff to verify the #428 pin applied — so
     a stub that records its environment and produces nothing aborts the run
     before ``ruff`` is ever reached, and this suite's subject (the scrub, at
-    every tool) would go unobserved. An empty file parses cleanly and carries no
-    ``AnyUrl``, so the post-condition passes and the stages under test still run.
+    every tool) would go unobserved. The file has to carry the five pinned
+    streaming URL fields as ``str``: the post-condition asserts they were found,
+    not merely that none of them is wrong, so an empty module reads as "the pin
+    covered nothing" and fails. ``tests/unit/test_generate_api_models_pin.py``
+    owns the pin's own behaviour; this stub only needs to clear it.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -82,7 +85,17 @@ def _install_env_recording_stub(tmp_path: Path, name: str) -> None:
         '  if [[ "$1" == "--output" ]]; then out="$2"; shift; fi\n'
         "  shift\n"
         "done\n"
-        'if [[ -n "$out" ]]; then mkdir -p "$(dirname "$out")"; : > "$out"; fi\n'
+        'if [[ -n "$out" ]]; then\n'
+        '  mkdir -p "$(dirname "$out")"\n'
+        '  cat > "$out" <<'
+        "'"
+        "PY"
+        "'"
+        "\n"
+        "class StreamingLinks:\n"
+        "    spotify_url: str | None = None\n    apple_music_url: str | None = None\n    youtube_music_url: str | None = None\n    bandcamp_url: str | None = None\n    soundcloud_url: str | None = None\n"
+        "PY\n"
+        "fi\n"
         "exit 0\n"
     )
     stub.chmod(0o755)

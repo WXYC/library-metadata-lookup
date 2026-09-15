@@ -246,9 +246,30 @@ pin_streaming_url_fields_to_str() {
 # ONE shape the generator can emit -- `Annotated[AnyUrl | None, Field(...)]`
 # defeats it and every substitution silently no-ops while returning 0. That is
 # the pin failing OPEN, so the post-condition cannot itself be another anchored
-# regex: it parses the output and asks whether AnyUrl appears ANYWHERE in each
-# pinned field's annotation, which covers shapes nobody has anticipated yet.
-# tests/unit/test_generate_api_models_pin.py drives both failure modes.
+# regex: it parses the output and inspects each pinned field's annotation.
+#
+# It asserts what the annotation IS (an allowlist: `str`, modulo None/Optional/
+# Union/Annotated/Field wrappers), not what it is not. LML#1312 review: a
+# denylist for the literal token `AnyUrl` -- which is what wxyc-shared's
+# canonical copy does today -- fails open on one indirection this generator
+# demonstrably produces. Give a field a named `$ref` schema and it generates as
+# `class StreamingUrl(RootModel[AnyUrl])` plus `field: StreamingUrl | None`; the
+# sed does not match, the token `AnyUrl` is absent from the field's own
+# annotation, and all five ship validating URLs at decode time anyway. That is
+# not hypothetical: this regen landed `class Url(RootModel[...])` for exactly
+# that reason, and AlbumMetadata's own docstring says these five fields "will be
+# migrated to use `$ref` in a future version". The allowlist also stops a
+# `constr(...)` narrowing, deliberately -- anything that is not plain `str`
+# decodes differently and wants a human, not a silent pass.
+#
+# It also asserts every pinned field was FOUND. `offenders`-only logic is
+# vacuous under a rename: upstream renames one of the five, the sed no-ops, the
+# walk yields nothing, and the run exits 0 with four of five pinned.
+#
+# This is a deliberate divergence from wxyc-shared's canonical script (a third
+# known one, after WXYC/wxyc-shared#369 and LML's download/auth branch); the
+# same hardening is worth taking upstream so the copies reconverge.
+# tests/unit/test_generate_api_models_pin.py drives every failure mode.
 verify_streaming_url_fields_pinned() {
     local python_cmd=()
     if command -v python3 &> /dev/null; then
@@ -274,24 +295,44 @@ fields = set(os.environ["STREAMING_URL_FIELDS_CSV"].split(","))
 with open(output_path, "r", encoding="utf-8") as f:
     source = f.read()
 
+# Wrappers that may surround the pinned type without changing what it decodes as.
+WRAPPERS = {"None", "Optional", "Union", "Annotated", "Field"}
+
 tree = ast.parse(source, filename=output_path)
 offenders = []
+seen = set()
 for node in ast.walk(tree):
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
         if node.target.id in fields:
+            seen.add(node.target.id)
             annotation_src = ast.unparse(node.annotation)
-            if "AnyUrl" in annotation_src:
+            referenced = {
+                n.id for n in ast.walk(node.annotation) if isinstance(n, ast.Name)
+            } - WRAPPERS
+            if referenced != {"str"}:
                 offenders.append(f"{node.target.id} (line {node.lineno}): {annotation_src}")
 
 if offenders:
     sys.stderr.write(
-        "#428 pin did not apply -- the following streaming URL fields still "
-        "carry AnyUrl in their generated annotation (pin_streaming_url_fields_to_str "
+        "#428 pin did not apply -- the following streaming URL fields are not plain "
+        "`str` in their generated annotation (pin_streaming_url_fields_to_str "
         "silently no-op'\''d, most likely because the generator emitted a shape its "
-        "sed pattern does not match):\n"
+        "sed pattern does not match -- e.g. an Annotated[...] or a named RootModel "
+        "wrapper):\n"
     )
     for offender in offenders:
         sys.stderr.write(f"  - {offender}\n")
+    sys.exit(1)
+
+missing = sorted(fields - seen)
+if missing:
+    sys.stderr.write(
+        "#428 pin did not apply -- the following streaming URL fields were not found "
+        "in the generated output at all, so the pin covered fewer fields than it "
+        "claims (most likely an upstream rename; update STREAMING_URL_FIELDS):\n"
+    )
+    for field in missing:
+        sys.stderr.write(f"  - {field}\n")
     sys.exit(1)
 '
 }
