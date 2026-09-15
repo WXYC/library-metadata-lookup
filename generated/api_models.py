@@ -592,6 +592,18 @@ class ShowDJ(BaseModel):
     active: bool | None = None
 
 
+class ShowPlaylistDJ(BaseModel):
+    """
+    A DJ on an archived show. Deliberately not `OnAirDJ`: that schema requires a non-null `dj_name`, which holds for the live-DJ endpoints but not here — an archived show can carry a member whose handle resolves to nothing.
+    """
+
+    id: str | None = Field(..., description="The DJ's better-auth `auth_user.id`, or null.")
+    dj_name: str | None = Field(
+        ...,
+        description="The DJ's public on-air handle, never their legal name. Null when the PII-safe chain resolves to nothing.",
+    )
+
+
 class Dj(BaseModel):
     dj_id: int | None = None
     dj_name: str | None = Field(
@@ -671,6 +683,23 @@ class UpdateAlbumRequest(BaseModel):
     disc_quantity: int | None = None
     discogsUnavailable: bool | None = None
     discogsUnavailableNote: constr(max_length=500) | None = None
+
+
+class Url(RootModel[constr(max_length=2048)]):
+    root: constr(max_length=2048)
+
+
+class AlbumUrlsUpdate(BaseModel):
+    """
+    Replace-wholesale set of a catalogued release's definitive external links — the request body of `PUT /library/{id}/urls`. The `urls` array REPLACES whatever links the release currently has; position IS the contract (storage order), an empty array clears them, and there is no partial/merge form. This is the release-scoped write that stands alone from a rotation add: `RotationCreateFields.urls` already carries links on the filings/rotation-add path (Backend persists those release-scoped for the catalogued arm), while this sets them independent of any rotation stint (BS#2491). Same one `urls` vocabulary as the read shapes (`AlbumSearchResult`/`AlbumDetail`) and `RotationCreateFields.urls`.
+
+    """
+
+    urls: list[Url] = Field(
+        ...,
+        description="The links to store for this release, in the order they should be displayed. Plain strings, not `format: uri` — MDs paste bare domains, so a value carries no scheme guarantee and a renderer must not bind one into an href without checking it. An empty array clears the release's links. Bounded at 20 links of 2048 characters each — identical to the read shapes and `RotationCreateFields.urls` — and the bounds ship with the field because oasdiff treats adding a request-side bound later as a breaking change.\n",
+        max_length=20,
+    )
 
 
 class CatalogExportRow(BaseModel):
@@ -828,17 +857,40 @@ class CatalogCompilationTrackRow(BaseModel):
     )
 
 
-class AddAlbumRequest(BaseModel):
+class AlbumCreateFields(BaseModel):
+    """
+    Every `AddAlbumRequest` field except the artist ones (`artist_name`, `artist_id`) — extracted so `POST /library/filings` (#454) can compose it with a top-level `artist` block without also accepting a second, conflicting artist reference nested inside `release`.
+    At least one of `label` or `label_id` must be provided (BS#2410; the rotation-import plan's D5). With `label_id` alone, Backend resolves `labels.label_name` server-side for the denormalized `library.label` column and skips label creation; a dangling `label_id` is a 400. With `label` alone, the create-or-reuse-by-exact-name behavior is unchanged.
+    Both may be sent together — the rule is at-least-one, not exactly-one. `label_id` is validated and written to the FK either way, and an explicitly sent non-empty `label` wins over the name resolved from `label_id` for the denormalized `library.label` column (Backend's `resolveNewAlbumLabel`, pinned by "keeps an explicitly sent label over the resolved name when both are present"). An empty `label` does not win: it falls back to the resolved name rather than storing `''`.
+
+    """
+
     album_title: str
-    artist_name: str | None = None
-    artist_id: int | None = None
-    label: str
+    label: str | None = None
     label_id: int | None = None
     genre_id: int
     format_id: int
+    code_number: conint(ge=1, le=32767) | None = Field(
+        None,
+        description="Operator-chosen release call number (BS#2410). `library.code_number` is a Postgres smallint, hence the 32767 ceiling. Omitted, Backend assigns MAX+1 for the artist — this field makes that assignment overridable, it does not replace it. No application-level collision check by design (single-librarian decision; the eventual DB uniqueness constraint and its 409 mapping are tracked at WXYC/Backend-Service#2033).\n",
+    )
+    code_volume_letters: constr(max_length=4) | None = Field(
+        None,
+        description="Optional volume letters for the release call code (BS#2410; `library.code_volume_letters`, varchar(4)). Trimmed server-side; an empty or whitespace-only value is stored as NULL rather than `''`, and over-length input is a 400 measured in code points, not UTF-16 units.\n",
+    )
     disc_quantity: int | None = None
     alternate_artist_name: str | None = None
     album_artist: str | None = None
+
+
+class AddAlbumRequest(AlbumCreateFields):
+    """
+    `AlbumCreateFields` plus the artist reference pair. The label rule travels with it: at least one of `label` or `label_id` must be provided, or the request is a 400 (BS#2410) — restated here, not only on `AlbumCreateFields`, because the Swift and Kotlin generators flatten `allOf` into a standalone type whose doc comment is this description, leaving no link to the composed schema's own text. See `AlbumCreateFields` for the full `label`/`label_id` resolution semantics (which value wins for the denormalized `library.label` column, dangling-`label_id` handling).
+
+    """
+
+    artist_name: str | None = None
+    artist_id: int | None = None
 
 
 class Label(BaseModel):
@@ -856,6 +908,10 @@ class AddArtistRequest(BaseModel):
     artist_name: str
     code_letters: str
     genre_id: int
+    code_number: conint(ge=1, le=2147483647) | None = Field(
+        None,
+        description="Operator-chosen artist call number within the `(genre_id, code_letters)` bucket. The backing column (`genre_artist_crossreference.artist_genre_code`) is a Postgres integer, hence the 2147483647 ceiling — bounded here, at publish time, because oasdiff treats adding request-side bounds later as a breaking change (see `RotationCreateFields.urls`). Declared optional ahead of the Backend-Service relaxation that honors omission (WXYC/Backend-Service#2475): the deployed `POST /library/artists` still 400s on a body without it, so a client must keep sending it until #2475 ships. Once omission is honored, the server assigns the next number in the bucket — the same generator behind Backend's artist-code peek route (`GET /library/artists/peek-code`, a Backend route this contract does not declare) — and this field makes that assignment overridable, it does not replace it.\n",
+    )
 
 
 class OrderDirection(StrEnum):
@@ -991,17 +1047,60 @@ class CompilationTrackSuggestions(BaseModel):
     tracks: list[CompilationTrackInput]
 
 
+class RotationCard(BaseModel):
+    id: int
+    bin: RotationBin
+    number: int = Field(
+        ...,
+        description="Contiguous 1..N within a bin. `POST /library/rotation/cards` assigns `max(number) + 1` for the bin; `DELETE /library/rotation/cards/{id}` is refused unless the card is the highest-numbered in its bin AND has zero active rotation rows (see that endpoint's 409 for the two ways it can fail). There is no renumber endpoint, so gaps do not arise through the API, even though the underlying storage does not itself forbid them. \"The bin's newest card\" — referenced by the server-side `card_id` default still being specified (WXYC/Backend-Service#2472, WXYC/Backend-Service#2473) — means the highest `number` in the bin, `id` descending as the tie-break; stated once here rather than re-derived at each call site.\n",
+    )
+    name: str | None = None
+
+
+class AddRotationCardRequest(BaseModel):
+    bin: RotationBin
+    name: str | None = None
+
+
+class UpdateRotationCardRequest(BaseModel):
+    name: str | None = Field(...)
+
+
 class RotationEntry(BaseModel):
     id: int
     album_id: int
     rotation_bin: RotationBin
     add_date: date_aliased
     kill_date: date_aliased | None = None
+    card: RotationCard | None = None
+    urls: list[str] | None = Field(
+        None,
+        description="Storage order. Plain strings, not `format: uri` — MDs paste bare domains, so a value carries no scheme guarantee and a renderer must not bind one into an href without checking it. Deliberately an inline twin: `Rotation.urls` and `RotationEntry.urls` are pinned identical by a spec test rather than `$ref`ing a named array schema, because naming a top-level array makes the Python generator wrap the field in a RootModel (`.root` to reach the list) while every other target keeps a plain string list.\n",
+    )
 
 
-class AddRotationRequest(BaseModel):
-    album_id: int
+class RotationCreateFields(BaseModel):
+    """
+    The rotation-create fields shared by `AddRotationRequest` and `FilingRotationRequest` (the rotation arm of `POST /library/filings`) — extracted so the bin, card, and URL bounds are declared once instead of hand-copied across the two envelopes. See `urls` below for the bounds rationale.
+
+    """
+
     rotation_bin: RotationBin
+    card_id: int | None = None
+    urls: list[Url] | None = Field(
+        None,
+        description="Storage order. Plain strings, not `format: uri` — MDs paste bare domains, so a value carries no scheme guarantee and a renderer must not bind one into an href without checking it. Bounded here, at publish time, because oasdiff treats adding request-side bounds later as a breaking change — they could never be added after this ships. The spec's existing request arrays split between per-item-work caps (25) and bulk-drain caps (1000); neither fits a hand-curated link list, so this takes a small cap of 20, with 2048 characters per item covering any pasted URL. An empty array is equivalent to omitting the field.\n",
+        max_length=20,
+    )
+
+
+class AddRotationRequest(RotationCreateFields):
+    """
+    `RotationCreateFields` plus the album reference required only on the direct-add path — `POST /library/filings` supplies its own release in the same request, so `FilingRotationRequest` omits it.
+
+    """
+
+    album_id: int
 
 
 class KillRotationRequest(BaseModel):
@@ -1014,6 +1113,106 @@ class RotationWithAlbum(RotationEntry):
     artist_name: str
     code_letters: str
     code_number: int
+
+
+class Kind(StrEnum):
+    create = "create"
+
+
+class FilingArtistCreate(AddArtistRequest):
+    """
+    The create arm of `FilingArtist`: a full `AddArtistRequest` plus the `kind` discriminant. Inherits `AddArtistRequest`'s field semantics unchanged, including `code_number`'s deployed-requirement-vs-#2475-assignment note.
+
+    """
+
+    kind: Literal["create"]
+
+
+class Kind1(StrEnum):
+    existing = "existing"
+
+
+class FilingArtistExisting(BaseModel):
+    kind: Literal["existing"]
+    artist_id: int
+
+
+class FilingArtist(RootModel[FilingArtistCreate | FilingArtistExisting]):
+    root: FilingArtistCreate | FilingArtistExisting = Field(
+        ...,
+        description="Either a full new-artist payload (`kind: create`) or a reference to an already-catalogued artist (`kind: existing`). Discriminated rather than left a bare `oneOf` deliberately — the same idiom as `LiveFsEvent` and `AutoDJWebSocketMessage`: without `kind`, a payload carrying both an `artist_id` and the new-artist trio validates against both arms, and try-order decoders (the generated Swift and Python clients) silently take the create arm — filing a duplicate artist while reporting success instead of attaching the release to the referenced one. The required `kind` makes the caller's intent explicit on the wire and that ambiguous payload rejectable.\n",
+        discriminator="kind",
+    )
+
+
+class FilingRotationRequest(RotationCreateFields):
+    """
+    `RotationCreateFields` with no album reference: the release this rotation entry attaches to is the one `LibraryFilingRequest.release` creates in the same request. Kept as its own name — rather than a bare `$ref` to `RotationCreateFields` — because `LibraryFilingRequest.rotation` reads clearer naming the filing-specific envelope than the shared fields schema.
+
+    """
+
+
+class LibraryFilingRequest(BaseModel):
+    """
+    Composite of the three sequential writes filing a new record into rotation previously required (create artist, create release, create rotation entry) — see `POST /library/filings` (#454). All-or-nothing: a mid-chain failure rolls back the whole request rather than stranding partial state for the client to reconcile.
+
+    """
+
+    artist: FilingArtist
+    release: AlbumCreateFields
+    rotation: FilingRotationRequest | None = None
+
+
+class LibraryFilingResponse(BaseModel):
+    artist: Artist
+    release: Album
+    rotation: RotationEntry | None = None
+
+
+class LibraryFilingConflictReason(StrEnum):
+    """
+    Discriminator for the `POST /library/filings` 409, telling the caller which composed write collided so it can offer the right remedy. Named rather than left inline, pairing with `LibraryFilingConflictError` the way `ShowAlreadyOpenErrorCode` pairs with `ShowAlreadyOpenError`. `artist_code_conflict` and `artist_name_conflict` are the exact strings the deployed `POST /library/artists` controller already answers with — the composite reuses that create path; `rotation_card_bin_mismatch` is defined ahead of the Backend-Service implementation for the rotation arm's card-bin invariant, the same string `RotationConflictReason` declares for the direct `POST /library/rotation` and `DELETE /library/rotation/cards/{id}` 409s (WXYC/Backend-Service#2472, inherited by the composite per WXYC/Backend-Service#2474) — pinned equal by a spec test rather than composed, since OpenAPI enums do not merge cleanly across two purpose-built discriminators.
+
+    """
+
+    artist_code_conflict = "artist_code_conflict"
+    artist_name_conflict = "artist_name_conflict"
+    rotation_card_bin_mismatch = "rotation_card_bin_mismatch"
+
+
+class RotationConflictReason(StrEnum):
+    """
+    Discriminator for the 409s on `POST /library/rotation` and `DELETE /library/rotation/cards/{id}`, pairing with `RotationConflictError` the way `ShowAlreadyOpenErrorCode` pairs with `ShowAlreadyOpenError`. `rotation_card_bin_mismatch` is the single source of truth for the identically-named value `LibraryFilingConflictReason` carries for the composite's rotation arm — see that schema's description. The other two distinguish the card-delete guard's conjunctive halves: a sibling card with a higher `number` (`card_not_highest_in_bin`) vs. an active rotation row still assigned to this card (`card_has_active_rotations`). All three values are declared ahead of the Backend-Service implementation (WXYC/Backend-Service#2472, delivered by its open PR WXYC/Backend-Service#2482): the deployed backend has no rotation-card code path yet, so no endpoint raises them today — each endpoint's 409 states what the deployed behavior is meanwhile.
+
+    """
+
+    rotation_card_bin_mismatch = "rotation_card_bin_mismatch"
+    card_not_highest_in_bin = "card_not_highest_in_bin"
+    card_has_active_rotations = "card_has_active_rotations"
+
+
+class RotationConflictError(BaseModel):
+    """
+    The 409 body on `POST /library/rotation` and `DELETE /library/rotation/cards/{id}`, following `ShowAlreadyOpenError`.
+
+    """
+
+    message: str
+    reason: RotationConflictReason
+
+
+class LibraryFilingConflictError(BaseModel):
+    """
+    The `POST /library/filings` 409 body. Purpose-built rather than a `$ref` to the shared `ApiErrorResponse`, following `ShowAlreadyOpenError`: on the artist-conflict reasons a client is expected to ACT on the conflicting `artist` row (offer "use the existing artist instead" and resubmit with `kind: existing`), not merely display a message — and the deployed artist-create 409 shape `{message, reason, artist}` does not match `ApiErrorResponse` anyway.
+
+    """
+
+    message: str
+    reason: LibraryFilingConflictReason
+    artist: Artist | None = Field(
+        None,
+        description="The already-catalogued artist that collided. Present on `artist_code_conflict` (the holder of the taken `(code_letters, genre_id, code_number)` triple) and `artist_name_conflict` (the genre-scoped fold-matched name); absent on `rotation_card_bin_mismatch`, which has no artist to name.\n",
+    )
 
 
 class Rotation(BaseModel):
@@ -1035,6 +1234,73 @@ class Rotation(BaseModel):
         None,
         description="The library row's surrogate key (BS#1963). Nullable here (unlike AlbumSearchResult/BinLibraryDetails/AlbumInfoResponse): a library-unlinked rotation row has no library row at all, hence no legacy id.\n",
     )
+    card: RotationCard | None = None
+    urls: list[str] | None = Field(
+        None,
+        description="Storage order. Plain strings, not `format: uri` — MDs paste bare domains, so a value carries no scheme guarantee and a renderer must not bind one into an href without checking it. Deliberately an inline twin: `Rotation.urls` and `RotationEntry.urls` are pinned identical by a spec test rather than `$ref`ing a named array schema, because naming a top-level array makes the Python generator wrap the field in a RootModel (`.root` to reach the list) while every other target keeps a plain string list.\n",
+    )
+
+
+class RotationRowSummary(BaseModel):
+    """
+    One `rotation` row projected to its published ten-column surface — the shape `GET /library/rotation/uncatalogued`, `GET /library/rotation/{id}` and `PATCH /library/rotation/{rotation_id}/link` all share (Backend's `toRotationRowSummary`, BS#2109/BS#2410). Referent rule: `format_id` and `label_id` here are the **rotation row's own pre-catalog fields** — captured at rotation-add, written only while `album_id` is NULL, retained after linking. They never describe the linked library release; that is the opposite of `GET /library/rotation`, whose joined rows read library-side fields where a link exists.
+
+    """
+
+    id: int = Field(..., description="The rotation row's own id — the id Kill/Unkill/link act on.")
+    album_id: int | None = Field(
+        None,
+        description="Linked `library.id`, or null while uncatalogued. Rows from `/library/rotation/uncatalogued` are null by construction.\n",
+    )
+    rotation_bin: RotationBin
+    add_date: date_aliased = Field(
+        ...,
+        description="Always present — `rotation.add_date` is NOT NULL with a `defaultNow()`, and it is the queue's sort key (newest first).\n",
+    )
+    kill_date: date_aliased | None = Field(
+        None,
+        description="May be future-dated: a scheduled kill leaves the row active until the date passes.\n",
+    )
+    artist_name: str | None = None
+    album_title: str | None = None
+    record_label: str | None = Field(
+        None,
+        description="Free-text label snapshot. Retained even when `label_id` is set, for rows whose text never resolved to a `labels` row.\n",
+    )
+    format_id: int | None = Field(
+        None,
+        description="Pre-catalog `format(id)` reference (BS#2409). Null on every row created before the dj-site classic add form began sending it; the legacy backfill is WXYC/Backend-Service#2412.\n",
+    )
+    label_id: int | None = Field(
+        None,
+        description="Pre-catalog `labels(id)` reference (BS#2409). Same null population and backfill story as `format_id`.\n",
+    )
+
+
+class LinkRotationRequest(BaseModel):
+    album_id: conint(ge=1) = Field(..., description="The `library.id` to link the rotation row to.")
+
+
+class ArtistSearchMatch(BaseModel):
+    id: int
+    artist_name: str
+    code_letters: str
+    code_number: int = Field(
+        ...,
+        description="The artist's genre-scoped code number (`genre_artist_crossreference.artist_genre_code`) — one row per (artist, genre) membership, so a multi-genre artist appears once per genre with different numbers.\n",
+    )
+    genre_id: int | None = Field(
+        None,
+        description='The genre whose membership this row represents. Declared because the library-wide search (the mode with no `genre_id` parameter) returns memberships from mixed genres, where the row alone no longer says which genre its `code_number` belongs to.\nPresent on every row Backend returns, in both search modes: one query builder serves both, its `genre_artist_crossreference` and `genres` joins are INNER either way, and `genre_artist_crossreference.genre_id` is NOT NULL with an FK. Optional here all the same — no consumer requires the guarantee, and narrowing a published response field breaks any client generated against the loose shape. Read "optional" as "the contract declines to promise it", not "the server omits it".\n',
+    )
+    genre_name: str | None = Field(
+        None,
+        description="The genre's display name, from the same INNER join as `genre_id` (`genres.genre_name` is NOT NULL). Same treatment: returned on every row, optional in the contract for the same reason.\n",
+    )
+
+
+class ArtistSearchResponse(BaseModel):
+    artists: list[ArtistSearchMatch]
 
 
 class BinEntry(BaseModel):
@@ -1853,11 +2119,26 @@ class AlbumMetadata(BaseModel):
     discogs_url: str | None = None
     discogs_id: int | None = None
     release_year: int | None = None
-    spotify_url: str | None = None
-    apple_music_url: str | None = None
-    youtube_music_url: str | None = None
-    bandcamp_url: str | None = None
-    soundcloud_url: str | None = None
+    spotify_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    apple_music_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    youtube_music_url: str | None = Field(
+        None,
+        description="Search URL -- a query URL for the release, not a deep link to it. The two search fields are `youtube_music_url` and `soundcloud_url`; neither carries a `StreamingResolution` verdict, because a search URL can always be constructed and so has no probe/absence distinction. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations.\n",
+    )
+    bandcamp_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    soundcloud_url: str | None = Field(
+        None,
+        description="Search URL -- a query URL for the release, not a deep link to it. The two search fields are `youtube_music_url` and `soundcloud_url`; neither carries a `StreamingResolution` verdict, because a search URL can always be constructed and so has no probe/absence distinction. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations.\n",
+    )
     last_fetched: AwareDatetime | None = None
 
 
@@ -1941,11 +2222,26 @@ class StreamingLinks(BaseModel):
 
     """
 
-    spotify_url: str | None = Field(None, description="Spotify album URL")
-    apple_music_url: str | None = Field(None, description="Apple Music album URL")
-    youtube_music_url: str | None = Field(None, description="YouTube Music search URL")
-    bandcamp_url: str | None = Field(None, description="Bandcamp album URL")
-    soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
+    spotify_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    apple_music_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    youtube_music_url: str | None = Field(
+        None,
+        description="Search URL -- a query URL for the release, not a deep link to it. The two search fields are `youtube_music_url` and `soundcloud_url`; neither carries a `StreamingResolution` verdict, because a search URL can always be constructed and so has no probe/absence distinction. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations.\n",
+    )
+    bandcamp_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    soundcloud_url: str | None = Field(
+        None,
+        description="Search URL -- a query URL for the release, not a deep link to it. The two search fields are `youtube_music_url` and `soundcloud_url`; neither carries a `StreamingResolution` verdict, because a search URL can always be constructed and so has no probe/absence distinction. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations.\n",
+    )
 
 
 class StreamingResolutionStatus(StrEnum):
@@ -3514,11 +3810,26 @@ class FlowsheetEntryFields(BaseModel):
     discogsUnavailableNote: constr(max_length=500) | None = Field(
         None, description="Optional free-text reason for `discogsUnavailable`."
     )
-    spotify_url: str | None = None
-    apple_music_url: str | None = None
-    youtube_music_url: str | None = None
-    bandcamp_url: str | None = None
-    soundcloud_url: str | None = None
+    spotify_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    apple_music_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    youtube_music_url: str | None = Field(
+        None,
+        description="Search URL -- a query URL for the release, not a deep link to it. The two search fields are `youtube_music_url` and `soundcloud_url`; neither carries a `StreamingResolution` verdict, because a search URL can always be constructed and so has no probe/absence distinction. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations.\n",
+    )
+    bandcamp_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    soundcloud_url: str | None = Field(
+        None,
+        description="Search URL -- a query URL for the release, not a deep link to it. The two search fields are `youtube_music_url` and `soundcloud_url`; neither carries a `StreamingResolution` verdict, because a search URL can always be constructed and so has no probe/absence distinction. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations.\n",
+    )
     artist_bio: str | None = None
     artist_wikipedia_url: str | None = None
     track_position: str | None = Field(
@@ -3593,11 +3904,26 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
     artwork_url: str | None = None
     discogs_url: str | None = None
     release_year: int | None = None
-    spotify_url: str | None = None
-    apple_music_url: str | None = None
-    youtube_music_url: str | None = None
-    bandcamp_url: str | None = None
-    soundcloud_url: str | None = None
+    spotify_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    apple_music_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    youtube_music_url: str | None = Field(
+        None,
+        description="Search URL -- a query URL for the release, not a deep link to it. The two search fields are `youtube_music_url` and `soundcloud_url`; neither carries a `StreamingResolution` verdict, because a search URL can always be constructed and so has no probe/absence distinction. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations.\n",
+    )
+    bandcamp_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    soundcloud_url: str | None = Field(
+        None,
+        description="Search URL -- a query URL for the release, not a deep link to it. The two search fields are `youtube_music_url` and `soundcloud_url`; neither carries a `StreamingResolution` verdict, because a search URL can always be constructed and so has no probe/absence distinction. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations.\n",
+    )
     artist_bio: str | None = None
     artist_wikipedia_url: str | None = None
     on_streaming: bool | None = Field(
@@ -3658,12 +3984,45 @@ class FlowsheetV2PaginatedResponse(BaseModel):
 
 
 class ShowPlaylist(BaseModel):
-    show_name: str | None = None
-    specialty_show: str | None = None
-    start_time: AwareDatetime | None = None
-    end_time: AwareDatetime | None = None
-    show_djs: list[OnAirDJ] | None = None
-    entries: list[FlowsheetEntryResponse] | None = None
+    """
+    The response of `GET /flowsheet/playlist?show_id=` — one archived show, its entries, and the ids of the shows either side of it.
+
+    The handler spreads the whole `shows` row, then adds the resolved specialty-show name, the show's DJs, the two neighbour ids and the projected entries. Every property below is therefore always present on the wire; the nullable ones carry `null`, they are not omitted. This schema previously described a shape the route has not emitted for some time: it declared `specialty_show` (emitted as `specialty_show_name`), typed `entries` as the V1 `FlowsheetEntryResponse` (emitted as the V2 discriminated union), declared no identifier at all, omitted the six `shows` columns the spread ships, and `$ref`ed `OnAirDJ`, whose `dj_name` is non-nullable where this route's is not.
+    """
+
+    id: int = Field(
+        ...,
+        description="`shows.id` — the same value passed as `show_id`, and the value to pass back for a neighbour. The row is spread, so the key is `id`, not `show_id`.",
+    )
+    specialty_id: int | None = Field(...)
+    show_name: str | None = Field(...)
+    start_time: AwareDatetime
+    end_time: AwareDatetime | None = Field(
+        ...,
+        description='Null does NOT mean "still on the air". It has two causes this column cannot distinguish: the show is genuinely live, or its `show_end` delivery was dropped and the column stayed null permanently. 2,813 of the ~2,814 null-`end_time` shows are legacy imports going back to 2006.',
+    )
+    primary_dj_id: str | None = Field(...)
+    legacy_show_id: int | None = Field(...)
+    legacy_dj_name: str | None = Field(...)
+    legacy_dj_id: int | None = Field(...)
+    dj_name_override: str | None = Field(...)
+    specialty_show_name: str = Field(
+        ...,
+        description="The resolved specialty-show name, or the empty string when the show is not a specialty show. Empty string, never null.",
+    )
+    show_djs: list[ShowPlaylistDJ]
+    previous_show_id: int | None = Field(
+        ...,
+        description="The show that aired immediately before this one, or null on the oldest show in the archive.\n\nOrdered by `(start_time, id)`, not by `id`: ids were airtime-ordered while tubafrenzy assigned them, but the import left 32 of ~72,900 shows carrying a lower id than a show that aired earlier. Null is the end of the archive and nothing else — never `0`, the sentinel the legacy JSP linked to and then failed to resolve.",
+    )
+    next_show_id: int | None = Field(
+        ...,
+        description="The show that aired immediately after this one, or null on the newest show.\n\nPoints at the live show while one is on the air: nothing filters on `end_time` (see the field's own note), matching the legacy behaviour. A client caching this response should exclude the newest show — the hazard is freezing a null `next_show_id` after a later show has started, not linking to a show still in progress.",
+    )
+    entries: list[Entries] = Field(
+        ...,
+        description="The V2 discriminated union, the same shape `GET /flowsheet` serves. The handler projects through `projectEntriesV2`; there is no V1 variant of this response.",
+    )
 
 
 class ShowPeek(BaseModel):
@@ -3699,6 +4058,10 @@ class AlbumSearchResult(BaseModel):
     artist_dist: float | None = None
     rotation_bin: RotationBin | None = None
     rotation_id: int | None = None
+    card: RotationCard | None = Field(
+        None,
+        description="The card this release is on, from the same CURRENT_DATE-filtered JOIN as rotation_bin. Non-null only while actively rotating, never on a killed row.\n",
+    )
     plays: int | None = None
     on_streaming: bool | None = Field(
         None,
@@ -3735,6 +4098,11 @@ class AlbumSearchResult(BaseModel):
     matched_via_alias: list[ArtistMatchHint] | None = Field(
         None,
         description="Populated by Backend's catalog search when an artist-alias match (from `artist_search_alias`) drove this release into the results, per artist-search-alias plan PR 5. Sibling field to `matched_via` (which is track-title provenance). Empty or absent on normal artist/album hits. Backward-compatible — existing consumers ignore the field.\n",
+    )
+    urls: list[Url] | None = Field(
+        None,
+        description="The release's definitive external links (label page, Bandcamp, streaming, press), in storage order — position IS the contract, so a consumer renders them in array order. Plain strings, not `format: uri` — MDs paste bare domains, so a value carries no scheme guarantee and a renderer must not bind one into an href without checking it. Release-scoped and rotation-independent: set replace-wholesale via `PUT /library/{id}/urls`. Bounded identically to that write shape (`AlbumUrlsUpdate.urls`) and `RotationCreateFields.urls` — at most 20 links, 2048 characters each — so the one `urls` vocabulary is the same on read and write. Optional here (never required) and absent until Backend-Service persists it (BS#2491); a consumer must tolerate its absence.\n",
+        max_length=20,
     )
 
 
@@ -3829,6 +4197,11 @@ class AlbumDetail(BaseModel):
         None,
         description="Stamped on every recheck attempt by the\n`library-discogs-unavailable-recheck` cron. Read-only from the\nclient side.\n",
     )
+    urls: list[Url] | None = Field(
+        None,
+        description="The release's definitive external links (label page, Bandcamp, streaming, press), in storage order — position IS the contract, so a consumer renders them in array order. Plain strings, not `format: uri` — MDs paste bare domains, so a value carries no scheme guarantee and a renderer must not bind one into an href without checking it. Release-scoped and rotation-independent: set replace-wholesale via `PUT /library/{id}/urls`. Same `urls` vocabulary and bounds as the search read (`AlbumSearchResult.urls`) and the write shape (`AlbumUrlsUpdate.urls`) — at most 20 links, 2048 characters each. Optional here (never required) and absent until Backend-Service persists it (BS#2491); a consumer must tolerate its absence.\n",
+        max_length=20,
+    )
     reconciled_identity: ReconciledIdentity | None = None
 
 
@@ -3872,11 +4245,26 @@ class DiscogsMatchResult(BaseModel):
     release_year: int | None = Field(None, description="Release year from Discogs")
     artist_bio: str | None = Field(None, description="Artist biography from Discogs profile")
     wikipedia_url: str | None = Field(None, description="Wikipedia URL for the artist")
-    spotify_url: str | None = Field(None, description="Spotify album URL")
-    apple_music_url: str | None = Field(None, description="Apple Music album URL")
-    youtube_music_url: str | None = Field(None, description="YouTube Music search URL")
-    bandcamp_url: str | None = Field(None, description="Bandcamp album URL")
-    soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
+    spotify_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    apple_music_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    youtube_music_url: str | None = Field(
+        None,
+        description="Search URL -- a query URL for the release, not a deep link to it. The two search fields are `youtube_music_url` and `soundcloud_url`; neither carries a `StreamingResolution` verdict, because a search URL can always be constructed and so has no probe/absence distinction. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations.\n",
+    )
+    bandcamp_url: str | None = Field(
+        None,
+        description="Album deep link -- a URL for this specific release. The three deep-link fields are `spotify_url`, `apple_music_url`, and `bandcamp_url`; they are the services that carry a `StreamingResolution` verdict. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations -- `bandcamp_url` is not host-checked at every seam it passes through.\n",
+    )
+    soundcloud_url: str | None = Field(
+        None,
+        description="Search URL -- a query URL for the release, not a deep link to it. The two search fields are `youtube_music_url` and `soundcloud_url`; neither carries a `StreamingResolution` verdict, because a search URL can always be constructed and so has no probe/absence distinction. Contract-level `format: uri` only. TypeScript (`string | null`) and Swift (`String?`) treat `format: uri` as documentation-only; this repo's Python codegen pin (`pin_streaming_url_fields_to_str`, WXYC/wxyc-shared#428) holds Python to `str`, and the two downstream Python regen scripts (library-metadata-lookup, request-o-matic) must adopt the same pin -- tracked in WXYC/library-metadata-lookup#1299 and WXYC/request-o-matic#282 -- a Python consumer's `str` holds only where that pin is in place. Kotlin does not treat it as documentation-only: its generator maps `format: uri` to `java.net.URI`, so Kotlin consumers regenerating models must pin these five fields to `String` (as Python pins to `str`) or accept construction-time parse failures on rows stored before 2026-08-31. Shape enforcement lives at two runtime seams, both shipped: the Backend-Service LML-response boundary guard (`sanitizeLookupStreamingUrls`, WXYC/Backend-Service#2351) -- a host allowlist for spotify/apple_music/youtube_music/soundcloud, and well-formedness only for bandcamp (deliberate: custom-domain deep links, see the guard's own doc comment) -- and the LML read seam (`streaming_links` copy-out, `lookup/enrichment/streaming_link_validation.py`, WXYC/library-metadata-lookup#1296; read-path suppression -- the persisted row is never rewritten) -- a host check on all five, plus a well-formedness floor on youtube_music/bandcamp/soundcloud only. Those are the two seams that enforce shape, not every path these fields reach the wire through: neither is on the Backend-Service flowsheet read path, where `GET /flowsheet` host-guards only `spotify_url`/`apple_music_url` (WXYC/Backend-Service#1714) and emits the other three as stored, so a row persisted before 2026-08-31 can still carry an unchecked value. The two seams deliberately disagree on bandcamp because they see different URL populations.\n",
+    )
     streaming_status: StreamingResolution | None = Field(
         None,
         description="Per-service streaming resolution status (verified / absent / unresolved) for this result, disambiguating WHY a sibling `*_url` field is null. A service marked `unresolved` timed out, had its enrichment tail shed, or was a cold cache miss — its null url is transient and MAY resolve on a later retry; `absent` means the service was consulted and genuinely has no match — its null url is terminal and must NOT be re-probed (re-asking `absent` is the per-play LML-call amplifier BS#1747 killed). A service whose key is OMITTED from this object was never consulted (e.g. Bandcamp on the `/lookup/bulk` path, or the library.db override skipped for a non-library row) and must not be treated as `absent`. Additive and optional: null/omitted on responses from an LML predating the producer rollout, or on paths that resolve no per-service status. Does not change the meaning of the `*_url` fields — it only annotates them. Emitted identically on `/lookup` and `/lookup/bulk` (the LML#681 parity rule). Mirrors the per-service verdict vocabulary of `/api/v1/streaming-check` (LML#376). See LML#1053 / BS#1819.\n",
