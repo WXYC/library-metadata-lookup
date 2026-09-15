@@ -56,6 +56,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT="$PROJECT_DIR/generated/api_models.py"
 
+# The five streaming URL fields WXYC/wxyc-shared#428 annotated with
+# `format: uri`, which datamodel-codegen maps to pydantic AnyUrl. Held at `str`
+# below; see pin_streaming_url_fields_to_str().
+STREAMING_URL_FIELDS=(
+    spotify_url
+    apple_music_url
+    youtube_music_url
+    bandcamp_url
+    soundcloud_url
+)
+
 REF="${WXYC_SHARED_REF:-}"
 DOWNLOAD_ONLY=0
 while [[ $# -gt 0 ]]; do
@@ -204,6 +215,90 @@ echo "Generating Python models..."
     --use-schema-description \
     --custom-file-header "# Generated from wxyc-shared/api.yaml -- do not edit manually.
 # Regenerate with: bash scripts/generate_api_models.sh"
+
+# The WXYC/wxyc-shared#428 pin (LML#1299), ported from that repo's canonical
+# scripts/generate-python-models.sh. The canonical rationale lives there and is
+# NOT restated here -- read it before changing either copy. The LML-specific
+# stake: `format: uri` makes pydantic validate at DECODE time, so an unpinned
+# regen turns every malformed streaming_links row already in this service's
+# database into a hard read failure. Three `format: uri` fields are deliberately
+# out of scope (the archive presigned-GET `url`, the OAuth device-flow
+# `verification_uri`/`verification_uri_complete`): they carry no stored data and
+# #428's decision does not cover them, which is why this is a name-keyed
+# substitution over the five and not a codegen-wide type override -- both
+# --field-constraints and --strict-types are file-wide once any override targets
+# `format: uri`.
+#
+# Ported rather than migrated onto the canonical script: that migration replaces
+# a ~10KB fork wholesale (LML's copy has its own download/auth branch, LML#1205,
+# and a known divergence in WXYC/wxyc-shared#369) and is a refactor with its own
+# review surface. This PR has to unblock Codegen Freshness; the two shouldn't
+# ride together. Migration stays available as a follow-up.
+pin_streaming_url_fields_to_str() {
+    local field
+    for field in "${STREAMING_URL_FIELDS[@]}"; do
+        sed -E "s/^([[:space:]]*${field}: )AnyUrl/\1str/" "$OUTPUT" > "$OUTPUT.pin-tmp"
+        mv "$OUTPUT.pin-tmp" "$OUTPUT"
+    done
+}
+
+# The substitution above is line-anchored on `fieldname: AnyUrl`, which is only
+# ONE shape the generator can emit -- `Annotated[AnyUrl | None, Field(...)]`
+# defeats it and every substitution silently no-ops while returning 0. That is
+# the pin failing OPEN, so the post-condition cannot itself be another anchored
+# regex: it parses the output and asks whether AnyUrl appears ANYWHERE in each
+# pinned field's annotation, which covers shapes nobody has anticipated yet.
+# tests/unit/test_generate_api_models_pin.py drives both failure modes.
+verify_streaming_url_fields_pinned() {
+    local python_cmd=()
+    if command -v python3 &> /dev/null; then
+        python_cmd=(python3)
+    elif command -v python &> /dev/null; then
+        python_cmd=(python)
+    elif command -v uv &> /dev/null; then
+        python_cmd=(uv run --no-project --python 3.12 python3)
+    else
+        echo "Error: no Python interpreter found to verify the #428 pin (need python3, python, or uv)." >&2
+        exit 1
+    fi
+
+    STREAMING_URL_FIELDS_CSV="$(IFS=,; echo "${STREAMING_URL_FIELDS[*]}")" OUTPUT="$OUTPUT" \
+        "${python_cmd[@]}" -c '
+import ast
+import os
+import sys
+
+output_path = os.environ["OUTPUT"]
+fields = set(os.environ["STREAMING_URL_FIELDS_CSV"].split(","))
+
+with open(output_path, "r", encoding="utf-8") as f:
+    source = f.read()
+
+tree = ast.parse(source, filename=output_path)
+offenders = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        if node.target.id in fields:
+            annotation_src = ast.unparse(node.annotation)
+            if "AnyUrl" in annotation_src:
+                offenders.append(f"{node.target.id} (line {node.lineno}): {annotation_src}")
+
+if offenders:
+    sys.stderr.write(
+        "#428 pin did not apply -- the following streaming URL fields still "
+        "carry AnyUrl in their generated annotation (pin_streaming_url_fields_to_str "
+        "silently no-op'\''d, most likely because the generator emitted a shape its "
+        "sed pattern does not match):\n"
+    )
+    for offender in offenders:
+        sys.stderr.write(f"  - {offender}\n")
+    sys.exit(1)
+'
+}
+
+echo "Pinning streaming URL fields to str (#428)..."
+pin_streaming_url_fields_to_str
+verify_streaming_url_fields_pinned
 
 # Format with ruff. Both steps are load-bearing: byte-equality against this
 # output is the entire drift contract the Codegen Freshness job checks, so a
