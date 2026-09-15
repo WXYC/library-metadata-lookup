@@ -62,6 +62,14 @@ def _install_env_recording_stub(tmp_path: Path, name: str) -> None:
     Used for the codegen/ruff stages, which the curl stub can't stand in for:
     the sibling-checkout arm never runs curl at all, so the token-scrub
     property has to be observed at the tools that actually run after it.
+
+    The stub also creates the file named by ``--output`` when it is passed one.
+    The real generator always writes that file, and since LML#1299 the script
+    reads it back between codegen and ruff to verify the #428 pin applied — so
+    a stub that records its environment and produces nothing aborts the run
+    before ``ruff`` is ever reached, and this suite's subject (the scrub, at
+    every tool) would go unobserved. An empty file parses cleanly and carries no
+    ``AnyUrl``, so the post-condition passes and the stages under test still run.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -69,6 +77,12 @@ def _install_env_recording_stub(tmp_path: Path, name: str) -> None:
     stub.write_text(
         "#!/usr/bin/env bash\n"
         f"env | grep -E '^(GITHUB_TOKEN|GH_TOKEN)=' > \"{tmp_path}/{name}.env\" || true\n"
+        'out=""\n'
+        "while [[ $# -gt 0 ]]; do\n"
+        '  if [[ "$1" == "--output" ]]; then out="$2"; shift; fi\n'
+        "  shift\n"
+        "done\n"
+        'if [[ -n "$out" ]]; then mkdir -p "$(dirname "$out")"; : > "$out"; fi\n'
         "exit 0\n"
     )
     stub.chmod(0o755)
