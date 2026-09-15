@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from lookup.rowless import ROWLESS_LIBRARY_ID, _make_rowless_item
 from lookup.validation import Step3bResult, apply_track_validation_cascade
 from tests.factories import make_library_item
 
@@ -235,3 +236,69 @@ class TestApplyTrackValidationCascade:
             )
 
         assert result == Step3bResult([compilation_item], False, {})
+
+    async def test_shelved_row_named_by_the_song_beats_the_a4_rowless_release(self):
+        """A row-less external release must not outrank a shelved row the request named.
+
+        Prod trace, 2026-09-14 19:43:37 PT — "Minimoonstar by Ricardo Villalobos".
+        WXYC shelves the CD as *Minimoonstar* (VI 10/2); Discogs titles the same
+        record — release 1350337 — *Vasco EP Part 1*, carrying "Minimoonstar" as a
+        track. Per-result validation can't confirm the track, so A4 asks the PG
+        cache, which confirms it on 1350337 and then matches back by **album
+        title** (``search_album_fuzzy(db, release.album)``). Nothing in the catalog
+        is titled "Vasco EP Part 1", so A4 concludes the release is not in the
+        library and surfaces it row-less — stepping over the shelved row for the
+        same physical record, which is also the row the listener named.
+
+        A4 returning first denies the LML#717 tier its say: "Minimoonstar" scores
+        100 against the row's title, well over ``_SONG_AS_ALBUM_TITLE_FLOOR``.
+
+        The consequence is user-visible, not cosmetic. request-o-matic strips
+        ``id=0`` rows from the request channel (``routers/request.py``, ROM#256)
+        because a DJ can't pull a non-shelved album, then re-derives
+        ``song_not_found`` from what survives — so the row-less answer reaches the
+        DJ as '"Minimoonstar" by Ricardo Villalobos not found in library' about a
+        CD sitting at VI 10/2.
+
+        Boundary: ``test_a4_cached_track_promotion_wins_after_validation_miss``
+        above pins A4 still winning when no surviving row's title answers the
+        request. This test narrows A4, it does not disable it.
+        """
+        shelved = make_library_item(
+            id=43063,
+            artist="Ricardo Villalobos",
+            title="Minimoonstar",
+            call_letters="VI",
+            artist_call_number=10,
+            release_call_number=2,
+        )
+        rowless = _make_rowless_item(artist="Ricardo Villalobos", title="Vasco EP Part 1")
+        with (
+            patch(
+                "lookup.validation.filter_results_by_track_validation",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "lookup.validation.find_library_albums_with_cached_track",
+                new_callable=AsyncMock,
+                return_value=([rowless], {ROWLESS_LIBRARY_ID: "resolved-1350337"}),
+            ),
+        ):
+            result = await apply_track_validation_cascade(
+                real_results=[shelved],
+                library_results=[shelved],
+                found_on_compilation=False,
+                song_not_found=True,
+                discogs_titles={},
+                artist_fallback_results=[],
+                song="Minimoonstar",
+                artist="Ricardo Villalobos",
+                match_artist="Ricardo Villalobos",
+                db=object(),
+                discogs_service=object(),
+                allow_release_resolution_fallback=True,
+            )
+
+        assert result.library_results == [shelved]
+        assert result.song_not_found is False

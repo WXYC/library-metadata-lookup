@@ -332,6 +332,19 @@ def _filter_results_by_song_as_album_title(
     return matches
 
 
+def _is_rowless_only(items: list[LibraryItem]) -> bool:
+    """True when every row in ``items`` is the id=0 carry-through sentinel.
+
+    Separates A4's two return shapes: shelved library rows the Discogs cache
+    confirmed (strong — it promotes over the unvalidated fallback) from the
+    single row-less release it synthesizes when nothing in the catalog
+    artist-matched (weak — it is an assertion that the library does not have
+    the record, reached through a title-keyed match-back that a
+    catalog/Discogs title divergence defeats).
+    """
+    return bool(items) and all(item.id == ROWLESS_LIBRARY_ID for item in items)
+
+
 @dataclass
 class Step3bResult:
     """Outcome of :func:`apply_track_validation_cascade`, ready to rebind onto ``LookupState``."""
@@ -369,13 +382,17 @@ async def apply_track_validation_cascade(
 ) -> Step3bResult:
     """Step-3b policy cascade: sequence the tiers that promote/narrow ``library_results``.
 
-    Not-on-a-compilation tier: per-result Discogs track validation over
-    ``real_results`` (``filter_results_by_track_validation``); on a total miss,
-    the LML#629 A4 cached-track safety net
-    (``find_library_albums_with_cached_track``); on a further miss, the
-    LML#717 song-as-album-title promotion over ``library_results``
-    (``_filter_results_by_song_as_album_title``) — each promotes over the
-    previous tier's result only when it finds something.
+    Not-on-a-compilation tier, strongest evidence first: per-result Discogs
+    track validation over ``real_results``
+    (``filter_results_by_track_validation``); on a total miss, the LML#629 A4
+    cached-track safety net (``find_library_albums_with_cached_track``) when it
+    promotes **shelved** rows; on a further miss, the LML#717
+    song-as-album-title promotion over ``library_results``
+    (``_filter_results_by_song_as_album_title``); and last, A4's **row-less**
+    carry-through, which asserts the library does not have the record and so
+    ranks below any shelved row that answers the request (see the comment at
+    that branch for the title-divergence shape it gets wrong). Each promotes
+    over the previous tier's result only when it finds something.
 
     On-a-compilation tier: validates the artist-fallback rows saved before
     ``TRACK_ON_COMPILATION`` replaced them, and prepends any confirmed matches
@@ -412,9 +429,10 @@ async def apply_track_validation_cascade(
             match_artist=match_artist,
             allow_release_resolution_fallback=allow_release_resolution_fallback,
         )
-        if promoted:
-            # A4 (LML#629): a row-less promotion carries its resolved release
-            # on the seam so Step 4 binds discogs_url by id.
+        if promoted and not _is_rowless_only(promoted):
+            # A4's in-library promotion (LML#629): shelved rows whose Discogs
+            # tracklist the cache confirms. Strongest tier below per-result
+            # validation, so it still runs first.
             return Step3bResult(promoted, False, {**discogs_titles, **promoted_titles})
 
         # Last resort before declaring song-not-found: the request shape
@@ -431,6 +449,32 @@ async def apply_track_validation_cascade(
                 f"'{song}' — treating as album request"
             )
             return Step3bResult(title_matches, False, discogs_titles)
+
+        if promoted:
+            # A4's row-less carry-through (LML#629), now ordered behind the
+            # shelf rather than ahead of it. It fires when the cache confirms
+            # the track on a release *no library row artist-matches* — but that
+            # match-back is keyed on album title
+            # (``search_album_fuzzy(db, release.album)``), so a catalog/Discogs
+            # title divergence reads as "not in the library" when the record is
+            # on the shelf. Prod, 2026-09-14: WXYC files release 1350337 as
+            # *Minimoonstar*; Discogs titles it *Vasco EP Part 1*, with
+            # "Minimoonstar" as a track. A4 confirmed the track, missed the row,
+            # and surfaced the same physical record row-less — over a shelved
+            # row the listener had named exactly.
+            #
+            # The consequence is not cosmetic: request-o-matic strips id=0 rows
+            # from the request channel (``routers/request.py``, ROM#256) because
+            # a DJ cannot pull a non-shelved album, then re-derives
+            # ``song_not_found`` from what survives. A row-less answer that
+            # displaced a shelf row therefore reaches the DJ as
+            # '"<song>" by <artist> not found in library'.
+            #
+            # A row-less release is the weakest thing this tier can return, so
+            # it yields to any shelved row that answers the request and keeps
+            # its seam entry for everything else.
+            return Step3bResult(promoted, False, {**discogs_titles, **promoted_titles})
+
         return Step3bResult(library_results, song_not_found, discogs_titles)
 
     # Compilation found, but the artist's own album may also contain the
