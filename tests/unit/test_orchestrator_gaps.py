@@ -1475,6 +1475,39 @@ class TestTrackOnCompilationAttemptDemotion:
         assert outcome.preserve_prior_results_as_fallback is False
 
     @pytest.mark.asyncio
+    async def test_last_resort_items_never_displace_a_prior_strategy_result(self):
+        """A last-resort hit speaks only when nothing else has.
+
+        Prod trace, 2026-09-14 19:43:37 PT — "Minimoonstar by Ricardo Villalobos".
+        ARTIST_PLUS_ALBUM's artist+song FTS branch had already surfaced the shelved
+        *Minimoonstar* row (VI 10/2) when this strategy ran, found 0 Discogs
+        releases for the track, and fell to the L1018 keyword branch. LML#1239
+        demotes that hit to ``artist_fallback`` rather than asserting it — but
+        ``_apply`` *replaces* ``state.results`` with an Outcome's items, so the
+        demoted guess still evicted the row a stronger strategy had confirmed by
+        name, and that eviction is what step 3b then validated.
+
+        Demoting the claim is not enough while the row still displaces its
+        betters. An unvalidated keyword hit is the weakest evidence the cascade
+        produces; it must not overwrite results already in hand.
+        """
+        prior = _item(id=43063, artist="Ricardo Villalobos", title="Minimoonstar")
+        keyword_hit = _item(id=40001, artist="Ricardo Villalobos", title="Fabric 36")
+        execute = AsyncMock(return_value=([keyword_hit], {}))
+        strategy = TrackOnCompilation(db=AsyncMock(), execute=execute)
+        parsed = ParsedRequest(artist="Ricardo Villalobos", song="Minimoonstar", raw_message="x")
+        state = SearchState(results=[prior])
+        state.song_not_found = True
+
+        outcome = await strategy.attempt(parsed, state, "x")
+        _apply(state, outcome)
+
+        assert state.results == [prior]
+        # The strategy's gate is ``song_not_found``; leaving it set keeps step 3b
+        # running exactly as the demotion intended.
+        assert state.song_not_found is True
+
+    @pytest.mark.asyncio
     async def test_tracklist_validated_items_still_confirm(self):
         """A genuinely validated match (registered in ``discogs_titles``) is
         unaffected -- still the full ``Outcome.compilation()`` signal."""

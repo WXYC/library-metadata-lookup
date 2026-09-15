@@ -166,6 +166,18 @@ class TrackOnCompilation:
             # keyword-search hit without ever consulting a tracklist. Return
             # it demoted -- a plausible artist row, not a confirmed find --
             # rather than asserting a match nothing has verified.
+            #
+            # Demoting the claim is only half of it: ``_apply`` replaces
+            # ``state.results`` wholesale, so a demoted guess still *evicts*
+            # whatever a prior strategy found -- in the prod trace, the shelved
+            # row ARTIST_PLUS_ALBUM had already matched by name -- and step 3b
+            # then validates the eviction rather than the row. Unvalidated
+            # keyword output is the weakest evidence this cascade produces, so
+            # it speaks only when nothing else has. ``song_not_found`` is this
+            # strategy's own gate and is already True, so the no-op leaves the
+            # downstream cascade exactly where ``artist_fallback`` would have.
+            if state.results:
+                return Outcome.empty()
             return Outcome.artist_fallback(items)
         return Outcome.compilation(items, discogs_titles=discogs_titles)
 
