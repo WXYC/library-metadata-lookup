@@ -206,3 +206,56 @@ async def test_cached_track_flag_off_no_rowless_release(library_db, disable_nonl
         r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
         for r in response.results
     )
+
+
+# A shelved Perry album whose title a listener can type as the "song" — the
+# request shape request-o-matic routes as ``song=<album title>``.
+SHELVED_ALBUM = "Dub Fire"
+SHELVED_ALBUM_ID = 12684
+
+
+@pytest.mark.asyncio
+async def test_shelved_row_named_by_the_song_outranks_the_rowless_release(
+    library_db, enable_nonlibrary_release
+):
+    """A title-divergent A4 hit must not bury the shelf row the listener named.
+
+    A4's match-back is keyed on album *title*
+    (``search_album_fuzzy(db, release.album)``), so whenever WXYC and Discogs
+    title the same record differently, A4 confirms the track, fails to find the
+    row, and asserts the library does not have it. Prod, 2026-09-14: WXYC files
+    release 1350337 as *Minimoonstar*, Discogs as *Vasco EP Part 1*; the DJ who
+    asked for "Minimoonstar by Ricardo Villalobos" was told it was not in the
+    library while the CD sat at VI 10/2.
+
+    Seeded here with the same shape: the listener names a shelved album
+    (``Dub Fire``) that arrives as ``song``, the live probes confirm nothing, and
+    the cache confirms the track on a release the catalog does not carry under
+    that title. The shelf row must win.
+
+    The false-positive side of the protocol is
+    ``test_cached_track_surfaces_rowless_release_end_to_end`` above: same service,
+    same cache hit, a ``song`` no shelved album answers — and the row-less release
+    still surfaces. This narrows A4; it does not disable it.
+    """
+    svc = _service(with_cache_hit=True)
+
+    request = LookupRequest(
+        artist=ARTIST, song=SHELVED_ALBUM, raw_message=f"{SHELVED_ALBUM}, {ARTIST}"
+    )
+    response = await perform_lookup(
+        request,
+        library_db,
+        svc,
+        telemetry=make_lml_telemetry(),
+        discogs_cache_pg=None,
+        allow_release_resolution_fallback=True,
+    )
+
+    assert [r.library_item.id for r in response.results] == [SHELVED_ALBUM_ID]
+    assert not any(r.library_item.id == 0 for r in response.results)
+    # The album was found, so the response must not caveat — this is the field
+    # request-o-matic re-derives its '"<song>" by <artist> not found in library'
+    # line from once it strips row-less rows (ROM#256).
+    assert response.song_not_found is False
+    assert response.context_message is None
