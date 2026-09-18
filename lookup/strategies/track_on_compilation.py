@@ -60,6 +60,7 @@ from lookup.matching import (
     _FETCH_LIMIT,
     MAX_SEARCH_RESULTS,
     WAVE_A_SEARCH_LIMIT,
+    album_title_acceptable,
     artist_matches_item,
     library_artist_for,
     limit_results,
@@ -179,7 +180,53 @@ class TrackOnCompilation:
             if state.results:
                 return Outcome.empty()
             return Outcome.artist_fallback(items)
+        carried = discogs_titles.get(ROWLESS_LIBRARY_ID)
+        if carried is not None and not carried.track_confirmed:
+            return _unconfirmed_album_outcome(parsed, state, items, discogs_titles)
         return Outcome.compilation(items, discogs_titles=discogs_titles)
+
+
+def _unconfirmed_album_outcome(
+    parsed: ParsedRequest,
+    state: SearchState,
+    items: list[LibraryItem],
+    discogs_titles: dict[int, ResolvedRelease],
+) -> Outcome:
+    """Surface the LML#1318 album-level degrade honestly.
+
+    The row-less carve failed to resolve the typed TRACK and the kernel
+    degraded to the typed ``(artist, album)`` album-level match
+    (``track_confirmed=False`` on the carried :class:`ResolvedRelease`).
+    Claiming ``Outcome.compilation`` here would assert a track find nothing
+    verified — exactly the ``direct|compilation`` set Backend-Service's
+    track-context trust gate accepts. Two shapes instead:
+
+    - **A surfaced row already answers the typed pair** (ARTIST_PLUS_ALBUM's
+      direct match with the song merely unconfirmed): contribute nothing.
+      That IS the library-lane behavior the degrade mirrors — the shelf row
+      keeps carrying the album metadata, and a row-less duplicate of a
+      shelved record is the LML#629 Minimoonstar failure class.
+    - **Otherwise**: lead with the row-less album answer (artwork binds to
+      position 0) and keep any prior artist-fallback rows *behind* it rather
+      than evicting them — the LML#1184 presentation, applied at the outcome
+      site because ``_apply`` replaces ``state.results`` wholesale and the
+      not-on-compilation step-3b tier has no re-merge lane for this shape.
+      ``song_not_found`` stays True, so ``get_search_type_from_state``'s
+      TRACK_ON_COMPILATION branch derives ``fallback``.
+    """
+    match_artist = library_artist_for(parsed) or ""
+    album_lower = (parsed.album or "").strip().lower()
+    pair_already_answered = album_lower and any(
+        r.id != ROWLESS_LIBRARY_ID
+        and artist_matches_item(r, match_artist)
+        and album_title_acceptable(album_lower, (r.title or "").lower())
+        for r in state.results
+    )
+    if pair_already_answered:
+        return Outcome.empty()
+    merged = list(items)
+    merged.extend(r for r in state.results if r.id != ROWLESS_LIBRARY_ID)
+    return Outcome.unconfirmed_album(merged[:MAX_SEARCH_RESULTS], discogs_titles=discogs_titles)
 
 
 _ProbeResult = TrackReleasesResponse | tuple[TrackReleasesResponse | None, str | None]

@@ -574,6 +574,31 @@ class Outcome:
         )
 
     @classmethod
+    def unconfirmed_album(
+        cls, items: list[LibraryItem], *, discogs_titles: "dict[int, ResolvedRelease]"
+    ) -> "Outcome":
+        """An album-level answer whose TRACK was never confirmed (LML#1318).
+
+        TRACK_ON_COMPILATION's degrade shape: its row-less carve failed to
+        resolve the typed track, and the kernel degraded to the typed
+        ``(artist, album)`` album-level match instead (a ``ResolvedRelease``
+        with ``track_confirmed=False`` riding ``discogs_titles``). The album
+        metadata and artwork persist, but the claim stays honest:
+
+        - ``song_not_found_after=True`` — the track was NOT matched, and
+          Backend-Service's track-context trust gate must be able to see that
+          (``search_type`` derives to ``fallback`` from this flag via
+          ``get_search_type_from_state``'s TRACK_ON_COMPILATION branch).
+        - no ``found_on_compilation`` — asserting a compilation find here
+          would put the response inside the ``direct|compilation`` set the
+          trust gate accepts.
+        - no stash: the caller merges any prior artist-fallback rows into
+          ``items`` itself (the LML#1184 presentation — typed-pair answer
+          first, the artist's shelf rows behind it), so nothing is evicted.
+        """
+        return cls(items=items, song_not_found_after=True, discogs_titles=discogs_titles)
+
+    @classmethod
     def track_match(
         cls,
         items: list[LibraryItem],

@@ -1,7 +1,9 @@
 """Row-less / non-library release synthesis for the lookup pipeline.
 
-Home of the LML#628 "A1 carry-through" kernel (``_resolve_nonlibrary_release``
-and its #632 cache re-hydrate ``_rehydrate_resolved_release``), the LML#631
+Home of the LML#628 "A1 carry-through" kernel (``_resolve_nonlibrary_release``;
+its #632 cache re-hydrate ``_rehydrate_resolved_release`` moved to
+``lookup/album_level_match.py`` with the LML#1318 album-level degrade, which
+imports acyclically in this direction), the LML#631
 SONG_AS_ARTIST row-less pick (``_select_rowless_artist_release`` /
 ``_own_release_credit``), the LML#660 per-track credit recovery
 (``_recover_track_credit``), and the synthetic ``LibraryItem(id=0)`` chokepoint
@@ -26,6 +28,10 @@ from entity.release_resolution_cache import (
 )
 from entity.sources import PgSource
 from library.models import LibraryItem
+from lookup.album_level_match import (
+    _rehydrate_resolved_release,
+    resolve_typed_album_level_match,
+)
 from lookup.name_folding import fold_punctuation_for_comparison, folded_hit
 from lookup.release_resolution import ResolvedRelease, resolve_release_for_track
 
@@ -277,6 +283,15 @@ async def _resolve_nonlibrary_release(
        absorb a re-add burst (the daily backfill flood), short enough that a
        resolvable release sorted past the window is not suppressed for the full
        miss TTL, and self-heals within the hour.
+    4. **LML#1318 album-level degrade** — when the track leg still resolves
+       nothing (a cold empty verdict, or layer 1's fresh known-miss
+       short-circuit) and the request typed an ``album``, degrade to
+       :func:`~lookup.album_level_match.resolve_typed_album_level_match`: the
+       typed ``(artist, album)`` pair matched album-level from the LOCAL
+       release cache, returned with ``track_confirmed=False`` so the caller
+       surfaces it without claiming the track. The track-key miss pin above is
+       still written (the track verdict was real); it never suppresses this
+       answer because the degrade reads its own ``is_track=False`` channel.
 
     ``pg`` is best-effort: ``None`` (or a PG failure, swallowed inside the cache
     helpers) degrades to an uncached bounded resolve. ``album`` (often absent on
@@ -294,7 +309,12 @@ async def _resolve_nonlibrary_release(
         if cached.was_present:
             if cached.release_id is None:
                 # Fresh known miss — the live probe came up empty recently.
-                return None
+                # LML#1318: the pin is track-key-scoped and must not suppress
+                # the album answer — degrade to the typed (artist, album)
+                # album-level match (local cache only) instead of zeroing.
+                return await resolve_typed_album_level_match(
+                    discogs_service, pg, artist=artist, album=album
+                )
             rehydrated = await _rehydrate_resolved_release(discogs_service, cached.release_id)
             if rehydrated is not None:
                 return rehydrated
@@ -349,35 +369,19 @@ async def _resolve_nonlibrary_release(
             crowd_out=crowd_out_miss,
         )
 
+    if best is None:
+        # LML#1318: the track resolution ran to a real empty verdict (and the
+        # miss pin above stays track-key-scoped). When the request typed an
+        # album, degrade to the typed (artist, album) album-level match — the
+        # ARTIST_PLUS_ALBUM class, local release cache only — so album
+        # metadata + artwork persist the way the library lane's do on an
+        # unconfirmed track. The returned release carries
+        # ``track_confirmed=False`` so the surfacing strategy keeps
+        # ``song_not_found``/``search_type`` honest.
+        return await resolve_typed_album_level_match(
+            discogs_service, pg, artist=artist, album=album
+        )
     return best
-
-
-async def _rehydrate_resolved_release(
-    discogs_service: DiscogsService, release_id: int
-) -> ResolvedRelease | None:
-    """Rebuild a :class:`ResolvedRelease` from a #632 cache-hit release_id.
-
-    The cache stores only the id; ``get_release`` (its own by-id cache) fills in
-    the title + URL. ``is_compilation`` is not needed downstream of
-    ``_bind_resolved_release`` (which keys on id/url/title), so it is left
-    ``False``. Returns ``None`` when the release can't be fetched **or rehydrates
-    to an empty title** (a malformed/title-less but non-404 Discogs release),
-    letting the caller fall through to a live resolve rather than surface a
-    degenerate row-less item with ``title=""``.
-    """
-    try:
-        metadata = await discogs_service.get_release(release_id)
-    except Exception as exc:
-        logger.warning("Row-less cache re-hydrate failed for release %s: %s", release_id, exc)
-        return None
-    if metadata is None or not metadata.release_id or not metadata.title:
-        return None
-    return ResolvedRelease(
-        release_id=metadata.release_id,
-        release_url=metadata.release_url or "",
-        is_compilation=False,
-        album_title=metadata.title or "",
-    )
 
 
 # How many candidate releases the SONG_AS_TRACK carry-through fetches while
