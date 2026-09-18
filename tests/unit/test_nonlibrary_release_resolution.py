@@ -244,6 +244,13 @@ async def test_fresh_known_miss_short_circuits_without_probe(monkeypatch):
         return ReleaseResolution(release_id=None, was_present=True)
 
     monkeypatch.setattr("lookup.rowless.get_cached_release_id", AsyncMock(side_effect=_miss))
+    # LML#1318: a fresh track-key miss no longer zeroes the lookup — it degrades
+    # to the (artist, album) album-level channel, which reads the same cache
+    # through its own module. Pin that read to a known miss too, so this test
+    # keeps exercising exactly its original claim: no live probe, no write.
+    monkeypatch.setattr(
+        "lookup.album_level_match.get_cached_release_id", AsyncMock(side_effect=_miss)
+    )
     set_spy = AsyncMock()
     monkeypatch.setattr("lookup.rowless.set_cached_release_id", set_spy)
 

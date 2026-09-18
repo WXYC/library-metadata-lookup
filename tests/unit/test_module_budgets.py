@@ -322,6 +322,14 @@ MODULE_BUDGETS: dict[str, int] = {
     # search_urls.py. Headroom deliberately small: a second service would
     # fit, a third should force the per-service handles into a bundle.
     "lookup/orchestrator.py": 1710,
+    # LML#1318: the album-level degrade for a failed non-library track
+    # resolution, extracted to its own module rather than appended to
+    # lookup/rowless.py (which sat at 420/450 — headroom for the two kernel
+    # call sites, not for the whole fallback). Also the new home of
+    # ``_rehydrate_resolved_release``, moved out of rowless.py so the import
+    # direction (rowless -> album_level_match) stays acyclic. Smallest
+    # multiple of 50 at or above 1.3x the 215-line measured size (279.5).
+    "lookup/album_level_match.py": 300,
     "lookup/release_resolution.py": 550,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line

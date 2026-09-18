@@ -54,6 +54,13 @@ class ResolvedRelease:
     # never album-matches — so the soft value must ride the seam to the bind,
     # which otherwise can't distinguish A4 from an album-ranked carry-through.
     confidence: float = 1.0
+    # Whether this release was validated to CONTAIN the requested track. True on
+    # every track-resolving path (that validation is what "resolved" means
+    # there). False only on the LML#1318 album-level degrade — the typed
+    # (artist, album) pair matched but the track leg failed — so the surfacing
+    # strategy can keep ``song_not_found``/``search_type`` honest instead of
+    # presenting the release as a confirmed track find.
+    track_confirmed: bool = True
 
 
 def has_va_compilation(releases: list[ReleaseInfo]) -> bool:
