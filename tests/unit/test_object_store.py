@@ -9,6 +9,7 @@ no pytest marker is needed.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import boto3
@@ -106,6 +107,39 @@ class TestObjectStoreContract:
         assert stat is not None
         assert stat.size == len(b"newer-and-longer")
 
+    @pytest.mark.asyncio
+    async def test_head_reports_last_modified(self, store):
+        """Both backends surface a tz-aware modification time (LML#1313, #1314)."""
+        before = datetime.now(UTC)
+        await store.put("library.db", b"12345")
+        stat = await store.head("library.db")
+        assert stat is not None
+        assert stat.last_modified is not None
+        assert stat.last_modified.tzinfo is not None
+        # Clock skew between the store's stamp and ours is possible; a generous
+        # window still proves the field is a real timestamp, not a placeholder.
+        assert abs((stat.last_modified - before).total_seconds()) < 300
+
+    @pytest.mark.asyncio
+    async def test_copy_duplicates_without_consuming_the_source(self, store):
+        await store.put("library.db", b"catalog-bytes")
+        await store.copy("library.db", "library.db.previous")
+        assert await store.get("library.db.previous") == b"catalog-bytes"
+        assert await store.get("library.db") == b"catalog-bytes"
+
+    @pytest.mark.asyncio
+    async def test_copy_overwrites_the_destination(self, store):
+        """Overwriting *is* the rotation for the fixed backup key (LML#1313)."""
+        await store.put("library.db.previous", b"two-generations-ago")
+        await store.put("library.db", b"yesterday")
+        await store.copy("library.db", "library.db.previous")
+        assert await store.get("library.db.previous") == b"yesterday"
+
+    @pytest.mark.asyncio
+    async def test_copy_missing_source_raises_object_not_found(self, store):
+        with pytest.raises(ObjectNotFoundError):
+            await store.copy("nope.db", "library.db.previous")
+
     def test_satisfies_runtime_protocol(self, store):
         assert isinstance(store, ObjectStore)
 
@@ -116,6 +150,13 @@ class TestLocalDirStore:
         """The atomic write-then-replace must not strand a ``.tmp`` sibling."""
         await local_store.put("library.db", b"data")
         assert [p.name for p in tmp_path.iterdir()] == ["library.db"]
+
+    @pytest.mark.asyncio
+    async def test_copy_leaves_no_tmp_file(self, local_store, tmp_path):
+        """The copy is write-then-replace too — no stranded ``.tmp`` sibling."""
+        await local_store.put("library.db", b"data")
+        await local_store.copy("library.db", "library.db.previous")
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["library.db", "library.db.previous"]
 
     @pytest.mark.asyncio
     async def test_put_creates_missing_base_dir(self, tmp_path):
