@@ -89,6 +89,22 @@ class Settings(BaseSettings):
             return Path("library.db")
         return self.library_db_path
 
+    library_db_min_rows: int = Field(
+        default=58_320,
+        description=(
+            "Absolute floor on `SELECT count(*) FROM library` for an uploaded "
+            "library.db (POST /admin/upload-library-db). An upload carrying fewer "
+            "rows is rejected with 400 and nothing is written. The default is "
+            "anchored to the real shelf — 90% of the ~64,800-row 2026-09 catalog — "
+            "rather than a round number, so it clears normal deaccession churn "
+            "while still catching a fraction-of-the-catalog upload. The catalog "
+            "only grows, so the margin widens over time. Set 0 to opt out entirely "
+            "(an environment seeded with a deliberately small catalog); pass "
+            "?force=true on a single upload to override without disarming the "
+            "guard. See WXYC/library-metadata-lookup#1313."
+        ),
+    )
+
     # Object Storage (Railway Bucket) — WXYC/library-metadata-lookup#835.
     # When BOTH are set, library.db and streaming_availability.db are served from
     # an S3-compatible Railway Bucket instead of the local /data volume (the

@@ -665,6 +665,7 @@ dependencies = [
     { name = "uvicorn" },
     { name = "wxyc-etl" },
     { name = "wxyc-fastapi", extra = ["posthog"] },
+    { name = "ytmusicapi" },
 ]
 
 [package.optional-dependencies]
@@ -678,9 +679,6 @@ dev = [
     { name = "pytest-httpx" },
     { name = "pytest-xdist" },
     { name = "ruff" },
-]
-drain = [
-    { name = "ytmusicapi" },
 ]
 
 [package.metadata]
@@ -710,7 +708,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.24.0" },
     { name = "wxyc-etl", specifier = ">=0.10.0,<0.11.0" },
     { name = "wxyc-fastapi", extras = ["posthog"], specifier = ">=1.5.0,<2.0.0" },
-    { name = "ytmusicapi", marker = "extra == 'drain'", specifier = "==1.12.1" },
+    { name = "ytmusicapi", specifier = "==1.12.1" },
 ]
 provides-extras = ["dev", "drain"]
 

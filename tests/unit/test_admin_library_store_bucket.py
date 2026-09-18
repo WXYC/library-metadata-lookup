@@ -7,6 +7,10 @@ the replica that served the request also picks up the new file. These tests pin
 the bucket-mode leg against a moto-backed :class:`S3ObjectStore`; the existing
 ``test_admin_router.py`` suite proves the identical contract against the default
 ``LocalDirStore`` (local mode unchanged).
+
+The fixture sets ``library_db_min_rows=0``: these uploads are 1-row catalogs
+exercising the store wiring, not the LML#1313 size floor, which has its own
+suite in ``test_admin_library_floor.py``.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ def admin_settings(tmp_path):
     return Settings(
         admin_token="bucket-token",
         library_db_path=tmp_path / "library.db",
+        library_db_min_rows=0,  # see module docstring
         discogs_token=None,
         database_url_discogs=None,
         sentry_dsn=None,
