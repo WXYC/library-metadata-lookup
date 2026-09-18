@@ -23,7 +23,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -54,18 +56,32 @@ class ObjectStat:
     verbatim from S3, i.e. wrapped in literal double-quotes and **not** an MD5 for
     multipart uploads (``upload_file`` on a large ``put``) — a consumer comparing
     ETags must account for both.
+
+    ``last_modified`` is the *store's* notion of when the object was last written
+    — S3's ``LastModified``, the local file's ``st_mtime`` — always timezone-aware
+    (UTC). It is deliberately read through the store rather than from the serving
+    replica's local copy: a replica that boot-fetched the object stamps its own
+    local file with the fetch time, so local mtime measures "when did this process
+    download it", not "how old is the catalog" (LML#1313, consumed by LML#1314).
+    ``None`` only if a backend cannot report one.
     """
 
     size: int
     etag: str | None = None
+    last_modified: datetime | None = None
 
 
 @runtime_checkable
 class ObjectStore(Protocol):
-    """Minimal async key -> blob store: ``get`` / ``put`` / ``exists`` / ``head``.
+    """Minimal async key -> blob store: ``get`` / ``put`` / ``copy`` / ``exists`` / ``head``.
 
     All methods are async so the S3 implementation can offload blocking boto3
     calls to a thread without changing the call sites.
+
+    There is deliberately no ``delete``: the one retention need so far (the
+    ``library.db`` upload backup, LML#1313) is served by a single fixed key whose
+    overwrite *is* the rotation, which is bounded by construction. Adding
+    ``delete`` should wait for a caller that genuinely needs N generations.
     """
 
     async def get(self, key: str) -> bytes:
@@ -74,6 +90,16 @@ class ObjectStore(Protocol):
 
     async def put(self, key: str, data: bytes | Path) -> None:
         """Store ``data`` (raw bytes or a source file path) under ``key``."""
+        ...
+
+    async def copy(self, src_key: str, dst_key: str) -> None:
+        """Copy ``src_key`` onto ``dst_key``, overwriting any existing destination.
+
+        Never routes the bytes through the caller's process (S3 does this
+        server-side via ``copy_object``), so backing up a ~16MB ``library.db``
+        costs no additional memory on the request that triggers it. Raises
+        :class:`ObjectNotFoundError` when ``src_key`` has no object.
+        """
         ...
 
     async def exists(self, key: str) -> bool:
@@ -169,6 +195,21 @@ class S3ObjectStore:
 
         await asyncio.to_thread(_put)
 
+    async def copy(self, src_key: str, dst_key: str) -> None:
+        def _copy() -> None:
+            try:
+                self._client.copy_object(
+                    Bucket=self.bucket,
+                    Key=dst_key,
+                    CopySource={"Bucket": self.bucket, "Key": src_key},
+                )
+            except ClientError as err:
+                if _s3_error_is_not_found(err):
+                    raise ObjectNotFoundError(src_key) from err
+                raise
+
+        await asyncio.to_thread(_copy)
+
     async def head(self, key: str) -> ObjectStat | None:
         def _head() -> ObjectStat | None:
             try:
@@ -177,7 +218,11 @@ class S3ObjectStore:
                 if _s3_error_is_not_found(err):
                     return None
                 raise
-            return ObjectStat(size=resp["ContentLength"], etag=resp.get("ETag"))
+            return ObjectStat(
+                size=resp["ContentLength"],
+                etag=resp.get("ETag"),
+                last_modified=resp.get("LastModified"),
+            )
 
         return await asyncio.to_thread(_head)
 
@@ -231,14 +276,38 @@ class LocalDirStore:
 
         await asyncio.to_thread(_put)
 
+    async def copy(self, src_key: str, dst_key: str) -> None:
+        src = self._resolve(src_key)
+        dest = self._resolve(dst_key)
+
+        def _copy() -> None:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + ".tmp")
+            try:
+                shutil.copyfile(src, tmp)
+                os.replace(tmp, dest)
+            except FileNotFoundError as err:
+                tmp.unlink(missing_ok=True)
+                raise ObjectNotFoundError(src_key) from err
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+
+        await asyncio.to_thread(_copy)
+
     async def head(self, key: str) -> ObjectStat | None:
         path = self._resolve(key)
 
         def _head() -> ObjectStat | None:
             try:
-                return ObjectStat(size=path.stat().st_size, etag=None)
+                st = path.stat()
             except FileNotFoundError:
                 return None
+            return ObjectStat(
+                size=st.st_size,
+                etag=None,
+                last_modified=datetime.fromtimestamp(st.st_mtime, tz=UTC),
+            )
 
         return await asyncio.to_thread(_head)
 
