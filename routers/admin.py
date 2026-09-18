@@ -5,6 +5,7 @@ import logging
 import os
 import sqlite3
 import tempfile
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -32,6 +33,22 @@ router = APIRouter(tags=["admin"])
 
 STREAMING_DB_FILENAME = "streaming_availability.db"
 LIBRARY_DB_FILENAME = "library.db"
+
+# The single fixed backup key for library.db (LML#1313). One generation, and
+# overwriting it *is* the rotation — bounded by construction, so there is no
+# lifecycle policy to configure, nothing to garbage-collect, and the ObjectStore
+# Protocol needs no `delete`. One generation covers the failure this exists for:
+# a bad upload a human notices within a day. Restore path in docs/deployment.md.
+LIBRARY_DB_PREVIOUS_FILENAME = "library.db.previous"
+
+# Relative row-count guard for /admin/upload-library-db (LML#1313). Same rule and
+# same tolerance as STREAMING_COVERAGE_TOLERANCE: 5% absorbs genuine deaccession
+# churn while catching a catalog that arrived a fraction of its real size.
+LIBRARY_ROW_DROP_TOLERANCE = 0.05
+
+# The metric name the library guard reports through _check_count_regression, and
+# the key that appears in a 409's `regressions` records.
+LIBRARY_ROW_METRIC = "library_rows"
 
 # Coverage-regression guard tolerance for /admin/upload-streaming-db (LML#672).
 # An upload is rejected if any guarded metric drops below prior * (1 - tolerance)
@@ -131,21 +148,26 @@ def _table_columns(conn: sqlite3.Connection, name: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({name})").fetchall()}
 
 
-def _check_streaming_regression(
+def _check_count_regression(
     old: dict[str, int],
     new: dict[str, int],
     tolerance: float = STREAMING_COVERAGE_TOLERANCE,
+    metrics: Sequence[str] = _STREAMING_COVERAGE_METRICS,
 ) -> list[dict]:
     """Return regression records for metrics that shrank too far.
 
-    For each of the five fixed metrics, a record ``{metric, old, new, floor}`` is
-    returned when ``new`` drops below ``floor = old * (1 - tolerance)`` **or** goes
-    non-zero -> zero. Empty list means the upload is safe. Pure function; both
-    inputs are expected to carry all five keys (``_streaming_coverage`` guarantees
-    this).
+    For each named metric, a record ``{metric, old, new, floor}`` is returned when
+    ``new`` drops below ``floor = old * (1 - tolerance)`` **or** goes non-zero ->
+    zero. Empty list means the upload is safe. Pure function; both inputs are
+    expected to carry every key in ``metrics``.
+
+    Written for the streaming-coverage guard (LML#672), whose five fixed metrics
+    are the default, and reused verbatim by the ``library.db`` row-count guard
+    (LML#1313) with ``metrics=(LIBRARY_ROW_METRIC,)`` — one rule for "did this
+    upload shrink too far", not two.
     """
     regressions: list[dict] = []
-    for metric in _STREAMING_COVERAGE_METRICS:
+    for metric in metrics:
         old_v = old.get(metric, 0)
         new_v = new.get(metric, 0)
         if old_v <= 0:
@@ -154,6 +176,38 @@ def _check_streaming_regression(
         if new_v == 0 or new_v < floor:
             regressions.append({"metric": metric, "old": old_v, "new": new_v, "floor": floor})
     return regressions
+
+
+def _library_row_count(db_path: Path) -> int:
+    """Rows in a library.db's ``library`` table; ``0`` when absent or unreadable.
+
+    The baseline half of the LML#1313 relative guard, read from the *serving*
+    replica's local file — the copy an upload is about to replace — so no object
+    fetch is needed to know what is being traded away.
+
+    Unlike ``_streaming_coverage``, an unreadable file degrades to ``0`` (i.e. "no
+    baseline", which the regression check skips) instead of raising to fail the
+    upload closed. That asymmetry is deliberate: an unreadable local catalog means
+    this replica is *already* degraded and this endpoint is its recovery path, so
+    failing closed would put recovery behind ``force=true``. The absolute floor
+    still applies, and it is the guard that does not depend on prior state.
+    """
+    if not db_path.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return int(conn.execute("SELECT count(*) FROM library").fetchone()[0])
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning(
+            "Failed to read a row-count baseline from the served %s; "
+            "the relative upload guard has nothing to compare against.",
+            db_path,
+            exc_info=True,
+        )
+        return 0
 
 
 def _get_streaming_ids(db_path: Path) -> set[int]:
@@ -244,18 +298,49 @@ async def _send_streaming_webhooks(
     summary="Upload a new library.db file",
     responses={
         200: {"description": "Upload successful"},
-        400: {"description": "Invalid SQLite database"},
+        400: {
+            "description": "Invalid SQLite database, or below the absolute row floor "
+            "(`LIBRARY_DB_MIN_ROWS`). The floor variant's JSON `detail` carries "
+            "`row_count` and `required_min_rows`."
+        },
         401: {"description": "Missing authorization"},
         403: {"description": "Invalid or missing token"},
+        409: {
+            "description": "Refused (use force=true): the upload drops more than "
+            f"{LIBRARY_ROW_DROP_TOLERANCE:.0%} of the rows in the currently-served copy. "
+            "`detail` is `{error, regressions, hint}`."
+        },
+        500: {"description": "Server-side fault writing the file or the object store"},
     },
     dependencies=[Depends(require_admin_token)],
 )
 async def upload_library_db(
     file: UploadFile,
+    force: bool = False,
     settings: Settings = Depends(get_settings),
     object_store: ObjectStore = Depends(get_object_store),
 ):
     """Replace the library.db file with an uploaded SQLite database.
+
+    Two size guards run before anything is written (LML#1313), because until this
+    ticket the endpoint accepted any file that parsed and kept no way back:
+
+    * **Absolute floor** -- fewer than ``LIBRARY_DB_MIN_ROWS`` rows in ``library``
+      is a **400** naming both the observed and the required count. Set the
+      setting to ``0`` to opt out.
+    * **Relative guard** -- dropping more than ``LIBRARY_ROW_DROP_TOLERANCE`` of
+      the rows in the copy this replica is currently serving is a **409** carrying
+      the same ``regressions`` record shape ``/admin/upload-streaming-db`` uses.
+
+    ``?force=true`` overrides both, loudly, for a legitimate large shrink. A
+    rejection writes nothing: the served file stays byte-identical, the stored
+    object is untouched, and the scratch upload file is removed.
+
+    On the way through, the outgoing stored object is preserved under
+    ``library.db.previous`` via the store's server-side
+    :meth:`~storage.object_store.ObjectStore.copy` (never a get-then-put through
+    this process), giving one generation to restore from -- see
+    ``docs/deployment.md`` for the restore procedure.
 
     The uploaded file is validated, written to the durable object store (the
     canonical copy other replicas and the next boot's lifespan fetch read —
@@ -302,12 +387,93 @@ async def upload_library_db(
             detail=f"Invalid SQLite database: {e}",
         ) from e
 
+    # Size guards (LML#1313). Both run before any write, so a rejection leaves the
+    # served file and the stored object exactly as they were.
+    min_rows = settings.library_db_min_rows
+    if min_rows > 0 and row_count < min_rows:
+        if force:
+            logger.warning(
+                "library.db upload carries %d rows, below the %d-row floor, "
+                "but force=true; publishing anyway.",
+                row_count,
+                min_rows,
+            )
+        else:
+            tmp_path.unlink(missing_ok=True)
+            logger.warning(
+                "Rejected library.db upload: %d rows is below the %d-row floor.",
+                row_count,
+                min_rows,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "library.db is below the absolute row floor",
+                    "row_count": row_count,
+                    "required_min_rows": min_rows,
+                    "hint": "re-run the producer against a healthy source, "
+                    "lower LIBRARY_DB_MIN_ROWS (0 disables the floor), "
+                    "or pass force=true to override this upload",
+                },
+            )
+
+    prior_rows = _library_row_count(db_path)
+    row_regressions = _check_count_regression(
+        {LIBRARY_ROW_METRIC: prior_rows},
+        {LIBRARY_ROW_METRIC: row_count},
+        tolerance=LIBRARY_ROW_DROP_TOLERANCE,
+        metrics=(LIBRARY_ROW_METRIC,),
+    )
+    if row_regressions:
+        if force:
+            logger.warning(
+                "library.db upload regresses the served row count but force=true; "
+                "publishing anyway. Regressions: %s",
+                row_regressions,
+            )
+        else:
+            tmp_path.unlink(missing_ok=True)
+            logger.warning(
+                "Rejected library.db upload: row-count regression vs the served copy. %s",
+                row_regressions,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "library.db row-count regression",
+                    "regressions": row_regressions,
+                    "hint": "re-run the producer against a healthy source, "
+                    "or pass force=true to override this upload",
+                },
+            )
+
     # Compute streaming diff before closing/replacing the old DB
     changes: list[dict] = []
     if settings.streaming_webhook_urls:
         old_ids = _get_streaming_ids(db_path)
         new_ids = _get_streaming_ids(tmp_path)
         changes = _compute_streaming_diff(old_ids, new_ids)
+
+    # Preserve the outgoing object before it is overwritten (LML#1313). Server-side
+    # in the store, so the ~16MB blob never transits this process. Attempted rather
+    # than gated on exists() so there is no window between the check and the copy;
+    # absence just means this is the first upload. A copy fault aborts with 500
+    # *before* anything is written — the upload retries on the next producer run,
+    # which is cheaper than publishing with no way back.
+    try:
+        await object_store.copy(LIBRARY_DB_FILENAME, LIBRARY_DB_PREVIOUS_FILENAME)
+    except ObjectNotFoundError:
+        logger.info(
+            "No stored %s to preserve; skipping the %s backup (first upload).",
+            LIBRARY_DB_FILENAME,
+            LIBRARY_DB_PREVIOUS_FILENAME,
+        )
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        logger.error(f"Failed to back up the stored library.db before replacing it: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to back up the current library.db: {e}"
+        ) from e
 
     # Durable canonical write first (WXYC#837). Put-first so a store failure
     # aborts with 500 *before* we mutate the serving replica's on-disk DB — no
@@ -477,7 +643,7 @@ async def upload_streaming_db(
                 detail=f"Uploaded streaming DB became unreadable after validation: {e}",
             ) from e
 
-        regressions = _check_streaming_regression(old_cov, new_cov)
+        regressions = _check_count_regression(old_cov, new_cov)
         if regressions:
             if force:
                 logger.warning(

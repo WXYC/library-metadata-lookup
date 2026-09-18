@@ -209,7 +209,7 @@ class TestCheckStreamingRegression:
         return base
 
     def test_growth_no_regression(self):
-        from routers.admin import _check_streaming_regression
+        from routers.admin import _check_count_regression
 
         old = self._cov(
             apple_url=100, spotify_url=200, deezer_url=150, albums=300, track_results=50
@@ -217,21 +217,21 @@ class TestCheckStreamingRegression:
         new = self._cov(
             apple_url=110, spotify_url=210, deezer_url=160, albums=320, track_results=60
         )
-        assert _check_streaming_regression(old, new, tolerance=0.05) == []
+        assert _check_count_regression(old, new, tolerance=0.05) == []
 
     def test_first_upload_old_all_zero(self):
-        from routers.admin import _check_streaming_regression
+        from routers.admin import _check_count_regression
 
         old = self._cov()  # nothing on disk
         new = self._cov(apple_url=5, spotify_url=9, deezer_url=7, albums=10, track_results=3)
-        assert _check_streaming_regression(old, new, tolerance=0.05) == []
+        assert _check_count_regression(old, new, tolerance=0.05) == []
 
     def test_nonzero_to_zero_flagged(self):
-        from routers.admin import _check_streaming_regression
+        from routers.admin import _check_count_regression
 
         old = self._cov(apple_url=288, spotify_url=200, deezer_url=150, albums=300)
         new = self._cov(apple_url=0, spotify_url=200, deezer_url=150, albums=300)
-        regs = _check_streaming_regression(old, new, tolerance=0.05)
+        regs = _check_count_regression(old, new, tolerance=0.05)
         assert [r["metric"] for r in regs] == ["apple_url"]
         assert regs[0]["old"] == 288
         assert regs[0]["new"] == 0
@@ -246,21 +246,21 @@ class TestCheckStreamingRegression:
         ],
     )
     def test_tolerance_boundary(self, tolerance, new_apple, expect_regression):
-        from routers.admin import _check_streaming_regression
+        from routers.admin import _check_count_regression
 
         old = self._cov(apple_url=100, albums=100)
         new = self._cov(apple_url=new_apple, albums=100)
-        regs = _check_streaming_regression(old, new, tolerance=tolerance)
+        regs = _check_count_regression(old, new, tolerance=tolerance)
         assert bool(regs) is expect_regression
 
     def test_multiple_metrics_flagged(self):
-        from routers.admin import _check_streaming_regression
+        from routers.admin import _check_count_regression
 
         old = self._cov(
             apple_url=100, spotify_url=100, deezer_url=100, albums=100, track_results=100
         )
         new = self._cov(apple_url=50, spotify_url=100, deezer_url=50, albums=100, track_results=100)
-        regs = _check_streaming_regression(old, new, tolerance=0.05)
+        regs = _check_count_regression(old, new, tolerance=0.05)
         assert {r["metric"] for r in regs} == {"apple_url", "deezer_url"}
 
 

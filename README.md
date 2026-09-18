@@ -102,8 +102,13 @@ Get full release metadata from Discogs.
 ### `POST /admin/upload-library-db`
 
 Upload a new `library.db` file. Requires `Authorization: Bearer <ADMIN_TOKEN>` header.
-The file is validated (must be a SQLite database with a `library` table), then atomically
+The file is validated (must be a SQLite database with a `library` table), size-guarded, then atomically
 replaces the current database. Returns `{"status": "ok", "row_count": <int>, "timestamp": "<ISO8601>"}`.
+
+An upload below `LIBRARY_DB_MIN_ROWS` is rejected with `400`, and one dropping more than 5% of the
+currently-served row count with `409`; both write nothing and are overridable with `?force=true`.
+The outgoing copy is preserved under the `library.db.previous` key — see
+[deployment.md](docs/deployment.md#restoring-the-previous-librarydb) for the restore path.
 
 ### `GET /health`
 

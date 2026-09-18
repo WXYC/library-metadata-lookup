@@ -134,6 +134,41 @@ atomically replaces the local `LIBRARY_DB_PATH` copy, and returns
 
 The ETL script in [discogs-cache](https://github.com/WXYC/discogs-etl) (`scripts/sync-library.sh`) handles daily uploads to both staging and production.
 
+### Size guards (LML#1313)
+
+Two checks run **before anything is written**, so a rejection leaves the served file byte-identical, the stored object untouched, and no scratch file behind:
+
+| Guard | Trips when | Status |
+|---|---|---|
+| Absolute floor | `count(*) FROM library` < `LIBRARY_DB_MIN_ROWS` (default 58,320; `0` disables — see [env-vars](env-vars.md)) | **400**, `detail` names `row_count` and `required_min_rows` |
+| Relative guard | the upload drops more than 5% of the rows in the copy this replica is currently serving | **409**, `detail.regressions` in the same shape `/admin/upload-streaming-db` returns |
+
+`?force=true` overrides both for one upload and logs the override at WARNING with the counts. Reach for it when a large shrink is genuinely correct (a bulk deaccession); reach for `LIBRARY_DB_MIN_ROWS` only when an environment's catalog is legitimately small. The relative guard has no baseline when the served file is missing or unreadable, and **fails open** in that case by design — an unreadable local catalog means the replica is already degraded and this endpoint is its recovery path. The absolute floor still applies there.
+
+### Restoring the previous `library.db`
+
+Every successful upload first copies the outgoing stored object to the fixed key **`library.db.previous`** (server-side in the store, via `ObjectStore.copy` — the bytes never transit LML). That is **one generation**: the next successful upload overwrites it, so a bad catalog is recoverable until the *following* upload lands, which in practice means until the next daily `sync-library.sh` run. A rejected upload does not rotate it.
+
+To roll back, re-upload the backup through the normal endpoint — there is no separate restore route, and going through the endpoint means the restore is itself guarded and gets its own backup:
+
+```bash
+# 1. Pull the previous generation out of the bucket (any S3 client; --endpoint-url is LML_BUCKET_ENDPOINT).
+aws s3 cp "s3://$LML_BUCKET_NAME/library.db.previous" ./library.db.previous --endpoint-url "$LML_BUCKET_ENDPOINT"
+
+# 2. Sanity-check it before publishing it.
+sqlite3 ./library.db.previous 'SELECT count(*) FROM library;'
+
+# 3. Publish it. force=true is usually needed: the restore is, by definition, a shrink
+#    versus the bad catalog now being served.
+curl -sS -X POST "$PRODUCTION_URL/admin/upload-library-db?force=true" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -F "file=@./library.db.previous"
+```
+
+**Time-sensitive:** if the producer is on a schedule, disable or hold the daily sync before restoring. Otherwise the next run overwrites both the served object and the one backup generation.
+
+With N≥2 replicas, the hot-swap refreshes only the replica that served the restore request; redeploy (or let the others restart) so every replica boot-fetches the restored object — the same caveat as a normal upload, below.
+
 ## Streaming Database Backup (Upload + Download)
 
 `streaming_availability.db` is the analysis database for streaming-availability search results — it holds Apple/Spotify/Deezer URLs, track-level results, and Discogs match state. It lives in the Railway Bucket alongside `library.db`. Two symmetric admin endpoints, both gated by `ADMIN_TOKEN`:

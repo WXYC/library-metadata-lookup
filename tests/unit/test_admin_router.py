@@ -1,4 +1,10 @@
-"""Unit tests for routers/admin.py -- library.db upload + streaming-db endpoints."""
+"""Unit tests for routers/admin.py -- library.db upload + streaming-db endpoints.
+
+These suites upload deliberately tiny catalogs to exercise contracts unrelated to
+size, so every fixture sets ``library_db_min_rows=0`` to disarm the LML#1313
+absolute row floor. The floor's own behavior is pinned in
+``tests/unit/test_admin_library_floor.py``.
+"""
 
 import asyncio
 import sqlite3
@@ -63,6 +69,7 @@ def admin_settings(tmp_path):
     return Settings(
         admin_token="test-secret-token",
         library_db_path=tmp_path / "library.db",
+        library_db_min_rows=0,  # see module docstring
         discogs_token=None,
         database_url_discogs=None,
         sentry_dsn=None,
@@ -77,6 +84,7 @@ def no_token_settings(tmp_path):
     return Settings(
         admin_token=None,
         library_db_path=tmp_path / "library.db",
+        library_db_min_rows=0,  # see module docstring
         discogs_token=None,
         database_url_discogs=None,
         sentry_dsn=None,
@@ -91,6 +99,7 @@ def webhook_settings(tmp_path):
     return Settings(
         admin_token="test-secret-token",
         library_db_path=tmp_path / "library.db",
+        library_db_min_rows=0,  # see module docstring
         streaming_webhook_urls="https://tubafrenzy.example.com/webhook",
         etl_notify_key="test-notify-key",
         discogs_token=None,
@@ -107,6 +116,7 @@ def multi_webhook_settings(tmp_path):
     return Settings(
         admin_token="test-secret-token",
         library_db_path=tmp_path / "library.db",
+        library_db_min_rows=0,  # see module docstring
         streaming_webhook_urls=(
             "https://tubafrenzy.example.com/webhook,https://backend.example.com/webhook"
         ),
