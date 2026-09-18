@@ -124,12 +124,6 @@ class HealthCheckResponse(BaseModel):
     )
 
 
-class Services(StrEnum):
-    ok = "ok"
-    unavailable = "unavailable"
-    timeout = "timeout"
-
-
 class ReadinessResponse(HealthCheckResponse):
     """
     Readiness response shape for `GET /ready` (and equivalent) endpoints.
@@ -137,15 +131,28 @@ class ReadinessResponse(HealthCheckResponse):
     Each entry in `services` reports the live state of one external
     dependency (database, upstream HTTP service, queue, etc.).
 
-    Status values:
-      - `ok`          — dependency reachable and responsive
-      - `unavailable` — dependency reachable but reporting an error,
-                        or the connection itself failed
-      - `timeout`     — dependency exceeded the readiness probe deadline
+    The status value is a free string, not a closed set, and the set of
+    keys is per-service. Each probe classifies its own failures, and the
+    vocabulary is expected to grow as probes are added.
+
+    The convention the existing probes follow, so a new one has something
+    to match rather than inventing a fourth spelling: `ok` on success, and
+    on failure one of `auth-error`, `rate-limited`, `upstream-error`,
+    `network-error`, `error` — shared deliberately between
+    Backend-Service's `services.database` and library-metadata-lookup's
+    `services.discogs_api` so operators can pattern-match one against the
+    other. Probes that cannot distinguish those buckets report a coarser
+    value: Backend-Service's auth proxy emits `unavailable`.
+
+    A probe-timeout value is deliberately absent. Postgres has no timeout
+    bucket distinct from "couldn't get a response", so a canceled
+    statement is reported as `network-error`; a probe whose client can
+    tell the two apart should say so in its own terms rather than reach
+    for a shared `timeout`.
 
     """
 
-    services: dict[str, Services] = Field(
+    services: dict[str, str] = Field(
         ..., description="Per-dependency readiness map keyed by dependency name."
     )
 
@@ -162,21 +169,15 @@ class RotationBin(StrEnum):
 
 
 class FlowsheetEntryBase(BaseModel):
-    id: int
-    play_order: int
-    show_id: int
-
-
-class FlowsheetRangeEntryBase(BaseModel):
     """
-    Identity block for `GET /flowsheet/range`. Identical to `FlowsheetEntryBase` except that `show_id` is nullable — see that property's description. Kept separate rather than relaxing `FlowsheetEntryBase` in place so the other flowsheet paths' documented shapes are untouched by this endpoint.
+    Identity block for the v1 flowsheet row. Composed by every v1 read shape; never by a write shape, which cannot supply the server-assigned `id` and `play_order` this block requires.
     """
 
     id: int
     play_order: int
     show_id: int | None = Field(
         ...,
-        description="The show this entry belongs to, or `null` for an **unattributed** entry — a row that exists with no linked show. 20 of 2,619,011 rows are in that state (2005-02-06 → 2026-04-21), and the Phase 0 audit for the tubafrenzy decommissioning decided against backfilling them, so this endpoint returns them rather than dropping them. Consumers that group entries by show must render an unattributed bucket; they must not assume every entry joins to a member of `shows`, and must not crash on the null. The key is always present.",
+        description="The show this entry belongs to, or `null` for an **unattributed** entry — a row that exists with no linked show. `flowsheet.show_id` carries no NOT NULL and its foreign key is `ON DELETE SET NULL`, and the table documents NULL `show_id` as a shape Backend-canonical writes must accept: entries that pre-date a show, marker rows, and never-linked tracks. The Phase 0 audit for the tubafrenzy decommissioning counted 20 such rows of 2,619,011 (2005-02-06 → 2026-04-21) and decided against backfilling them, so they reach the wire rather than being dropped.\n\nConsumers that group entries by show must render an unattributed bucket; they must not assume every entry joins to a show, and must not crash on the null. The key is always present. Same column and same contract as `FlowsheetV2Base.show_id` — the two identity blocks are separate for historical reasons, not because the column differs between them.",
     )
 
 
@@ -187,7 +188,7 @@ class FlowsheetRangeShow(BaseModel):
 
     id: int = Field(
         ...,
-        description="Matches `FlowsheetRangeEntry.show_id` for every entry belonging to this show.",
+        description="Matches `entries[].show_id` for every entry belonging to this show.",
     )
     show_name: str | None = Field(
         None, description="Specialty-show name, or `null` for a regular show."
@@ -206,14 +207,17 @@ class FlowsheetRangeShow(BaseModel):
 
 class FlowsheetSongEntry(FlowsheetEntryBase):
     """
-    Song entry in the flowsheet
+    Song entry in the flowsheet. Not `$ref`'d by any operation in this document — every v1 read path composes `FlowsheetEntryResponse` instead — but published as a generated type, so it is kept accurate.
     """
 
     track_title: str
     artist_name: str
     album_title: str
     record_label: str
-    label_id: int | None = None
+    label_id: int | None = Field(
+        None,
+        description="Same column and same contract as `FlowsheetEntryFields.label_id`: `labels.id` for `record_label`, or `null` when the row's label was never linked to a catalog row, which is the state of the large majority of rows. Declared again here because this shape carries its own copy of the field set rather than composing that block.",
+    )
     request_flag: bool
     segue: bool | None = None
     album_id: int | None = None
@@ -384,7 +388,10 @@ class FlowsheetV2Base(BaseModel):
     """
 
     id: int
-    show_id: int | None = Field(...)
+    show_id: int | None = Field(
+        ...,
+        description="The show this entry belongs to, or `null` for an **unattributed** entry — a row that exists with no linked show. 20 of 2,619,011 rows are in that state (2005-02-06 → 2026-04-21), and the Phase 0 audit for the tubafrenzy decommissioning decided against backfilling them, so every read that can reach a historical row can reach a null here. Consumers that group entries by show must render an unattributed bucket; they must not assume every entry joins to a show, and must not crash on the null. The key is always present.",
+    )
     play_order: int
     add_time: AwareDatetime
 
@@ -514,19 +521,20 @@ class OnAirInfo(BaseModel):
 
 
 class OnAirDJ(BaseModel):
+    """
+    One DJ in a DJ list — the `auth_user.id` and the PII-safe on-air handle, both nullable.
+
+    The single shape for all three list sites: `/flowsheet/djs-on-air`, `/flowsheet/shows/recent`'s `djs` and `/flowsheet/playlist`'s `show_djs`. Every one of them resolves the handle through the same `resolveDjDisplayName`, so none can constrain `dj_name` more tightly than the others — the premise a per-site fork would rest on. A second declaration of one shape is how the two come to disagree; declare the site, not the shape.
+    """
+
     id: str | None = Field(
         ...,
         description="The DJ's better-auth `auth_user.id` (an opaque `varchar(255)` string), or `null` for a legacy/tubafrenzy-mirrored show whose on-air DJ has no Backend-Service account (their identity is `legacy_dj_name`, surfaced on `/flowsheet/djs-on-air` with a null id). Historically mistyped as `integer`; corrected to the nullable string it is at runtime (BS#1547).",
     )
-    dj_name: str = Field(
+    dj_name: str | None = Field(
         ...,
-        description="The DJ's public on-air handle, never the DJ's legal name. For a DJ with a Backend-Service account, the DJ's chosen handle (`user.djName`); for a legacy/tubafrenzy-mirrored show with no account, the full PII-safe chain (BS#1371) down to `shows.legacy_dj_name`.",
+        description="The DJ's public on-air handle, never the DJ's legal name. For a DJ with a Backend-Service account, the DJ's chosen handle (`user.djName`); for a legacy/tubafrenzy-mirrored show with no account, the full PII-safe chain (BS#1371) down to `shows.legacy_dj_name`.\n\n`null` when that chain resolves to nothing. The account arm keeps the DJ's row and nulls the name — `resolveDjDisplayName` discards a blank handle and the literal \"Anonymous\" (BS#1286) — so every operation serving this schema can return it. Present-but-null, never omitted: `dj_name` stays required.\n\nA null `dj_name` and a null `id` never co-occur. The legacy arm is the only source of a null `id`, and it emits an entry only when it has a name to put in it.",
     )
-
-
-class OnAirStatusResponse(BaseModel):
-    djs: list[OnAirDJ]
-    onAir: str = Field(..., description='Status indicator - "on" or "off"')
 
 
 class Show(BaseModel):
@@ -586,22 +594,41 @@ class OpenShowsResponse(BaseModel):
     )
 
 
+class RecentShow(BaseModel):
+    """
+    One show as reported by `GET /flowsheet/shows/recent`. Distinct from `OpenShow`: it carries `end_time` and the DJ list, and omits the `entry_count`, `is_current` and `likely_abandoned` fields that exist to help an operator decide what to force-end.
+
+    Every property is always present on the wire; the nullable ones carry `null`, they are not omitted.
+
+    """
+
+    id: int = Field(
+        ...,
+        description="`shows.id` — the value to pass as `show_id` to `GET /flowsheet/playlist` to read the show itself.\n",
+    )
+    show_name: str | None = Field(...)
+    start_time: AwareDatetime
+    end_time: AwareDatetime | None = Field(
+        ...,
+        description='`null` while the show is still on the air — and also when its sign-off was lost, which is common enough that `null` must not be read as "live". `GET /flowsheet/open-shows` is the read that separates the two, via its `is_current` field.\n',
+    )
+    djs: list[OnAirDJ] = Field(
+        ...,
+        description='Who had the room. `$ref`s the same `OnAirDJ` that `GET /flowsheet/djs-on-air` returns, because Backend composes both from one function (`composeShowDJList`) — a second declaration of the shape is how the two would come to disagree.\n\nEmpty when the show carries no account rows AND no resolvable show-level handle. The show is still listed, so a consumer renders "unknown" against real times rather than losing the row.\n\nMembership is NOT filtered to still-active DJs, unlike `/flowsheet/djs-on-air`: sign-off deactivates every remaining membership, so filtering would empty the list for every properly ended show. Co-hosts therefore appear alongside the primary DJ.\n',
+    )
+
+
+class RecentShowsResponse(BaseModel):
+    shows: list[RecentShow] = Field(
+        ...,
+        description="Ordered newest-first by `start_time`, tie-broken on `id` DESC.\n\nCapped at 200 rows, which truncates the OLDEST shows in the window — the reason no `limit` parameter is offered, since those are the least useful rows to a DJ taking over. A page that reaches the cap carries no flag saying so; narrow `window_hours` if you need to know you have the whole window.\n",
+    )
+
+
 class ShowDJ(BaseModel):
     show_id: int | None = None
     dj_id: int | None = None
     active: bool | None = None
-
-
-class ShowPlaylistDJ(BaseModel):
-    """
-    A DJ on an archived show. Deliberately not `OnAirDJ`: that schema requires a non-null `dj_name`, which holds for the live-DJ endpoints but not here — an archived show can carry a member whose handle resolves to nothing.
-    """
-
-    id: str | None = Field(..., description="The DJ's better-auth `auth_user.id`, or null.")
-    dj_name: str | None = Field(
-        ...,
-        description="The DJ's public on-air handle, never their legal name. Null when the PII-safe chain resolves to nothing.",
-    )
 
 
 class Dj(BaseModel):
@@ -618,13 +645,6 @@ class Artist(BaseModel):
     code_letters: str
     code_artist_number: int
     genre_id: int
-
-
-class ArtistWithGenre(Artist):
-    genre_name: str = Field(
-        ...,
-        description="Free-form: `genres.genre_name` is a `varchar(64)` in a lookup table `POST /library/genres` appends to. `GET /library/genres` is the authoritative enumeration (#367).\n",
-    )
 
 
 class Album(BaseModel):
@@ -914,19 +934,6 @@ class AddArtistRequest(BaseModel):
     )
 
 
-class OrderDirection(StrEnum):
-    asc = "asc"
-    desc = "desc"
-
-
-class CatalogSearchParams(BaseModel):
-    artist_name: str | None = None
-    album_title: str | None = None
-    n: int | None = Field(None, description="Maximum number of results")
-    orderBy: str | None = None
-    orderDirection: OrderDirection | None = None
-
-
 class FormatEntry(BaseModel):
     id: int
     format_name: str
@@ -941,34 +948,6 @@ class GenreEntry(BaseModel):
     id: int
     genre_name: str
     code_letters: str
-
-
-class Source(StrEnum):
-    discogs = "discogs"
-    flowsheet = "flowsheet"
-    bin = "bin"
-
-
-class TrackSearchResult(BaseModel):
-    track_id: int | None = None
-    title: str
-    position: str | None = None
-    duration: str | None = None
-    album_id: int | None = None
-    album_title: str
-    artist_name: str
-    label: str | None = None
-    rotation_id: int | None = None
-    rotation_bin: RotationBin | None = None
-    source: Source
-
-
-class TrackSearchParams(BaseModel):
-    song: str
-    artist: str | None = None
-    album: str | None = None
-    label: str | None = None
-    n: int | None = None
 
 
 class CompilationTrackInput(BaseModel):
@@ -1068,7 +1047,10 @@ class UpdateRotationCardRequest(BaseModel):
 
 class RotationEntry(BaseModel):
     id: int
-    album_id: int
+    album_id: int | None = Field(
+        ...,
+        description="Linked `library.id`, or `null` on a rotation row that never linked to a catalog release — the defining state of the Awaiting Cataloging queue, which `GET /library/rotation/uncatalogued` serves as exactly the rows where this is null. Passed straight through from `rotation.album_id`, which carries no NOT NULL and whose table documents the unlinked row as a shape Backend-canonical writes must accept. Both operations returning this schema echo the raw rotation row, so `PATCH /library/rotation` reports null whenever the killed row was never catalogued. Same column and same contract as `RotationRowSummary.album_id`. A consumer keying a catalog cache on this value must skip the null rather than write an entry under it.",
+    )
     rotation_bin: RotationBin
     add_date: date_aliased
     kill_date: date_aliased | None = None
@@ -1215,32 +1197,6 @@ class LibraryFilingConflictError(BaseModel):
     )
 
 
-class Rotation(BaseModel):
-    id: int | None = None
-    code_letters: str | None = None
-    code_artist_number: int | None = None
-    code_number: int | None = None
-    artist_name: str | None = None
-    album_title: str | None = None
-    record_label: str | None = None
-    genre_name: str | None = None
-    format_name: str | None = None
-    rotation_id: int | None = None
-    add_date: date_aliased | None = None
-    play_freq: RotationBin | None = None
-    kill_date: date_aliased | None = None
-    plays: int | None = None
-    legacy_release_id: int | None = Field(
-        None,
-        description="The library row's surrogate key (BS#1963). Nullable here (unlike AlbumSearchResult/BinLibraryDetails/AlbumInfoResponse): a library-unlinked rotation row has no library row at all, hence no legacy id.\n",
-    )
-    card: RotationCard | None = None
-    urls: list[str] | None = Field(
-        None,
-        description="Storage order. Plain strings, not `format: uri` — MDs paste bare domains, so a value carries no scheme guarantee and a renderer must not bind one into an href without checking it. Deliberately an inline twin: `Rotation.urls` and `RotationEntry.urls` are pinned identical by a spec test rather than `$ref`ing a named array schema, because naming a top-level array makes the Python generator wrap the field in a RootModel (`.root` to reach the list) while every other target keeps a plain string list.\n",
-    )
-
-
 class RotationRowSummary(BaseModel):
     """
     One `rotation` row projected to its published ten-column surface — the shape `GET /library/rotation/uncatalogued`, `GET /library/rotation/{id}` and `PATCH /library/rotation/{rotation_id}/link` all share (Backend's `toRotationRowSummary`, BS#2109/BS#2410). Referent rule: `format_id` and `label_id` here are the **rotation row's own pre-catalog fields** — captured at rotation-add, written only while `album_id` is NULL, retained after linking. They never describe the linked library release; that is the opposite of `GET /library/rotation`, whose joined rows read library-side fields where a link exists.
@@ -1318,36 +1274,9 @@ class AddToBinRequest(BaseModel):
     album_id: int
 
 
-class Playlist(BaseModel):
-    id: int
-    dj_id: int
-    name: str
-    created_at: AwareDatetime
-    updated_at: AwareDatetime
-
-
-class PlaylistEntry(BaseModel):
-    id: int
-    playlist_id: int
-    album_id: int
-    track_title: str | None = None
-    position: int
-    album_title: str
-    artist_name: str
-
-
-class PlaylistWithEntries(Playlist):
-    entries: list[PlaylistEntry]
-
-
 class DJBinResponse(BaseModel):
     dj_id: int
     entries: list[BinEntry]
-
-
-class DJPlaylistsResponse(BaseModel):
-    dj_id: int
-    playlists: list[Playlist]
 
 
 class BinLibraryDetails(BaseModel):
@@ -1389,12 +1318,6 @@ class AddScheduleShiftRequest(BaseModel):
     specialty_id: int | None = None
 
 
-class SpecialtyShow(BaseModel):
-    id: int
-    specialty_name: str
-    description: str | None = None
-
-
 class Schedule(BaseModel):
     id: int | None = Field(None, description="Primary key")
     day: conint(ge=0, le=6) | None = Field(
@@ -1433,22 +1356,6 @@ class ParsedSongRequest(BaseModel):
     album: str | None = None
     confidence: confloat(ge=0.0, le=1.0)
     interpretation: str | None = None
-
-
-class MatchType(StrEnum):
-    exact = "exact"
-    fuzzy = "fuzzy"
-    partial = "partial"
-
-
-class DeviceRegistration(BaseModel):
-    device_id: str
-    registered_at: AwareDatetime
-
-
-class DeviceToken(BaseModel):
-    token: str
-    expires_at: AwareDatetime
 
 
 class Venue(BaseModel):
@@ -2150,70 +2057,6 @@ class ArtistMetadata(BaseModel):
     discogs_id: int | None = None
     image_url: str | None = None
     last_fetched: AwareDatetime | None = None
-
-
-class MetadataFetchRequest(BaseModel):
-    album_id: int | None = None
-    artist_id: int | None = None
-    force_refresh: bool | None = None
-
-
-class MetadataFetchResponse(BaseModel):
-    album: AlbumMetadata | None = None
-    artist: ArtistMetadata | None = None
-    source: MetadataSource
-    cached: bool
-
-
-class Type(StrEnum):
-    release = "release"
-    master = "master"
-    artist = "artist"
-
-
-class DiscogsSearchResult(BaseModel):
-    id: int
-    title: str
-    year: int | None = None
-    thumb: str | None = None
-    cover_image: str | None = None
-    resource_url: str
-    type: Type
-
-
-class DiscogsArtistRef(BaseModel):
-    name: str
-    id: int
-
-
-class DiscogsLabelRef(BaseModel):
-    name: str
-    id: int
-
-
-class DiscogsTrack(BaseModel):
-    position: str
-    title: str
-    duration: str | None = None
-
-
-class DiscogsImage(BaseModel):
-    type: str
-    uri: str
-    width: int
-    height: int
-
-
-class DiscogsRelease(BaseModel):
-    id: int
-    title: str
-    year: int | None = None
-    artists: list[DiscogsArtistRef]
-    labels: list[DiscogsLabelRef]
-    genres: list[str]
-    styles: list[str]
-    tracklist: list[DiscogsTrack]
-    images: list[DiscogsImage] | None = None
 
 
 class StreamingLinks(BaseModel):
@@ -3107,7 +2950,7 @@ class DiscogsReleaseMetadata(BaseModel):
     videos: list[DiscogsReleaseVideo] = Field([], validate_default=True)
 
 
-class Type1(StrEnum):
+class Type(StrEnum):
     plainText = "plainText"
     artistLink = "artistLink"
     labelName = "labelName"
@@ -3124,7 +2967,7 @@ class DiscogsResolvedToken(BaseModel):
     A single resolved token from Discogs markup parsing. Discriminated by the `type` field.
     """
 
-    type: Type1
+    type: Type
     text: str | None = Field(None, description="Content for plainText tokens")
     name: str | None = Field(None, description="Name for artistLink and labelName tokens")
     display_name: str | None = Field(
@@ -3477,7 +3320,7 @@ class ArtworkSearchResponse(BaseModel):
     confidence: float | None = Field(None, description="Confidence score of the match (0-1)")
 
 
-class Type2(StrEnum):
+class Type1(StrEnum):
     """
     Discogs entity type
     """
@@ -3489,7 +3332,7 @@ class Type2(StrEnum):
 
 class EntityResolveResponse(BaseModel):
     name: str = Field(..., description="Entity name")
-    type: Type2 = Field(..., description="Discogs entity type")
+    type: Type1 = Field(..., description="Discogs entity type")
     id: int = Field(..., description="Discogs entity ID")
 
 
@@ -3500,11 +3343,11 @@ class SpotifyTrackResponse(BaseModel):
     artworkUrl: str | None = Field(None, description="Album artwork URL from Spotify")
 
 
-class Type3(StrEnum):
+class Type2(StrEnum):
     update = "update"
 
 
-class Type4(StrEnum):
+class Type3(StrEnum):
     refetch = "refetch"
 
 
@@ -3525,7 +3368,7 @@ class LiveFsRefetchEvent(BaseModel):
     timestamp: AwareDatetime
 
 
-class Type5(StrEnum):
+class Type4(StrEnum):
     insert = "insert"
 
 
@@ -3585,7 +3428,7 @@ class AutoDJLastTrack(BaseModel):
     posted_at: int = Field(..., description="Unix timestamp")
 
 
-class Type6(StrEnum):
+class Type5(StrEnum):
     heartbeat = "heartbeat"
 
 
@@ -3619,7 +3462,7 @@ class AutoDJHeartbeat(BaseModel):
     )
 
 
-class Type7(StrEnum):
+class Type6(StrEnum):
     command = "command"
 
 
@@ -3631,7 +3474,7 @@ class AutoDJCommand(BaseModel):
     value: str | None = Field(None, description="Config value (only for set_config)")
 
 
-class Type8(StrEnum):
+class Type7(StrEnum):
     ack = "ack"
 
 
@@ -3652,7 +3495,7 @@ class AutoDJAck(BaseModel):
     )
 
 
-class Type9(StrEnum):
+class Type8(StrEnum):
     now_playing = "now_playing"
 
 
@@ -3665,7 +3508,7 @@ class AutoDJNowPlaying(BaseModel):
     is_live: bool = Field(..., description="Whether a live DJ is streaming")
 
 
-class Type10(StrEnum):
+class Type9(StrEnum):
     error = "error"
 
 
@@ -3681,7 +3524,7 @@ class AutoDJErrorReport(BaseModel):
     count: int = Field(..., description="Occurrences since last report")
 
 
-class Type11(StrEnum):
+class Type10(StrEnum):
     button_toggle = "button_toggle"
 
 
@@ -3786,7 +3629,7 @@ class ShowAlreadyOpenErrorDetails(BaseModel):
 
 class FlowsheetEntryFields(BaseModel):
     """
-    Every non-identity field of a v1 flowsheet row. Factored out of `FlowsheetEntryResponse` so `FlowsheetRangeEntry` can carry the identical field set while relaxing `show_id` to nullable — the two response shapes must not drift, because iOS V2 decodes both with one decoder (tubafrenzy-decommissioning plan §2.5, consumer #3). Not referenced directly by any path; compose it with an identity block instead.
+    Every non-identity field of a v1 flowsheet row, factored out so that more than one identity block can carry the identical field set without the copies drifting. `FlowsheetEntryResponse` is currently the only composer — the sibling that shared it has since moved to the V2 union — and it stays factored rather than inlined for two reasons: the V1 shape is being retired one caller at a time, and this schema is where the two streaming-URL YAML anchors are defined, which a YAML alias requires to precede every use. Not referenced directly by any path; compose it with an identity block instead.
     """
 
     album_id: int | None = None
@@ -3794,7 +3637,14 @@ class FlowsheetEntryFields(BaseModel):
     album_title: str | None = None
     artist_name: str | None = None
     record_label: str | None = None
-    label_id: int | None = None
+    rotation_label: str | None = Field(
+        None,
+        description="The rotation release's CANONICAL label, resolved server-side `flowsheet.rotation_id -> rotation.label_id -> labels.label_name` (WXYC/Backend-Service#2505).\n\nDistinct from `record_label` above, which is the free text a DJ typed mid-show and is UNCHANGED by this field's addition — it stays the snapshot and the fallback. The two exist together because the weekly airplay report names each ranked line from the FIRST rotation-linked play of the week, and 2.5% of rotation releases carry more than one label spelling across their weekly plays (2.2% differing by more than case), so one variant or one wrong early entry names the whole line. Resolving from the linked release removes the spelling contest at the root: every play of a release reads one row.\n\nNull when the entry has no rotation link, and null when the linked release has no `label_id` — the state of every row until WXYC/Backend-Service#2412 backfills it from tubafrenzy's `COMPANY_ID`, and the permanent state of a release whose label never resolved to a `labels` row. Consumers must fall back to `record_label` on null.\n\nResolved by rotation id with no status filter, so a KILLED release with plays in the window still names its label — unlike `GET /library/rotation`, which serves active rows only. A historical report must not lose the releases that were retired since the week it covers.",
+    )
+    label_id: int | None = Field(
+        None,
+        description="`labels.id` for `record_label`, or `null` when the row's label was never linked to a catalog row — the state of the large majority of rows, not an edge case. Passed straight through from `flowsheet.label_id`, which carries no NOT NULL. Consumers must fall back to the free-text `record_label` on null. Same column and same contract as `FlowsheetV2TrackEntry.label_id`; the V1 and V2 field sets are separate for historical reasons, not because the column differs between them.",
+    )
     rotation_id: int | None = None
     rotation_bin: RotationBin | None = None
     request_flag: bool
@@ -3805,7 +3655,7 @@ class FlowsheetEntryFields(BaseModel):
     release_year: int | None = None
     discogsUnavailable: bool | None = Field(
         None,
-        description='Rides the same MD-set "not on Discogs" flag as the Album surfaces (see `Album.discogsUnavailable`), non-nullable to match them. Deliberately camelCase — unlike its snake_case siblings in this block — to match Backend\'s `withDiscogsUnavailableCamelCase` serializer. Contract-first: the V2 flowsheet album embed will carry this field once the BS-emit piece (WXYC/Backend-Service#1908) lands; it is not emitted there yet.',
+        description='Rides the same MD-set "not on Discogs" flag as the Album surfaces (see `Album.discogsUnavailable`), non-nullable to match them. Deliberately camelCase — unlike its snake_case siblings in this block — to match Backend\'s `withDiscogsUnavailableCamelCase` serializer. The V2 union declares this field with the identical shape (`FlowsheetV2TrackEntry.discogsUnavailable`); one writer emits both surfaces, so the two declarations must not drift.',
     )
     discogsUnavailableNote: constr(max_length=500) | None = Field(
         None, description="Optional free-text reason for `discogsUnavailable`."
@@ -3857,27 +3707,6 @@ class FlowsheetEntryResponse(FlowsheetEntryBase, FlowsheetEntryFields):
     """
 
 
-class FlowsheetRangeEntry(FlowsheetRangeEntryBase, FlowsheetEntryFields):
-    """
-    A flowsheet row as returned by `GET /flowsheet/range`. Carries the exact field set of `FlowsheetEntryResponse` (both compose `FlowsheetEntryFields`) and differs from it in one respect: `show_id` is nullable. Field parity is a contract requirement, not a coincidence — iOS V2 decodes this endpoint and `GET /flowsheet` with a single decoder (tubafrenzy-decommissioning plan §2.5, consumer #3).
-    """
-
-
-class FlowsheetRangeResponse(BaseModel):
-    """
-    Response body of `GET /flowsheet/range`. `shows` is a deliberate superset: consumers that only need the entry stream (which carries inline `show_start` / `show_end` markers in `entry_type`) can ignore it.
-    """
-
-    shows: list[FlowsheetRangeShow] = Field(
-        ...,
-        description="Every show overlapping the window, ordered by `start_time` ascending. Empty when the window contains no shows.",
-    )
-    entries: list[FlowsheetRangeEntry] = Field(
-        ...,
-        description="Every flowsheet row in the window, ordered by `add_time` ascending and tie-broken on `id` — NOT by `play_order`, which is per-show and interleaves a multi-show window (see the endpoint description). Includes the `show_start` / `show_end` marker rows. Those markers are a convenience, not a guarantee: a show whose `show_end` delivery was dropped has no closing marker (the same failure that leaves `FlowsheetRangeShow.end_time` null), so a consumer that segments purely on markers will run one show's entries into the next. Segment on `show_id` and treat the markers as labels.",
-    )
-
-
 class FlowsheetV2TrackEntry(FlowsheetV2Base):
     """
     V2 track entry - a song that was played
@@ -3898,6 +3727,10 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
         description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Set by the dj-site flowsheet picker (catalog-track-search plan §5.3 / Track 3) when the DJ selected a track from the resolved release, or supplied directly on a freeform (LML-only) entry; null when the DJ entered a free-text track_title without a tracklist lookup. String-typed to match Discogs\'s `release_track.position`.\n',
     )
     record_label: str | None = None
+    rotation_label: str | None = Field(
+        None,
+        description="The rotation release's CANONICAL label, resolved server-side `flowsheet.rotation_id -> rotation.label_id -> labels.label_name` (WXYC/Backend-Service#2505).\n\nDistinct from `record_label` above, which is the free text a DJ typed mid-show and is UNCHANGED by this field's addition — it stays the snapshot and the fallback. The two exist together because the weekly airplay report names each ranked line from the FIRST rotation-linked play of the week, and 2.5% of rotation releases carry more than one label spelling across their weekly plays (2.2% differing by more than case), so one variant or one wrong early entry names the whole line. Resolving from the linked release removes the spelling contest at the root: every play of a release reads one row.\n\nNull when the entry has no rotation link, and null when the linked release has no `label_id` — the state of every row until WXYC/Backend-Service#2412 backfills it from tubafrenzy's `COMPANY_ID`, and the permanent state of a release whose label never resolved to a `labels` row. Consumers must fall back to `record_label` on null.\n\nResolved by rotation id with no status filter, so a KILLED release with plays in the window still names its label — unlike `GET /library/rotation`, which serves active rows only. A historical report must not lose the releases that were retired since the week it covers.",
+    )
     request_flag: bool
     segue: bool | None = None
     rotation_bin: RotationBin | None = None
@@ -3941,13 +3774,25 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
         None,
         description="An optional embedded upcoming Triangle-area concert whose headliner is this track's resolved catalog artist, attached server-side at feed-assembly time so the iOS \"On Tour\" Box Office CTA renders inline with no second round-trip.\n\nMatch rule (mirrors `GET /concerts?curated=true`): the track's resolved artist — `flowsheet.album_id → library.artist_id` — is matched against `concerts.headlining_artist_id` on curated, non-tombstoned, upcoming rows (`headlining_artist_id IS NOT NULL`, `removed_at IS NULL`, `starts_on >= today` America/New_York). When an artist has several upcoming dates the **soonest** wins (`ORDER BY starts_on ASC LIMIT 1`), so at most one concert rides each playcut.\n\nAbsent/null when the track has no resolved artist (free-form entries with no `album_id`, or an `album_id` whose library row has no matched artist) or when that artist has no curated upcoming date. The field is additive and optional — older app builds that don't decode it are unaffected. Reuses the `Concert` schema verbatim so iOS decodes one type across the On Tour tab and the playcut CTA; the `BoxOfficeTicketPresenter` reads `id`, `title` / `headlining_artist_raw`, `venue` (name + city), `starts_on`, `doors_at`, `status`, `price_min` / `price_max`, `ticket_url`, and `image_url` off it.\n",
     )
+    label_id: int | None = Field(
+        None,
+        description="`labels.id` for `record_label`, or `null` when the row's label was never linked to a catalog row — the state of the large majority of rows, not an edge case. Passed straight through from `flowsheet.label_id`, which carries no NOT NULL.",
+    )
+    discogsUnavailable: bool | None = Field(
+        None,
+        description='MD-set "not on Discogs" marker for this track\'s resolved release, the same flag `Album.discogsUnavailable` carries. Deliberately camelCase among snake_case siblings, matching Backend\'s `withDiscogsUnavailableCamelCase` serializer.\n\n**Absent — never `null`, never `false`-by-default — when the track resolved to no library row.** The key\'s absence is the only "unknown"; do not read a missing key as "available on Discogs". This is why the field is optional and NOT nullable: a nullable declaration would offer a second spelling of unknown that the wire never sends.',
+    )
+    discogsUnavailableNote: constr(max_length=500) | None = Field(
+        None,
+        description="Optional free-text reason for `discogsUnavailable`. Emitted independently of the flag — a library row can carry the flag with no note — so its presence implies nothing about the flag's.",
+    )
     critic_reviews: list[CriticReviewItem] | None = Field(
         None,
         description="An optional array of attributed external critic-review snippets for this track's resolved album, attached server-side at feed-assembly time so the iOS Reviews card can render inline for enriched playcuts with no second round-trip — iOS skips the `/proxy/metadata/album` fetch for terminal rows (wxyc-ios-64#685/#691).\n\nPopulated only on `track` entries whose linked `album_id` has rows in Backend-Service's `album_critic_reviews` table; attached via one batched query per page (no per-row lookups). Capped at 5 items (`CRITIC_REVIEWS_LIMIT`), ordered `published_at DESC NULLS LAST`. Absent — never `null` or empty — when the track has no matching album, when the attach is skipped, or on servers where Backend's `CRITIC_REVIEWS_ENABLED` env flag (ADR 0012) is off, including older servers that predate this field. Reuses the `CriticReviewItem` schema verbatim — the same shape `AlbumMetadataResponse.criticReviews` already serves — so clients decode one type across both surfaces.\n",
     )
 
 
-class Entries(
+class FlowsheetV2Entry(
     RootModel[
         FlowsheetV2TrackEntry
         | FlowsheetV2ShowStartEntry
@@ -3968,11 +3813,19 @@ class Entries(
         | FlowsheetV2TalksetEntry
         | FlowsheetV2BreakpointEntry
         | FlowsheetV2MessageEntry
-    ) = Field(..., discriminator="entry_type")
+    ) = Field(
+        ...,
+        description="One row of the V2 flowsheet projection — the discriminated union every `projectEntriesV2` caller emits.\n\nDeclared once and referenced from all four of its sites (`FlowsheetV2PaginatedResponse.entries`, `ShowPlaylist.entries`, `FlowsheetRangeResponse.entries`, and the array branches of `GET /flowsheet`) rather than inlined per site. It was previously pasted into two of them, which is how the copies come to disagree: nothing makes an inlined `oneOf` track a variant added to its twin. Add a variant here and to `entry_type`'s mapping, never to a call site.",
+        discriminator="entry_type",
+    )
 
 
 class FlowsheetV2PaginatedResponse(BaseModel):
-    entries: list[Entries]
+    """
+    The response of the default (paginated) branch of `GET /flowsheet` — the branch a request carrying neither `shows_limit` nor `start_id`/`end_id` selects, and the one the iOS app polls. The other two branches of that endpoint answer with a bare `FlowsheetV2Entry` array and no envelope; see the path for which query selects which.
+    """
+
+    entries: list[FlowsheetV2Entry]
     page: int
     limit: int
     total: int = Field(..., description="Total number of entries")
@@ -3987,7 +3840,7 @@ class ShowPlaylist(BaseModel):
     """
     The response of `GET /flowsheet/playlist?show_id=` — one archived show, its entries, and the ids of the shows either side of it.
 
-    The handler spreads the whole `shows` row, then adds the resolved specialty-show name, the show's DJs, the two neighbour ids and the projected entries. Every property below is therefore always present on the wire; the nullable ones carry `null`, they are not omitted. This schema previously described a shape the route has not emitted for some time: it declared `specialty_show` (emitted as `specialty_show_name`), typed `entries` as the V1 `FlowsheetEntryResponse` (emitted as the V2 discriminated union), declared no identifier at all, omitted the six `shows` columns the spread ships, and `$ref`ed `OnAirDJ`, whose `dj_name` is non-nullable where this route's is not.
+    The handler spreads the whole `shows` row, then adds the resolved specialty-show name, the show's DJs, the two neighbour ids and the projected entries. Every property below is therefore always present on the wire; the nullable ones carry `null`, they are not omitted. This schema previously described a shape the route has not emitted for some time: it declared `specialty_show` (emitted as `specialty_show_name`), typed `entries` as the V1 `FlowsheetEntryResponse` (emitted as the V2 discriminated union), declared no identifier at all, and omitted the six `shows` columns the spread ships.
     """
 
     id: int = Field(
@@ -4010,7 +3863,7 @@ class ShowPlaylist(BaseModel):
         ...,
         description="The resolved specialty-show name, or the empty string when the show is not a specialty show. Empty string, never null.",
     )
-    show_djs: list[ShowPlaylistDJ]
+    show_djs: list[OnAirDJ]
     previous_show_id: int | None = Field(
         ...,
         description="The show that aired immediately before this one, or null on the oldest show in the archive.\n\nOrdered by `(start_time, id)`, not by `id`: ids were airtime-ordered while tubafrenzy assigned them, but the import left 32 of ~72,900 shows carrying a lower id than a show that aired earlier. Null is the end of the archive and nothing else — never `0`, the sentinel the legacy JSP linked to and then failed to resolve.",
@@ -4019,7 +3872,7 @@ class ShowPlaylist(BaseModel):
         ...,
         description="The show that aired immediately after this one, or null on the newest show.\n\nPoints at the live show while one is on the air: nothing filters on `end_time` (see the field's own note), matching the legacy behaviour. A client caching this response should exclude the newest show — the hazard is freezing a null `next_show_id` after a later show has started, not linking to a show still in progress.",
     )
-    entries: list[Entries] = Field(
+    entries: list[FlowsheetV2Entry] = Field(
         ...,
         description="The V2 discriminated union, the same shape `GET /flowsheet` serves. The handler projects through `projectEntriesV2`; there is no V1 variant of this response.",
     )
@@ -4044,8 +3897,14 @@ class AlbumSearchResult(BaseModel):
     code_artist_number: int
     format_name: str
     genre_name: str
-    label: str
-    label_id: int | None = None
+    label: str | None = Field(
+        ...,
+        description='`library.label`. Nullable in the database; the key is always present because the projection always selects it. `GET /library` sends that null through, while `GET /library/query` currently coalesces it to `""` — treat both as "no label on file".\n',
+    )
+    label_id: int | None = Field(
+        None,
+        description="`library.label_id`. Nullable in the database (no NOT NULL, no FK-driven default) — the same shape as `label`, one line above. `library_artist_view` selects it straight off the base `library` row (no COALESCE), and neither `/library/query` mapper nor `GET /library`'s serializer coalesces it, so a release with no catalogued label reaches the wire with `label_id: null`.\n",
+    )
     artist_id: int | None = Field(
         None,
         description="The WXYC catalog artist id, sharing the `library.artist_id` keyspace. Optional here (never required): it lands ahead of the Backend-Service change that populates it (BS#2227), so a consumer compiled against this field must still tolerate its absence until that deploys.\n",
@@ -4056,7 +3915,10 @@ class AlbumSearchResult(BaseModel):
     )
     album_dist: float | None = None
     artist_dist: float | None = None
-    rotation_bin: RotationBin | None = None
+    rotation_bin: RotationBin | None = Field(
+        None,
+        description="Current-rotation bin, from the CURRENT_DATE-filtered LEFT JOIN against `rotation`. Null whenever the release is not actively rotating — never added, or added and since killed — which is most of the catalog. That filtering happens server-side, so `rotation_bin != null` is this endpoint's in-rotation test, unlike CatalogExportRow's, which ships rotation raw and defers expiry to the client. `card` below is NOT a substitute for that test: it rides a further join through the nullable `rotation.card_id`, so a release that is actively rotating but filed on no card carries a bin and a null card. A present value is always exactly one of H/M/L/S — `rotation.rotation_bin` is a NOT NULL Postgres enum, so the null here comes from the absent join row, never the column.\n",
+    )
     rotation_id: int | None = None
     card: RotationCard | None = Field(
         None,
@@ -4067,7 +3929,10 @@ class AlbumSearchResult(BaseModel):
         None,
         description="True if this release is available on at least one streaming service. False means only available in the WXYC physical library. Null if unknown.",
     )
-    album_artist: str | None = Field(None, description="Credited album artist for compilations.")
+    album_artist: str | None = Field(
+        None,
+        description="Credited album artist for compilations. `library.album_artist` is nullable (most releases are not compilations); the view and both `/library/query` mappers, plus `GET /library`'s serializer, all pass it through unchanged, so a non-compilation row reaches the wire with `album_artist: null`.\n",
+    )
     date_lost: AwareDatetime | None = Field(
         None,
         description="When the release was marked missing from the physical library. Null if in library.",
@@ -4205,23 +4070,86 @@ class AlbumDetail(BaseModel):
     reconciled_identity: ReconciledIdentity | None = None
 
 
-class LibraryMatch(BaseModel):
-    album: AlbumSearchResult
-    confidence: confloat(ge=0.0, le=1.0)
-    matchType: MatchType
-    reasoning: str | None = None
-
-
-class EnhancedRequest(SongRequest):
-    parsed: ParsedSongRequest | None = None
-    matches: list[LibraryMatch] | None = None
-    artwork_url: str | None = None
-    discogs_url: str | None = None
+class Rotation(BaseModel):
+    id: int | None = Field(
+        None,
+        description="Linked `library.id`, or null on an uncatalogued row (album_id IS NULL has no library row to join).\n",
+    )
+    code_letters: str | None = Field(
+        None,
+        description="`artists.code_letters` via the library/artists join. Null on an uncatalogued row for the same reason as `id`.\n",
+    )
+    code_artist_number: int | None = Field(
+        None,
+        description="`genre_artist_crossreference.artist_genre_code`. Null on an uncatalogued row (no `library.artist_id` to join the crossreference on).\n",
+    )
+    code_number: int | None = Field(
+        None,
+        description="`library.code_number`. Null on an uncatalogued row for the same reason as `id`.\n",
+    )
+    artist_name: str | None = Field(
+        None,
+        description="COALESCE(artists.artist_name, rotation.artist_name) — the same expression and the same fallback as `alphabetical_name` below, nullable for the identical reason: `rotation.artist_name` carries no NOT NULL.\n",
+    )
+    alphabetical_name: str | None = Field(
+        None,
+        description="COALESCE(artists.alphabetical_name, rotation.artist_name) — the library-linked artist's shelf-order name (\"Beatles, The\") on a catalogued row, falling back to this row's own denormalized artist_name snapshot on an uncatalogued one (album_id IS NULL has no artists row to join). Nullable because that fallback itself carries no NOT NULL. Derived, not stored: PATCH /library/rotation/:id rejects the field outright rather than silently no-op writing it — there is no rotation.alphabetical_name column, so edit artists.alphabetical_name via PATCH /library/artists/:id on a catalogued row, or artist_name on an uncatalogued one.\n",
+    )
+    album_title: str | None = Field(
+        None,
+        description="COALESCE(library.album_title, rotation.album_title). Nullable for two independent reasons: `library.album_title` is NOT NULL but the `library` join misses entirely on an uncatalogued row, and its fallback `rotation.album_title` carries no NOT NULL of its own.\n",
+    )
+    record_label: str | None = Field(
+        None,
+        description="COALESCE(library.label, rotation.record_label). `library.label` is already nullable in the database, and an uncatalogued row has no `library` row to join at all; the fallback `rotation.record_label` carries no NOT NULL either.\n",
+    )
+    label_id: int | None = Field(
+        None,
+        description="library.label_id, the FK to the labels table for a catalogued row's linked label. Nullable for two independent reasons: the column itself carries no NOT NULL (a catalogued release can have no resolved label), and an uncatalogued rotation row (album_id IS NULL) has no library row to join at all. Distinct from record_label, the free-text display snapshot.\n",
+    )
+    genre_name: str | None = Field(
+        None,
+        description="`genres.genre_name` via the library/genres join. Null on an uncatalogued row for the same reason as `id`, and also on a catalogued row whose release has no genre link.\n",
+    )
+    format_name: str | None = Field(
+        None,
+        description="`format.format_name` via the library/format join. Null on an uncatalogued row for the same reason as `id`, and also on a catalogued row whose release has no format link.\n",
+    )
+    rotation_id: int | None = None
+    add_date: str | None = Field(
+        None,
+        description="`library.add_date` — the catalog release's own add date. Null on an uncatalogued row (album_id IS NULL has no library row to join). No `format` is declared: `library.add_date` is a `timestamptz`, and `getRotationFromDB` reads it via a raw `db.execute` call — drizzle's postgres-js driver installs a transparent (pass-through) parser for timestamp/date OIDs on that path, so the wire carries Postgres' own text rendering (`YYYY-MM-DD HH:MI:SS±TZ`, e.g. `2026-08-20 00:00:00+00`) rather than a parsed-and-reformatted value. That satisfies neither RFC 3339 date-time (`T` separator, colon-delimited offset) nor an RFC 3339 full-date (10 bytes), so no `format` is declared here — see WXYC/Backend-Service#2349 for the identical defect already tracked on `PlaylistSearchResult.play_date`; normalizing the server's own serialization is that ticket's job, not this contract's.\n",
+    )
+    rotation_add_date: date_aliased | None = Field(
+        None,
+        description="rotation.add_date — when this rotation record itself was added, distinct from add_date (the library release's own catalog add date, absent on an uncatalogued row). Always present: rotation is this query's driving table, so every returned row carries its own rotation.add_date regardless of whether it ever linked to a library row.\n",
+    )
+    rotation_bin: RotationBin | None = None
+    rotation_kill_date: date_aliased | None = Field(
+        None, description="rotation.kill_date — null while the record is still active."
+    )
+    plays: int | None = Field(
+        None,
+        description="`library.plays`. Null on an uncatalogued row for the same reason as `id`.\n",
+    )
+    legacy_release_id: int | None = Field(
+        None,
+        description="The library row's surrogate key (BS#1963). Nullable here (unlike AlbumSearchResult/BinLibraryDetails/AlbumInfoResponse): a library-unlinked rotation row has no library row at all, hence no legacy id.\n",
+    )
+    reconciled_identity: ReconciledIdentity | None = Field(
+        None,
+        description="The library-linked artist's external identifiers (toReconciledIdentity), or null both when the row is uncatalogued (no artists row to join) and when a catalogued artist has resolved none of the six IDs yet.\n",
+    )
+    card: RotationCard | None = None
+    urls: list[str] | None = Field(
+        None,
+        description="Storage order. Plain strings, not `format: uri` — MDs paste bare domains, so a value carries no scheme guarantee and a renderer must not bind one into an href without checking it. Deliberately an inline twin: `Rotation.urls` and `RotationEntry.urls` are pinned identical by a spec test rather than `$ref`ing a named array schema, because naming a top-level array makes the Python generator wrap the field in a RootModel (`.root` to reach the list) while every other target keeps a plain string list.\n",
+    )
 
 
 class DiscogsMatchResult(BaseModel):
     """
-    A processed Discogs search result with artwork and enriched metadata. Distinct from the raw DiscogsSearchResult which mirrors the Discogs API response directly. Streaming URL fields match the StreamingLinks schema and will be migrated to use $ref in a future version.
+    A processed Discogs search result with artwork and enriched metadata. Distinct from the raw Discogs API search response, which this contract deliberately does not model -- no WXYC endpoint proxies Discogs unmodified. Streaming URL fields match the StreamingLinks schema and will be migrated to use $ref in a future version.
     Two distinct states share this shape, told apart by `release_id`: a real Discogs identity has `release_id > 0` with a non-empty `release_url`; the streaming-only sentinel (BS#1185) has `release_id == 0` and `release_url == ""`, signalling "I carry only streaming URLs, there is no Discogs release to link or to fetch album metadata from." A consumer keying "has Discogs identity" on `release_id != 0` therefore handles both states correctly, including the row-less identity described on `LookupResultItem`.
 
     """
@@ -4426,6 +4354,21 @@ class ShowAlreadyOpenError(BaseModel):
     message: str
     code: ShowAlreadyOpenErrorCode | None = None
     details: ShowAlreadyOpenErrorDetails | None = None
+
+
+class FlowsheetRangeResponse(BaseModel):
+    """
+    Response body of `GET /flowsheet/range`. `shows` is a deliberate superset: consumers that only need the entry stream (which carries inline `show_start` / `show_end` markers in `entry_type`) can ignore it.
+    """
+
+    shows: list[FlowsheetRangeShow] = Field(
+        ...,
+        description="Every show overlapping the window, ordered by `start_time` ascending. Empty when the window contains no shows.",
+    )
+    entries: list[FlowsheetV2Entry] = Field(
+        ...,
+        description="Every flowsheet row in the window, ordered by `add_time` ascending and tie-broken on `id` — NOT by `play_order`, which is per-show and interleaves a multi-show window (see the endpoint description). Includes the `show_start` / `show_end` marker rows. Those markers are a convenience, not a guarantee: a show whose `show_end` delivery was dropped has no closing marker (the same failure that leaves `FlowsheetRangeShow.end_time` null), so a consumer that segments purely on markers will run one show's entries into the next. Segment on `show_id` and treat the markers as labels.\n\nThe rows are `FlowsheetV2Entry` — the same discriminated union `GET /flowsheet` serves, discriminated on `entry_type` — so a marker row carries only the marker's own fields and not the track field set. Sharing the union with `GET /flowsheet` is a contract requirement rather than a convenience: iOS V2 decodes both endpoints with a single decoder (tubafrenzy-decommissioning plan §2.5, consumer #3). `show_id` is nullable here as it is everywhere in the union; see `FlowsheetV2Base.show_id` for the unattributed case a window of historical entries can contain.",
+    )
 
 
 class LibraryQueryResponse(BaseModel):
