@@ -14,9 +14,11 @@ Strategy-adjacent, so it lives in this package (LML#727).
 import logging
 
 from clients.streaming.matching import find_best_typed_match
+from core.search import SEARCH_TYPE_FALLBACK
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResponse, DiscogsSearchResult
 from discogs.service import DiscogsService
 from library.models import LibraryItem
+from lookup.enrichment.item import compute_row_title_matches_requested_album
 from lookup.matching import (
     artist_variant_tie_break_key,
     artist_variants_with_stripped_suffix,
@@ -26,6 +28,56 @@ from lookup.strategies.va_rescue import find_va_comp_match
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
+
+
+def fallback_rows_block_serving(
+    parsed: ParsedRequest,
+    library_results: list[LibraryItem],
+    search_type: str,
+    *,
+    found_on_compilation: bool = False,
+) -> bool:
+    """LML#1319: is the songless lane holding only fallback rows that can never serve?
+
+    The two-floor contradiction this predicate names: the artist-fallback
+    album filter (``_filter_results_by_album_match``) admits a row via
+    ``fuzz.token_set_ratio``, which scores 100 for any token subset — so a
+    sibling album "E" passes against a typed "E at Home" — while the LML#477
+    serve floor (``compute_row_title_matches_requested_album``, via
+    ``score_match``) re-scores the same pair at 20 and collapses the row to
+    the LML#401/BS#1185 ``release_id=0`` streaming-only sentinel. Such a row
+    used to occupy ``library_results`` and close step 3a's emptiness gate:
+    no probe, no Discogs id, no artwork — even when the local release cache
+    held the exact typed pair.
+
+    True only when EVERY row would fail the serve floor, on exactly the lane
+    the contradiction lives on:
+
+    - songless only (``parsed.song`` absent) — the song-bearing fallback
+      behaviors (LML#801/#1184) and the LML#1228 album-as-artist lane
+      (``search_type='alternative'``) keep their existing gates untouched;
+    - artist-fallback provenance only (``search_type == 'fallback'``) — a
+      direct album-leg match is never second-guessed;
+    - any row clearing the serve floor keeps the suppression: that row will
+      serve with artwork, so the probe would only add load.
+
+    The serve-floor check calls the serve gate itself (``artwork=None``, so
+    its LML#628/#684 validated-release carve-outs — structurally track-lane
+    shapes — are inert here) rather than a re-derived ``score_match``, so the
+    two floors cannot drift apart again.
+    """
+    if parsed.song:
+        return False
+    if search_type != SEARCH_TYPE_FALLBACK:
+        return False
+    if not library_results:
+        return False
+    return not any(
+        compute_row_title_matches_requested_album(
+            parsed.album, item, None, found_on_compilation=found_on_compilation
+        )
+        for item in library_results
+    )
 
 
 async def _library_miss_discogs_search(

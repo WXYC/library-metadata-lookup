@@ -27,10 +27,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from core.search import SEARCH_TYPE_FALLBACK
 from discogs.models import DiscogsSearchResponse
 from lookup.models import LookupRequest, LookupResponse
 from lookup.orchestrator import perform_lookup
-from lookup.strategies.library_miss import _library_miss_discogs_search
+from lookup.strategies.library_miss import (
+    _library_miss_discogs_search,
+    fallback_rows_block_serving,
+)
 from services.parser import MessageType, ParsedRequest
 from tests.conftest import make_lml_telemetry
 from tests.factories import make_discogs_result, make_library_item, make_parsed_request
@@ -1610,3 +1614,243 @@ class TestPerformLookupDisambiguationSuffixRecall:
         item = response.results[0]
         assert item.artwork is not None
         assert item.artwork.release_id == 37193856
+
+
+# ---------------------------------------------------------------------------
+# LML#1319 — serve-aware step-3a gate on the songless lane
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackRowsBlockServing:
+    """Unit tests for ``fallback_rows_block_serving`` (LML#1319).
+
+    The two-floor contradiction: ``_filter_results_by_album_match`` admits an
+    artist-fallback row via ``fuzz.token_set_ratio`` (100 for any token
+    subset), while the LML#477 serve floor re-scores the same pair with
+    ``score_match`` (20 for "E" against "E at Home"). A row passing the first
+    floor and failing the second used to occupy ``library_results``, close the
+    step-3a emptiness gate, and then collapse to the ``release_id=0``
+    streaming-only sentinel — no probe, no Discogs id, no artwork.
+    """
+
+    def test_songless_fallback_row_below_serve_floor_blocks_serving(self):
+        parsed = make_parsed_request(artist="Eliana Glass", album="E at Home")
+        rows = [make_library_item(id=63861, artist="Eliana Glass", title="E")]
+        assert fallback_rows_block_serving(parsed, rows, SEARCH_TYPE_FALLBACK) is True
+
+    def test_any_row_clearing_serve_floor_keeps_suppression(self):
+        parsed = make_parsed_request(artist="Eliana Glass", album="E at Home")
+        rows = [
+            make_library_item(id=63861, artist="Eliana Glass", title="E"),
+            make_library_item(id=63862, artist="Eliana Glass", title="E at Home"),
+        ]
+        assert fallback_rows_block_serving(parsed, rows, SEARCH_TYPE_FALLBACK) is False
+
+    def test_song_bearing_request_never_blocks(self):
+        """The LML#801/#1184 song-bearing fallback behaviors keep their gate."""
+        parsed = ParsedRequest(
+            artist="Eliana Glass",
+            album="E at Home",
+            song="Song for Emahoy",
+            message_type=MessageType.REQUEST,
+            is_request=True,
+        )
+        rows = [make_library_item(id=63861, artist="Eliana Glass", title="E")]
+        assert fallback_rows_block_serving(parsed, rows, SEARCH_TYPE_FALLBACK) is False
+
+    def test_direct_match_provenance_never_blocks(self):
+        """A direct album match is never second-guessed (search_type='direct')."""
+        parsed = make_parsed_request(artist="Eliana Glass", album="E at Home")
+        rows = [make_library_item(id=63861, artist="Eliana Glass", title="E")]
+        assert fallback_rows_block_serving(parsed, rows, "direct") is False
+
+    def test_alternative_provenance_never_blocks(self):
+        """LML#1228 blast-radius pin: the album-as-artist preemption lane
+        (``search_type='alternative'``) keeps its existing behavior — this fix
+        must neither open nor close that lane's gate."""
+        parsed = make_parsed_request(artist="Sluice", album="Companion")
+        rows = [make_library_item(id=4886, artist="Companion Trio", title='Nona Lim 7"')]
+        assert fallback_rows_block_serving(parsed, rows, "alternative") is False
+
+    def test_empty_results_never_block(self):
+        """Emptiness is the classic gate's own arm — not this predicate's."""
+        parsed = make_parsed_request(artist="Eliana Glass", album="E at Home")
+        assert fallback_rows_block_serving(parsed, [], SEARCH_TYPE_FALLBACK) is False
+
+    def test_missing_album_never_blocks(self):
+        """No typed album → no serve floor to fail (the serve gate falls
+        through open), so the fallback rows stay authoritative. The outer
+        step-3a gate independently requires a non-empty album anyway."""
+        parsed = ParsedRequest(
+            artist="Eliana Glass",
+            message_type=MessageType.REQUEST,
+            is_request=True,
+        )
+        rows = [make_library_item(id=63861, artist="Eliana Glass", title="E")]
+        assert fallback_rows_block_serving(parsed, rows, SEARCH_TYPE_FALLBACK) is False
+
+
+class TestServeAwareStep3aGate:
+    """perform_lookup wiring for the serve-aware step-3a gate (LML#1319).
+
+    The Eliana Glass / "E at Home" shape end to end: the library holds only
+    the sibling album "E", the local Discogs cache holds the typed pair. The
+    wrong-album fallback row must not suppress the library-miss probe it can
+    never be served in place of.
+    """
+
+    @staticmethod
+    def _search_side_effect(artist_only_rows):
+        """db.search stub: the artist-only fallback query hits, every
+        artist+album (and other) query misses — the ``fallback_used=True``
+        shape from the LML#1319 diagnosis replay."""
+
+        async def _search(query: str, limit: int = 10, **kwargs):
+            if query.strip().lower() == "eliana glass":
+                return list(artist_only_rows)
+            return []
+
+        return _search
+
+    @pytest.mark.asyncio
+    async def test_unservable_fallback_row_no_longer_blocks_probe(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Songless + wrong-album fallback row + cached typed pair → the probe
+        runs and the typed pair resolves with a real Discogs id + artwork
+        (pre-fix: the row collapsed to the release_id=0 streaming-only
+        sentinel and the probe never ran)."""
+        wrong_album_row = make_library_item(id=63861, artist="Eliana Glass", title="E")
+        mock_library_db.search = AsyncMock(side_effect=self._search_side_effect([wrong_album_row]))
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=37161147,
+                    artist="Eliana Glass",
+                    album="E At Home",
+                    artwork_url="https://img.discogs.com/e-at-home.jpg",
+                )
+            ]
+        )
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Eliana Glass",
+            album="E at Home",
+            raw_message="Eliana Glass - E at Home",
+        )
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert len(response.results) == 1
+        item = response.results[0]
+        assert item.library_item.id == 0, (
+            "expected the step-3a synthesized pair, got library row "
+            f"{item.library_item.id} ({item.library_item.title!r})"
+        )
+        assert item.library_item.call_number == "(external)"
+        assert item.artwork is not None
+        assert item.artwork.release_id == 37161147
+        assert item.artwork.artwork_url == "https://img.discogs.com/e-at-home.jpg"
+        # A synthesized hit resolves the request, exactly as on the classic
+        # empty-library step-3a path.
+        assert response.song_not_found is False
+
+    @pytest.mark.asyncio
+    async def test_serve_floor_clearing_fallback_row_still_suppresses_probe(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """A fallback row that CAN clear the serve floor keeps the probe
+        suppressed — it will serve with artwork, so current behavior holds."""
+        servable_row = make_library_item(id=63862, artist="Eliana Glass", title="E at Home")
+        mock_library_db.search = AsyncMock(side_effect=self._search_side_effect([servable_row]))
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=37161147,
+                    artist="Eliana Glass",
+                    album="E At Home",
+                )
+            ]
+        )
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Eliana Glass",
+            album="E at Home",
+            raw_message="Eliana Glass - E at Home",
+        )
+        with patch(
+            "lookup.orchestrator._library_miss_discogs_search", new_callable=AsyncMock
+        ) as probe:
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+            probe.assert_not_called()
+
+        assert len(response.results) == 1
+        assert response.results[0].library_item.id == 63862
+
+    @pytest.mark.asyncio
+    async def test_direct_album_match_keeps_probe_suppressed(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """The direct (non-fallback) lane is untouched: a real album-leg match
+        never consults the probe, whatever its title scores."""
+        direct_row = make_library_item(
+            id=11, artist="Jessica Pratt", title="On Your Own Love Again"
+        )
+        mock_library_db.search = AsyncMock(return_value=[direct_row])
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=5678,
+                    artist="Jessica Pratt",
+                    album="On Your Own Love Again",
+                )
+            ]
+        )
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Jessica Pratt",
+            album="On Your Own Love Again",
+            raw_message="Jessica Pratt - On Your Own Love Again",
+        )
+        with patch(
+            "lookup.orchestrator._library_miss_discogs_search", new_callable=AsyncMock
+        ) as probe:
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+            probe.assert_not_called()
+
+        assert len(response.results) == 1
+        assert response.results[0].library_item.id == 11
+
+    @pytest.mark.asyncio
+    async def test_probe_miss_keeps_the_fallback_row(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """When the opened probe finds nothing, the unservable fallback row is
+        NOT thrown away: it still collapses to the streaming-only sentinel
+        downstream (which carries the streaming URLs the row can vouch for),
+        exactly as before the fix."""
+        wrong_album_row = make_library_item(id=63861, artist="Eliana Glass", title="E")
+        mock_library_db.search = AsyncMock(side_effect=self._search_side_effect([wrong_album_row]))
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Eliana Glass",
+            album="E at Home",
+            raw_message="Eliana Glass - E at Home",
+        )
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert len(response.results) == 1
+        assert response.results[0].library_item.id == 63861
+        assert response.song_not_found is True
