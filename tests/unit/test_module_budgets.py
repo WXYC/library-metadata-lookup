@@ -321,7 +321,16 @@ MODULE_BUDGETS: dict[str, int] = {
     # actual logic all landed in streaming_url_registry.py (new) and
     # search_urls.py. Headroom deliberately small: a second service would
     # fit, a third should force the per-service handles into a bundle.
-    "lookup/orchestrator.py": 1710,
+    # Recalibrated 2026-09-18 (LML#1319): the step-3a gate went serve-aware on
+    # the songless lane. The policy itself lives in
+    # `lookup/strategies/library_miss.py` (`fallback_rows_block_serving`) per
+    # this module's extraction policy; the growth here is the irreducible call
+    # site — the predicate call feeding the widened gate condition, the
+    # serve-blocked hit's `library_results` clear (that field's write sites
+    # live in this module by design), and the READS/WRITES docstring updates.
+    # Same tight-on-purpose formula as every prior recalibration: smallest
+    # multiple of 50 at or above the new measured 1733, not a re-derived 1.3x.
+    "lookup/orchestrator.py": 1750,
     # LML#1318: the album-level degrade for a failed non-library track
     # resolution, extracted to its own module rather than appended to
     # lookup/rowless.py (which sat at 420/450 — headroom for the two kernel
@@ -361,7 +370,13 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/spine_deadline.py": 250,
     "lookup/strategies/__init__.py": 150,
     "lookup/strategies/artist_plus_album.py": 300,
-    "lookup/strategies/library_miss.py": 200,
+    # Recalibrated 2026-09-18 (LML#1319): gained `fallback_rows_block_serving`,
+    # the serve-aware step-3a gate policy — strategy-adjacent by the same
+    # LML#727 rationale that placed `_library_miss_discogs_search` here, and
+    # deliberately NOT in orchestrator.py (whose own budget entry documents
+    # the extraction policy). Smallest multiple of 50 at or above the new
+    # measured 217.
+    "lookup/strategies/library_miss.py": 250,
     "lookup/strategies/song_as_artist.py": 250,
     "lookup/strategies/song_as_track.py": 150,
     "lookup/strategies/swapped_interpretation.py": 300,

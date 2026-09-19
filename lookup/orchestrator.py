@@ -87,7 +87,10 @@ from lookup.spine_deadline import (
 )
 from lookup.strategies import build_strategies
 from lookup.strategies.artist_plus_album import search_library_with_fallback
-from lookup.strategies.library_miss import _library_miss_discogs_search
+from lookup.strategies.library_miss import (
+    _library_miss_discogs_search,
+    fallback_rows_block_serving,
+)
 from lookup.strategies.song_as_artist import search_song_as_artist
 from lookup.strategies.song_as_track import search_song_as_track
 from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
@@ -673,15 +676,19 @@ async def _step_library_miss_probe(
 ) -> None:
     """Step 3a — library-miss Discogs search (LML#583).
 
-    READS: ``library_results`` (the emptiness gate).
-    WRITES: ``items_with_artwork``, ``song_not_found``, ``library_miss_outcome``.
+    READS: ``library_results``, ``search_type``, ``found_on_compilation``
+    (the serve-aware emptiness gate, LML#1319).
+    WRITES: ``items_with_artwork``, ``song_not_found``, ``library_miss_outcome``;
+    ``library_results`` (cleared on a serve-blocked-lane hit, LML#1319).
 
     Ordering invariant (enforced here and at step 4's emptiness guard): on a
     hit this step writes ``items_with_artwork`` directly and clears
     ``song_not_found``, deliberately bypassing track validation (3b) and the
     artwork fetch (4). The bypass holds because this step only fires when
-    ``library_results`` is empty — so 3b's and 4's non-empty gates never run on
-    this path and cannot overwrite the synthesized pair.
+    ``library_results`` is empty or holds only unservable songless-fallback
+    rows (LML#1319) — and a hit on the latter lane empties ``library_results``
+    itself — so 3b's and 4's non-empty gates never run after a hit and cannot
+    overwrite the synthesized pair.
     """
     # When the entire search pipeline returned no library results AND the request
     # carries both artist and album, probe Discogs directly. A confident match
@@ -707,8 +714,20 @@ async def _step_library_miss_probe(
     # ranks items_with_artwork first).
     if _task_resolved_with_renderable_locations(location_union_task):
         return
+    # LML#1319: the emptiness gate is serve-aware on the songless lane. A
+    # wrong-album artist-fallback row that cannot clear the LML#477 serve
+    # floor would collapse to the release_id=0 streaming-only sentinel
+    # downstream, so letting it close this gate starved the probe of exactly
+    # the lookups the local release cache could answer. Policy + rationale
+    # live on ``fallback_rows_block_serving``.
+    serve_blocked = fallback_rows_block_serving(
+        parsed,
+        state.library_results,
+        state.search_type,
+        found_on_compilation=state.found_on_compilation,
+    )
     if (
-        not state.library_results
+        (not state.library_results or serve_blocked)
         and services.allow_release_resolution_fallback
         and parsed.artist
         and parsed.album
@@ -722,6 +741,14 @@ async def _step_library_miss_probe(
             # A synthesized Discogs match resolves the request — clear song_not_found so
             # build_context_message and LookupResponse.song_not_found reflect reality.
             state.song_not_found = False
+            if serve_blocked:
+                # LML#1319: drop the unservable fallback rows so the step-4
+                # emptiness guard holds and the synthesized pair is not
+                # overwritten — a probe hit supersedes rows that could only
+                # ever collapse to the sentinel. On a probe MISS they are
+                # kept: the sentinel still carries the streaming URLs the
+                # rows can vouch for, exactly the pre-fix behavior.
+                state.library_results = []
             state.library_miss_outcome = "library_miss_discogs_match"
             services.telemetry.record_api_call("discogs")
         elif services.discogs_service is not None:
