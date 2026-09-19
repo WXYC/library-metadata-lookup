@@ -604,8 +604,17 @@ class TestFindAlbumMatchViaSearch:
         mock_http.request = AsyncMock(return_value=_bot_wall_response())
         client._http = mock_http
 
-        with pytest.raises(BandcampSearchUnavailableError):
+        with pytest.raises(BandcampSearchUnavailableError) as exc_info:
             await client.find_album_match_via_search("George Theodorakis", "The Rules of the Game")
+
+        # LML#1323 review: the translation must not sever the chain (it used to
+        # be ``from None``), or the only record of WHY the search was
+        # unavailable is gone by the time a caller logs it -- and a persistent
+        # bot-wall then looks exactly like a one-off blip in the drain's tally.
+        transport = exc_info.value.__cause__
+        assert isinstance(transport, BandcampTransportError)
+        assert "unparseable body" in str(transport)
+        assert isinstance(transport.__cause__, ValueError)
 
     @pytest.mark.asyncio
     async def test_pine_hill_haints_recovers_via_normalized_pass(self):

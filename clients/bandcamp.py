@@ -152,10 +152,18 @@ class BandcampTransportError(Exception):
     gets its own breaker method that counts toward opening, unlike
     ``discogs/breaker.py``'s neutral ``record_server_error``.
 
-    ``search_artist`` and ``search_albums`` raise it directly, and it always
-    propagates unmodified from those two -- neither has anywhere else in
-    ``_find_album_match_impl`` to be caught. ``fetch_artist_catalog`` is the
-    one leg where a raise here does NOT always propagate: LML#1106 review
+    ``search_artist`` and ``search_albums`` raise it directly, but only
+    ``search_artist``'s raise reaches ``_find_album_match_impl`` unmodified --
+    there is nowhere in that method for it to be caught.
+    ``search_albums`` is called from ``find_album_match_via_search``, which
+    catches it and, in the DEFAULT mode, re-raises it as
+    :class:`BandcampSearchUnavailableError` (propagating it unmodified only
+    under ``fail_fast``); LML#1323 widened what reaches that translation, since
+    an unparseable body now raises here in default mode too. The chain is
+    preserved through it (``raise ... from e``), so the original cause stays
+    readable at whatever log site finally handles it.
+    ``fetch_artist_catalog`` is the leg where a raise here does NOT
+    propagate at all: LML#1106 review
     FIX 5 catches it inside ``_find_album_match_impl`` so the album-first
     fallback still runs, and a fresh :class:`BandcampTransportError` is only
     re-raised from there if that fallback ALSO fails to produce a match --
@@ -725,12 +733,21 @@ class BandcampClient(BaseStreamingClient):
         LML#1115 extended the non-200 raise to the default (retrying) mode,
         since a default-mode failure was otherwise indistinguishable from a
         genuine no-results response and could be cached as a false negative.
-        LML#1323 finishes that extension: the FIX 6 unparseable-body raise now
-        covers BOTH modes too. It had been left behind, which mattered because
-        a live Bandcamp/Cloudflare bot-wall arrives as exactly a 200 + HTML
-        body and default mode is the mode production uses -- so the one
-        couldn't-ask shape the block actually produces was the one shape that
-        escaped as a raw ``ValueError``.
+        LML#1323 carries that extension to the FIX 6 unparseable-body raise,
+        which had been left behind in default mode -- the mode production uses,
+        and the shape a live Bandcamp/Cloudflare bot-wall actually arrives as
+        (200 + HTML).
+
+        That closes the shape CI was tripping over; it does not make this leg
+        airtight. A 200 carrying valid JSON with **no ``results`` key at all**
+        is still read as "asked, nothing matched" in BOTH modes, ``fail_fast``
+        included: ``_reject_malshaped_fail_fast_body`` accepts any dict, and
+        ``data.get("results", [])`` below defaults a missing key to empty. A
+        block that answers ``{"error": "blocked"}`` at 200 therefore still
+        returns ``[]`` and stays negative-cacheable. Tracked as Shape B of
+        https://github.com/WXYC/library-metadata-lookup/issues/1325 --
+        requiring the key is a behavior change (it would reclassify any genuine
+        API response that omits it) and deliberately out of #1323's scope.
 
         LML#1106 review round 2, FIX B: a 200 whose body IS valid JSON but
         not object-shaped (a bare list, a bare string) or whose ``results``
@@ -752,7 +769,12 @@ class BandcampClient(BaseStreamingClient):
         try:
             data = resp.json()
         except ValueError as e:
-            raise BandcampTransportError(AUTOCOMPLETE_URL) from e
+            # The message names the shape, and ``from e`` keeps the
+            # JSONDecodeError in the chain: both raises out of this method are
+            # otherwise byte-identical, and a persistent bot-wall would be
+            # indistinguishable from a one-off 5xx at every log site above
+            # (LML#1323 review).
+            raise BandcampTransportError(f"{AUTOCOMPLETE_URL} (unparseable body)") from e
         if fail_fast:
             data = _reject_malshaped_fail_fast_body(data, AUTOCOMPLETE_URL)
         results = []
@@ -801,14 +823,39 @@ class BandcampClient(BaseStreamingClient):
         retry loop. Every other non-200 (5xx, 403, 429, ...) still raises,
         unchanged.
 
-        LML#1323 audited this method and left its body handling alone: it
-        scrapes ``resp.text`` with regexes and never calls ``resp.json()``, so
-        it has no unparseable-body case to bring into the taxonomy. A bot-wall
-        HTML body here simply matches no album link and yields ``[]`` -- the
-        same shape a genuinely empty catalog gives -- which the two
-        autocomplete legs' raises already cover on the way in, since a block
-        severe enough to serve this page also blocks ``search_artist`` and no
-        slug is ever reached to fetch.
+        LML#1323 audited this method and left its body handling alone, but does
+        NOT cover it. This leg scrapes ``resp.text`` with regexes and never
+        calls ``resp.json()``, so it has no unparseable-*body* case in #1323's
+        sense -- there is no parse step to route into the taxonomy. What it has
+        instead is worse and still open: a bot-wall HTML interstitial at 200
+        matches no album link and yields ``[]``, which is **indistinguishable
+        from a genuinely empty catalog**, the one value this method's contract
+        (above) declares to mean "the artist has no releases."
+
+        Do not read the autocomplete legs' raises as covering this. The two
+        legs hit DIFFERENT hosts -- ``{slug}.bandcamp.com/music`` here versus
+        ``bandcamp.com/api/fuzzysearch`` there -- and this module's own FIX A
+        reasoning treats per-subdomain failure as independent (see
+        ``_find_album_match_impl``, and
+        ``tests/unit/test_bandcamp_client.py::
+        test_catalog_fetch_failure_still_tries_the_album_first_fallback``), so a
+        walled artist page behind a healthy API endpoint is the EXPECTED case,
+        not a corner. And ``scripts/bandcamp_pipeline.py::phase_lookup`` reads
+        ``bandcamp_slug`` straight from the database via
+        ``get_pending_bandcamp_lookup`` and calls this method without ever
+        calling ``search_artist`` in that run, so there is no autocomplete raise
+        upstream of it to fire at all.
+
+        Both consequences are live: ``phase_lookup`` routes the ``[]`` to its
+        "genuinely empty catalog: definitively absent" branch and durably
+        ``mark_bandcamp_not_found``s every album for that slug, and the live
+        path gets ``catalog_leg_failed=False`` -> a clean fallback miss ->
+        ``None`` -> a 7-day known-miss row plus ``on_streaming=False`` written
+        through to Backend. Tracked as Shape A of
+        https://github.com/WXYC/library-metadata-lookup/issues/1325;
+        ``verify_album_page`` shares the shape. Fixing it is a behavior change
+        (a scrape leg needs its own block detection) and deliberately out of
+        #1323's scope.
         """
         url = f"https://{slug}.bandcamp.com/music"
         resp = await self._request_with_retry(
@@ -896,7 +943,12 @@ class BandcampClient(BaseStreamingClient):
         try:
             data = resp.json()
         except ValueError as e:
-            raise BandcampTransportError(AUTOCOMPLETE_URL) from e
+            # The message names the shape, and ``from e`` keeps the
+            # JSONDecodeError in the chain: both raises out of this method are
+            # otherwise byte-identical, and a persistent bot-wall would be
+            # indistinguishable from a one-off 5xx at every log site above
+            # (LML#1323 review).
+            raise BandcampTransportError(f"{AUTOCOMPLETE_URL} (unparseable body)") from e
         if fail_fast:
             data = _reject_malshaped_fail_fast_body(data, AUTOCOMPLETE_URL)
         results = []
@@ -952,10 +1004,16 @@ class BandcampClient(BaseStreamingClient):
         query = f"{artist} {clean_title_for_query(title)}".strip()
         try:
             results = await self.search_albums(query, fail_fast=fail_fast)
-        except BandcampTransportError:
+        except BandcampTransportError as e:
             if fail_fast:
                 raise
-            raise BandcampSearchUnavailableError(query) from None
+            # ``from e`` rather than the previous ``from None``: the translation
+            # changes the TYPE for this method's contract, but severing the chain
+            # also discarded the only evidence of which couldn't-ask shape it
+            # was -- since LML#1323 that now includes the bot-wall's
+            # JSONDecodeError, the one shape whose persistence a caller most
+            # needs to be able to see (LML#1323 review).
+            raise BandcampSearchUnavailableError(query) from e
         if not results:
             return None
 

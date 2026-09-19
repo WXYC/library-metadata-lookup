@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -163,7 +164,7 @@ class TestPhaseAlbumSearchMisses:
 
 class TestPhaseAlbumSearchFetchFailure:
     @pytest.mark.asyncio
-    async def test_fetch_failure_tallied_and_row_stays_pending(self, db):
+    async def test_fetch_failure_tallied_and_row_stays_pending(self, db, caplog):
         from scripts.bandcamp_pipeline import phase_album_search
 
         await db.insert_albums([_make_album()])
@@ -172,7 +173,17 @@ class TestPhaseAlbumSearchFetchFailure:
             side_effect=BandcampSearchUnavailableError("boom")
         )
 
-        report = await phase_album_search(client, db, execute=True, verify_hits=False)
+        with caplog.at_level(logging.WARNING):
+            report = await phase_album_search(client, db, execute=True, verify_hits=False)
+
+        # LML#1323 review: this branch used to tally silently, so a whole drain
+        # run under a persistent bot-wall was indistinguishable from a clean one
+        # -- ``fetch_failed=N`` at the end and no reason anywhere. Say which row
+        # and why. Still strictly quieter than the pre-#1323 behavior, where this
+        # shape reached the ``except Exception`` branch and logged a traceback
+        # per row.
+        assert "Stereolab" in caplog.text
+        assert "boom" in caplog.text
 
         assert report["fetch_failed"] == 1
         assert report["hits"] == 0
