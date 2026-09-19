@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from config.settings import get_settings
 from entity.sources import PgSource
 from lookup.release_resolution import ResolvedRelease
 from lookup.rowless import ROWLESS_LIBRARY_ID, _make_rowless_item
@@ -327,6 +328,24 @@ class TestApplyTrackValidationCascade:
 # question directly — an id-equality check, no title similarity at all.
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture
+def _override_flag_on(monkeypatch):
+    """The LML#850 flag the reverse probe is gated on. Off by default."""
+    monkeypatch.setenv("LML_LIBRARY_RELEASE_OVERRIDE", "true")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def _override_flag_off(monkeypatch):
+    monkeypatch.setenv("LML_LIBRARY_RELEASE_OVERRIDE", "false")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 BROADCAST_ITEM = make_library_item(
     id=55651,
     artist="Broadcast",
@@ -358,6 +377,7 @@ HIDING_PLACES_OWN_RELEASE_ID = 6001234
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_override_flag_on")
 class TestRebindRowlessReleaseViaOverride:
     """Direct unit tests for ``_rebind_rowless_release_via_override``."""
 
@@ -438,6 +458,7 @@ class TestRebindRowlessReleaseViaOverride:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_override_flag_on")
 class TestCascadeRowLessReverseProbe:
     """``apply_track_validation_cascade``'s use of the LML#850 reverse probe."""
 
@@ -606,11 +627,12 @@ class TestCascadeRowLessReverseProbe:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_override_flag_on")
 class TestShelfRebindProbeBound:
     """The probe's bound must clear the real WXYC shelf-count distribution.
 
     Measured against ``library.db`` (64,193 rows, 2026-09-19): 162 artists
-    shelve more than 20 releases, and five of them are in the very
+    shelve more than 20 releases, and four of them are in the very
     title-divergence cohort LML#1330 names — ``Sun Ra`` (49 rows),
     ``Various Artists - Rock - F`` (90), ``David Bowie`` (33), ``Keith
     Jarrett`` (32). A 20-row bound therefore truncated exactly the artists
@@ -642,3 +664,165 @@ class TestShelfRebindProbeBound:
         queried_ids = pg.fetchall.await_args.args[1]
         assert len(queried_ids) == _SHELF_REBIND_PROBE_LIMIT
         assert queried_ids == list(range(1, _SHELF_REBIND_PROBE_LIMIT + 1))
+
+
+@pytest.mark.asyncio
+class TestProbeHonoursTheOverrideFlag:
+    """LML#1332: the probe must be gated exactly like every other read of
+    ``lml_cache.library_release_override``.
+
+    ``_prefetch_release_overrides`` promises that flag-off means zero PG work
+    and "the pre-override fuzzy pick byte-for-byte". The probe reached the
+    same table without consulting the flag, so a row-less-tier request still
+    queried it and still rebound its answer from pins the operator had
+    disabled — defeating LML#850's documented rollback (scoped DELETE plus
+    flag off), which is the lever for the 1,444 contradicted pins LML#1316
+    reports.
+    """
+
+    async def test_flag_off_does_no_pg_work(self, _override_flag_off):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[])
+        result = await _rebind_rowless_release_via_override(
+            pg, release_id=BROADCAST_RELEASE_ID, shelf_rows=[BROADCAST_ITEM]
+        )
+        assert result is None
+        pg.fetchall.assert_not_awaited()
+
+    async def test_flag_off_leaves_the_rowless_answer_untouched(self, _override_flag_off):
+        """End-to-end through the cascade: the pre-probe answer, byte for byte."""
+        rowless = _make_rowless_item(
+            artist="Broadcast", title="Investigate Witch Cults Of The Radio Age"
+        )
+        resolved = ResolvedRelease(
+            release_id=BROADCAST_RELEASE_ID,
+            release_url=f"https://www.discogs.com/release/{BROADCAST_RELEASE_ID}",
+            is_compilation=False,
+            album_title="Investigate Witch Cults Of The Radio Age",
+            confidence=0.8,
+            track_confirmed=True,
+        )
+        with (
+            patch(
+                "lookup.validation.filter_results_by_track_validation",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "lookup.validation.find_library_albums_with_cached_track",
+                new_callable=AsyncMock,
+                return_value=([rowless], {ROWLESS_LIBRARY_ID: resolved}),
+            ),
+            patch(
+                "lookup.validation.get_library_release_overrides",
+                new_callable=AsyncMock,
+                return_value={BROADCAST_ITEM.id: BROADCAST_RELEASE_ID},
+            ) as mock_overrides,
+        ):
+            result = await apply_track_validation_cascade(
+                real_results=[BROADCAST_ITEM],
+                library_results=[BROADCAST_ITEM],
+                found_on_compilation=False,
+                song_not_found=True,
+                discogs_titles={},
+                artist_fallback_results=[],
+                song="The Be Colony",
+                artist="Broadcast",
+                match_artist="Broadcast",
+                db=object(),
+                discogs_service=object(),
+                allow_release_resolution_fallback=True,
+                pg=AsyncMock(spec=PgSource),
+            )
+        mock_overrides.assert_not_awaited()
+        assert result.library_results[0].id == ROWLESS_LIBRARY_ID
+        assert result.release_overrides == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_override_flag_on")
+class TestRebindCarriesTheResolvedRelease:
+    """LML#1332: a rebound shelf row must carry its release on the seam.
+
+    The probe matched on release-id equality, so the cascade already holds the
+    ``ResolvedRelease`` the track leg resolved — but it returned only
+    ``discogs_titles``, dropping ``promoted_titles``. That left the bind
+    depending on step 4 re-fetching the same pin: correct only by coincidence
+    with the flag on, and flag-off it re-derives the release through the very
+    80/80 title floor the probe exists to bypass (51/100 for this pair),
+    landing on the ``release_id=0`` sentinel and losing artwork + tracklist.
+    """
+
+    async def _rebind(self):
+        rowless = _make_rowless_item(
+            artist="Broadcast", title="Investigate Witch Cults Of The Radio Age"
+        )
+        resolved = ResolvedRelease(
+            release_id=BROADCAST_RELEASE_ID,
+            release_url=f"https://www.discogs.com/release/{BROADCAST_RELEASE_ID}",
+            is_compilation=False,
+            album_title="Investigate Witch Cults Of The Radio Age",
+            confidence=0.8,
+            track_confirmed=True,
+        )
+        with (
+            patch(
+                "lookup.validation.filter_results_by_track_validation",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "lookup.validation.find_library_albums_with_cached_track",
+                new_callable=AsyncMock,
+                return_value=([rowless], {ROWLESS_LIBRARY_ID: resolved}),
+            ),
+            patch(
+                "lookup.validation.get_library_release_overrides",
+                new_callable=AsyncMock,
+                return_value={BROADCAST_ITEM.id: BROADCAST_RELEASE_ID},
+            ),
+        ):
+            return await apply_track_validation_cascade(
+                real_results=[BROADCAST_ITEM],
+                library_results=[BROADCAST_ITEM],
+                found_on_compilation=False,
+                song_not_found=True,
+                discogs_titles={},
+                artist_fallback_results=[],
+                song="The Be Colony",
+                artist="Broadcast",
+                match_artist="Broadcast",
+                db=object(),
+                discogs_service=object(),
+                allow_release_resolution_fallback=True,
+                pg=AsyncMock(spec=PgSource),
+            )
+
+    async def test_seam_carries_the_release_keyed_by_the_shelf_row(self):
+        result = await self._rebind()
+        assert result.library_results == [BROADCAST_ITEM]
+        carried = result.discogs_titles.get(BROADCAST_ITEM.id)
+        assert carried is not None
+        assert carried.release_id == BROADCAST_RELEASE_ID
+
+    async def test_seam_keeps_the_catalog_title_not_the_discogs_one(self):
+        """``fetch_artwork_for_items``'s own override path binds with
+        ``album_title=item.title`` — "the pin only redirects the release id".
+        Carrying the row-less release verbatim would surface "Investigate
+        Witch Cults Of The Radio Age" where the album leg surfaces the
+        librarians' "Broadcast & the Focus Group Investigate...".
+        """
+        result = await self._rebind()
+        carried = result.discogs_titles[BROADCAST_ITEM.id]
+        assert carried.album_title == BROADCAST_ITEM.title
+        assert carried.album_title != "Investigate Witch Cults Of The Radio Age"
+
+    async def test_the_rowless_seam_entry_does_not_ride_along(self):
+        """Only the shelf row is returned, so the id=0 entry must not linger."""
+        result = await self._rebind()
+        assert ROWLESS_LIBRARY_ID not in result.discogs_titles
+
+    async def test_hands_the_pin_forward_so_step_four_need_not_requery(self):
+        """LML#1332 finding 3: the probe already fetched this pin."""
+        result = await self._rebind()
+        assert result.release_overrides == {BROADCAST_ITEM.id: BROADCAST_RELEASE_ID}

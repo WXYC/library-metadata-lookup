@@ -335,7 +335,15 @@ MODULE_BUDGETS: dict[str, int] = {
     # owns the state. Same tight-on-purpose formula as every prior
     # recalibration: smallest multiple of 50 at or above the measured 1784, not
     # a re-derived 1.3x.
-    "lookup/orchestrator.py": 1800,
+    #
+    # LML#1332 adds the `release_overrides` LookupState field (pins step 3b
+    # already fetched, so step 4's prefetch can skip a duplicate round-trip),
+    # its `prefetched` parameter and coverage test in
+    # `_prefetch_release_overrides`, and the two one-line reads/writes that
+    # carry it between the steps. Same shape as the entry above: every piece
+    # is a `LookupState` read/write, which cannot move out of the module that
+    # owns the state. Measured 1810; smallest multiple of 50 at or above it.
+    "lookup/orchestrator.py": 1850,
     # LML#1318: the album-level degrade for a failed non-library track
     # resolution, extracted to its own module rather than appended to
     # lookup/rowless.py (which sat at 420/450 — headroom for the two kernel
@@ -461,10 +469,16 @@ MODULE_BUDGETS: dict[str, int] = {
     # calls it before conceding row-less — carried this file from 543 to 649.
     # Smallest multiple of 50 at or above the measured size, this table's
     # tight-recalibration convention for one bounded, self-contained addition
-    # (not a re-derived 1.3x). It is a deliberately tight fit: prose about the
-    # override table's measured coverage belongs in the docstring, and a 700
-    # ceiling would buy room this module has not earned.
-    "lookup/validation.py": 650,
+    # (not a re-derived 1.3x).
+    #
+    # LML#1332 spends the remaining 1 line and then some, on three defects in
+    # that probe rather than on prose: the `lml_library_release_override` gate
+    # it was missing (every other reader of the pin table honours it, and
+    # LML#850's rollback depends on it), the seam carry that stops a rebound
+    # row from re-deriving its release through the title floor the probe
+    # exists to bypass, and handing the fetched pin forward to step 4.
+    # Measured 693; smallest multiple of 50 at or above it.
+    "lookup/validation.py": 700,
     # LML#513 (Phase A of the Wikipedia-preferred-bio program, docs/plans/
     # lml-1192-wikipedia-artist-bio.md): the slug-scored Wikipedia URL
     # extractor -- parsing, the hard-reject denylist, disambig stripping,

@@ -338,6 +338,15 @@ class LookupState:
     read by track validation (3b) to validate the artist's own album against
     Discogs tracklists on the compilation branch."""
 
+    release_overrides: dict[int, int] = field(default_factory=dict)
+    """LML#1332: verified LML#850 pins an earlier step already fetched.
+
+    Written by track validation (3b) — only the row-less reverse probe fills
+    it, and only on a hit, since that probe queries the pin table to find its
+    ``library_id -> release_id`` equality. Read by the artwork step (4), whose
+    own prefetch then skips a second round-trip for ids this already covers.
+    Positively-known pins only, never "queried and absent"."""
+
     unranked_fallback_candidates: list[LibraryItem] = field(default_factory=list)
     """LML#808: ``search_state.results`` pre-``limit_results`` truncation
     (unranked rowid order on the artist-only branch), distinct from
@@ -869,6 +878,7 @@ async def _step_validate_tracks(
     state.library_results = result.library_results
     state.song_not_found = result.song_not_found
     state.discogs_titles = result.discogs_titles
+    state.release_overrides = result.release_overrides
     if result.found_on_compilation is not None:
         state.found_on_compilation = result.found_on_compilation
         if not result.found_on_compilation:
@@ -910,6 +920,7 @@ async def _prefetch_release_overrides(
     discogs_cache_pg: PgSource | None,
     *,
     allow_release_resolution_fallback: bool = True,
+    prefetched: dict[int, int] | None = None,
 ) -> dict[int, int]:
     """Flag-gated prefetch of verified library-release overrides (LML#850).
 
@@ -926,15 +937,28 @@ async def _prefetch_release_overrides(
     warm) so the 35k-album drain never fans this per-item PG query out across the
     shared discogs-cache pool. On bulk the prefetch is skipped entirely; the flag
     is scoped to the live ``/lookup`` path.
+
+    ``prefetched`` (LML#1332) carries pins an earlier step already fetched —
+    today only ``Step3bResult.release_overrides`` from the row-less reverse
+    probe, which queried this same table to find its id equality and then
+    narrowed ``library_results`` to the row it matched. When it covers every
+    requested id there is nothing left to ask, so the query is skipped
+    entirely; partial coverage is NOT authoritative for the uncovered ids and
+    still queries. It holds only positively-known pins, never "queried and
+    absent", which is what makes the coverage test sound. The flag gate
+    outranks it: disabled means disabled, cached pin or not.
     """
     if not allow_release_resolution_fallback:
         return {}
     if not get_settings().lml_library_release_override:
         return {}
-    if discogs_cache_pg is None:
-        return {}
     library_ids = [item.id for item in library_results if item.id > 0]
     if not library_ids:
+        return {}
+    known = prefetched or {}
+    if known and all(library_id in known for library_id in library_ids):
+        return {library_id: known[library_id] for library_id in library_ids}
+    if discogs_cache_pg is None:
         return {}
     return await get_library_release_overrides(discogs_cache_pg, library_ids)
 
@@ -975,6 +999,7 @@ async def _step_fetch_artwork(
                 state.library_results,
                 services.discogs_cache_pg,
                 allow_release_resolution_fallback=services.allow_release_resolution_fallback,
+                prefetched=state.release_overrides,
             )
             for _ in state.library_results:
                 services.telemetry.record_api_call("discogs")
