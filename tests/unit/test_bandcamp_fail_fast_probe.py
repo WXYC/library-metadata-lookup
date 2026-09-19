@@ -348,7 +348,7 @@ class TestFailFastTransportErrorRaiseSitesIndividually:
         assert client._http.request.await_count == 2
 
 
-class TestFailFastUnparseableJsonBody:
+class TestUnparseableJsonBody:
     """LML#1106 review FIX 6: ``search_artist`` / ``search_albums`` call
     ``resp.json()`` unguarded after the non-200 check. A 200 with a
     non-JSON body (a Cloudflare HTML interstitial, a truncated response)
@@ -357,10 +357,16 @@ class TestFailFastUnparseableJsonBody:
     ``lookup/enrichment/bandcamp_probe.py``'s ``except Exception`` catch-all
     -- a loud ``logger.exception`` per item (the #755 flood shape) instead
     of the quiet, counted shed path. Catching ``ValueError`` around both
-    ``.json()`` calls and raising ``BandcampTransportError`` under
-    ``fail_fast`` routes this couldn't-ask through the same taxonomy as a
-    5xx or a connect timeout. Default mode is untouched -- an unparseable
-    200 still propagates exactly as it does today."""
+    ``.json()`` calls and raising ``BandcampTransportError`` routes this
+    couldn't-ask through the same taxonomy as a 5xx or a connect timeout.
+
+    LML#1323 extends that catch to the DEFAULT (retrying) mode, where it was
+    originally left behind: a real Bandcamp/Cloudflare bot-wall arrives as a
+    200 + HTML body, and the default mode is the one production uses. The
+    argument is LML#1115's verbatim -- it already extended the NON-200 raise
+    to default mode because a couldn't-ask was otherwise indistinguishable
+    from a genuine no-results response and riskable as a cached false
+    negative -- applied to the other half of the same taxonomy."""
 
     @staticmethod
     def _malformed_json_response() -> httpx.Response:
@@ -380,11 +386,15 @@ class TestFailFastUnparseableJsonBody:
             await client.search_artist("Autechre", fail_fast=True)
 
     @pytest.mark.asyncio
-    async def test_search_artist_default_mode_still_raises_value_error(self, client):
-        # Default mode is untouched -- no new catch is added there.
+    async def test_search_artist_default_mode_also_raises_transport_error(self, client):
+        # LML#1323: default mode raises the taxonomy type too, no longer the
+        # raw ValueError. ``BandcampTransportError`` is deliberately NOT a
+        # ``ValueError`` subclass, so this assertion would have failed before
+        # the fix and a caller that was catching ``ValueError`` here cannot
+        # keep quietly doing so (the caller audit in the PR body).
         client._http.request = AsyncMock(return_value=self._malformed_json_response())
 
-        with pytest.raises(ValueError):
+        with pytest.raises(BandcampTransportError):
             await client.search_artist("Autechre", fail_fast=False)
 
     @pytest.mark.asyncio
@@ -395,10 +405,11 @@ class TestFailFastUnparseableJsonBody:
             await client.search_albums("Autechre Confield", fail_fast=True)
 
     @pytest.mark.asyncio
-    async def test_search_albums_default_mode_still_raises_value_error(self, client):
+    async def test_search_albums_default_mode_also_raises_transport_error(self, client):
+        # LML#1323, the ``param=a`` half of the same fix.
         client._http.request = AsyncMock(return_value=self._malformed_json_response())
 
-        with pytest.raises(ValueError):
+        with pytest.raises(BandcampTransportError):
             await client.search_albums("Autechre Confield", fail_fast=False)
 
     @pytest.mark.asyncio
@@ -439,10 +450,18 @@ class TestFailFastMalshapedJsonBody:
     counted ``record_transport_failure`` shed path, so the flood runs for
     the whole outage instead of tripping the breaker. Under ``fail_fast``,
     a mal-shaped-but-parseable body must raise :class:`BandcampTransportError`
-    exactly like an unparseable one. Default mode is untouched -- these
-    shapes still raise their raw ``AttributeError`` there, byte-identical to
-    today (pinned by the two existing ``test_search_*_default_mode_still_
-    raises_value_error`` tests above, which this class does not touch)."""
+    exactly like an unparseable one.
+
+    Default mode stays untouched -- these shapes still raise their raw
+    ``AttributeError`` there -- and LML#1323 deliberately kept it that way
+    while extending the UNPARSEABLE-body catch (above) to default mode. The
+    two cases are not the same claim. A body that is not JSON at all cannot
+    have come from the autocomplete API, so "couldn't ask" is the only
+    reading. A body that IS valid JSON but shaped wrong is equally well read
+    as Bandcamp's unofficial API having changed shape -- contract drift, which
+    the live smoke exists to report loudly and must not be taught to skip
+    (tests/integration/test_bandcamp_album_search_live.py). Default mode is
+    the mode that smoke runs in, so the narrower catch stays narrow."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -488,8 +507,10 @@ class TestFailFastMalshapedJsonBody:
     async def test_search_artist_default_mode_still_raises_attribute_error_on_bare_list(
         self, client
     ):
-        # Default mode is untouched -- no new shape guard is added there;
-        # a bare-list body still crashes with its raw AttributeError.
+        # Default mode has no shape guard, LML#1323 included -- a bare-list
+        # body still crashes with its raw AttributeError. See the class
+        # docstring for why the unparseable-body catch was widened and this
+        # one was not.
         client._http.request = AsyncMock(
             return_value=httpx.Response(200, json=[], request=httpx.Request("GET", _URL))
         )

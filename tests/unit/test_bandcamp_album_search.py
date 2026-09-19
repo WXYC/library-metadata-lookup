@@ -41,6 +41,17 @@ def _error_response(status: int, url: str) -> httpx.Response:
     return httpx.Response(status, request=httpx.Request("GET", url))
 
 
+def _bot_wall_response() -> httpx.Response:
+    """The LML#1323 shape: HTTP 200 carrying a Cloudflare/bot-wall HTML
+    interstitial instead of the autocomplete JSON, so the status check passes
+    and ``resp.json()`` is what fails."""
+    return httpx.Response(
+        200,
+        content=b"<html><body>please enable javascript</body></html>",
+        request=httpx.Request("GET", "https://bandcamp.com/api/fuzzysearch/2/app_autocomplete"),
+    )
+
+
 def _album_result(
     name: str = "Aluminum Tunes",
     band_name: str = "Stereolab",
@@ -300,6 +311,21 @@ class TestSearchAlbums:
 
         with pytest.raises(BandcampTransportError):
             await client.search_albums("Unreachable")
+
+    @pytest.mark.asyncio
+    async def test_raises_transport_error_on_bot_wall_html_body(self):
+        # LML#1323: the bot-wall arrives as a 200 with an HTML body, so the
+        # non-200 check can't see it and the default mode's unguarded
+        # ``resp.json()`` used to leak a raw ``json.JSONDecodeError``. Same
+        # "couldn't ask" shape as a 500 -- and the one the offline drain must
+        # not durably record as ``not_found`` (#661).
+        client = BandcampClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(return_value=_bot_wall_response())
+        client._http = mock_http
+
+        with pytest.raises(BandcampTransportError):
+            await client.search_albums("Nobody")
 
     @pytest.mark.asyncio
     async def test_returns_empty_list_on_genuinely_no_results(self):
@@ -563,6 +589,23 @@ class TestFindAlbumMatchViaSearch:
 
         with pytest.raises(BandcampTransportError):
             await client.find_album_match_via_search("Nobody", "Nothing", fail_fast=True)
+
+    @pytest.mark.asyncio
+    async def test_bot_wall_surfaces_search_unavailable(self):
+        # LML#1323, end-to-end from the HTTP layer rather than a mocked
+        # ``search_albums``: a 200 + HTML bot-wall must reach this method's
+        # callers as BandcampSearchUnavailableError, the type the offline drain
+        # and the live smoke (tests/integration/test_bandcamp_album_search_live.py)
+        # both branch on. Before the fix a raw json.JSONDecodeError escaped
+        # instead, so the smoke reported contract drift that hadn't happened
+        # and the drain took its logger.exception path.
+        client = BandcampClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(return_value=_bot_wall_response())
+        client._http = mock_http
+
+        with pytest.raises(BandcampSearchUnavailableError):
+            await client.find_album_match_via_search("George Theodorakis", "The Rules of the Game")
 
     @pytest.mark.asyncio
     async def test_pine_hill_haints_recovers_via_normalized_pass(self):
