@@ -276,7 +276,11 @@ async def phase_lookup(
             # this loop is unchanged: leave the slug's albums 'pending' so a
             # re-run retries them. Marking not_found here would permanently
             # drop the slug on a network blip during the multi-hour drain
-            # (#661).
+            # (#661). LML#1326 routes one more shape through this same branch:
+            # a 200 carrying a Bandcamp/Cloudflare bot-wall interstitial, which
+            # used to scrape to [] and reach the definitively-absent branch
+            # below. That is the whole of #1326 from this loop's point of view
+            # -- no code here changed, the client stopped lying about it.
             catalog = None
         albums = slug_albums[slug]
         processed += 1
@@ -321,6 +325,11 @@ async def phase_lookup(
         else:
             # Successful fetch of a genuinely empty catalog (the artist page has
             # no releases): definitively absent, mark every album attempted.
+            # LML#1326: "genuinely" is now load-bearing rather than aspirational
+            # -- a bot-wall interstitial used to arrive here as [] and get every
+            # album for the slug durably marked not_found. It raises upstream
+            # now (clients.bandcamp.detect_bot_wall) and lands in the
+            # BandcampTransportError branch above.
             for album_row in albums:
                 await db.mark_bandcamp_not_found(album_row["id"])
                 not_found += 1
