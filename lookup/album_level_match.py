@@ -8,13 +8,20 @@ song-bearing lookup used to zero out, even when the album-level path resolves
 the same typed ``(artist, album)`` pair from the local release cache.
 
 :func:`resolve_typed_album_level_match` is that degrade: the ARTIST_PLUS_ALBUM
-match class (``find_best_typed_match``'s joint 80/80 floor over artist AND
-album, with the LML#1206 suffix-stripped artist variants and the LML#784
-self-titled swap — the same gates ``lookup/strategies/library_miss.py``
-applies), served **exclusively from the local release cache**. No live Discogs
-probe, ever: the track waves already spent the caller budget (LML#1112), and a
-cache-only miss here is not evidence Discogs lacks the pair — only positives
-are durable.
+match class, served **exclusively from the local release cache**. No live
+Discogs probe, ever: the track waves already spent the caller budget
+(LML#1112), and a cache-only miss here is not evidence Discogs lacks the pair —
+only positives are durable.
+
+The match class is not restated here. ``lookup/typed_pair_floor.py`` owns it
+(the joint 80/80 floor, the LML#1206 suffix-stripped artist variants and
+exact-credit tie-break, the LML#784 self-titled swap) and
+``lookup/strategies/library_miss.py`` — the step-3a probe this degrade claims
+parity with — calls the same two functions, at the same page size
+(``DISCOGS_SEARCH_PAGE_LIMIT``) over rows mapped by the same
+``DiscogsSearchResult.from_cache_row``. LML#1321 made that parity structural:
+``tests/unit/test_typed_pair_floor_parity.py`` drives both callers over one
+candidate table and fails when either forks.
 
 Cache tiers, mirroring the kernel's own #632 shape:
 
@@ -25,8 +32,8 @@ Cache tiers, mirroring the kernel's own #632 shape:
    and can never suppress this album answer.
 2. **Local-cache probe on a cold read** — ``DiscogsCacheService
    .search_releases`` (the same PG arm ``DiscogsService.search`` reads),
-   floored by ``find_best_typed_match`` on the TYPED pair. Never an
-   ``alternative``/``fallback`` same-artist substitution (the BS#1359 class).
+   floored on the TYPED pair. Never an ``alternative``/``fallback``
+   same-artist substitution (the BS#1359 class).
 3. **Write-back** — a resolved id lands durably on the ``is_track=False``
    channel; a cache-only empty is pinned with the LML#824 **crowd-out**
    marker (1-hour TTL), never the 7-day miss: the daily ETL may cache the
@@ -51,8 +58,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 
-from clients.streaming.matching import find_best_typed_match
-from discogs.models import DiscogsSearchResult
+from discogs.models import DISCOGS_SEARCH_PAGE_LIMIT, DiscogsSearchResult
 from discogs.service import DiscogsService
 from entity.release_resolution_cache import (
     ReleaseResolution,
@@ -60,19 +66,10 @@ from entity.release_resolution_cache import (
     set_cached_release_id,
 )
 from entity.sources import PgSource
-from lookup.matching import (
-    artist_variant_tie_break_key,
-    artist_variants_with_stripped_suffix,
-    is_self_titled,
-)
 from lookup.release_resolution import ResolvedRelease
+from lookup.typed_pair_floor import floor_best_typed_pair, typed_album_axis
 
 logger = logging.getLogger(__name__)
-
-# How many local-cache candidates the typed-pair floor considers. Matches the
-# ``limit=5`` the ``DiscogsService.search`` seam passes its own PG arm, so this
-# degrade sees the same candidate set the album-level lookup path would.
-_ALBUM_MATCH_CACHE_LIMIT = 5
 
 
 async def _rehydrate_resolved_release(
@@ -110,45 +107,30 @@ async def _album_level_cache_match(
 
     Returns ``(match, probe_answered)``. ``probe_answered`` is False on a probe
     failure — "couldn't ask" must never be pinned as a known miss (the same
-    couldn't-ask ≠ confirmed-empty principle the breaker enforces). The floor
-    call mirrors ``_library_miss_discogs_search._floor_best`` — same 80/80
-    joint floor, same LML#1206 artist-variant widening and exact-credit
-    tie-break — so this degrade admits exactly the ARTIST_PLUS_ALBUM match
-    class and nothing wider.
+    couldn't-ask ≠ confirmed-empty principle the breaker enforces).
+
+    The candidate set and the floor are both shared with the step-3a probe: the
+    same page size, the same ``from_cache_row`` mapping, and
+    :func:`~lookup.typed_pair_floor.floor_best_typed_pair`. Rows are floored in
+    SQL order — the PG arm's confidence sort changes no verdict here, because
+    the floor's tie-break key is a total order over a ``DISTINCT ON (r.id)``
+    result set (see ``lookup/typed_pair_floor.py``).
     """
     try:
         rows = await cache_service.search_releases(
-            artist=artist, album=album, limit=_ALBUM_MATCH_CACHE_LIMIT
+            artist=artist, album=album, limit=DISCOGS_SEARCH_PAGE_LIMIT
         )
-        # Inside the try on purpose (review fix 7): the hard-indexed keys are
-        # part of the probe's contract, and a malformed row must degrade like
-        # any other probe failure rather than escape as a KeyError 500 (the
-        # strategy runner catches only TimeoutError/BreakerOpenError).
-        candidates = [
-            DiscogsSearchResult(
-                release_id=row["release_id"],
-                release_url=f"https://www.discogs.com/release/{row['release_id']}",
-                artist=row["artist_name"],
-                artist_credits=row.get("artist_credits") or None,
-                album=row["title"],
-                artwork_url=row.get("artwork_url"),
-            )
-            for row in rows or []
-            if row.get("release_id")
-        ]
+        # Inside the try on purpose (review fix 7): the mapper hard-indexes the
+        # NOT NULL columns, and a malformed row must degrade like any other
+        # probe failure rather than escape as a KeyError 500 (the strategy
+        # runner catches only TimeoutError/BreakerOpenError).
+        candidates = [DiscogsSearchResult.from_cache_row(row) for row in rows]
     except Exception as exc:
         logger.warning(
             "Album-level cache probe failed for artist=%r album=%r: %s", artist, album, exc
         )
         return None, False
-    best = find_best_typed_match(
-        candidates,
-        query_artist=artist,
-        query_title=album,
-        artist_fn=artist_variants_with_stripped_suffix,
-        title_fn=lambda r: r.album,
-        key_fn=lambda r: artist_variant_tie_break_key(artist, r),
-    )
+    best = floor_best_typed_pair(candidates, artist=artist, album=album)
     if best is None:
         return None, True
     return ResolvedRelease(
@@ -178,18 +160,17 @@ async def resolve_typed_album_level_match(
     ``pg`` is best-effort exactly as in the kernel: ``None`` (or a PG failure
     swallowed inside the cache helpers) degrades to an unpinned cache probe.
     """
-    if discogs_service is None or not artist or not album or not album.strip():
+    album = (album or "").strip()
+    if discogs_service is None or not artist or not album:
         return None
     cache_service = getattr(discogs_service, "cache_service", None)
     if cache_service is None:
         # Every tier below is local-cache-backed; with no cache wired the
         # degrade is inert (and must write nothing — no probe, no evidence).
         return None
-    album = album.strip()
-    # LML#784 category 4 parity with the ARTIST_PLUS_ALBUM class: a query-side
-    # self-titled placeholder ("S/T") can never match a real cache title.
-    if is_self_titled(album):
-        album = artist
+    # The shared LML#784 category-4 self-titled swap: a query-side "S/T" can
+    # never match a real cache title (lookup/typed_pair_floor.py).
+    album = typed_album_axis(artist, album)
 
     pinned_positive_unhydrated = False
     if pg is not None:
@@ -198,8 +179,13 @@ async def resolve_typed_album_level_match(
         )
         if cached.was_present:
             if cached.release_id is None:
-                # Fresh known miss on the ALBUM channel — the short-TTL
-                # crowd-out-flavored pin the empty-probe branch below writes.
+                # Fresh known miss on the ALBUM channel. REACHABLE, and the
+                # only writer is the empty-probe branch below (the LML#824
+                # crowd-out pin #1322's review round added) — so this is the
+                # O(1) repeat path inside that pin's 1-hour TTL, not a defence
+                # against a shape nothing produces. Pinned by the pg tier's
+                # ``TestAlbumChannelDegradeDiscipline``
+                # ::test_probe_miss_pins_crowd_out_and_honors_the_1h_ttl.
                 return None
             # Review fix 3: rehydrate from the LOCAL cache's lean by-id read,
             # never DiscogsService.get_release — that read-through's API leg

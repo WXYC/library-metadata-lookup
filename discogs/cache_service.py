@@ -23,6 +23,7 @@ from config.settings import _WORK_MEM_RE, get_settings
 from discogs.matching import TracklistEntry, scan_tracklist_for_match
 from discogs.memory_cache import async_cached, create_ttl_cache
 from discogs.models import (
+    DISCOGS_SEARCH_PAGE_LIMIT,
     ArtistCredit,
     ArtistDetails,
     ArtistRef,
@@ -1998,7 +1999,10 @@ class DiscogsCacheService:
     """
 
     async def search_releases(
-        self, artist: str | None = None, album: str | None = None, limit: int = 5
+        self,
+        artist: str | None = None,
+        album: str | None = None,
+        limit: int = DISCOGS_SEARCH_PAGE_LIMIT,
     ) -> list[dict]:
         """Search for releases by artist and/or album title.
 

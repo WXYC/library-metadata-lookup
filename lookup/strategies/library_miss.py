@@ -13,18 +13,13 @@ Strategy-adjacent, so it lives in this package (LML#727).
 
 import logging
 
-from clients.streaming.matching import find_best_typed_match
 from core.search import SEARCH_TYPE_FALLBACK
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResponse, DiscogsSearchResult
 from discogs.service import DiscogsService
 from library.models import LibraryItem
 from lookup.enrichment.item import compute_row_title_matches_requested_album
-from lookup.matching import (
-    artist_variant_tie_break_key,
-    artist_variants_with_stripped_suffix,
-    is_self_titled,
-)
 from lookup.strategies.va_rescue import find_va_comp_match
+from lookup.typed_pair_floor import floor_best_typed_pair, typed_album_axis
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -121,11 +116,13 @@ async def _library_miss_discogs_search(
     unchanged on both lanes: cache-first, with the seam's single API fetch only
     on a genuine PG miss.
 
-    Applies the same 80/80-floor as ``find_best_typed_match`` (LML#400) on both
-    artist AND album jointly — different from the contamination shape in LML#400
-    which was artist-fallback returning any release for any album. The new risk
-    shape is near-miss typed albums (typed "Anthology" → "Anthology, Vol. 1");
-    see regression tests for pinned cases.
+    Admits the ARTIST_PLUS_ALBUM match class and nothing wider, via the shared
+    :func:`~lookup.typed_pair_floor.floor_best_typed_pair` — the 80/80 floor
+    (LML#400) on artist AND album jointly, different from the contamination
+    shape in LML#400 which was artist-fallback returning any release for any
+    album. The new risk shape is near-miss typed albums (typed "Anthology" →
+    "Anthology, Vol. 1"); see regression tests for pinned cases. The LML#1318
+    album-level degrade shares that floor, so the two cannot fork (LML#1321).
 
     When every candidate from a PG-served response floor-fails, the search
     is re-issued once with ``skip_pg=True`` (LML#784 category 1): the PG arm
@@ -160,35 +157,17 @@ async def _library_miss_discogs_search(
     if not artist or not album:
         return None
 
-    # LML#784 category 4: a query-side self-titled placeholder ("S/T",
-    # "s.t.", "self-titled") can never match a real Discogs title — swap in
-    # the artist name for both the search and the title-axis scoring,
-    # mirroring the library-side swap in ``lookup/artwork.py``. The trigger
-    # string is NOT kept as a scoring variant: a wrong-release candidate
-    # literally titled "S/T" would clear the floor trivially.
-    if is_self_titled(album):
-        album = artist
+    # The LML#784 category-4 self-titled swap, shared with the LML#1318
+    # album-level degrade (see lookup/typed_pair_floor.py).
+    album = typed_album_axis(artist, album)
 
     request = DiscogsSearchRequest(album=album, artist=artist)
 
     def _floor_best(response: DiscogsSearchResponse | None) -> DiscogsSearchResult | None:
+        """This arm's response -> the ARTIST_PLUS_ALBUM winner (or None)."""
         if not response or not response.results:
             return None
-        return find_best_typed_match(
-            response.results,
-            query_artist=artist,
-            query_title=album,
-            # LML#1206: widened with the suffix-stripped form of each
-            # candidate variant -- see lookup.matching.artist_variants_with_stripped_suffix.
-            artist_fn=artist_variants_with_stripped_suffix,
-            title_fn=lambda r: r.album,
-            # LML#1097's release_id tie-break, guarded by LML#1206's exact-
-            # raw-credit preference (lookup.matching.artist_variant_tie_break_key):
-            # a bare-name query that ties an exact credit against a suffix-
-            # widened one must keep the exact credit, not whichever sorts
-            # first by release_id.
-            key_fn=lambda r: artist_variant_tie_break_key(artist, r),
-        )
+        return floor_best_typed_pair(response.results, artist=artist, album=album)
 
     try:
         response = await discogs_service.search(request)

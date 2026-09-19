@@ -497,15 +497,16 @@ def artist_variants_with_stripped_suffix(result: DiscogsSearchResult) -> list[st
     stripped form is byte-identical to the raw one, so without this every
     ordinary candidate would score twice for nothing (review finding 5).
 
-    The sole caller, ``lookup.strategies.library_miss._library_miss_discogs_search``,
-    leaves its title axis untouched by this widening: when the cache holds
-    multiple suffixed variants of one bare name, every variant's artist axis
-    can clear via its own stripped form, but only the one whose album also
-    matches the query clears ``is_acceptable_match`` -- on that caller's
-    normal path, the existing album confirmation stays the conservative gate.
+    The sole caller is ``lookup.typed_pair_floor.floor_best_typed_pair`` (the
+    ARTIST_PLUS_ALBUM match class, shared since LML#1321 by the step-3a probe
+    and the LML#1318 album-level degrade). It leaves its title axis untouched:
+    when the cache holds multiple suffixed variants of one bare name, every
+    variant's artist axis can clear via its own stripped form, but only the one
+    whose album also matches the query clears ``is_acceptable_match`` -- on the
+    normal path, the album confirmation stays the conservative gate.
 
-    That confirmation is NOT independent on the caller's self-titled path
-    (``if is_self_titled(album): album = artist``) -- there the title axis
+    That confirmation is NOT independent on the self-titled path
+    (``typed_album_axis`` swapping the artist in) -- there the title axis
     becomes a copy of the artist name, so it confirms nothing this widening
     didn't already decide on the artist axis alone. That collapse predates
     LML#1206 (an unsuffixed candidate matched a self-titled query identically
