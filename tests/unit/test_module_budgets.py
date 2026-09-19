@@ -458,10 +458,12 @@ MODULE_BUDGETS: dict[str, int] = {
     # than in ``entity/library_release_override.py``, whose read primitive it
     # reuses unchanged — this function's job is turning an id map back into a
     # ``LibraryItem``, a lookup-domain concern), and the cascade tail that
-    # calls it before conceding row-less — carried this file from 543 to 629.
+    # calls it before conceding row-less — carried this file from 543 to 649.
     # Smallest multiple of 50 at or above the measured size, this table's
     # tight-recalibration convention for one bounded, self-contained addition
-    # (not a re-derived 1.3x).
+    # (not a re-derived 1.3x). It is a deliberately tight fit: prose about the
+    # override table's measured coverage belongs in the docstring, and a 700
+    # ceiling would buy room this module has not earned.
     "lookup/validation.py": 650,
     # LML#513 (Phase A of the Wikipedia-preferred-bio program, docs/plans/
     # lml-1192-wikipedia-artist-bio.md): the slug-scored Wikipedia URL

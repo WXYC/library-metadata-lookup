@@ -16,6 +16,7 @@ from entity.sources import PgSource
 from lookup.release_resolution import ResolvedRelease
 from lookup.rowless import ROWLESS_LIBRARY_ID, _make_rowless_item
 from lookup.validation import (
+    _SHELF_REBIND_PROBE_LIMIT,
     Step3bResult,
     _rebind_rowless_release_via_override,
     apply_track_validation_cascade,
@@ -412,8 +413,8 @@ class TestRebindRowlessReleaseViaOverride:
         )
         assert result is None
 
-    async def test_bounded_to_the_probe_limit(self):
-        """Only the first 20 shelf rows are queried, in one call."""
+    async def test_a_whole_shelf_under_the_bound_is_probed_in_one_call(self):
+        """Every row of an ordinary artist's shelf, fetched in a single query."""
         rows = [
             make_library_item(id=n, artist="Prolific Artist", title=f"Album {n}")
             for n in range(1, 26)
@@ -423,7 +424,7 @@ class TestRebindRowlessReleaseViaOverride:
         await _rebind_rowless_release_via_override(pg, release_id=999, shelf_rows=rows)
         assert pg.fetchall.await_count == 1
         queried_ids = pg.fetchall.await_args.args[1]
-        assert queried_ids == list(range(1, 21))
+        assert queried_ids == list(range(1, 26))
 
     async def test_skips_nonpositive_ids_defensively(self):
         rowless_lookalike = make_library_item(id=0, artist="Broadcast", title="row-less")
@@ -602,3 +603,42 @@ class TestCascadeRowLessReverseProbe:
             )
 
         assert result.library_results[0].id == ROWLESS_LIBRARY_ID
+
+
+@pytest.mark.asyncio
+class TestShelfRebindProbeBound:
+    """The probe's bound must clear the real WXYC shelf-count distribution.
+
+    Measured against ``library.db`` (64,193 rows, 2026-09-19): 162 artists
+    shelve more than 20 releases, and five of them are in the very
+    title-divergence cohort LML#1330 names — ``Sun Ra`` (49 rows),
+    ``Various Artists - Rock - F`` (90), ``David Bowie`` (33), ``Keith
+    Jarrett`` (32). A 20-row bound therefore truncated exactly the artists
+    the ticket calls out by name, and did so silently: the probe returns
+    ``None`` identically whether the row has no pin or was never looked at.
+    """
+
+    async def test_binds_a_row_past_the_old_twenty_row_bound(self):
+        """Sun Ra's 49th shelf row must still be probed, not truncated away."""
+        rows = [make_library_item(id=n, artist="Sun Ra", title=f"Album {n}") for n in range(1, 50)]
+        target = rows[48]
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(
+            return_value=[{"library_id": target.id, "discogs_release_id": 8894021}]
+        )
+        result = await _rebind_rowless_release_via_override(pg, release_id=8894021, shelf_rows=rows)
+        assert result == target
+
+    async def test_still_one_query_and_still_bounded(self):
+        """The bound is raised, not removed — one query, capped array."""
+        rows = [
+            make_library_item(id=n, artist="Various Artists", title=f"Comp {n}")
+            for n in range(1, 401)
+        ]
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[])
+        await _rebind_rowless_release_via_override(pg, release_id=999, shelf_rows=rows)
+        assert pg.fetchall.await_count == 1
+        queried_ids = pg.fetchall.await_args.args[1]
+        assert len(queried_ids) == _SHELF_REBIND_PROBE_LIMIT
+        assert queried_ids == list(range(1, _SHELF_REBIND_PROBE_LIMIT + 1))
