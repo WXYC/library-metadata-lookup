@@ -451,7 +451,18 @@ MODULE_BUDGETS: dict[str, int] = {
     # (``apply_track_validation_cascade``) and the LML#717 song-as-album-title
     # promotion moved in from the spine, carrying this file from 243 to ~395
     # lines. Smallest multiple of 50 at or above 1.3x the post-change size.
-    "lookup/validation.py": 550,
+    #
+    # Recalibrated again: the row-less-to-shelf-row reverse probe — a ``pg``
+    # parameter, its docstring note, the LML#850-override helper
+    # ``_rebind_rowless_release_via_override`` (self-contained here rather
+    # than in ``entity/library_release_override.py``, whose read primitive it
+    # reuses unchanged — this function's job is turning an id map back into a
+    # ``LibraryItem``, a lookup-domain concern), and the cascade tail that
+    # calls it before conceding row-less — carried this file from 543 to 629.
+    # Smallest multiple of 50 at or above the measured size, this table's
+    # tight-recalibration convention for one bounded, self-contained addition
+    # (not a re-derived 1.3x).
+    "lookup/validation.py": 650,
     # LML#513 (Phase A of the Wikipedia-preferred-bio program, docs/plans/
     # lml-1192-wikipedia-artist-bio.md): the slug-scored Wikipedia URL
     # extractor -- parsing, the hard-reject denylist, disambig stripping,
