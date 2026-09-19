@@ -24,7 +24,7 @@ import html
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
 import httpx
 
@@ -101,6 +101,43 @@ _NORMALIZE_SLASH_SPACING_RE = re.compile(r"\s*/\s*")
 _OG_TITLE_RE = re.compile(r'<meta property="og:title" content="([^"]+)"')
 _OG_TITLE_SPLIT_RE = re.compile(r"^(.*), by (.+)$")
 
+# LML#1326: bot-wall detection for the two HTML-SCRAPING legs
+# (``fetch_artist_catalog``, ``verify_album_page``). See ``detect_bot_wall``
+# for why every marker here is structural and why the obvious ones are absent.
+_DOCUMENT_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+# Document-title phrases only a challenge/block page carries. Scoped to the
+# ``<title>`` ELEMENT, never the whole body, so an artist's own album called
+# "Just a Moment" cannot trip it -- a real ``/music`` page's title is
+# "Music | <Band>" and an album page's is "<Album> | <Band>".
+_BOT_WALL_TITLE_MARKERS = (
+    "just a moment",  # Cloudflare managed challenge / JS challenge
+    "attention required",  # Cloudflare WAF block (1020) and friends
+    "checking your browser",  # legacy Cloudflare "under attack" interstitial
+    "access denied",
+    "verify you are human",  # Cloudflare Turnstile interstitial wording
+    "verifying you are human",
+    "one more step",  # Cloudflare CAPTCHA page
+    "security check",
+)
+
+# Challenge-runtime tokens that appear in the MARKUP of an interstitial and
+# nowhere else. Case-folded before matching.
+_BOT_WALL_BODY_MARKERS = (
+    "_cf_chl_opt",  # Cloudflare challenge bootstrap object
+    "cf_chl_prog",  # its progress element
+    "cf-browser-verification",  # legacy challenge wrapper id/class
+    "challenge-form",  # the challenge POST form's id
+    "sorry, you have been blocked",  # Cloudflare 1020 block-page copy
+    "captcha-delivery.com",  # DataDome interstitial iframe host
+    "_px_captcha",  # PerimeterX interstitial
+)
+
+# Cloudflare stamps this header on a response it mitigated (challenged). It
+# cannot appear on a page Bandcamp actually served, so it needs no
+# corroboration from the body.
+_CF_MITIGATED_HEADER = "cf-mitigated"
+
 
 class BandcampRateLimitedError(Exception):
     """Raised by ``_request_with_retry(..., fail_fast=True)`` when a single
@@ -123,10 +160,16 @@ class BandcampTransportError(Exception):
     layer (network error, connect timeout) or returns an unexpected non-200
     response (5xx, Cloudflare 403/1015, etc.) -- or, for the two autocomplete
     methods, returns a 200 whose body will not parse as JSON (the
-    Bandcamp/Cloudflare bot-wall's HTML interstitial). All of those, in BOTH
+    Bandcamp/Cloudflare bot-wall's HTML interstitial) -- or, for
+    ``fetch_artist_catalog``, returns a 200 carrying that same interstitial
+    where an artist page should be (LML#1326, detected by
+    :func:`detect_bot_wall`: the HTML-scraping leg's counterpart to the
+    autocomplete legs' unparseable body, since a regex scrape has no parse step
+    to fail). All of those, in BOTH
     ``fail_fast=True`` and the default retrying mode (LML#1115 extended the
     LML#1106 fail_fast-only raise to the default path for the transport and
-    non-200 cases; LML#1323 extended it for the unparseable-body case; see the
+    non-200 cases; LML#1323 extended it for the unparseable-body case; LML#1326
+    added the scrape-leg interstitial in both modes at once; see the
     default-mode note below). Excludes a 429
     (:class:`BandcampRateLimitedError` instead) and,
     for ``fetch_artist_catalog`` only, a 404/410 -- a clean "no artist page
@@ -277,6 +320,81 @@ def parse_og_title(og_title: str) -> tuple[str, str] | None:
     if not match:
         return None
     return html.unescape(match.group(1)), html.unescape(match.group(2))
+
+
+def detect_bot_wall(text: str, headers: Mapping[str, str] | None = None) -> str | None:
+    """Classify a 200 response on one of the HTML-scraping legs as a bot-wall
+    interstitial (LML#1326). Returns a short description of the signal that
+    matched -- for the raise message and the log line -- or ``None`` when the
+    response looks like a page Bandcamp served.
+
+    **Positive evidence only.** The bug this closes is that an interstitial
+    matches no album regex and so returns ``[]``, the value
+    ``fetch_artist_catalog``'s contract reserves for a genuinely empty catalog.
+    The fix must not invert that error: answering "wall" because a scrape came
+    up empty would reclassify every artist with an empty ``/music`` page as a
+    couldn't-ask, which is the same false verdict in the opposite direction (and
+    would stall the offline drain on those slugs forever). So nothing here looks
+    at album content, or at how much of it there was. Four signals, in order:
+
+    1. the ``cf-mitigated`` response header, which Cloudflare sets only on a
+       response it challenged;
+    2. a document ``<title>`` carrying a challenge/block phrase
+       (``_BOT_WALL_TITLE_MARKERS``) -- scoped to the ``<title>`` element, so an
+       album *named* "Just a Moment" cannot trip it;
+    3. a challenge-runtime token in the markup (``_BOT_WALL_BODY_MARKERS``):
+       Cloudflare's ``_cf_chl_opt`` bootstrap, its challenge form, the 1020
+       block-page copy, or the DataDome/PerimeterX equivalents;
+    4. a body with no document in it at all (empty or whitespace-only) -- a
+       real Bandcamp page is never zero bytes, and this shape has the same harm
+       as a wall: it scrapes to ``[]`` and is durably recorded.
+
+    **Deliberately NOT markers**, both of which a real Bandcamp page carries:
+
+    - ``/cdn-cgi/challenge-platform/`` on its own. Cloudflare's JS Detections
+      injects ``scripts/jsd/main.js`` from that path into ordinary 200
+      responses, so it says the site is behind Cloudflare, not that this
+      response is a challenge. Matching it would turn every healthy fetch into
+      a transport error.
+    - "enable javascript" and similar prose. Bandcamp's own pages say it in a
+      ``noscript`` block because the player needs JS; it is also the body of
+      LML#1323's autocomplete bot-wall test fixture, where it was harmless
+      because the JSON parse was what failed.
+
+    The marker set is an allowlist, so an unrecognised wall shape behaves
+    exactly as it did before this change -- no regression, and the honest
+    failure direction for a detector that cannot be calibrated against a live
+    page while Bandcamp is actively walling us. Extend the tuples above (with a
+    fixture in ``tests/unit/test_bandcamp_scrape_bot_wall.py``) when a new shape
+    is observed; a chrome-PRESENCE test was considered and rejected for the
+    opposite reason -- guessing at what every real page carries, and being
+    wrong, silently converts every genuine empty catalog into a permanent
+    ``pending`` row.
+
+    Both callers consult this only on the branch where they could not read the
+    page they wanted (``fetch_artist_catalog`` when the scrape found no albums,
+    ``verify_album_page`` when there is no ``og:title``). That ordering is not
+    the detection criterion -- it changes no verdict this function returns -- but
+    it does make the title scan collision-proof for the one shape that could
+    otherwise bite: a Bandcamp page's ``<title>`` carries the band's or the
+    album's own name, so a band called "Access Denied" or an album called "Just
+    a Moment" is never asked about while its page is parsing fine.
+    """
+    if headers is not None and headers.get(_CF_MITIGATED_HEADER):
+        return f"{_CF_MITIGATED_HEADER}: {headers[_CF_MITIGATED_HEADER]}"
+    if not text.strip():
+        return "empty body at HTTP 200"
+    lowered = text.lower()
+    title_match = _DOCUMENT_TITLE_RE.search(lowered)
+    if title_match:
+        title = " ".join(title_match.group(1).split())
+        for marker in _BOT_WALL_TITLE_MARKERS:
+            if marker in title:
+                return f'document title "{title}" contains "{marker}"'
+    for marker in _BOT_WALL_BODY_MARKERS:
+        if marker in lowered:
+            return f'challenge marker "{marker}" in body'
+    return None
 
 
 def extract_slug(url: str | None) -> str | None:
@@ -655,7 +773,8 @@ class BandcampClient(BaseStreamingClient):
             # 404/410 absence -- in BOTH modes (LML#1121 review F2); ``or []``
             # coalesces that into an empty catalog so the album-first
             # fallback below still gets its shot. Every other failure (5xx,
-            # 403, timeout, ...) raises ``BandcampTransportError`` in BOTH
+            # 403, timeout, and since LML#1326 a 200 carrying a bot-wall
+            # interstitial) raises ``BandcampTransportError`` in BOTH
             # modes too (see the comment above this block); LML#1106 review
             # FIX 5 catches it here so it degrades the SAME way -- an empty
             # catalog that falls through to the fallback -- rather than
@@ -823,19 +942,25 @@ class BandcampClient(BaseStreamingClient):
         retry loop. Every other non-200 (5xx, 403, 429, ...) still raises,
         unchanged.
 
-        LML#1323 audited this method and left its body handling alone, but does
-        NOT cover it. This leg scrapes ``resp.text`` with regexes and never
-        calls ``resp.json()``, so it has no unparseable-*body* case in #1323's
-        sense -- there is no parse step to route into the taxonomy. What it has
-        instead is worse and still open: a bot-wall HTML interstitial at 200
-        matches no album link and yields ``[]``, which is **indistinguishable
-        from a genuinely empty catalog**, the one value this method's contract
-        (above) declares to mean "the artist has no releases."
+        LML#1326: a bot-wall HTML interstitial at 200 also raises
+        :class:`BandcampTransportError`, with ``(bot-wall interstitial: ...)`` in
+        the message. This leg scrapes ``resp.text`` with regexes and never calls
+        ``resp.json()``, so LML#1323's unparseable-*body* guard has nothing to
+        hook here -- and what it had instead was worse: an interstitial matches
+        no album link and yields ``[]``, which was **indistinguishable from a
+        genuinely empty catalog**, the one value this method's contract (above)
+        declares to mean "the artist has no releases." It is now distinguished
+        by :func:`detect_bot_wall`, which keys on positive evidence that the
+        response is an interstitial (a Cloudflare ``cf-mitigated`` header, a
+        challenge/block document ``<title>``, a challenge-runtime token in the
+        markup, or a body with no document in it) and never on "no albums were
+        found" -- a genuinely empty ``/music`` page still returns ``[]`` and is
+        still safe for a caller to record.
 
-        Do not read the autocomplete legs' raises as covering this. The two
-        legs hit DIFFERENT hosts -- ``{slug}.bandcamp.com/music`` here versus
-        ``bandcamp.com/api/fuzzysearch`` there -- and this module's own FIX A
-        reasoning treats per-subdomain failure as independent (see
+        Why this needed its own fix rather than the autocomplete legs' raises:
+        the two legs hit DIFFERENT hosts -- ``{slug}.bandcamp.com/music`` here
+        versus ``bandcamp.com/api/fuzzysearch`` there -- and this module's own
+        FIX A reasoning treats per-subdomain failure as independent (see
         ``_find_album_match_impl``, and
         ``tests/unit/test_bandcamp_client.py::
         test_catalog_fetch_failure_still_tries_the_album_first_fallback``), so a
@@ -843,19 +968,23 @@ class BandcampClient(BaseStreamingClient):
         not a corner. And ``scripts/bandcamp_pipeline.py::phase_lookup`` reads
         ``bandcamp_slug`` straight from the database via
         ``get_pending_bandcamp_lookup`` and calls this method without ever
-        calling ``search_artist`` in that run, so there is no autocomplete raise
-        upstream of it to fire at all.
+        calling ``search_artist`` in that run, so there was no autocomplete
+        raise upstream of it to fire at all.
 
-        Both consequences are live: ``phase_lookup`` routes the ``[]`` to its
-        "genuinely empty catalog: definitively absent" branch and durably
-        ``mark_bandcamp_not_found``s every album for that slug, and the live
-        path gets ``catalog_leg_failed=False`` -> a clean fallback miss ->
-        ``None`` -> a 7-day known-miss row plus ``on_streaming=False`` written
-        through to Backend. Tracked as Shape A of
-        https://github.com/WXYC/library-metadata-lookup/issues/1325;
-        ``verify_album_page`` shares the shape. Fixing it is a behavior change
-        (a scrape leg needs its own block detection) and deliberately out of
-        #1323's scope.
+        Both consequences the raise closes were live and durable:
+        ``phase_lookup`` routed the ``[]`` to its "genuinely empty catalog:
+        definitively absent" branch and ``mark_bandcamp_not_found``-ed every
+        album for that slug, and the live path got ``catalog_leg_failed=False``
+        -> a clean fallback miss -> ``None`` -> a 7-day known-miss row plus
+        ``on_streaming=False`` written through to Backend. Both now route
+        through the pre-existing ``BandcampTransportError`` handling instead:
+        the drain leaves the slug ``pending``/re-runnable, and
+        ``_find_album_match_impl`` sets ``catalog_leg_failed`` so a clean
+        fallback miss raises rather than resolving to a cachable ``None``.
+        Shape A of https://github.com/WXYC/library-metadata-lookup/issues/1325,
+        closed by #1326; Shape B (a 200 JSON body with no ``results`` key) is
+        still open. ``verify_album_page`` shares the response shape but not the
+        harm -- see its docstring for that decision.
         """
         url = f"https://{slug}.bandcamp.com/music"
         resp = await self._request_with_retry(
@@ -870,7 +999,9 @@ class BandcampClient(BaseStreamingClient):
 
         # Bandcamp serves UTF-8 but its Content-Type often omits `charset=`;
         # force UTF-8 so diacritic-bearing album titles don't mojibake. See
-        # release/bandcamp_resolver.py for the same shape.
+        # release/bandcamp_resolver.py for the same shape. NOTE: httpx forbids
+        # setting ``encoding`` after ``text`` has been read, so this must stay
+        # above the ``detect_bot_wall`` call below.
         resp.encoding = "utf-8"
         html = resp.text
         seen_paths: set[str] = set()
@@ -902,6 +1033,25 @@ class BandcampClient(BaseStreamingClient):
                         "title": path.split("/")[-1].replace("-", " "),
                     }
                 )
+
+        # LML#1326: before returning ``[]`` -- the one value this contract
+        # declares to mean "the artist has no releases", and the value callers
+        # durably record -- ask whether we were shown an artist page at all.
+        # The emptiness is only a PRECONDITION for asking: the answer comes
+        # entirely from :func:`detect_bot_wall`'s positive evidence, so a real
+        # empty catalog with no block markers still returns ``[]``, unchanged.
+        # Asking only here (rather than before the scrape) also means a band
+        # whose own NAME collides with a challenge-page phrase -- "Music |
+        # Access Denied" -- keeps scraping normally as long as their page lists
+        # anything.
+        if not albums:
+            bot_wall = detect_bot_wall(html, resp.headers)
+            if bot_wall is not None:
+                log.warning(
+                    f"Bandcamp bot-wall interstitial at {url} ({bot_wall}) -- treating as "
+                    "couldn't-ask, NOT an empty catalog"
+                )
+                raise BandcampTransportError(f"{url} (bot-wall interstitial: {bot_wall})")
 
         return albums
 
@@ -1058,13 +1208,47 @@ class BandcampClient(BaseStreamingClient):
         [full-length]" vs the page's "Dreamy") gets re-scored here against
         the raw un-normalized title and wrongly rejected -- the LML#1069
         85-row verify_failed floor.
+
+        LML#1326 decision -- this leg shares ``fetch_artist_catalog``'s scrape
+        shape but NOT its harm, so it keeps returning ``False`` for a bot-wall
+        rather than raising, and only gains a log line naming the wall:
+
+        - Its sole caller is ``phase_album_search``'s ``verify_hits`` leg, where
+          a ``False`` tallies ``verify_failed``, writes NOTHING, and leaves the
+          row ``pending``/re-runnable. There is no ``mark_bandcamp_not_found``,
+          no known-miss row and no ``on_streaming=False`` on this path, so the
+          durable-negative harm #1326 exists to narrow simply is not reachable
+          here. The conservative "an unverifiable hit is not written" contract
+          above already gives a wall the right answer.
+        - Raising instead would land in that caller's ``except Exception``,
+          produce the identical ``verify_failed`` tally, and add a traceback per
+          row -- no data-safety gain, strictly more log volume under a sustained
+          wall (the noise LML#1323's review cut).
+        - What WAS missing is tellability: a walled run reported
+          ``verify_failed=N``, indistinguishable from N genuinely wrong links.
+          The ``detect_bot_wall`` log line closes that without touching the
+          contract.
         """
         resp = await self._request_with_retry("GET", url, timeout=15.0, follow_redirects=True)
         if resp is None or resp.status_code != 200:
             return False
         resp.encoding = "utf-8"
-        match = _OG_TITLE_RE.search(resp.text)
+        body = resp.text
+        match = _OG_TITLE_RE.search(body)
         if not match:
+            # LML#1326: an interstitial carries no Bandcamp ``og:title``, so it
+            # already lands here and already returns the right answer. Detect it
+            # only to SAY so -- see the docstring for why this leg keeps its
+            # ``False`` contract while ``fetch_artist_catalog`` raises. Asking
+            # only on this branch is also what makes the check collision-proof:
+            # an album page's ``<title>`` contains the ALBUM's name, so an album
+            # called "Just a Moment" would otherwise read as a challenge page.
+            bot_wall = detect_bot_wall(body, resp.headers)
+            if bot_wall is not None:
+                log.warning(
+                    f"Bandcamp bot-wall interstitial while verifying {url} ({bot_wall}) -- "
+                    "unverifiable, so the hit is not written; the row stays re-runnable"
+                )
             return False
         parsed = parse_og_title(match.group(1))
         if parsed is None:

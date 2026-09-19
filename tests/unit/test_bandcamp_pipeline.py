@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 import pytest_asyncio
 
-from clients.bandcamp import BandcampTransportError
+from clients.bandcamp import BandcampClient, BandcampTransportError
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
 from scripts.streaming_availability.results_db import ResultsDB
 
@@ -546,6 +547,73 @@ class TestPhaseLookup:
         results = await phase_lookup(mock_client, db)
 
         assert len(results) == 0
+
+
+class TestPhaseLookupBotWall:
+    """LML#1326: a Bandcamp/Cloudflare interstitial on the ``/music`` scrape
+    must not reach the "genuinely empty catalog: definitively absent" branch.
+
+    Driven from the HTTP layer with a real ``BandcampClient`` rather than a
+    mocked ``fetch_artist_catalog``: the whole defect lived in what the client
+    returned for that response shape, so a test that stubs the client's return
+    value cannot see it. The sibling ``test_empty_catalog_marks_not_found``
+    above is the control -- a real empty catalog still marks ``not_found``.
+    """
+
+    @staticmethod
+    def _walled_client() -> BandcampClient:
+        from tests.unit.test_bandcamp_scrape_bot_wall import CF_MANAGED_CHALLENGE_HTML
+
+        client = BandcampClient()
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.request = AsyncMock(
+            return_value=httpx.Response(
+                200,
+                content=CF_MANAGED_CHALLENGE_HTML.encode("utf-8"),
+                request=httpx.Request("GET", "https://stereolab.bandcamp.com/music"),
+            )
+        )
+        return client
+
+    @pytest.mark.asyncio
+    async def test_never_marks_not_found_and_leaves_the_slug_pending(self, db):
+        from scripts.bandcamp_pipeline import phase_lookup
+
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
+
+        client = self._walled_client()
+        with patch.object(
+            db, "mark_bandcamp_not_found", wraps=db.mark_bandcamp_not_found
+        ) as mark_not_found:
+            results = await phase_lookup(client, db)
+
+        assert results == []
+        mark_not_found.assert_not_called()
+        all_rows = await db.get_all_results()
+        assert all_rows[0]["bandcamp_status"] == "pending"
+        assert all_rows[0]["bandcamp_url"] is None
+        # Still pending -> a re-run retries it once the wall lifts, instead of
+        # having durably dropped the whole slug.
+        assert len(await db.get_pending_bandcamp_lookup()) == 1
+
+    @pytest.mark.asyncio
+    async def test_artist_fallback_does_not_write_an_artist_url_for_a_wall(self, db):
+        # ``--artist-fallback`` writes ``https://{slug}.bandcamp.com`` for an
+        # empty catalog. A wall is not an empty catalog, so it must not get a
+        # write either -- the row stays re-runnable.
+        from scripts.bandcamp_pipeline import phase_lookup
+
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
+
+        await phase_lookup(self._walled_client(), db, artist_fallback=True)
+
+        all_rows = await db.get_all_results()
+        assert all_rows[0]["bandcamp_url"] is None
+        assert all_rows[0]["bandcamp_status"] == "pending"
 
 
 class TestConcurrentPipeline:

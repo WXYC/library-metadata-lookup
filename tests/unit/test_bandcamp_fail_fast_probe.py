@@ -370,11 +370,15 @@ class TestUnparseableJsonBody:
 
     Not the LAST such shape, and this suite does not claim otherwise: a 200
     carrying valid JSON with no ``results`` key still reads as "asked, nothing
-    matched" in both modes, and the HTML-scraping legs
-    (``fetch_artist_catalog``, ``verify_album_page``) still read an
-    interstitial as an empty catalog. Both are tracked in
-    https://github.com/WXYC/library-metadata-lookup/issues/1325 and are
-    behavior changes, not documentation ones."""
+    matched" in both modes -- Shape B of
+    https://github.com/WXYC/library-metadata-lookup/issues/1325, still open.
+    The sibling shape on the HTML-scraping legs (an interstitial read as an
+    empty catalog) was Shape A and is CLOSED by LML#1326: those legs have no
+    ``resp.json()`` to route into this taxonomy, so they got their own
+    positive-evidence wall detector instead -- see
+    ``clients.bandcamp.detect_bot_wall`` and
+    ``tests/unit/test_bandcamp_scrape_bot_wall.py``, plus
+    ``TestScrapeLegBotWallBreakerAccounting`` below for the fail-fast half."""
 
     @staticmethod
     def _malformed_json_response() -> httpx.Response:
@@ -772,3 +776,61 @@ class TestFindAlbumMatchFailFastBreakerIntegration:
         # not strand HALF_OPEN (which would shed every subsequent caller for
         # the full watchdog window, ~200s at the old, un-retuned multiplier).
         assert breaker.state is BandcampBreakerState.OPEN
+
+
+class TestScrapeLegBotWallBreakerAccounting:
+    """LML#1326, the fail-fast half: a bot-wall on ``{slug}.bandcamp.com/music``
+    must be recorded as a transport failure, exactly like the autocomplete
+    legs' unparseable body.
+
+    Before the fix the wall returned ``[]`` -- an empty catalog -- so the call
+    resolved to a clean ``None`` and the breaker recorded a SUCCESS, which can
+    declare a HALF_OPEN trial recovered while Bandcamp is still walling us and
+    lets ``resolve_streaming_url_with_cache`` UPSERT a 7-day false-negative row.
+    Same bug class as FIX 1 and as ``TestUnparseableJsonBody``'s
+    ``test_malformed_json_records_transport_failure_not_aborted``, on the leg
+    that has no ``resp.json()`` to guard."""
+
+    @pytest.mark.asyncio
+    async def test_records_transport_failure_not_success(self, client):
+        from tests.unit.test_bandcamp_scrape_bot_wall import CF_MANAGED_CHALLENGE_HTML
+
+        client._http.request = AsyncMock(
+            side_effect=[
+                # 1: search_artist -> a matching band.
+                httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "type": "b",
+                                "name": "Autechre",
+                                "url": "https://autechre.bandcamp.com",
+                            }
+                        ]
+                    },
+                    request=httpx.Request("GET", _URL),
+                ),
+                # 2: fetch_artist_catalog -> the wall, at HTTP 200.
+                httpx.Response(
+                    200,
+                    content=CF_MANAGED_CHALLENGE_HTML.encode("utf-8"),
+                    request=httpx.Request("GET", "https://autechre.bandcamp.com/music"),
+                ),
+                # 3: search_albums -> a clean, genuinely empty index.
+                httpx.Response(200, json={"results": []}, request=httpx.Request("GET", _URL)),
+            ]
+        )
+        breaker = get_bandcamp_probe_breaker()
+
+        with (
+            patch.object(breaker, "record_success", wraps=breaker.record_success) as record_success,
+            patch.object(
+                breaker, "record_transport_failure", wraps=breaker.record_transport_failure
+            ) as record_transport_failure,
+        ):
+            with pytest.raises(BandcampTransportError):
+                await client.find_album_match("Autechre", "Confield", fail_fast=True)
+
+        record_transport_failure.assert_called_once_with(epoch=0)
+        record_success.assert_not_called()
