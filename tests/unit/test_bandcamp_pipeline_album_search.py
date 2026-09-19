@@ -184,10 +184,12 @@ class TestPhaseAlbumSearchFetchFailure:
     @pytest.mark.asyncio
     async def test_unexpected_exception_from_search_does_not_abort_remaining_rows(self, db):
         # A malformed autocomplete row (e.g. a non-string field triggering a
-        # TypeError deep in the shared matcher, or a JSONDecodeError from a
-        # truncated response) must degrade to a per-row fetch_failed, not
-        # crash the whole multi-thousand-row unattended drain (#661 posture,
-        # same principle phase_search already applies via process_batched).
+        # TypeError deep in the shared matcher) must degrade to a per-row
+        # fetch_failed, not crash the whole multi-thousand-row unattended drain
+        # (#661 posture, same principle phase_search already applies via
+        # process_batched). A truncated/bot-walled body is no longer an example
+        # of this class: LML#1323 routes it through BandcampSearchUnavailableError
+        # and the clause above, which tallies the same fetch_failed.
         from scripts.bandcamp_pipeline import phase_album_search
 
         await db.insert_albums(

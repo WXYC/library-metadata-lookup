@@ -121,10 +121,14 @@ class BandcampTransportError(Exception):
     """Raised by ``search_artist`` / ``fetch_artist_catalog`` / ``search_albums``
     when the underlying ``_request_with_retry`` call fails at the transport
     layer (network error, connect timeout) or returns an unexpected non-200
-    response (5xx, Cloudflare 403/1015, etc.) -- in BOTH ``fail_fast=True``
-    and the default retrying mode (LML#1115 extended the LML#1106
-    fail_fast-only raise to the default path too; see the default-mode note
-    below). Excludes a 429 (:class:`BandcampRateLimitedError` instead) and,
+    response (5xx, Cloudflare 403/1015, etc.) -- or, for the two autocomplete
+    methods, returns a 200 whose body will not parse as JSON (the
+    Bandcamp/Cloudflare bot-wall's HTML interstitial). All of those, in BOTH
+    ``fail_fast=True`` and the default retrying mode (LML#1115 extended the
+    LML#1106 fail_fast-only raise to the default path for the transport and
+    non-200 cases; LML#1323 extended it for the unparseable-body case; see the
+    default-mode note below). Excludes a 429
+    (:class:`BandcampRateLimitedError` instead) and,
     for ``fetch_artist_catalog`` only, a 404/410 -- a clean "no artist page
     at this slug" absence, not a transport failure (LML#1121 review F2; see
     that method's docstring).
@@ -301,6 +305,17 @@ def _reject_malshaped_fail_fast_body(data: object, url: str) -> dict:
     Only called from ``fail_fast`` call sites -- default mode never guards
     shape and still propagates a raw ``AttributeError`` on these bodies,
     unchanged.
+
+    LML#1323 widened the sibling UNPARSEABLE-body catch to default mode and
+    deliberately did NOT widen this one, because the two are different claims.
+    A body that isn't JSON at all cannot have come from the autocomplete API,
+    so "couldn't ask" is its only reading. A body that IS valid JSON but
+    shaped wrong reads just as well as Bandcamp's unofficial API having
+    changed shape -- contract drift, which the live smoke
+    (``tests/integration/test_bandcamp_album_search_live.py``) exists to report
+    loudly and must not be taught to skip. Default mode is the mode that smoke
+    runs in, so this guard stays where a shed, not a report, is what the
+    caller wants.
     """
     if not isinstance(data, dict):
         raise BandcampTransportError(url)
@@ -701,21 +716,28 @@ class BandcampClient(BaseStreamingClient):
         ``fail_fast=True`` (LML#1106, FIX 2): a non-200 response or a
         network-layer failure raises :class:`BandcampTransportError` instead
         of degrading to ``[]`` -- an empty list must mean "asked, no artists
-        matched", not "couldn't ask". The default mode's degrade-to-``[]``
-        behavior is unchanged. LML#1106 review FIX 6: a 200 whose body isn't
-        valid JSON (a Cloudflare HTML interstitial, a truncated response) is
-        the SAME "couldn't ask" shape -- under ``fail_fast`` it also raises
-        :class:`BandcampTransportError` rather than letting the raw
-        ``json.JSONDecodeError`` escape the fail-fast taxonomy entirely.
+        matched", not "couldn't ask". LML#1106 review FIX 6: a 200 whose body
+        isn't valid JSON (a Cloudflare HTML interstitial, a truncated
+        response) is the SAME "couldn't ask" shape and raises the same type
+        rather than letting the raw ``json.JSONDecodeError`` escape the
+        taxonomy entirely.
+
+        LML#1115 extended the non-200 raise to the default (retrying) mode,
+        since a default-mode failure was otherwise indistinguishable from a
+        genuine no-results response and could be cached as a false negative.
+        LML#1323 finishes that extension: the FIX 6 unparseable-body raise now
+        covers BOTH modes too. It had been left behind, which mattered because
+        a live Bandcamp/Cloudflare bot-wall arrives as exactly a 200 + HTML
+        body and default mode is the mode production uses -- so the one
+        couldn't-ask shape the block actually produces was the one shape that
+        escaped as a raw ``ValueError``.
+
         LML#1106 review round 2, FIX B: a 200 whose body IS valid JSON but
         not object-shaped (a bare list, a bare string) or whose ``results``
-        field isn't a list is the same "couldn't ask" shape and is guarded
-        the same way (see ``_reject_malshaped_fail_fast_body``). Default
-        mode is unchanged: an unparseable or mal-shaped body still
-        propagates exactly as it does today.
-        LML#1115 extends the raise to the default (retrying) mode too, since a
-        default-mode failure was otherwise indistinguishable from a genuine
-        no-results response and could be cached as a false negative.
+        field isn't a list raises too -- but under ``fail_fast`` ONLY (see
+        ``_reject_malshaped_fail_fast_body`` for why LML#1323 deliberately
+        left that half narrow). In default mode a mal-shaped body still
+        propagates its raw ``AttributeError``, unchanged.
         """
         resp = await self._request_with_retry(
             "GET",
@@ -727,14 +749,12 @@ class BandcampClient(BaseStreamingClient):
         if resp is None or resp.status_code != 200:
             raise BandcampTransportError(AUTOCOMPLETE_URL)
 
-        if fail_fast:
-            try:
-                data = resp.json()
-            except ValueError as e:
-                raise BandcampTransportError(AUTOCOMPLETE_URL) from e
-            data = _reject_malshaped_fail_fast_body(data, AUTOCOMPLETE_URL)
-        else:
+        try:
             data = resp.json()
+        except ValueError as e:
+            raise BandcampTransportError(AUTOCOMPLETE_URL) from e
+        if fail_fast:
+            data = _reject_malshaped_fail_fast_body(data, AUTOCOMPLETE_URL)
         results = []
         for item in data.get("results", []):
             if item.get("type") != "b":
@@ -780,6 +800,15 @@ class BandcampClient(BaseStreamingClient):
         stays negative-cacheable rather than being forced into a permanent
         retry loop. Every other non-200 (5xx, 403, 429, ...) still raises,
         unchanged.
+
+        LML#1323 audited this method and left its body handling alone: it
+        scrapes ``resp.text`` with regexes and never calls ``resp.json()``, so
+        it has no unparseable-body case to bring into the taxonomy. A bot-wall
+        HTML body here simply matches no album link and yields ``[]`` -- the
+        same shape a genuinely empty catalog gives -- which the two
+        autocomplete legs' raises already cover on the way in, since a block
+        severe enough to serve this page also blocks ``search_artist`` and no
+        slug is ever reached to fetch.
         """
         url = f"https://{slug}.bandcamp.com/music"
         resp = await self._request_with_retry(
@@ -845,15 +874,14 @@ class BandcampClient(BaseStreamingClient):
         caller's default-mode contract.
 
         Returns a list of dicts with keys ``artist``, ``title``, ``url``
-        (de-doubled via ``fix_autocomplete_url``) on success, or (default
-        mode) ``None`` on fetch failure. Under ``fail_fast=True`` (LML#1106,
-        FIX 2), that same failure instead raises
-        :class:`BandcampTransportError` -- see ``search_artist`` for why
-        (including the FIX 6 unparseable-body case and the FIX B round-2
-        mal-shaped-body case).
-        LML#1115 extends the raise to the default (retrying) mode too, since a
-        default-mode failure was otherwise indistinguishable from a genuine
-        no-results response and could be cached as a false negative.
+        (de-doubled via ``fix_autocomplete_url``) on success. A fetch failure
+        raises :class:`BandcampTransportError` in BOTH modes -- LML#1106 FIX 2
+        introduced the raise under ``fail_fast``, LML#1115 extended the non-200
+        and network-layer cases to the default (retrying) mode, and LML#1323
+        extended the FIX 6 unparseable-body case (the 200 + HTML bot-wall) to
+        default mode as well. See ``search_artist`` for the full argument,
+        including why the FIX B round-2 mal-shaped-body guard stays
+        ``fail_fast``-only.
         """
         resp = await self._request_with_retry(
             "GET",
@@ -865,14 +893,12 @@ class BandcampClient(BaseStreamingClient):
         if resp is None or resp.status_code != 200:
             raise BandcampTransportError(AUTOCOMPLETE_URL)
 
-        if fail_fast:
-            try:
-                data = resp.json()
-            except ValueError as e:
-                raise BandcampTransportError(AUTOCOMPLETE_URL) from e
-            data = _reject_malshaped_fail_fast_body(data, AUTOCOMPLETE_URL)
-        else:
+        try:
             data = resp.json()
+        except ValueError as e:
+            raise BandcampTransportError(AUTOCOMPLETE_URL) from e
+        if fail_fast:
+            data = _reject_malshaped_fail_fast_body(data, AUTOCOMPLETE_URL)
         results = []
         for item in data.get("results", []):
             if item.get("type") != "a":

@@ -56,6 +56,17 @@ def _error_response(status: int, url: str) -> httpx.Response:
     return httpx.Response(status, request=httpx.Request("GET", url))
 
 
+def _bot_wall_response(url: str = _AUTOCOMPLETE_URL) -> httpx.Response:
+    """The LML#1323 shape: HTTP 200 carrying a Cloudflare/bot-wall HTML
+    interstitial instead of the autocomplete JSON, so the status check passes
+    and ``resp.json()`` is what fails."""
+    return httpx.Response(
+        200,
+        content=b"<html><body>please enable javascript</body></html>",
+        request=httpx.Request("GET", url),
+    )
+
+
 class TestExtractSlug:
     def test_standard_url(self):
         assert extract_slug("https://autechre.bandcamp.com") == "autechre"
@@ -155,6 +166,23 @@ class TestSearchArtist:
 
         with pytest.raises(BandcampTransportError):
             await client.search_artist("Nobody")
+
+    @pytest.mark.asyncio
+    async def test_raises_transport_error_on_bot_wall_html_body(self):
+        # LML#1323: a Bandcamp/Cloudflare bot-wall arrives as a 200 whose body
+        # is HTML, so the non-200 check above cannot see it and ``resp.json()``
+        # used to raise a raw ``json.JSONDecodeError`` in the default mode --
+        # outside the couldn't-ask taxonomy the module documents (LML#1106 FIX
+        # 6 already routed it there under ``fail_fast``). It is the same
+        # "couldn't ask" shape as a 500 or a connect timeout, and LML#1115's
+        # argument for raising the non-200 in default mode applies verbatim.
+        client = BandcampClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(return_value=_bot_wall_response())
+        client._http = mock_http
+
+        with pytest.raises(BandcampTransportError):
+            await client.search_artist("Autechre")
 
     @pytest.mark.asyncio
     async def test_returns_empty_on_no_results(self):
