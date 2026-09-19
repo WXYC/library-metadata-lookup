@@ -349,10 +349,21 @@ def _is_rowless_only(items: list[LibraryItem]) -> bool:
 
 
 # How many of the artist's shelf rows ``_rebind_rowless_release_via_override``
-# probes before giving up. Bounds a title-divergent artist's shelf count into
-# one bounded PG query rather than an unbounded one; "typically under 20 rows"
-# for a WXYC-shelved artist in practice, so this rarely truncates a real hit.
-_SHELF_REBIND_PROBE_LIMIT = 20
+# probes before giving up. This bounds the ``= ANY($1)`` array, not the query
+# count — the probe is one round-trip at any size — so the only thing the cap
+# buys is a ceiling on a pathological input, and setting it too low costs
+# recall silently (a truncated row and an unpinned row both return ``None``).
+#
+# Sized from the real distribution rather than a guess. Measured against
+# ``library.db`` (64,193 rows, 2026-09-19): 162 artists shelve more than 20
+# releases, and the largest non-Various-Artists shelf is 90 rows. An earlier
+# 20-row cap therefore truncated ``Sun Ra`` (49), ``Various Artists - Rock -
+# F`` (90), ``David Bowie`` (33) and ``Keith Jarrett`` (32) — four artists
+# that are themselves in the LML#1330 title-divergence cohort, Sun Ra by name.
+# 200 clears every real artist; only the catch-all ``Various Artists`` shelf
+# (3,107 rows) exceeds it, and an artist-keyed probe is the wrong instrument
+# for that row anyway.
+_SHELF_REBIND_PROBE_LIMIT = 200
 
 
 async def _rebind_rowless_release_via_override(
@@ -380,6 +391,15 @@ async def _rebind_rowless_release_via_override(
     lookup, so a same-artist/different-album row (a "Hiding Places" shelf row
     against a "High Places" query) is rejected by id inequality, not by a
     title floor this function does not restate.
+
+    That table is the densest ``library_id -> discogs_release_id`` map LML has,
+    and not a thin one: 61,046 pins over 86.6% of ``library.db``'s 64,193 rows,
+    58 of the 68 in LML#1330's ellipsis cohort (prod, 2026-09-19). The ~13%
+    with no pin is unbindable by anything shipping today — ``library.db``
+    carries no release id, and ``entity.release_identity`` keys Discogs against
+    MusicBrainz / Spotify / Apple / Bandcamp with **no library column**, so it
+    cannot say which shelf row a release is. That tail is ``library_identity``
+    (cross-cache-identity #25), which slots in here as a second source.
 
     Bounded to the first :data:`_SHELF_REBIND_PROBE_LIMIT` rows and fetched in
     ONE query (``get_library_release_overrides``, best-effort — a PG failure
@@ -535,7 +555,7 @@ async def apply_track_validation_cascade(
             # displaced a shelf row therefore reaches the DJ as
             # '"<song>" by <artist> not found in library'.
             #
-            # Stopgap: before conceding row-less, ask whether one of the
+            # LML#1330: before conceding row-less, ask whether one of the
             # artist's OWN shelf rows already carries a hand-verified override
             # to the SAME release (LML#850) — ``real_results`` is already the
             # artist-filtered shelf set per-result validation just failed to
