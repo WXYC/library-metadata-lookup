@@ -175,3 +175,55 @@ class TestStepWiring:
             await _step_fetch_artwork(_parsed_stub(), state, services)
 
         assert mock_prefetch.await_args.kwargs["allow_release_resolution_fallback"] is False
+
+
+@pytest.mark.asyncio
+class TestPrefetchReusesCascadePins:
+    """LML#1332 finding 3: don't re-query pins step 3b already fetched.
+
+    The row-less reverse probe queries the pin table to find its
+    ``library_id -> release_id`` equality, then narrows ``library_results`` to
+    the single row it matched. Step 4 then prefetched the very same id against
+    the shared discogs-cache pool — a second round-trip for an answer the
+    request already had, on the hot path Project #32 exists to slim.
+    """
+
+    async def test_fully_covered_ids_skip_the_query(self, _flag_on):
+        pg = AsyncMock()
+        pg.fetchall = AsyncMock(return_value=[])
+        items = [make_library_item(id=55651, artist="Broadcast", title="Investigate...")]
+
+        result = await _prefetch_release_overrides(items, pg, prefetched={55651: 1944554})
+
+        assert result == {55651: 1944554}
+        pg.fetchall.assert_not_awaited()
+
+    async def test_partially_covered_ids_still_query(self, _flag_on):
+        """A pin map that covers only some rows is not authoritative for the rest."""
+        pg = AsyncMock()
+        pg.fetchall = AsyncMock(
+            return_value=[
+                {"library_id": 55651, "discogs_release_id": 1944554},
+                {"library_id": 52201, "discogs_release_id": 5441389},
+            ]
+        )
+        items = [
+            make_library_item(id=55651, artist="Broadcast", title="Investigate..."),
+            make_library_item(id=52201, artist="Broadcast", title="Tender Buttons"),
+        ]
+
+        result = await _prefetch_release_overrides(items, pg, prefetched={55651: 1944554})
+
+        assert result == {55651: 1944554, 52201: 5441389}
+        pg.fetchall.assert_awaited_once()
+
+    async def test_flag_off_ignores_prefetched_pins_entirely(self, _flag_off):
+        """The flag gate outranks the cache: disabled means disabled."""
+        pg = AsyncMock()
+        pg.fetchall = AsyncMock(return_value=[])
+        items = [make_library_item(id=55651, artist="Broadcast", title="Investigate...")]
+
+        result = await _prefetch_release_overrides(items, pg, prefetched={55651: 1944554})
+
+        assert result == {}
+        pg.fetchall.assert_not_awaited()

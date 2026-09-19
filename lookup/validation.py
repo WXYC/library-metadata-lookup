@@ -15,7 +15,7 @@ from ``lookup/orchestrator.py`` (LML#728, LML#750).
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
@@ -401,11 +401,21 @@ async def _rebind_rowless_release_via_override(
     cannot say which shelf row a release is. That tail is ``library_identity``
     (cross-cache-identity #25), which slots in here as a second source.
 
+    Gated on ``lml_library_release_override`` (LML#1332), the same flag
+    ``lookup.orchestrator._prefetch_release_overrides`` reads — checked BEFORE
+    ``pg`` is touched, so flag-off means zero PG work and the pre-probe answer
+    byte for byte. Without that gate this path reached the pin table while
+    every other reader honoured the switch, so LML#850's documented rollback
+    (scoped ``DELETE`` plus flag off) could not disarm it — the lever that
+    matters for the 1,444 behaviorally-contradicted pins LML#1316 reports.
+
     Bounded to the first :data:`_SHELF_REBIND_PROBE_LIMIT` rows and fetched in
     ONE query (``get_library_release_overrides``, best-effort — a PG failure
     or an empty/absent ``pg`` degrades to no match, never a crash). Returns the
     first shelf row whose override matches, in ``shelf_rows`` order.
     """
+    if not get_settings().lml_library_release_override:
+        return None
     if pg is None or not shelf_rows:
         return None
     candidate_rows = [row for row in shelf_rows[:_SHELF_REBIND_PROBE_LIMIT] if row.id > 0]
@@ -425,6 +435,18 @@ class Step3bResult:
     library_results: list[LibraryItem]
     song_not_found: bool
     discogs_titles: dict[int, ResolvedRelease]
+
+    release_overrides: dict[int, int] = field(default_factory=dict)
+    """LML#850 pins this cascade already fetched, for step 4 to reuse.
+
+    Populated only by the row-less reverse probe, and only on a hit: the probe
+    queried the pin table to find ``library_id -> release_id`` equality, so
+    re-querying the same id in ``_prefetch_release_overrides`` is pure
+    duplicate work against the shared discogs-cache pool (LML#1332 finding 3).
+    Contains only ids whose pin is positively known — never "queried and
+    absent" — so a caller may treat a present key as authoritative and must
+    still query for any id it does not cover.
+    """
 
     found_on_compilation: bool | None = None
     """Desired ``state.found_on_compilation`` after the caller rebinds this.
@@ -581,7 +603,29 @@ async def apply_track_validation_cascade(
                         resolved_release.release_id,
                         shelf_row.title,
                     )
-                    return Step3bResult([shelf_row], False, discogs_titles)
+                    # Carry the release onto the seam under the SHELF row's id
+                    # (LML#1332 finding 2). The probe matched on this exact
+                    # release, so dropping it would make the bind depend on
+                    # step 4 re-fetching the same pin — correct only while the
+                    # flag is on, and flag-off it re-derives the release
+                    # through the 80/80 title floor this probe exists to
+                    # bypass (51/100 for the Broadcast pair), landing on the
+                    # release_id=0 sentinel with no artwork or tracklist.
+                    #
+                    # ``album_title`` is rewritten to the CATALOG row's title,
+                    # matching what ``fetch_artwork_for_items`` does on its own
+                    # override path — "the pin only redirects the release id".
+                    # Carrying the row-less title verbatim would surface
+                    # Discogs's "Investigate Witch Cults Of The Radio Age"
+                    # where the album leg surfaces the librarians' own
+                    # "Broadcast & the Focus Group Investigate...".
+                    carried = replace(resolved_release, album_title=shelf_row.title or "")
+                    return Step3bResult(
+                        [shelf_row],
+                        False,
+                        {**discogs_titles, shelf_row.id: carried},
+                        release_overrides={shelf_row.id: resolved_release.release_id},
+                    )
 
             # A row-less release is the weakest thing this tier can return, so
             # it yields to any shelved row that answers the request and keeps
