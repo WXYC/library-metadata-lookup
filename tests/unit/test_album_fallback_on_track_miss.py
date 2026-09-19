@@ -115,6 +115,9 @@ def _build_discogs_service(
     # Step 3b's A4 net probes this on the compilation-tier path; a bare
     # AsyncMock would return a truthy Mock and derail the cascade.
     svc.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+    # The album-channel pin rehydrate (review fix 3) reads this lean local
+    # hydration; None = "row not in the local cache", falling to the probe.
+    svc.cache_service.get_release_lean = AsyncMock(return_value=None)
     svc.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
     svc.search_releases_by_track = AsyncMock(
         return_value=_track_response(song, artist, track_candidates)
@@ -187,6 +190,10 @@ class TestKernelAlbumLevelDegrade:
             svc, None, song=self.SONG, artist=self.ARTIST, album=self.ALBUM
         )
         svc.search.assert_not_called()
+        # Review fix 3: nor the get_release read-through, whose fallthrough
+        # seam includes a LIVE API leg — the degrade never leaves the local
+        # cache on ANY of its branches.
+        svc.get_release.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_album_typed_still_returns_none(self):
@@ -243,10 +250,15 @@ class TestKernelAlbumLevelDegrade:
 
     @pytest.mark.asyncio
     async def test_album_channel_positive_short_circuits_the_cache_probe(self):
+        """Review fix 3: the pin-hit rehydrate reads the LOCAL cache's lean
+        by-id hydration, never ``DiscogsService.get_release`` (whose
+        fallthrough seam includes a live API leg + write-back) — the exact
+        shape where a pin outlives its pruned PG row must stay cache-only."""
         pg = _RecordingPg()
         pg.seed(("agriculture", "the spiritual sound", False), AGRICULTURE_RELEASE_ID)
-        svc = self._service(
-            rehydrate=ReleaseMetadataResponse(
+        svc = self._service()
+        svc.cache_service.get_release_lean = AsyncMock(
+            return_value=ReleaseMetadataResponse(
                 release_id=AGRICULTURE_RELEASE_ID,
                 title=self.ALBUM,
                 artist=self.ARTIST,
@@ -260,19 +272,83 @@ class TestKernelAlbumLevelDegrade:
         assert resolved.release_id == AGRICULTURE_RELEASE_ID
         assert resolved.track_confirmed is False
         svc.cache_service.search_releases.assert_not_called()
+        svc.get_release.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_album_cache_miss_pins_nothing_on_the_album_channel(self):
-        """A cache-only miss is not evidence Discogs lacks the pair — the local
-        cache merely doesn't hold it (yet: the daily ETL may add it tomorrow).
-        Only positives are durable on the album channel."""
+    async def test_pin_outliving_its_cache_row_falls_back_to_the_probe_without_api(self):
+        """Review fix 3, the 9/4-rebuild shape: the album pin survives but the
+        pruned cache row is gone. The lean rehydrate misses, the trgm probe
+        answers, and the API leg is never entered."""
+        pg = _RecordingPg()
+        pg.seed(("agriculture", "the spiritual sound", False), AGRICULTURE_RELEASE_ID)
+        svc = self._service()
+        svc.cache_service.get_release_lean = AsyncMock(return_value=None)
+        resolved = await _resolve_nonlibrary_release(
+            svc, pg, song=self.SONG, artist=self.ARTIST, album=self.ALBUM
+        )
+        assert resolved is not None
+        assert resolved.release_id == AGRICULTURE_RELEASE_ID
+        svc.cache_service.search_releases.assert_called()
+        svc.get_release.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_album_cache_miss_pins_a_short_ttl_crowd_out_miss(self):
+        """Review fix 4: a cache-only empty is not evidence Discogs lacks the
+        pair (the daily ETL may cache it tomorrow), but leaving it unpinned
+        made every repeat inside the 7-day track-miss window pay the pin read
+        + a pg_trgm scan. Pin it with the 1-hour crowd-out TTL semantics —
+        the same "self-heals within the hour" trade LML#824 codified."""
         pg = _RecordingPg()
         svc = self._service(album_cache_rows=[])
         resolved = await _resolve_nonlibrary_release(
             svc, pg, song=self.SONG, artist=self.ARTIST, album=self.ALBUM
         )
         assert resolved is None
-        assert ("agriculture", "the spiritual sound", False) not in pg.store
+        album_row = pg.store[("agriculture", "the spiritual sound", False)]
+        assert album_row["release_id"] is None
+        assert album_row["crowd_out"] is True
+
+    @pytest.mark.asyncio
+    async def test_fresh_album_channel_miss_short_circuits_the_probe(self):
+        pg = _RecordingPg()
+        pg.seed(("agriculture", "the spiritual sound", False), None, crowd_out=True)
+        svc = self._service()
+        resolved = await _resolve_nonlibrary_release(
+            svc, pg, song=self.SONG, artist=self.ARTIST, album=self.ALBUM
+        )
+        assert resolved is None
+        svc.cache_service.search_releases.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_album_channel_miss_expires_on_the_crowd_out_ttl(self):
+        from entity.release_resolution_cache import DEFAULT_CROWD_OUT_MISS_TTL
+
+        pg = _RecordingPg()
+        pg.seed(("agriculture", "the spiritual sound", False), None, crowd_out=True)
+        pg.age(("agriculture", "the spiritual sound", False), DEFAULT_CROWD_OUT_MISS_TTL * 2)
+        svc = self._service()
+        resolved = await _resolve_nonlibrary_release(
+            svc, pg, song=self.SONG, artist=self.ARTIST, album=self.ALBUM
+        )
+        assert resolved is not None
+        assert resolved.release_id == AGRICULTURE_RELEASE_ID
+        svc.cache_service.search_releases.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_unhydratable_positive_pin_is_not_demoted_to_a_miss(self):
+        """Self-heal guard, mirroring the kernel's own: a positive album pin
+        whose cache row is temporarily unreadable must not be overwritten by
+        a miss when the probe also comes up empty."""
+        pg = _RecordingPg()
+        pg.seed(("agriculture", "the spiritual sound", False), AGRICULTURE_RELEASE_ID)
+        svc = self._service(album_cache_rows=[])
+        svc.cache_service.get_release_lean = AsyncMock(return_value=None)
+        resolved = await _resolve_nonlibrary_release(
+            svc, pg, song=self.SONG, artist=self.ARTIST, album=self.ALBUM
+        )
+        assert resolved is None
+        album_row = pg.store[("agriculture", "the spiritual sound", False)]
+        assert album_row["release_id"] == AGRICULTURE_RELEASE_ID
 
     @pytest.mark.asyncio
     async def test_floor_rejects_an_alternative_same_artist_album(self):
@@ -325,23 +401,30 @@ class TestAlbumLevelMatchHelper:
     """Direct contract of ``resolve_typed_album_level_match``."""
 
     @pytest.mark.asyncio
-    async def test_no_cache_service_degrades_to_none(self):
+    async def test_no_cache_service_degrades_to_none_and_writes_nothing(self):
         svc = AsyncMock()
         svc.cache_service = None
+        pg = _RecordingPg()
         resolved = await resolve_typed_album_level_match(
-            svc, None, artist="Agriculture", album="The Spiritual Sound"
+            svc, pg, artist="Agriculture", album="The Spiritual Sound"
         )
         assert resolved is None
+        assert pg.store == {}
 
     @pytest.mark.asyncio
-    async def test_cache_probe_failure_degrades_to_none(self):
+    async def test_cache_probe_failure_degrades_to_none_and_pins_no_miss(self):
+        """Couldn't-ask is never a known miss: a probe failure must not pin the
+        1-hour miss a probe-answered empty earns."""
         svc = AsyncMock()
         svc.cache_service = AsyncMock()
+        svc.cache_service.get_release_lean = AsyncMock(return_value=None)
         svc.cache_service.search_releases = AsyncMock(side_effect=RuntimeError("pg down"))
+        pg = _RecordingPg()
         resolved = await resolve_typed_album_level_match(
-            svc, None, artist="Agriculture", album="The Spiritual Sound"
+            svc, pg, artist="Agriculture", album="The Spiritual Sound"
         )
         assert resolved is None
+        assert pg.store == {}
 
     @pytest.mark.asyncio
     async def test_blank_album_returns_none(self):
@@ -363,6 +446,18 @@ class TestAlbumLevelMatchHelper:
         resolved = await resolve_typed_album_level_match(svc, None, artist="Duster", album="S/T")
         assert resolved is not None
         assert resolved.release_id == 22222222
+
+    @pytest.mark.asyncio
+    async def test_malformed_cache_row_degrades_to_none(self):
+        """Review fix 7: a row missing the hard-indexed keys must degrade like
+        any other probe failure, never escape as a KeyError 500."""
+        svc = AsyncMock()
+        svc.cache_service = AsyncMock()
+        svc.cache_service.search_releases = AsyncMock(return_value=[{"release_id": 5}])
+        resolved = await resolve_typed_album_level_match(
+            svc, None, artist="Agriculture", album="The Spiritual Sound"
+        )
+        assert resolved is None
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +635,108 @@ class TestUnconfirmedAlbumOutcome:
         outcome = _unconfirmed_album_outcome(parsed, state, [rowless], titles)
         assert outcome.items == []
         assert outcome.discogs_titles is None
+
+    @pytest.mark.parametrize("shelf_title", ["S/T", "Duster"])
+    def test_self_titled_query_recognizes_the_shelved_self_titled_row(self, shelf_title):
+        """Review fix 2: the pair guard must mirror the kernel's LML#784
+        self-titled swap (and the catalog's own "S/T" filing form, the
+        artist_plus_album.py sibling), or a typed "S/T" album surfaces a
+        row-less duplicate ahead of the shelved self-titled record — the
+        Minimoonstar class this guard exists to prevent."""
+        parsed = ParsedRequest(artist="Duster", album="S/T", song="Unheard Track")
+        state = SearchState()
+        state.results = [make_library_item(id=88, artist="Duster", title=shelf_title)]
+        rowless = make_library_item(id=ROWLESS_LIBRARY_ID, artist="Duster", title="Duster")
+        titles = {
+            ROWLESS_LIBRARY_ID: ResolvedRelease(
+                release_id=22222222,
+                release_url="https://www.discogs.com/release/22222222",
+                is_compilation=False,
+                album_title="Duster",
+                track_confirmed=False,
+            )
+        }
+        outcome = _unconfirmed_album_outcome(parsed, state, [rowless], titles)
+        assert outcome.items == []
+
+
+class TestSongAsAlbumTitlePromotionHonesty:
+    """Review fix 1: step 3b's LML#717 promotion must never promote the
+    never-track-confirmed degrade row into a found answer."""
+
+    @pytest.mark.asyncio
+    async def test_degrade_row_is_never_promoted_to_a_found_answer(self, enable_nonlibrary_release):
+        """The DOGA class: song == album (album title typed in the track
+        field) plus a shelf row ("Remixes of DOGA") that survives
+        ARTIST_PLUS_ALBUM's token-set floor (100 — token subset) but fails
+        ``album_title_acceptable`` (ratio 42), so the pair guard does not
+        suppress the degrade and step 3b runs over [rowless, shelf]. The
+        id=0 row scores 100 against the typed song and — without the
+        exclusion — is promoted with ``song_not_found=False`` while
+        ``search_type`` stays ``fallback``: internally inconsistent, and a
+        found-claim nothing track-confirmed."""
+        artist, album, song = "Juana Molina", "DOGA", "DOGA"
+        shelf = make_library_item(id=46524, artist=artist, title="Remixes of DOGA")
+        svc = _build_discogs_service(
+            artist=artist,
+            album_cache_rows=[_cache_row(44444444, "DOGA", artist)],
+            track_candidates=[_release_info(44444444, "DOGA", artist)],
+            song=song,
+        )
+        db = _build_library_db({f"{artist} {album}": [shelf]})
+        request = LookupRequest(
+            artist=artist, album=album, song=song, raw_message=f"{artist} - {album} - {song}"
+        )
+        response = await perform_lookup(request, db, svc, make_lml_telemetry())
+        ids = [item.library_item.id for item in response.results]
+        assert not (response.song_not_found is False and ROWLESS_LIBRARY_ID in ids), (
+            "the id=0 degrade row was promoted to a found answer without any track confirmation"
+        )
+
+
+class TestKernelCallSiteHonesty:
+    """Review fix 5: the SONG_AS_TRACK/SWAPPED kernel surfaces every non-None
+    kernel result via Outcome.track_match (song_not_found_after=False), so a
+    track-unconfirmed release must never be surfaced there."""
+
+    @pytest.mark.asyncio
+    async def test_track_unconfirmed_release_is_not_surfaced_as_a_track_match(
+        self, enable_nonlibrary_release, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        from lookup.strategies.track_release_matching import _match_track_releases_to_library
+
+        unconfirmed = ResolvedRelease(
+            release_id=AGRICULTURE_RELEASE_ID,
+            release_url=f"https://www.discogs.com/release/{AGRICULTURE_RELEASE_ID}",
+            is_compilation=False,
+            album_title="The Spiritual Sound",
+            track_confirmed=False,
+        )
+        svc = _build_discogs_service(
+            artist="Agriculture",
+            album_cache_rows=[],
+            track_candidates=[
+                _release_info(AGRICULTURE_RELEASE_ID, "The Spiritual Sound", "Agriculture")
+            ],
+            song="Micah (5:15 AM)",
+        )
+        db = _build_library_db()
+        with patch(
+            "lookup.strategies.track_release_matching._resolve_nonlibrary_release",
+            AsyncMock(return_value=unconfirmed),
+        ):
+            items, hints, titles = await _match_track_releases_to_library(
+                db,
+                svc,
+                "Micah (5:15 AM)",
+                artist="Agriculture",
+                source="swapped_interpretation",
+                require_artist="Agriculture",
+            )
+        assert items == []
+        assert titles == {}
 
 
 class TestLibraryLaneParity:

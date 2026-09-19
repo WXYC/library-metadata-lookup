@@ -441,7 +441,14 @@ async def apply_track_validation_cascade(
         # the user wanted that album. Surfacing it as found-the-album avoids
         # the misleading 'not on any album' message about a row sitting in
         # the result list.
-        title_matches = _filter_results_by_song_as_album_title(library_results, song)
+        # LML#1318 review fix 1: the id=0 degrade row is excluded — its title
+        # IS the typed album (the DOGA/Eliana shape scores 100 by construction),
+        # and promoting it would flip ``song_not_found`` to False on a row
+        # nothing ever track-confirmed, while ``search_type`` stays ``fallback``.
+        # Only shelved rows can earn the LML#717 "user meant the album" reading.
+        title_matches = _filter_results_by_song_as_album_title(
+            [r for r in library_results if r.id != ROWLESS_LIBRARY_ID], song
+        )
         if title_matches:
             logger.info(
                 f"Promoted {len(title_matches)} of {len(library_results)} "

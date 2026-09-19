@@ -62,6 +62,7 @@ from lookup.matching import (
     WAVE_A_SEARCH_LIMIT,
     album_title_acceptable,
     artist_matches_item,
+    is_self_titled,
     library_artist_for,
     limit_results,
 )
@@ -215,11 +216,22 @@ def _unconfirmed_album_outcome(
       TRACK_ON_COMPILATION branch derives ``fallback``.
     """
     match_artist = library_artist_for(parsed) or ""
-    album_lower = (parsed.album or "").strip().lower()
+    album_query = (parsed.album or "").strip()
+    # Mirror the kernel's LML#784 self-titled swap (and the catalog's own
+    # "S/T" filing form, per the artist_plus_album/validation siblings).
+    if is_self_titled(album_query):
+        album_query = (parsed.artist or "").strip() or album_query
+    album_lower = album_query.lower()
+    album_is_artist = bool(match_artist) and normalize_for_comparison(
+        album_query
+    ) == normalize_for_comparison(match_artist)
     pair_already_answered = album_lower and any(
         r.id != ROWLESS_LIBRARY_ID
         and artist_matches_item(r, match_artist)
-        and album_title_acceptable(album_lower, (r.title or "").lower())
+        and (
+            album_title_acceptable(album_lower, (r.title or "").lower())
+            or (album_is_artist and is_self_titled(r.title or ""))
+        )
         for r in state.results
     )
     if pair_already_answered:
@@ -926,10 +938,15 @@ async def _carry_through_nonlibrary_release(
 
     rowless = _make_rowless_item(artist=parsed.artist or "", title=resolved_nonlibrary.album_title)
     discogs_titles[ROWLESS_LIBRARY_ID] = resolved_nonlibrary
+    # "validated" is only true for a track-confirmed resolution (LML#1318).
+    verdict = (
+        "validated, not in library"
+        if resolved_nonlibrary.track_confirmed
+        else "album-level match, track unconfirmed (LML#1318), not in library"
+    )
     logger.info(
         f"TRACK_ON_COMPILATION: surfacing row-less Discogs release "
-        f"{resolved_nonlibrary.release_id} ('{resolved_nonlibrary.album_title}') "
-        f"— validated, not in library"
+        f"{resolved_nonlibrary.release_id} ('{resolved_nonlibrary.album_title}') — {verdict}"
     )
     return rowless
 
