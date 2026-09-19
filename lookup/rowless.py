@@ -301,7 +301,12 @@ async def _resolve_nonlibrary_release(
     if discogs_service is None or not song or not artist:
         return None
 
+    best: ResolvedRelease | None = None
     cached_positive_unhydrated = False
+    # Set when layer 1 answered "no release" from a fresh pin: the track verdict
+    # is already known, so layers 2 and 3 are skipped entirely (no probe, and
+    # nothing to re-pin) and control falls straight to the degrade tail.
+    track_verdict_pinned_empty = False
     if pg is not None:
         cached: ReleaseResolution = await get_cached_release_id(
             pg, artist=artist, title=song, is_track=is_track
@@ -309,79 +314,82 @@ async def _resolve_nonlibrary_release(
         if cached.was_present:
             if cached.release_id is None:
                 # Fresh known miss — the live probe came up empty recently.
-                # LML#1318: the pin is track-key-scoped and must not suppress
-                # the album answer — degrade to the typed (artist, album)
-                # album-level match (local cache only) instead of zeroing.
-                return await resolve_typed_album_level_match(
-                    discogs_service, pg, artist=artist, album=album
-                )
-            rehydrated = await _rehydrate_resolved_release(discogs_service, cached.release_id)
-            if rehydrated is not None:
-                return rehydrated
-            # The id is cached but its metadata is unfetchable right now; fall
-            # through to a live resolve rather than fabricate a release — but
-            # remember we hold a known-good id so the write-back below doesn't
-            # demote it on a transient outage.
-            cached_positive_unhydrated = True
+                track_verdict_pinned_empty = True
+            else:
+                rehydrated = await _rehydrate_resolved_release(discogs_service, cached.release_id)
+                if rehydrated is not None:
+                    return rehydrated
+                # The id is cached but its metadata is unfetchable right now; fall
+                # through to a live resolve rather than fabricate a release — but
+                # remember we hold a known-good id so the write-back below doesn't
+                # demote it on a transient outage.
+                cached_positive_unhydrated = True
 
-    # LML#816/#824: ``truncated_out`` reports whether the bounded resolve validated
-    # fewer candidates than it surfaced (the id-having set exceeded the cap). An
-    # empty result under truncation may be a *crowd-out* — a resolvable release
-    # sorted outside the 5-candidate window, an effect #802's improved recall
-    # amplifies — rather than a confirmed miss.
-    truncated_out: list[bool] = []
-    candidates = await resolve_release_for_track(
-        song,
-        artist,
-        album,
-        discogs_service,
-        also_probe_album_title=bool(album),
-        max_validations=5,
-        truncated_out=truncated_out,
-    )
-    best = candidates[0] if candidates else None
-    # Default to "not truncated" when the sink was left unpopulated (a monkeypatched
-    # resolver in tests, or any non-bounded path), so the pin policy is unchanged
-    # for every case that can't be a crowd-out.
-    bounded_resolve_truncated = bool(truncated_out and truncated_out[0])
+    if not track_verdict_pinned_empty:
+        # LML#816/#824: ``truncated_out`` reports whether the bounded resolve validated
+        # fewer candidates than it surfaced (the id-having set exceeded the cap). An
+        # empty result under truncation may be a *crowd-out* — a resolvable release
+        # sorted outside the 5-candidate window, an effect #802's improved recall
+        # amplifies — rather than a confirmed miss.
+        truncated_out: list[bool] = []
+        candidates = await resolve_release_for_track(
+            song,
+            artist,
+            album,
+            discogs_service,
+            also_probe_album_title=bool(album),
+            max_validations=5,
+            truncated_out=truncated_out,
+        )
+        best = candidates[0] if candidates else None
+        # Default to "not truncated" when the sink was left unpopulated (a monkeypatched
+        # resolver in tests, or any non-bounded path), so the pin policy is unchanged
+        # for every case that can't be a crowd-out.
+        bounded_resolve_truncated = bool(truncated_out and truncated_out[0])
 
-    # self-heal guard (LML#628): if we already held a positive entry that merely
-    # failed to re-hydrate (transient get_release / validate outage) and the live
-    # resolve also came up empty, leave the positive intact so it heals once the
-    # outage clears — never demote good data to a miss (short-TTL or long). This
-    # is the one case that skips the write entirely; it gates on ``best is None``
-    # so a real resolution is never suppressed.
+        # self-heal guard (LML#628): if we already held a positive entry that merely
+        # failed to re-hydrate (transient get_release / validate outage) and the live
+        # resolve also came up empty, leave the positive intact so it heals once the
+        # outage clears — never demote good data to a miss (short-TTL or long). This
+        # is the one case that skips the write entirely; it gates on ``best is None``
+        # so a real resolution is never suppressed.
+        #
+        # Otherwise write the outcome. A positive (``best is not None``) is written
+        # with the marker cleared. A miss is marked ``crowd_out`` when the empty came
+        # from a *truncated* candidate set (LML#824) — the correct release may just
+        # have sorted past the validation window, so it earns a short TTL (self-heals
+        # within the hour) rather than the full 7-day miss a genuine exhaustion
+        # (candidate set NOT truncated, every candidate tried and failed) gets.
+        crowd_out_miss = best is None and bounded_resolve_truncated
+        if pg is not None and not (cached_positive_unhydrated and best is None):
+            await set_cached_release_id(
+                pg,
+                artist=artist,
+                title=song,
+                is_track=is_track,
+                release_id=best.release_id if best is not None else None,
+                crowd_out=crowd_out_miss,
+            )
+
+    if best is not None:
+        return best
+    # LML#1318 degrade tail — the SINGLE exit for "no release on the track key".
+    # Both routes here leave the track-key miss pin scoped to the track (it is
+    # correct that the typed track is not on the release) while the degrade reads
+    # its own ``is_track=False`` channel, so neither suppresses the album answer:
+    # a fresh pinned empty verdict (layer 1) and a live resolve that ran to a real
+    # empty (layer 2). When the request typed an album, degrade to the typed
+    # (artist, album) album-level match — the ARTIST_PLUS_ALBUM class, local
+    # release cache only — so album metadata + artwork persist the way the library
+    # lane's do on an unconfirmed track. The returned release carries
+    # ``track_confirmed=False`` so the surfacing strategy keeps
+    # ``song_not_found``/``search_type`` honest.
     #
-    # Otherwise write the outcome. A positive (``best is not None``) is written
-    # with the marker cleared. A miss is marked ``crowd_out`` when the empty came
-    # from a *truncated* candidate set (LML#824) — the correct release may just
-    # have sorted past the validation window, so it earns a short TTL (self-heals
-    # within the hour) rather than the full 7-day miss a genuine exhaustion
-    # (candidate set NOT truncated, every candidate tried and failed) gets.
-    crowd_out_miss = best is None and bounded_resolve_truncated
-    if pg is not None and not (cached_positive_unhydrated and best is None):
-        await set_cached_release_id(
-            pg,
-            artist=artist,
-            title=song,
-            is_track=is_track,
-            release_id=best.release_id if best is not None else None,
-            crowd_out=crowd_out_miss,
-        )
-
-    if best is None:
-        # LML#1318: the track resolution ran to a real empty verdict (and the
-        # miss pin above stays track-key-scoped). When the request typed an
-        # album, degrade to the typed (artist, album) album-level match — the
-        # ARTIST_PLUS_ALBUM class, local release cache only — so album
-        # metadata + artwork persist the way the library lane's do on an
-        # unconfirmed track. The returned release carries
-        # ``track_confirmed=False`` so the surfacing strategy keeps
-        # ``song_not_found``/``search_type`` honest.
-        return await resolve_typed_album_level_match(
-            discogs_service, pg, artist=artist, album=album
-        )
-    return best
+    # LML#1321: deliberately ONE tail rather than a copy at each exit. The
+    # copy-at-each-exit shape is what forced #1320 to patch the fresh-miss branch
+    # separately; a third no-release exit added here inherits the degrade instead
+    # of forgetting it.
+    return await resolve_typed_album_level_match(discogs_service, pg, artist=artist, album=album)
 
 
 # How many candidate releases the SONG_AS_TRACK carry-through fetches while
