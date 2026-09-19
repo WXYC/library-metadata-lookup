@@ -311,7 +311,13 @@ async def _match_track_releases_to_library(
             album=album,
             is_track=True,
         )
-        if resolved is not None:
+        # ``track_confirmed`` gate (LML#1318 review fix 5): this call site
+        # surfaces via ``Outcome.track_match`` (``song_not_found_after=False``),
+        # which only a track-CONFIRMED resolution may claim. Unreachable while
+        # both kernel wrappers pass ``album=None`` (the degrade needs a typed
+        # album), but the kernel's contract shouldn't depend on that staying
+        # true at a distance.
+        if resolved is not None and resolved.track_confirmed:
             rowless = _make_rowless_item(artist=anchor_artist, title=resolved.album_title)
             logger.info(
                 f"{label}: surfacing row-less Discogs release {resolved.release_id} "

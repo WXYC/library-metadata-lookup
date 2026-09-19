@@ -25,6 +25,7 @@ Run with: pytest -m pg -v tests/integration/test_release_resolution_cache.py
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
@@ -35,6 +36,7 @@ from entity.release_resolution_cache import (
     set_cached_release_id,
     set_up_release_resolution_cache_schema,
 )
+from lookup.album_level_match import resolve_typed_album_level_match
 from tests.integration.conftest import skip_if_named_tables_populated
 
 
@@ -387,3 +389,114 @@ class TestCrowdOutMissTTL:
                 "AND title_normalized = 'metronomic underground' AND is_track = true"
             )
         assert row["crowd_out"] is False
+
+
+@pytest.mark.pg
+class TestAlbumChannelDegradeDiscipline:
+    """LML#1318 review fix 8: the album-level degrade's ``is_track=False``
+    read/write discipline against real PG — the Bug Fix Protocol's integration
+    half of the unit coverage in ``tests/unit/test_album_fallback_on_track_miss.py``.
+
+    ``resolve_typed_album_level_match`` is driven with a mocked Discogs
+    service (its local-cache probe is the unit tier's concern); what runs for
+    real here is the pin layer: the UPSERT shapes it writes and the tiered-TTL
+    SELECT it reads back through.
+    """
+
+    ARTIST = "Agriculture"
+    ALBUM = "The Spiritual Sound"
+    RELEASE_ID = 35246362
+
+    def _service(self, rows: list[dict]) -> AsyncMock:
+        svc = AsyncMock()
+        svc.cache_service = AsyncMock()
+        svc.cache_service.search_releases = AsyncMock(return_value=rows)
+        svc.cache_service.get_release_lean = AsyncMock(return_value=None)
+        return svc
+
+    def _row(self) -> dict:
+        return {
+            "release_id": self.RELEASE_ID,
+            "title": self.ALBUM,
+            "artist_name": self.ARTIST,
+            "artist_credits": [self.ARTIST],
+            "artwork_url": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_positive_lands_on_the_album_channel_and_reads_back_fresh(self, pg_source):
+        resolved = await resolve_typed_album_level_match(
+            self._service([self._row()]), pg_source, artist=self.ARTIST, album=self.ALBUM
+        )
+        assert resolved is not None and resolved.release_id == self.RELEASE_ID
+        pinned = await get_cached_release_id(
+            pg_source, artist=self.ARTIST, title=self.ALBUM, is_track=False
+        )
+        assert pinned.was_present is True
+        assert pinned.release_id == self.RELEASE_ID
+
+    @pytest.mark.asyncio
+    async def test_probe_miss_pins_crowd_out_and_honors_the_1h_ttl(self, pg_source, pg_pool):
+        svc = self._service([])
+        assert (
+            await resolve_typed_album_level_match(
+                svc, pg_source, artist=self.ARTIST, album=self.ALBUM
+            )
+            is None
+        )
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT release_id, crowd_out FROM lml_cache.release_resolution_cache "
+                "WHERE artist_normalized = 'agriculture' "
+                "AND title_normalized = 'the spiritual sound' AND is_track = false"
+            )
+        assert row["release_id"] is None
+        assert row["crowd_out"] is True
+        # Fresh inside the hour: the next call short-circuits without probing.
+        svc.cache_service.search_releases.reset_mock()
+        assert (
+            await resolve_typed_album_level_match(
+                svc, pg_source, artist=self.ARTIST, album=self.ALBUM
+            )
+            is None
+        )
+        svc.cache_service.search_releases.assert_not_called()
+        # Stale past the hour: the SELECT filters the row out and the probe
+        # re-runs (self-heal — the ETL may have cached the release since).
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.release_resolution_cache "
+                "SET resolved_at = resolved_at - interval '2 hours' "
+                "WHERE artist_normalized = 'agriculture' "
+                "AND title_normalized = 'the spiritual sound' AND is_track = false"
+            )
+        healed_svc = self._service([self._row()])
+        healed = await resolve_typed_album_level_match(
+            healed_svc, pg_source, artist=self.ARTIST, album=self.ALBUM
+        )
+        assert healed is not None and healed.release_id == self.RELEASE_ID
+        healed_svc.cache_service.search_releases.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_album_positive_coexists_with_the_track_null_pin(self, pg_source):
+        # The acceptance-criterion-3 shape end to end: the failed track leg's
+        # durable NULL pin and the album answer live on independent channels.
+        await set_cached_release_id(
+            pg_source,
+            artist=self.ARTIST,
+            title="Micah (5:15 AM)",
+            is_track=True,
+            release_id=None,
+        )
+        resolved = await resolve_typed_album_level_match(
+            self._service([self._row()]), pg_source, artist=self.ARTIST, album=self.ALBUM
+        )
+        assert resolved is not None and resolved.release_id == self.RELEASE_ID
+        track_pin = await get_cached_release_id(
+            pg_source, artist=self.ARTIST, title="Micah (5:15 AM)", is_track=True
+        )
+        assert track_pin.was_present is True and track_pin.release_id is None
+        album_pin = await get_cached_release_id(
+            pg_source, artist=self.ARTIST, title=self.ALBUM, is_track=False
+        )
+        assert album_pin.was_present is True and album_pin.release_id == self.RELEASE_ID
