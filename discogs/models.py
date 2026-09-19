@@ -222,6 +222,25 @@ class EntityResolveResponse(BaseModel):
     id: int
 
 
+DISCOGS_SEARCH_PAGE_LIMIT = 5
+"""Candidate page size for the release-search seam (LML#1321).
+
+The single name behind three formerly-bare ``limit=5`` literals: the default of
+``DiscogsService.search`` (which forwards it verbatim to its PG arm's
+``DiscogsCacheService.search_releases`` call and to the API arm's ``per_page``),
+the default of ``search_releases`` itself, and the explicit limit the LML#1318
+album-level degrade (``lookup/album_level_match.py``) passes when it probes that
+same cache directly.
+
+That third caller is why this is a constant rather than three defaults: the
+degrade claims to see "the same candidate set the album-level lookup path
+would", which is only true while its limit equals the seam's. Widening one in
+isolation silently narrows the degrade's match class relative to the step-3a
+probe it claims parity with — ``tests/unit/test_typed_pair_floor_parity.py``
+fails when they diverge.
+"""
+
+
 class DiscogsSearchRequest(BaseModel):
     """Request for general Discogs search."""
 
@@ -288,6 +307,39 @@ class DiscogsSearchResult(BaseModel):
     # lookup enrichment seam (``lookup/enrichment``) from the resolved release's
     # writer-role credits. Rides the same extended gate as the other enriched fields.
     writer_credits: WriterCredits | None = None
+
+    @classmethod
+    def from_cache_row(cls, row: dict, *, confidence: float = 0.0) -> DiscogsSearchResult:
+        """Build a candidate from one ``DiscogsCacheService.search_releases`` row.
+
+        The sole mapping from that query's row shape to a search candidate
+        (LML#1321). Two callers read those rows: ``DiscogsService.search``'s PG
+        arm, which passes the ``calculate_confidence`` score it computes for
+        ranking, and the LML#1318 album-level degrade, which probes the same
+        cache directly and leaves ``confidence`` at its default — it floors the
+        typed pair rather than ranking, so no confidence is computed (see
+        ``lookup/typed_pair_floor.py`` on why the unranked order is equivalent).
+
+        Keeping this in one place is what makes the degrade's "same candidate
+        set" claim structural: a cache column added, renamed, or narrowed
+        differently (``artist_credits or None`` collapses the query's ``[]`` to
+        the API arm's ``None``, which the LML#784 artist-axis widening reads as
+        "no per-credit variants") lands on both callers or neither.
+
+        ``release_id`` and ``title`` are hard-indexed, not ``.get``: they are
+        NOT NULL columns of the ``release`` table, so a missing key is a
+        malformed row, and both callers would rather see the ``KeyError``
+        degrade their probe than admit a candidate with a fabricated id.
+        """
+        return cls(
+            release_id=row["release_id"],
+            release_url=f"https://www.discogs.com/release/{row['release_id']}",
+            artist=row["artist_name"],
+            artist_credits=row.get("artist_credits") or None,
+            album=row["title"],
+            artwork_url=row.get("artwork_url"),
+            confidence=confidence,
+        )
 
     def artist_variants(self) -> list[str | None]:
         """Artist-axis scoring variants: the joined credit plus the PG arm's

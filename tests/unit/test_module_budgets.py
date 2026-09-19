@@ -438,6 +438,15 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/streaming_warm_admission.py": 100,
     "lookup/tail_deadline.py": 150,
     "lookup/timeouts.py": 100,
+    # LML#1321: the ARTIST_PLUS_ALBUM match class — the joint 80/80 floor, the
+    # LML#1206 artist-variant widening + exact-credit tie-break, and the LML#784
+    # self-titled swap — hoisted out of `lookup/strategies/library_miss.py`,
+    # whose copy the LML#1318 album-level degrade had duplicated verbatim under
+    # a comment asserting parity. A shared class with two callers is a concern,
+    # not a utility drawer: growth here should be the class getting a new gate
+    # (which both callers then inherit), never a third unrelated predicate.
+    # 1.3x its 110 measured lines -> smallest multiple of 50 at or above that.
+    "lookup/typed_pair_floor.py": 150,
     # Recalibrated 2026-07-29 (LML#750): the step-3b validation cascade
     # (``apply_track_validation_cascade``) and the LML#717 song-as-album-title
     # promotion moved in from the spine, carrying this file from 243 to ~395

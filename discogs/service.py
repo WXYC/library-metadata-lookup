@@ -57,6 +57,7 @@ from discogs.memory_cache import (
     async_cached,
 )
 from discogs.models import (
+    DISCOGS_SEARCH_PAGE_LIMIT,
     ArtistCredit,
     ArtistDetails,
     ArtistRef,
@@ -1955,7 +1956,10 @@ class DiscogsService:
 
     @async_cached(SEARCH_CACHE)
     async def search(
-        self, request: DiscogsSearchRequest, limit: int = 5, skip_pg: bool = False
+        self,
+        request: DiscogsSearchRequest,
+        limit: int = DISCOGS_SEARCH_PAGE_LIMIT,
+        skip_pg: bool = False,
     ) -> DiscogsSearchResponse | None:
         """General release search for artwork discovery.
 
@@ -2009,17 +2013,9 @@ class DiscogsService:
                     request_format=request.format,
                     result_format=None,  # cache doesn't include format yet
                 )
-                results.append(
-                    DiscogsSearchResult(
-                        album=row["title"],
-                        artist=row["artist_name"],
-                        artist_credits=row.get("artist_credits") or None,
-                        release_id=row["release_id"],
-                        release_url=f"https://www.discogs.com/release/{row['release_id']}",
-                        artwork_url=row.get("artwork_url"),
-                        confidence=confidence,
-                    )
-                )
+                # LML#1321: one mapper for this row shape, shared with the
+                # album-level degrade that probes ``search_releases`` directly.
+                results.append(DiscogsSearchResult.from_cache_row(row, confidence=confidence))
             results.sort(key=lambda r: r.confidence, reverse=True)
             return DiscogsSearchResponse(
                 results=results, total=len(results), cached=True, pg_served=True
@@ -2160,7 +2156,9 @@ class DiscogsService:
         # empty) API parse is a real response and is cached as before.
         return result
 
-    def _build_search_params(self, request: DiscogsSearchRequest, limit: int = 5) -> dict:
+    def _build_search_params(
+        self, request: DiscogsSearchRequest, limit: int = DISCOGS_SEARCH_PAGE_LIMIT
+    ) -> dict:
         """Build search params using Discogs-specific fields.
 
         Args:
