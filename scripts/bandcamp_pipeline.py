@@ -396,7 +396,19 @@ async def phase_album_search(
 
         try:
             match: SourceMatch | None = await client.find_album_match_via_search(artist, title)
-        except BandcampSearchUnavailableError:
+        except BandcampSearchUnavailableError as e:
+            # LML#1323 review: this branch used to tally silently, which made a
+            # whole drain run under a persistent Bandcamp bot-wall look exactly
+            # like a clean one -- ``fetch_failed=N`` at the end, no reason
+            # recorded anywhere. ``e.__cause__`` names the couldn't-ask shape now
+            # that #1323 preserves the chain through the translation. One line
+            # per row is strictly quieter than the pre-#1323 behavior, where an
+            # unparseable body fell to the ``except Exception`` branch below and
+            # logged a full traceback per row.
+            log.warning(
+                f"Album-search unavailable for {artist!r} / {title!r} "
+                f"(row {row['id']}): {e.__cause__ or e} -- row stays re-runnable"
+            )
             tallies["fetch_failed"] += 1
             continue
         except Exception:

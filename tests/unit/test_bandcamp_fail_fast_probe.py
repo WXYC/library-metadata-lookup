@@ -366,7 +366,15 @@ class TestUnparseableJsonBody:
     argument is LML#1115's verbatim -- it already extended the NON-200 raise
     to default mode because a couldn't-ask was otherwise indistinguishable
     from a genuine no-results response and riskable as a cached false
-    negative -- applied to the other half of the same taxonomy."""
+    negative -- applied to another shape in the same taxonomy.
+
+    Not the LAST such shape, and this suite does not claim otherwise: a 200
+    carrying valid JSON with no ``results`` key still reads as "asked, nothing
+    matched" in both modes, and the HTML-scraping legs
+    (``fetch_artist_catalog``, ``verify_album_page``) still read an
+    interstitial as an empty catalog. Both are tracked in
+    https://github.com/WXYC/library-metadata-lookup/issues/1325 and are
+    behavior changes, not documentation ones."""
 
     @staticmethod
     def _malformed_json_response() -> httpx.Response:
@@ -411,6 +419,31 @@ class TestUnparseableJsonBody:
 
         with pytest.raises(BandcampTransportError):
             await client.search_albums("Autechre Confield", fail_fast=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail_fast", [True, False])
+    async def test_unparseable_body_raise_is_distinguishable_from_a_5xx(self, client, fail_fast):
+        # LML#1323 review: the raise must stay TELLABLE from a plain transport
+        # failure. Cloudflare blocks CI runner IPs persistently, so a smoke that
+        # skips on this shape can skip forever; without something naming the
+        # cause, "Bandcamp is walling us" and "Bandcamp 500'd once" are the same
+        # byte-identical ``BandcampTransportError(AUTOCOMPLETE_URL)``. Message
+        # marker + preserved ``__cause__`` are the cheap half (a counter is
+        # LML#1325's scope).
+        client._http.request = AsyncMock(return_value=self._malformed_json_response())
+
+        with pytest.raises(BandcampTransportError) as unparseable:
+            await client.search_albums("Autechre Confield", fail_fast=fail_fast)
+
+        assert "unparseable body" in str(unparseable.value)
+        assert isinstance(unparseable.value.__cause__, ValueError)
+
+        client._http.request = AsyncMock(return_value=_response(500))
+
+        with pytest.raises(BandcampTransportError) as server_error:
+            await client.search_albums("Autechre Confield", fail_fast=fail_fast)
+
+        assert "unparseable body" not in str(server_error.value)
 
     @pytest.mark.asyncio
     async def test_malformed_json_records_transport_failure_not_aborted(self, client):
