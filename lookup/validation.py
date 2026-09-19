@@ -8,9 +8,10 @@ Discogs PG cache answers "which releases by this artist contain this track?"
 and promotes matching library rows, or surfaces the best release row-less),
 and the Step-3b orchestration cascade itself (``apply_track_validation_cascade``
 — per-result validation, the A4 promotion, the LML#717 song-as-album-title
-promotion, and the compilation artist-fallback merge, in the order the spine
-used to run them inline). Extracted verbatim from ``lookup/orchestrator.py``
-(LML#728, LML#750).
+promotion, the row-less-to-shelf-row reverse probe that narrows A4's row-less
+carry-through just before it surfaces, and the compilation artist-fallback
+merge, in the order the spine used to run them inline). Extracted verbatim
+from ``lookup/orchestrator.py`` (LML#728, LML#750).
 """
 
 import logging
@@ -22,6 +23,8 @@ from config.settings import get_settings
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import DiscogsSearchRequest
 from discogs.service import DiscogsService
+from entity.library_release_override import get_library_release_overrides
+from entity.sources import PgSource
 from library.db import LibraryDB
 from library.models import LibraryItem
 from lookup.concurrency import _chunked_gather
@@ -345,6 +348,56 @@ def _is_rowless_only(items: list[LibraryItem]) -> bool:
     return bool(items) and all(item.id == ROWLESS_LIBRARY_ID for item in items)
 
 
+# How many of the artist's shelf rows ``_rebind_rowless_release_via_override``
+# probes before giving up. Bounds a title-divergent artist's shelf count into
+# one bounded PG query rather than an unbounded one; "typically under 20 rows"
+# for a WXYC-shelved artist in practice, so this rarely truncates a real hit.
+_SHELF_REBIND_PROBE_LIMIT = 20
+
+
+async def _rebind_rowless_release_via_override(
+    pg: PgSource | None,
+    *,
+    release_id: int,
+    shelf_rows: list[LibraryItem],
+) -> LibraryItem | None:
+    """Reverse-probe: does one of the artist's OWN shelf rows already carry a
+    hand-verified override (LML#850, ``lml_cache.library_release_override``)
+    pinning it to ``release_id``?
+
+    Title-based match-back (``search_album_fuzzy``, and the ``find_best_typed_match``
+    80/80 floor behind ``resolve_typed_album_level_match``) cannot bridge the
+    Broadcast/Minimoonstar class of divergence: WXYC shelves the record as
+    "Broadcast & the Focus Group Investigate...", Discogs titles the release
+    itself just "Investigate Witch Cults Of The Radio Age" — a 51-point
+    ``token_sort_ratio``, well under any reasonable floor, because the two
+    strings share one token. But that same shelf row is exactly the kind of
+    title-vs-catalog mismatch LML#850's override table exists to correct — DJ
+    Alex L.'s manual card-catalog walk (``entity/library_release_override.py``)
+    already carries a verified pin for it. This asks the SAME question the A4
+    carry-through was about to answer "no" to, against a source that needs no
+    title similarity at all: an exact ``library_id -> discogs_release_id``
+    lookup, so a same-artist/different-album row (a "Hiding Places" shelf row
+    against a "High Places" query) is rejected by id inequality, not by a
+    title floor this function does not restate.
+
+    Bounded to the first :data:`_SHELF_REBIND_PROBE_LIMIT` rows and fetched in
+    ONE query (``get_library_release_overrides``, best-effort — a PG failure
+    or an empty/absent ``pg`` degrades to no match, never a crash). Returns the
+    first shelf row whose override matches, in ``shelf_rows`` order.
+    """
+    if pg is None or not shelf_rows:
+        return None
+    candidate_rows = [row for row in shelf_rows[:_SHELF_REBIND_PROBE_LIMIT] if row.id > 0]
+    if not candidate_rows:
+        return None
+    overrides = await get_library_release_overrides(pg, [row.id for row in candidate_rows])
+    for row in candidate_rows:
+        if overrides.get(row.id) == release_id:
+            return row
+    return None
+
+
 @dataclass
 class Step3bResult:
     """Outcome of :func:`apply_track_validation_cascade`, ready to rebind onto ``LookupState``."""
@@ -379,6 +432,7 @@ async def apply_track_validation_cascade(
     db: LibraryDB,
     discogs_service: DiscogsService | None,
     allow_release_resolution_fallback: bool,
+    pg: PgSource | None = None,
 ) -> Step3bResult:
     """Step-3b policy cascade: sequence the tiers that promote/narrow ``library_results``.
 
@@ -406,6 +460,11 @@ async def apply_track_validation_cascade(
     invoking this (both ``song`` and ``artist`` typed, plus either a non-empty
     ``real_results`` or — on the compilation tier — a non-empty
     ``artist_fallback_results``); this function does not re-check it.
+
+    ``pg`` (the discogs-cache PG source that also backs the LML#850 override
+    table, best-effort like every other cache read in this pipeline) is
+    forwarded to the row-less reverse probe below; ``None`` degrades that
+    probe to no match, never a crash.
     """
     if not found_on_compilation:
         validated = await filter_results_by_track_validation(
@@ -458,10 +517,9 @@ async def apply_track_validation_cascade(
             return Step3bResult(title_matches, False, discogs_titles)
 
         if promoted:
-            # A4's row-less carry-through (LML#629), now ordered behind the
-            # shelf rather than ahead of it. It fires when the cache confirms
-            # the track on a release *no library row artist-matches* — but that
-            # match-back is keyed on album title
+            # A4's row-less carry-through (LML#629). It fires when the cache
+            # confirms the track on a release *no library row artist-matches*
+            # — but that match-back is keyed on album title
             # (``search_album_fuzzy(db, release.album)``), so a catalog/Discogs
             # title divergence reads as "not in the library" when the record is
             # on the shelf. Prod, 2026-09-14: WXYC files release 1350337 as
@@ -477,6 +535,34 @@ async def apply_track_validation_cascade(
             # displaced a shelf row therefore reaches the DJ as
             # '"<song>" by <artist> not found in library'.
             #
+            # Stopgap: before conceding row-less, ask whether one of the
+            # artist's OWN shelf rows already carries a hand-verified override
+            # to the SAME release (LML#850) — ``real_results`` is already the
+            # artist-filtered shelf set per-result validation just failed to
+            # confirm the track on, so no new library fetch is needed, and an
+            # id-equality check needs no title floor at all. This is exactly
+            # the "Broadcast" / "The Be Colony" shape: WXYC shelves the split
+            # LP abbreviated as "Broadcast & the Focus Group Investigate...",
+            # Discogs's own track search returns just "Investigate Witch Cults
+            # Of The Radio Age" (a 51-point token_sort_ratio — no title floor
+            # bridges that), but the shelf row already carries a verified pin
+            # to the same release from DJ Alex L.'s card-catalog walk.
+            resolved_release = promoted_titles.get(ROWLESS_LIBRARY_ID)
+            if resolved_release is not None:
+                shelf_row = await _rebind_rowless_release_via_override(
+                    pg,
+                    release_id=resolved_release.release_id,
+                    shelf_rows=real_results,
+                )
+                if shelf_row is not None:
+                    logger.info(
+                        "Row-less reverse probe rebound release %s to shelved row "
+                        "%r via its LML#850 override instead of surfacing it row-less",
+                        resolved_release.release_id,
+                        shelf_row.title,
+                    )
+                    return Step3bResult([shelf_row], False, discogs_titles)
+
             # A row-less release is the weakest thing this tier can return, so
             # it yields to any shelved row that answers the request and keeps
             # its seam entry for everything else.

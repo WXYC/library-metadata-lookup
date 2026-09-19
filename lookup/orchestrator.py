@@ -864,6 +864,7 @@ async def _step_validate_tracks(
             db=services.db,
             discogs_service=services.discogs_service,
             allow_release_resolution_fallback=services.allow_release_resolution_fallback,
+            pg=services.discogs_cache_pg,
         )
     state.library_results = result.library_results
     state.song_not_found = result.song_not_found
