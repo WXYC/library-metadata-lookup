@@ -34,8 +34,6 @@ def fallback_rows_block_serving(
     parsed: ParsedRequest,
     library_results: list[LibraryItem],
     search_type: str,
-    *,
-    found_on_compilation: bool = False,
 ) -> bool:
     """LML#1319: is the songless lane holding only fallback rows that can never serve?
 
@@ -61,10 +59,24 @@ def fallback_rows_block_serving(
     - any row clearing the serve floor keeps the suppression: that row will
       serve with artwork, so the probe would only add load.
 
-    The serve-floor check calls the serve gate itself (``artwork=None``, so
-    its LML#628/#684 validated-release carve-outs — structurally track-lane
-    shapes — are inert here) rather than a re-derived ``score_match``, so the
-    two floors cannot drift apart again.
+    The serve-floor check calls the serve gate itself rather than a re-derived
+    ``score_match``, so the two floors cannot drift apart again. Both of that
+    gate's carve-outs are structurally unreachable from here, which is why this
+    predicate takes no ``found_on_compilation`` argument and passes ``False``:
+    each carve-out requires ``artwork is not None``, and the serve decision this
+    lane asks about happens before any artwork exists (hence the hard-coded
+    ``None``); independently, ``search_type == 'fallback'`` already implies
+    ``found_on_compilation`` is False, because ``get_search_type_from_state``
+    returns "compilation" from its first branch whenever that flag is set
+    (``core/search.py``). A caller that ever needs the compilation lane must
+    revisit the gate call below, not thread a flag through.
+
+    NOTE for the gap class (LML#1319 review): "cannot serve" is a *token-subset*
+    property, not a wrong-album one. Same-record title truncation lands here too
+    — a typed "Aluminum Tunes (Switched On Volume 3)" against a catalog
+    "Aluminum Tunes" scores token_set 100 / score_match 54.9 — so a caller
+    acting on True must keep the library rows (they carry the call number a DJ
+    pulls the record by) and treat the probe result as *additional* evidence.
     """
     if parsed.song:
         return False
@@ -74,7 +86,7 @@ def fallback_rows_block_serving(
         return False
     return not any(
         compute_row_title_matches_requested_album(
-            parsed.album, item, None, found_on_compilation=found_on_compilation
+            parsed.album, item, None, found_on_compilation=False
         )
         for item in library_results
     )
@@ -83,13 +95,31 @@ def fallback_rows_block_serving(
 async def _library_miss_discogs_search(
     parsed: ParsedRequest,
     discogs_service: DiscogsService | None,
+    *,
+    allow_api_escalation: bool = True,
 ) -> tuple[LibraryItem, DiscogsSearchResult] | None:
     """Search Discogs for a library-miss (artist, album) pair.
 
-    Called only when the library search returned no results AND both
-    ``parsed.artist`` and ``parsed.album`` are non-empty (after strip). Uses the
-    existing ``discogs_service.search()`` fallthrough seam (cache-first, API on
-    miss, outage degradation) so a Discogs outage degrades gracefully.
+    Called when the library search returned no results — or, on the songless
+    lane, only rows that cannot clear the serve floor
+    (:func:`fallback_rows_block_serving`) — AND both ``parsed.artist`` and
+    ``parsed.album`` are non-empty (after strip). Uses the existing
+    ``discogs_service.search()`` fallthrough seam (cache-first, API on miss,
+    outage degradation) so a Discogs outage degrades gracefully.
+
+    ``allow_api_escalation=False`` (LML#1319) confines the probe to the seam's
+    local-cache arm by skipping both API escalations below — the LML#784
+    ``skip_pg=True`` re-search and the V/A rescue's per-candidate tracklist
+    fetches. The serve-blocked lane passes False: on the common "artist is
+    shelved, typed album is not" shape the PG arm usually returns same-artist
+    siblings (discogs-cache is filtered to library artists) that all floor-fail,
+    which would trip the retry gate and spend up to two live
+    ``/database/search`` calls plus rescue fetches on a request that already had
+    an answer — a probe miss there keeps the rows and serves the sentinel
+    exactly as before. Given LML's saturation history (#1112, the July 2026
+    saturation era), that is the direction not worth spending. The first arm is
+    unchanged on both lanes: cache-first, with the seam's single API fetch only
+    on a genuine PG miss.
 
     Applies the same 80/80-floor as ``find_best_typed_match`` (LML#400) on both
     artist AND album jointly — different from the contamination shape in LML#400
@@ -117,6 +147,8 @@ async def _library_miss_discogs_search(
     - ``parsed.artist`` or ``parsed.album`` is empty / whitespace-only
     - Discogs returns no candidates
     - No candidate clears the 80/80 floor (on either arm) nor the V/A rescue
+    - No candidate clears the floor on the cache arm and
+      ``allow_api_escalation`` is False (neither escalation runs)
     - The first Discogs search raises (outage, rate-limit exhaustion) —
       logged and swallowed; a raised API *retry* instead degrades to the
       rescue over the cache-served candidates
@@ -166,7 +198,7 @@ async def _library_miss_discogs_search(
 
     best = _floor_best(response)
 
-    if best is None and response is not None and response.pg_served:
+    if best is None and response is not None and response.pg_served and allow_api_escalation:
         logger.info(
             "library-miss cache candidates all floor-failed for artist=%r album=%r; "
             "retrying API-only (LML#784)",
@@ -191,7 +223,7 @@ async def _library_miss_discogs_search(
                 # PG-served candidates.
                 response = retry
 
-    if best is None and response is not None and response.results:
+    if best is None and response is not None and response.results and allow_api_escalation:
         # LML#784 category 2: compilation-credited candidates structurally
         # cannot clear the release-level floor ("Various" on the artist axis,
         # subtitled comp titles on the album axis). Give them one more look

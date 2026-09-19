@@ -322,15 +322,20 @@ MODULE_BUDGETS: dict[str, int] = {
     # search_urls.py. Headroom deliberately small: a second service would
     # fit, a third should force the per-service handles into a bundle.
     # Recalibrated 2026-09-18 (LML#1319): the step-3a gate went serve-aware on
-    # the songless lane. The policy itself lives in
+    # the songless lane. The gate POLICY itself lives in
     # `lookup/strategies/library_miss.py` (`fallback_rows_block_serving`) per
-    # this module's extraction policy; the growth here is the irreducible call
-    # site — the predicate call feeding the widened gate condition, the
-    # serve-blocked hit's `library_results` clear (that field's write sites
-    # live in this module by design), and the READS/WRITES docstring updates.
-    # Same tight-on-purpose formula as every prior recalibration: smallest
-    # multiple of 50 at or above the new measured 1733, not a re-derived 1.3x.
-    "lookup/orchestrator.py": 1750,
+    # this module's extraction policy; what lands here is the irreducible
+    # orchestration — the predicate call feeding the widened gate condition, the
+    # two-lane hit/miss branch (including the distinct `lookup.outcome` values,
+    # since `library_miss_outcome` is this module's field), the
+    # `serve_blocked_probe_pair` field the review's finding-1 fix parks the hit
+    # on rather than discarding real library rows, and step 4's one-line prepend
+    # that splices it ahead of those rows. Each of the four is a `LookupState`
+    # read/write, which is precisely what cannot move out of the module that
+    # owns the state. Same tight-on-purpose formula as every prior
+    # recalibration: smallest multiple of 50 at or above the measured 1784, not
+    # a re-derived 1.3x.
+    "lookup/orchestrator.py": 1800,
     # LML#1318: the album-level degrade for a failed non-library track
     # resolution, extracted to its own module rather than appended to
     # lookup/rowless.py (which sat at 420/450 — headroom for the two kernel
@@ -374,8 +379,14 @@ MODULE_BUDGETS: dict[str, int] = {
     # the serve-aware step-3a gate policy — strategy-adjacent by the same
     # LML#727 rationale that placed `_library_miss_discogs_search` here, and
     # deliberately NOT in orchestrator.py (whose own budget entry documents
-    # the extraction policy). Smallest multiple of 50 at or above the new
-    # measured 217.
+    # the extraction policy) — plus the review's `allow_api_escalation`
+    # cache-only posture and the gap-class note the predicate's callers depend
+    # on. Smallest multiple of 50 at or above the measured 249. That leaves one
+    # line of headroom, which is the guard working as intended here rather than
+    # the LML#1126 zero-headroom hazard: that incident was an unrelated change
+    # rebasing onto a file every ticket touches (orchestrator.py), whereas this
+    # module changes only when this one lane does — so the next edit tripping
+    # the ceiling should stop and recalibrate deliberately.
     "lookup/strategies/library_miss.py": 250,
     "lookup/strategies/song_as_artist.py": 250,
     "lookup/strategies/song_as_track.py": 150,

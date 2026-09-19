@@ -170,8 +170,10 @@ class TestServeAwareGateAgainstRealCache:
         self, fallback_library_db, discogs_service
     ):
         """The full LML#1319 shape: probe opened, trigram SQL answers, the
-        typed pair resolves with a real Discogs id + artwork — with the live
-        search arm returning empty throughout."""
+        typed pair leads the response with a real Discogs id + artwork — with
+        the live search arm returning empty throughout — and the artist's
+        shelved row is still returned behind it, call number intact (LML#1319
+        review finding 1)."""
         from lookup.orchestrator import perform_lookup
 
         request = LookupRequest(
@@ -183,10 +185,10 @@ class TestServeAwareGateAgainstRealCache:
             request, fallback_library_db, discogs_service, make_lml_telemetry()
         )
 
-        assert len(response.results) == 1, f"got {response.results}"
+        assert len(response.results) == 2, f"got {response.results}"
         item = response.results[0]
         assert item.library_item.id == 0, (
-            "expected the row-less synthesized pair, got library row "
+            "expected the row-less synthesized pair to lead, got library row "
             f"{item.library_item.id} ({item.library_item.title!r})"
         )
         assert item.library_item.call_number == "(external)"
@@ -196,13 +198,32 @@ class TestServeAwareGateAgainstRealCache:
             "https://img.discogs.com/e-at-home-lp.jpg",
             "https://img.discogs.com/e-at-home-ep.jpg",
         )
+        shelved = response.results[1]
+        assert shelved.library_item.id == 63861
+        assert shelved.library_item.call_number == "Rock CD S 1/1", (
+            "the shelved row must keep the call number a DJ pulls the record by"
+        )
         assert response.song_not_found is False
 
     @pytest.mark.asyncio
-    async def test_resolution_is_cache_served_not_live(self, fallback_library_db, discogs_service):
-        """The pg leg is terminal at the fallthrough seam: resolving the
-        cached pair must not spend a single live ``/database/search`` call —
-        the fix's zero-added-Discogs-load guarantee."""
+    async def test_probe_resolution_spends_no_live_search_for_the_typed_pair(
+        self, fallback_library_db, discogs_service
+    ):
+        """The probe's own resolution is fully cache-served: the pg leg is
+        terminal at the fallthrough seam, so no live ``/database/search``
+        carries the typed album.
+
+        Deliberately scoped to the typed pair rather than asserting zero live
+        traffic overall. Keeping the shelved rows (LML#1319 review finding 1)
+        means step 4 runs its normal per-row artwork pass, whose queries carry
+        the ROW's title ("E") — traffic this request already paid before this
+        PR existed, since the row occupied ``library_results`` then too. What
+        must stay true is that opening the probe adds none of its own.
+
+        This is the cache-HIT path; the cache-MISS cost of this lane is bounded
+        separately by the ``allow_api_escalation=False`` posture (unit-tested in
+        ``TestServeBlockedProbeIsCacheOnly``).
+        """
         from lookup.orchestrator import perform_lookup
 
         request = LookupRequest(
@@ -216,4 +237,12 @@ class TestServeAwareGateAgainstRealCache:
 
         assert response.results[0].artwork is not None
         assert response.results[0].artwork.release_id in _E_AT_HOME_RELEASE_IDS
-        discogs_service._request_with_retry.assert_not_called()
+
+        typed_album_calls = [
+            call
+            for call in discogs_service._request_with_retry.call_args_list
+            if "e at home" in str(call.kwargs.get("params", "")).lower()
+        ]
+        assert typed_album_calls == [], (
+            f"the probe escalated the typed pair to the live API: {typed_album_calls}"
+        )

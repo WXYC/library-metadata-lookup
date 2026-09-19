@@ -1700,13 +1700,13 @@ class TestServeAwareStep3aGate:
     """
 
     @staticmethod
-    def _search_side_effect(artist_only_rows):
+    def _search_side_effect(artist_only_rows, artist_key="eliana glass"):
         """db.search stub: the artist-only fallback query hits, every
         artist+album (and other) query misses — the ``fallback_used=True``
         shape from the LML#1319 diagnosis replay."""
 
         async def _search(query: str, limit: int = 10, **kwargs):
-            if query.strip().lower() == "eliana glass":
+            if query.strip().lower() == artist_key:
                 return list(artist_only_rows)
             return []
 
@@ -1717,9 +1717,14 @@ class TestServeAwareStep3aGate:
         self, mock_library_db, mock_discogs_service, telemetry
     ):
         """Songless + wrong-album fallback row + cached typed pair → the probe
-        runs and the typed pair resolves with a real Discogs id + artwork
-        (pre-fix: the row collapsed to the release_id=0 streaming-only
-        sentinel and the probe never ran)."""
+        runs and the typed pair leads the response with a real Discogs id +
+        artwork (pre-fix: the row collapsed to the release_id=0 streaming-only
+        sentinel and the probe never ran).
+
+        The shelved row is kept behind it — see
+        ``test_truncated_title_same_record_keeps_shelved_row_and_call_number``
+        for why discarding it is not an option.
+        """
         wrong_album_row = make_library_item(id=63861, artist="Eliana Glass", title="E")
         mock_library_db.search = AsyncMock(side_effect=self._search_side_effect([wrong_album_row]))
         mock_library_db.find_similar_artist.return_value = None
@@ -1742,19 +1747,85 @@ class TestServeAwareStep3aGate:
         )
         response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
 
-        assert len(response.results) == 1
+        assert len(response.results) == 2, f"got {response.results}"
         item = response.results[0]
         assert item.library_item.id == 0, (
-            "expected the step-3a synthesized pair, got library row "
+            "expected the step-3a synthesized pair to lead, got library row "
             f"{item.library_item.id} ({item.library_item.title!r})"
         )
         assert item.library_item.call_number == "(external)"
         assert item.artwork is not None
         assert item.artwork.release_id == 37161147
         assert item.artwork.artwork_url == "https://img.discogs.com/e-at-home.jpg"
+        # The artist's shelved row survives behind the probe hit.
+        assert response.results[1].library_item.id == 63861
         # A synthesized hit resolves the request, exactly as on the classic
         # empty-library step-3a path.
         assert response.song_not_found is False
+
+    @pytest.mark.asyncio
+    async def test_truncated_title_same_record_keeps_shelved_row_and_call_number(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """The predicate's gap class is the token-SUBSET shape, which also
+        catches same-record title truncation — so opening the probe must never
+        cost the shelved row.
+
+        A DJ types the fuller sleeve title "Aluminum Tunes (Switched On Volume
+        3)" while the catalog holds the truncated "Aluminum Tunes" — the SAME
+        record. ``token_set_ratio`` = 100, ``score_match`` = 54.9, so the row
+        is serve-blocked and the probe opens. Emptying ``library_results`` here
+        would hand back only the synthesized ``(external)`` row and drop the
+        call number needed to pull the record off the shelf — strictly worse
+        than the pre-fix sentinel, which at least carried it. The fix must add
+        the probe's artwork WITHOUT discarding in-library evidence.
+        """
+        shelved_row = make_library_item(
+            id=42,
+            artist="Stereolab",
+            title="Aluminum Tunes",
+            call_letters="ST",
+            artist_call_number=7,
+            release_call_number=3,
+        )
+        mock_library_db.search = AsyncMock(
+            side_effect=self._search_side_effect([shelved_row], artist_key="stereolab")
+        )
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=380118,
+                    artist="Stereolab",
+                    album="Aluminum Tunes (Switched On Volume 3)",
+                    artwork_url="https://img.discogs.com/aluminum-tunes.jpg",
+                )
+            ]
+        )
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Stereolab",
+            album="Aluminum Tunes (Switched On Volume 3)",
+            raw_message="Stereolab - Aluminum Tunes (Switched On Volume 3)",
+        )
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        returned_ids = [item.library_item.id for item in response.results]
+        assert 42 in returned_ids, (
+            f"the shelved row must survive the probe hit; got ids {returned_ids}"
+        )
+        shelved = next(item for item in response.results if item.library_item.id == 42)
+        assert shelved.library_item.call_number == "Rock CD ST 7/3", (
+            "the shelved row must keep the call number a DJ pulls the record by"
+        )
+        # ...and the probe's Discogs identity + artwork is what leads.
+        assert response.results[0].library_item.id == 0
+        assert response.results[0].artwork is not None
+        assert response.results[0].artwork.release_id == 380118
+        assert response.results[0].artwork.artwork_url == (
+            "https://img.discogs.com/aluminum-tunes.jpg"
+        )
 
     @pytest.mark.asyncio
     async def test_serve_floor_clearing_fallback_row_still_suppresses_probe(
@@ -1854,3 +1925,183 @@ class TestServeAwareStep3aGate:
         assert len(response.results) == 1
         assert response.results[0].library_item.id == 63861
         assert response.song_not_found is True
+
+
+class TestServeBlockedProbeIsCacheOnly:
+    """The serve-blocked lane enters the probe CACHE-ONLY (LML#1319 review).
+
+    On the common "artist is shelved, typed album is not" shape the PG arm
+    usually DOES return sibling releases (discogs-cache is filtered to library
+    artists) which then all floor-fail. On the classic empty-library lane that
+    trips the LML#784 ``pg_served`` retry gate — a ``skip_pg=True`` re-search
+    costing up to two live ``/database/search`` calls — and then the V/A rescue's
+    per-candidate tracklist fetches. That escalation ladder buys nothing on this
+    lane (a probe miss keeps the rows and serves the sentinel exactly as before)
+    and lands on requests that already had an answer, so given LML's saturation
+    history (#1112, the July saturation era) the ladder is skipped here.
+    """
+
+    @staticmethod
+    def _floor_failing_pg_response():
+        """A PG-served candidate set of same-artist siblings that all floor-fail
+        the typed album — the shape that trips the #784 retry gate."""
+        return DiscogsSearchResponse(
+            cached=True,
+            pg_served=True,
+            results=[
+                make_discogs_result(release_id=1, artist="Eliana Glass", album="E"),
+                make_discogs_result(release_id=2, artist="Eliana Glass", album="Kite Song"),
+            ],
+        )
+
+    @pytest.mark.asyncio
+    async def test_helper_skips_api_retry_and_va_rescue_when_escalation_disabled(
+        self, mock_discogs_service
+    ):
+        mock_discogs_service.search.return_value = self._floor_failing_pg_response()
+
+        with patch(
+            "lookup.strategies.library_miss.find_va_comp_match", new_callable=AsyncMock
+        ) as rescue:
+            result = await _library_miss_discogs_search(
+                _parsed("Eliana Glass", "E at Home"),
+                discogs_service=mock_discogs_service,
+                allow_api_escalation=False,
+            )
+            rescue.assert_not_called()
+
+        assert result is None
+        assert mock_discogs_service.search.call_count == 1
+        assert mock_discogs_service.search.call_args_list[0].kwargs.get("skip_pg") is not True
+
+    @pytest.mark.asyncio
+    async def test_helper_still_escalates_by_default(self, mock_discogs_service):
+        """The classic empty-library lane keeps the full #784 ladder — the
+        default must not move (symmetry pin for the test above)."""
+        mock_discogs_service.search.side_effect = [
+            self._floor_failing_pg_response(),
+            DiscogsSearchResponse(cached=False, results=[]),
+        ]
+
+        with patch(
+            "lookup.strategies.library_miss.find_va_comp_match", new_callable=AsyncMock
+        ) as rescue:
+            rescue.return_value = None
+            await _library_miss_discogs_search(
+                _parsed("Eliana Glass", "E at Home"), discogs_service=mock_discogs_service
+            )
+
+        assert mock_discogs_service.search.call_count == 2
+        assert mock_discogs_service.search.call_args_list[1].kwargs.get("skip_pg") is True
+
+    @pytest.mark.asyncio
+    async def test_serve_blocked_lane_spends_no_live_search(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """End to end: a serve-blocked-opened probe over floor-failing PG
+        siblings issues exactly one (cache-served) search — no API retry, no
+        rescue — and still serves the shelved row."""
+        wrong_album_row = make_library_item(id=63861, artist="Eliana Glass", title="E")
+        mock_library_db.search = AsyncMock(
+            side_effect=TestServeAwareStep3aGate._search_side_effect([wrong_album_row])
+        )
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = self._floor_failing_pg_response()
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Eliana Glass",
+            album="E at Home",
+            raw_message="Eliana Glass - E at Home",
+        )
+        with patch(
+            "lookup.strategies.library_miss.find_va_comp_match", new_callable=AsyncMock
+        ) as rescue:
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+            rescue.assert_not_called()
+
+        skip_pg_calls = [
+            call
+            for call in mock_discogs_service.search.call_args_list
+            if call.kwargs.get("skip_pg") is True
+        ]
+        assert skip_pg_calls == [], f"serve-blocked lane escalated to the API arm: {skip_pg_calls}"
+        assert [item.library_item.id for item in response.results] == [63861]
+
+
+class TestServeBlockedOutcomeTelemetry:
+    """The serve-blocked arms get their own ``lookup.outcome`` values (LML#1319
+    review finding 4).
+
+    ``library_miss_discogs_match`` / ``library_miss_no_discogs_match`` mean
+    "the library returned nothing and the probe did/didn't resolve it". The
+    serve-blocked lane fires the probe while the library DID answer, so reusing
+    those values would silently change the population behind every existing
+    slice and runbook built on them.
+    """
+
+    @staticmethod
+    def _record_outcomes():
+        outcome_recorded: list[str] = []
+
+        class FakeTransaction:
+            def set_data(self, key: str, value: object) -> None:
+                if key == "lookup.outcome":
+                    outcome_recorded.append(str(value))
+
+        class FakeScope:
+            transaction = FakeTransaction()
+
+        return outcome_recorded, FakeScope()
+
+    @pytest.mark.asyncio
+    async def test_serve_blocked_hit_uses_distinct_outcome(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        wrong_album_row = make_library_item(id=63861, artist="Eliana Glass", title="E")
+        mock_library_db.search = AsyncMock(
+            side_effect=TestServeAwareStep3aGate._search_side_effect([wrong_album_row])
+        )
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(release_id=37161147, artist="Eliana Glass", album="E At Home")
+            ]
+        )
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Eliana Glass", album="E at Home", raw_message="Eliana Glass - E at Home"
+        )
+        recorded, scope = self._record_outcomes()
+        with patch("sentry_sdk.get_current_scope", return_value=scope):
+            await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert "serve_blocked_fallback_discogs_match" in recorded
+        assert "library_miss_discogs_match" not in recorded
+
+    @pytest.mark.asyncio
+    async def test_serve_blocked_miss_uses_distinct_outcome(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        wrong_album_row = make_library_item(id=63861, artist="Eliana Glass", title="E")
+        mock_library_db.search = AsyncMock(
+            side_effect=TestServeAwareStep3aGate._search_side_effect([wrong_album_row])
+        )
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Eliana Glass", album="E at Home", raw_message="Eliana Glass - E at Home"
+        )
+        recorded, scope = self._record_outcomes()
+        with patch("sentry_sdk.get_current_scope", return_value=scope):
+            await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert "serve_blocked_fallback_no_discogs_match" in recorded
+        assert "library_miss_no_discogs_match" not in recorded, (
+            "the classic slice must keep meaning 'the library returned nothing'"
+        )

@@ -306,9 +306,25 @@ class LookupState:
     response build."""
 
     library_miss_outcome: str | None = None
-    """LML#583 outcome marker (``library_miss_discogs_match`` /
-    ``library_miss_no_discogs_match``) for the Sentry trace projection. Written
-    by the library-miss probe (step 3a)."""
+    """LML#583 outcome marker for the Sentry trace projection (``lookup.outcome``).
+    Written by the library-miss probe (step 3a). Four values, two per lane, kept
+    distinct because the lanes describe different situations and existing slices
+    key on the first pair: ``library_miss_discogs_match`` /
+    ``library_miss_no_discogs_match`` mean the library returned NOTHING and the
+    probe did or didn't resolve the pair; ``serve_blocked_fallback_discogs_match``
+    / ``serve_blocked_fallback_no_discogs_match`` are the LML#1319 songless lane,
+    where the library DID answer but only with rows that cannot clear the serve
+    floor."""
+
+    serve_blocked_probe_pair: tuple[LibraryItem, DiscogsSearchResult] | None = None
+    """LML#1319: the step-3a probe hit parked on the serve-blocked songless
+    lane, where ``library_results`` is non-empty and must stay that way (those
+    rows carry the call numbers). Written by the library-miss probe (3a); read
+    by artwork fetch (4), which prepends it to ``items_with_artwork`` after
+    building the rows' own pairs, so the probe's release id + artwork lead the
+    response and every shelved row follows. ``None`` on every other lane —
+    including the classic empty-library hit, which writes
+    ``items_with_artwork`` directly."""
 
     corrected_artist: str | None = None
     """Fuzzy artist-spelling correction from the library vocabulary, reported
@@ -676,19 +692,25 @@ async def _step_library_miss_probe(
 ) -> None:
     """Step 3a — library-miss Discogs search (LML#583).
 
-    READS: ``library_results``, ``search_type``, ``found_on_compilation``
-    (the serve-aware emptiness gate, LML#1319).
-    WRITES: ``items_with_artwork``, ``song_not_found``, ``library_miss_outcome``;
-    ``library_results`` (cleared on a serve-blocked-lane hit, LML#1319).
+    READS: ``library_results``, ``search_type`` (the serve-aware emptiness
+    gate, LML#1319).
+    WRITES: ``items_with_artwork``, ``song_not_found``, ``library_miss_outcome``,
+    ``serve_blocked_probe_pair``.
 
     Ordering invariant (enforced here and at step 4's emptiness guard): on a
-    hit this step writes ``items_with_artwork`` directly and clears
-    ``song_not_found``, deliberately bypassing track validation (3b) and the
-    artwork fetch (4). The bypass holds because this step only fires when
-    ``library_results`` is empty or holds only unservable songless-fallback
-    rows (LML#1319) — and a hit on the latter lane empties ``library_results``
-    itself — so 3b's and 4's non-empty gates never run after a hit and cannot
+    classic library-miss hit this step writes ``items_with_artwork`` directly
+    and clears ``song_not_found``, deliberately bypassing track validation (3b)
+    and the artwork fetch (4). The bypass holds because ``library_results`` is
+    empty on that lane, so 3b's and 4's non-empty gates never run and cannot
     overwrite the synthesized pair.
+
+    The LML#1319 serve-blocked lane is the deliberate exception: there
+    ``library_results`` is non-empty and stays non-empty (its rows carry the
+    call numbers), so steps 3c and 4 DO run over them — and the probe pair
+    rides on ``serve_blocked_probe_pair`` until step 4 prepends it, rather than
+    racing the artwork fetch for ``items_with_artwork``. Track validation (3b)
+    still cannot interfere: this lane is songless by construction and 3b's gate
+    requires ``parsed.song``.
     """
     # When the entire search pipeline returned no library results AND the request
     # carries both artist and album, probe Discogs directly. A confident match
@@ -724,7 +746,6 @@ async def _step_library_miss_probe(
         parsed,
         state.library_results,
         state.search_type,
-        found_on_compilation=state.found_on_compilation,
     )
     if (
         (not state.library_results or serve_blocked)
@@ -734,26 +755,46 @@ async def _step_library_miss_probe(
         and parsed.album.strip()
     ):
         with services.telemetry.track_step("library_miss_discogs_search"):
-            miss_match = await _library_miss_discogs_search(parsed, services.discogs_service)
+            miss_match = await _library_miss_discogs_search(
+                parsed,
+                services.discogs_service,
+                # LML#1319 review: the serve-blocked lane probes CACHE-ONLY.
+                # Rationale on ``_library_miss_discogs_search``.
+                allow_api_escalation=not serve_blocked,
+            )
         if miss_match is not None:
-            synthesized_lib_item, discogs_result = miss_match
-            state.items_with_artwork = [(synthesized_lib_item, discogs_result)]
             # A synthesized Discogs match resolves the request — clear song_not_found so
             # build_context_message and LookupResponse.song_not_found reflect reality.
             state.song_not_found = False
             if serve_blocked:
-                # LML#1319: drop the unservable fallback rows so the step-4
-                # emptiness guard holds and the synthesized pair is not
-                # overwritten — a probe hit supersedes rows that could only
-                # ever collapse to the sentinel. On a probe MISS they are
-                # kept: the sentinel still carries the streaming URLs the
-                # rows can vouch for, exactly the pre-fix behavior.
-                state.library_results = []
-            state.library_miss_outcome = "library_miss_discogs_match"
+                # LML#1319: the probe hit is ADDITIONAL evidence, never a
+                # replacement. The rows that opened this lane are real shelved
+                # records whose call number is the whole point of a card-catalog
+                # lookup, and "cannot serve" is a token-SUBSET property — a
+                # typed "Aluminum Tunes (Switched On Volume 3)" against a
+                # catalog "Aluminum Tunes" lands here, the SAME record — so
+                # discarding them would lose the shelf location for a title
+                # spelling. Park the pair instead; step 4 prepends it to
+                # ``items_with_artwork`` after fetching the rows' own artwork,
+                # so the response leads with the probe's release id/artwork and
+                # still carries every shelved row behind it.
+                state.serve_blocked_probe_pair = miss_match
+                state.library_miss_outcome = "serve_blocked_fallback_discogs_match"
+            else:
+                state.items_with_artwork = [miss_match]
+                state.library_miss_outcome = "library_miss_discogs_match"
             services.telemetry.record_api_call("discogs")
         elif services.discogs_service is not None:
             # Discogs was available and searched but found no confident match.
-            state.library_miss_outcome = "library_miss_no_discogs_match"
+            # The serve-blocked arm gets its own value: the classic pair means
+            # "the library returned nothing", and on this lane it DID answer —
+            # reusing it would silently change the population behind every
+            # existing `lookup.outcome` slice and runbook (LML#1319 review).
+            state.library_miss_outcome = (
+                "serve_blocked_fallback_no_discogs_match"
+                if serve_blocked
+                else "library_miss_no_discogs_match"
+            )
 
 
 async def _step_validate_tracks(
@@ -904,7 +945,8 @@ async def _step_fetch_artwork(
 ) -> None:
     """Step 4 — fetch artwork for the library results.
 
-    READS: ``library_results``, ``discogs_titles``, ``found_on_compilation``.
+    READS: ``library_results``, ``discogs_titles``, ``found_on_compilation``,
+    ``serve_blocked_probe_pair``.
     WRITES: ``items_with_artwork`` (builds the ``(item, artwork)`` pairs every
     later step consumes). The flag-gated LML#850 prefetch feeds
     ``release_overrides`` to ``fetch_artwork_for_items`` so a hand-verified pin
@@ -915,6 +957,12 @@ async def _step_fetch_artwork(
     ``library_results`` is empty by 3a's own gate, so this step must not run
     and overwrite the synthesized pair (re-searching here would re-open the
     floor mis-selection risk 3a's bypass exists to avoid).
+
+    LML#1319 adds the one lane where both are non-empty: a serve-blocked
+    songless probe hit parks its pair on ``serve_blocked_probe_pair`` precisely
+    so the rows keep their own artwork pass here, then rides in front of them.
+    The prepend runs after (not inside) the timed fetch — it is a list splice,
+    not I/O, and timing it would inflate the artwork leg.
     """
     with services.telemetry.track_step("artwork_fetch"):
         if state.library_results:
@@ -939,6 +987,9 @@ async def _step_fetch_artwork(
                 found_on_compilation=state.found_on_compilation,
                 release_overrides=override_map,
             )
+
+    if state.serve_blocked_probe_pair is not None:
+        state.items_with_artwork = [state.serve_blocked_probe_pair, *state.items_with_artwork]
 
 
 async def _step_enrich_metadata(
