@@ -1665,7 +1665,7 @@ class DiscogsService:
                 #
                 # LML#1237: that widening is correct for `get_release` in
                 # general, but it is wrong for the one caller whose entire
-                # question IS the artwork (`lookup.artwork.
+                # question IS the artwork (`lookup.fallback_artwork.
                 # _resolve_fallback_artwork`) -- arm 2 alone let it read a
                 # never-asked row's NULL `artwork_url` as "no cover" without
                 # ever hitting the live API. `require_artwork_answer` scopes
