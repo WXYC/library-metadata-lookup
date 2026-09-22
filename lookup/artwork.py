@@ -5,8 +5,10 @@ Discogs search with the LML#478 80/80 fuzzy floor), the LML#604
 trust-and-bind of an already-validated ``ResolvedRelease``
 (``_bind_resolved_release``), and the release-cover → artist-image
 fallback cascade, which now lives in ``lookup/fallback_artwork.py``
-(``_resolve_fallback_artwork``, imported here for the bind path). Extracted
-verbatim from ``lookup/orchestrator.py`` (LML#728).
+(``_resolve_fallback_artwork``, imported here for both of its callers: the
+trust-and-bind path and ``fetch_artwork_for_items``' artwork-empty fallback
+on the search path). Extracted verbatim from ``lookup/orchestrator.py``
+(LML#728).
 """
 
 import asyncio
