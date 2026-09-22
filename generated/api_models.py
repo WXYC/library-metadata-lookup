@@ -7,6 +7,7 @@ from datetime import date as date_aliased
 from datetime import time as time_aliased
 from enum import Enum, IntEnum, StrEnum
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import (
     AnyUrl,
@@ -652,6 +653,10 @@ class Album(BaseModel):
     artist_id: int
     album_title: str
     code_number: int
+    code_volume_letters: constr(max_length=4) | None = Field(
+        None,
+        description="Volume letters for the release call code (`library.code_volume_letters`, varchar(4)).\n\n**Present here for longer than it has been writable, and the two facts are separate.** This is a raw-row schema — no joins, just the `library` columns as they were inserted — so the column has ridden along in this payload since it existed, because the create returns the whole row. Writability arrived per verb: `AlbumCreateFields.code_volume_letters` on the create wire (BS#2410) and `UpdateAlbumRequest.code_volume_letters` on the PATCH wire (BS#2564). A client written against an older contract version still RECEIVES this field; what it could not do is send it.\n",
+    )
     genre_id: int
     format_id: int
     label: str | None = None
@@ -681,15 +686,33 @@ class UpdateAlbumRequest(BaseModel):
     Partial-update payload for `PATCH /library/{id}` (BS#1154). Mirrors
     Backend-Service's wire-level `UpdateAlbumRequest` type
     (apps/backend/controllers/library.controller.ts) exactly: only fields
-    present in the body are validated and written. The 8 legacy fields
+    present in the body are validated and written. The legacy fields
     are snake_case (matching AddAlbumRequest / the DB columns); the two
     BS#1281 discogs fields are camelCase, per the whitelist BS's
     `UPDATABLE_ALBUM_FIELDS` actually reads from `req.body`.
-    `artist_name` and `code_number` are deliberately absent — they are
-    server-derived (re-attribution side effects of an `artist_id`
-    change), never read from the client body. `lastDiscogsRecheckAt` is
-    also absent — it is server-write-only (the recheck cron writes it
-    directly).
+
+    `artist_name` is deliberately absent from THIS schema's properties
+    — on the album body it stays server-derived, a re-attribution side
+    effect of an `artist_id` change, never read from the client. That
+    claim is scoped to this endpoint: `artist_name` IS a writable field
+    on the separate `PATCH /library/artists/{id}` endpoint's body
+    (`UpdateArtistRequest`), which renames the artist row directly
+    rather than moving one release between artists. The two fields
+    share a name and nothing else; do not read one endpoint's rule as
+    describing the other.
+
+    `code_number` and `code_volume_letters`, by contrast, ARE writable
+    here as of BS#2564 (production image `backend/v0.1.920`,
+    2026-09-18) — an earlier version of this description grouped
+    `code_number` with `artist_name` as server-derived, which stopped
+    being true the same day it shipped. See their own descriptions
+    below; the write semantics differ from
+    `AlbumCreateFields.code_number` / `.code_volume_letters` because a
+    PATCH can also be re-filing the release under a different
+    `artist_id` in the same request.
+
+    `lastDiscogsRecheckAt` is also absent — it is server-write-only
+    (the recheck cron writes it directly).
 
     """
 
@@ -701,6 +724,14 @@ class UpdateAlbumRequest(BaseModel):
     artist_id: int | None = None
     alternate_artist_name: str | None = None
     disc_quantity: int | None = None
+    code_number: conint(ge=1, le=32767) | None = Field(
+        None,
+        description="Operator-chosen release call number (BS#2564; the PATCH half of `AlbumCreateFields.code_number`, BS#2410). `library.code_number` is a Postgres smallint, hence the 32767 ceiling. No application-level collision check on a `code_number`-only or `artist_id`-only edit, same as the create side (single-librarian decision, rotation-import plan D2); for those paths the eventual DB uniqueness constraint and its 409 mapping are tracked at WXYC/Backend-Service#2033. The one path that IS checked is a PATCH that changes `genre_id` (WXYC/Backend-Service#2587): the resulting `(artist_id, genre_id, code_number, code_volume_letters)` slot is looked up against the real shelf, and an occupied slot refuses with `409 library_slot_conflict` rather than silently filing two releases onto it — see this operation's 409. Alongside an `artist_id` move in the same request, a value that DIFFERS from the stored one is honored verbatim as the destination shelf; a value that merely echoes the stored one expresses no choice and still auto-regenerates when the destination artist already owns that number.\n",
+    )
+    code_volume_letters: constr(max_length=4) | None = Field(
+        None,
+        description='Volume letters for the release call code (`library.code_volume_letters`, varchar(4)). An empty string or an explicit `null` clears it to NULL — `null` is accepted here (unlike `AlbumCreateFields.code_volume_letters`, which has nothing to clear on a create) because omitting the key already means "leave unchanged" on a PATCH, so clearing needs a distinct spelling, and `AlbumDetail.code_volume_letters` is `nullable: true`, so a client round-tripping a GET body into a PATCH must be able to send back the `null` it just received.\n',
+    )
     discogsUnavailable: bool | None = None
     discogsUnavailableNote: constr(max_length=500) | None = None
 
@@ -1257,6 +1288,483 @@ class ArtistSearchMatch(BaseModel):
 
 class ArtistSearchResponse(BaseModel):
     artists: list[ArtistSearchMatch]
+
+
+class ArtistCard(BaseModel):
+    """
+    The classic-librarian artist-card field set (`artist_id`, not `id` — a different shape from `Artist`, the raw `POST /library/artists` insert row above). Not returned directly by either artist-card endpoint: both `GET /library/artists/{id}` and its `PATCH` 200 answer `ArtistCardWithDependentCounts`, which embeds this shape via `allOf`.
+
+    """
+
+    artist_id: int
+    artist_name: str
+    alphabetical_name: str
+    genre_id: int
+    code_letters: str
+    code_artist_number: int
+
+
+class ArtistCardWithDependentCounts(ArtistCard):
+    """
+    `ArtistCard` plus the dependent counts behind `DELETE /library/artists/{id}`'s refusal (WXYC/Backend-Service#2562, the counts shipped ahead of the delete itself as #2597). Returned by BOTH `GET /library/artists/{id}` and the `PATCH` 200 on the same path — the two endpoints deliberately agree, so a client that PATCHes can refresh its delete-control state from the PATCH body instead of re-GETting.
+
+    """
+
+    release_count: int = Field(
+        ...,
+        description="Catalog releases filed to this artist (`library.artist_id`). A non-zero count is the primary `DELETE /library/artists/{id}` refusal — move or delete the releases first.\n",
+    )
+    cross_reference_source_count: int = Field(
+        ...,
+        description="Legacy artist-to-artist cross-references naming this artist as the source (tubafrenzy's `LIBRARY_CODE_CROSS_REFERENCE`). A non-zero count refuses the delete.\n",
+    )
+    cross_reference_target_count: int = Field(
+        ...,
+        description="The same legacy cross-reference collection, naming this artist as the target. A non-zero count refuses the delete.\n",
+    )
+    library_cross_reference_count: int = Field(
+        ...,
+        description="Legacy release cross-references pointing at this artist (tubafrenzy's `RELEASE_CROSS_REFERENCE`). A non-zero count refuses the delete.\n",
+    )
+    compilation_credit_count: int = Field(
+        ...,
+        description="Compilation-track credits attributed to this artist (`compilation_track_artist.track_artist_id`). Informational only — never a delete refusal. The FK is `ON DELETE SET NULL` (the `concerts.headlining_artist_id` precedent): a delete drops the credit's canonicalization link rather than being blocked by it.\n",
+    )
+
+
+class UpdateArtistRequest(BaseModel):
+    """
+    Partial-update payload for `PATCH /library/artists/{id}` (WXYC/Backend-Service#2156, `artist_name` restored by BS#2563). Two writable fields, either or both; a body with neither is a 400. `genre_id`, `code_letters`, and `code_artist_number` are real fields on the `/wxycdb` artist-card form but have no write path on this endpoint — sending one is a 400 naming why, not silently dropped. Do not confuse this `artist_name` with `UpdateAlbumRequest`'s absent one: this endpoint renames the artist row directly; the album PATCH never accepts `artist_name` at all, on any artist.
+
+    """
+
+    artist_name: constr(min_length=1, max_length=128) | None = Field(
+        None,
+        description="Trimmed and NFC-normalized before storage, then measured in code points against the `varchar(128)` column. Checked against a folded-name collision probe (case/diacritic/Unicode-form insensitive) across every genre the artist is filed in; a hit is a 409 (`ArtistNameConflictError`). Cascades: `library.artist_name` is rewritten on every release the artist holds, and `library.artwork_lookup_attempted_at` is cleared on those rows. `flowsheet.artist_name` is deliberately NOT rewritten — it is a historical on-air snapshot.\n",
+    )
+    alphabetical_name: constr(min_length=1, max_length=128) | None = Field(
+        None,
+        description="The filing name that governs shelf order. Trimmed and NFC-normalized before storage, then measured in code points against the `varchar(128)` column.\n",
+    )
+
+
+class Reason(StrEnum):
+    artist_name_conflict = "artist_name_conflict"
+
+
+class Artist1(BaseModel):
+    """
+    The conflicting artist, so a client can offer merging into it rather than reporting a bare failure.
+
+    """
+
+    artist_id: int
+    artist_name: str
+    code_letters: str
+
+
+class ArtistNameConflictError(BaseModel):
+    """
+    `PATCH /library/artists/{id}`'s 409: the requested `artist_name` folds equal to a DIFFERENT artist already filed in one of this artist's genres. Advisory rather than authoritative — no unique constraint backs the folded name, so a concurrent write can still produce the collision.
+
+    """
+
+    message: str
+    reason: Reason
+    artist: Artist1 = Field(
+        ...,
+        description="The conflicting artist, so a client can offer merging into it rather than reporting a bare failure.\n",
+    )
+
+
+class Reason1(StrEnum):
+    """
+    Which of the four `/wxycdb` refusals fired, checked in that order. `compilation_credit_count` never appears here — that dependent is informational only and never refuses a delete (see its own description on `ArtistCardWithDependentCounts`).
+
+    """
+
+    artist_has_releases = "artist_has_releases"
+    artist_crossreference_source = "artist_crossreference_source"
+    artist_crossreference_target = "artist_crossreference_target"
+    artist_library_crossreference = "artist_library_crossreference"
+
+
+class ArtistDeleteRefusal(BaseModel):
+    """
+    `DELETE /library/artists/{id}`'s 409 (WXYC/Backend-Service#2562), reproducing one of the four retired `/wxycdb` `ArtistAdminServlet` refusals.
+
+    **Three fields, not the dependent-count card.** `reason` says which predicate fired and `count` is how many rows it found — the only number the refusal has to communicate, since the librarian's next move is to clear those rows. A client that wants the full card refreshes it with `GET /library/artists/{id}`, which is the read that owns that shape; duplicating it here would oblige the refusal path to assemble a five-count card on the way out of a transaction that has already decided to refuse.
+
+    Refusals are checked in the `reason` enum's order and the FIRST one to fire answers, so `count` describes that predicate alone — an artist holding both releases and cross-references reports only its release count, and a client must not present it as a total.
+
+    """
+
+    message: str
+    reason: Reason1 = Field(
+        ...,
+        description="Which of the four `/wxycdb` refusals fired, checked in that order. `compilation_credit_count` never appears here — that dependent is informational only and never refuses a delete (see its own description on `ArtistCardWithDependentCounts`).\n",
+    )
+    count: int = Field(
+        ...,
+        description="How many rows the refusing predicate found: releases on file, cross-references in the naming direction, or release cross-references. Scoped to the one predicate named by `reason`, never a sum across them.\n",
+    )
+
+
+class ArtistByCodeMatch(BaseModel):
+    """
+    One row of `GET /library/artists/by-code`. Deliberately NOT `ArtistSearchMatch`, which is one field wider and reads `genre_artist_crossreference` joined to `genres`; this lookup projects `(artist_id, artist_name, code_letters)` and never joins `genres`, echoing the already-validated `genre_id`/`code_number` back onto each row rather than reading a per-row fact.
+
+    """
+
+    id: int
+    artist_name: str
+    code_letters: str
+    code_number: int = Field(
+        ...,
+        description="Mode-dependent. Fully specified (`code_number` given on the request), this is an ECHO of the request value, identical on every row — NOT the row's own `artist_genre_code` the way the same-named field on `ArtistSearchMatch` is. Browsing (`code_number` omitted on the request), it is the row's real `artist_genre_code` and varies across the list.\n",
+    )
+    genre_id: int = Field(
+        ..., description="Echo of the request's `genre_id`, identical on every row."
+    )
+
+
+class ArtistByCodeResponse(BaseModel):
+    artists: list[ArtistByCodeMatch]
+
+
+class Reason2(StrEnum):
+    genre_not_found = "genre_not_found"
+    code_not_assigned = "code_not_assigned"
+
+
+class ArtistByCodeError(BaseModel):
+    """
+    `GET /library/artists/by-code`'s 404. Two distinct outcomes, told apart by `reason`, never by `message` text: `genre_not_found` (no genre has that `genre_id`) vs. `code_not_assigned` (the genre exists and no artist is filed under that exact code — NOT a guarantee that creating an artist under the code is safe; the column has no case-fold constraint and neither writer canonicalizes it the same way).
+
+    """
+
+    message: str
+    reason: Reason2
+
+
+class ArtistRelease(BaseModel):
+    """
+    One row of `GET /library/artists/{id}/releases`, in shelf order.
+    """
+
+    id: int
+    last_modified: AwareDatetime
+    format_name: str
+    genre_id: int
+    code_letters: str
+    code_artist_number: int
+    code_number: int
+    code_volume_letters: str | None = None
+    album_title: str
+    alternate_artist_name: str | None = None
+
+
+class ArtistReleasesPage(BaseModel):
+    """
+    One page of `GET /library/artists/{id}/releases`, in shelf order (`code_number`, then `code_volume_letters`, then `id`).
+
+    """
+
+    artist_id: int
+    releases: list[ArtistRelease]
+    total: int
+    page: int
+    totalPages: int
+
+
+class NextCodeNumberResponse(BaseModel):
+    next_code_number: int = Field(
+        ...,
+        description="Shared shape for `GET /library/artists/peek-code` (next ARTIST code number in a `(genre_id, code_letters)` bucket) and `GET /library/artists/{id}/next-release-number` (next RELEASE code number for one artist's shelf, within one genre). Pure read, no side effects, in both cases.\n",
+    )
+
+
+class Reason3(StrEnum):
+    lock_unavailable = "lock_unavailable"
+
+
+class LockUnavailableRefusal(BaseModel):
+    """
+    503 shared by `DELETE /library/{id}`, `DELETE /library/artists/{id}`, and `POST /library/deleted/{batchId}/restore`: the operation stood down rather than wait on rows a live writer holds. Retryable, and says nothing about whether the target is deletable/restorable — deliberately not a 409, which on these endpoints means "refused on the merits". Each transaction sets a `lock_timeout` below Postgres's deadlock-detection threshold on purpose, so it is always the librarian's write that stands down rather than the side that wins a deadlock arbitration.
+
+    **What it stands down TO differs by endpoint.** `DELETE /library/{id}` really does contend with a DJ's play insert — `flowsheet.album_id` references `library.id`, so the insert takes `FOR KEY SHARE` on the row being deleted. `DELETE /library/artists/{id}` cannot: `flowsheet` stores `artist_name` as text and has no FK to `artists`, so its contenders are the catalog ETL jobs and a concurrent artist edit. Standing down is still right — a librarian retries a click in a second, where a job that loses a row may skip it until its next run — but a 503 from the artist delete is not evidence that a DJ was logging a play.
+
+    """
+
+    message: str = Field(
+        ...,
+        examples=[
+            "Could not delete: the release is being written to right now. Try again in a moment."
+        ],
+    )
+    reason: Reason3
+
+
+class DigitalAssetReference(BaseModel):
+    """
+    One live `digital_asset` row blocking `DELETE /library/{id}` — rip evidence / S3-backed audio-archive metadata with no `onDelete` and nothing that casually re-enters it. A row with `status: rejected` never appears here: the delete snapshots and removes those instead of refusing over them.
+
+    """
+
+    id: int
+    provenance: str = Field(
+        ...,
+        description="Open vocabulary, not a closed enum. `rotation_upload` and `cd_rip` are the values in use today.\n",
+        examples=["rotation_upload"],
+    )
+    disc_number: int
+    status: str = Field(
+        ...,
+        description="Open vocabulary, not a closed enum. `needs_review`, `bound` and `rejected` are in use today; the CD-rip phase adds `pulled`, `ripped` and `exception`.\n",
+        examples=["needs_review"],
+    )
+
+
+class Reason4(StrEnum):
+    digital_asset_references = "digital_asset_references"
+
+
+class ReleaseDeleteRefusal(BaseModel):
+    """
+    `DELETE /library/{id}`'s 409 (BS#2112). Refused on the merits — the release has a LIVE `digital_asset` row (any status but `rejected`). Deliberately NOT this document's `ApiErrorResponse` shape: the specifics are the substance of the refusal, telling the librarian what the delete would have damaged.
+
+    """
+
+    message: str = Field(
+        ...,
+        examples=["Cannot delete: release has 2 digital assets on record (ids: 41, 42)"],
+    )
+    reason: Reason4
+    asset_count: int = Field(
+        ...,
+        description="Number of LIVE `digital_asset` rows blocking this delete (`assets.length`).",
+    )
+    assets: list[DigitalAssetReference]
+
+
+class FlowsheetPlayCounts(BaseModel):
+    """
+    `GET /library/{id}/flowsheet-play-counts`'s 200 (WXYC/Backend-Service#2592). Answers "what would deleting this release damage?" ahead of `DELETE /library/{id}`, which cannot answer that on its own response — BS#2565 removed that delete's prior 409-on-flowsheet-plays refusal, so plays are affected silently unless read here first.
+    **The three counts are disjoint by construction and deliberately NOT summable.** They partition one row set — every flowsheet play naming this release, each counted in exactly one of `direct` / `rotation_linked` / `legacy_linked` — but a total would misstate what the delete actually does: the `legacy_linked` arm STRANDS its plays permanently rather than unlinking them (the delete-denylist guarantees no future release will ever carry that legacy id again), while `direct` and `rotation_linked` are merely unlinked. Summing collapses "permanently orphaned" into the same number as "loses a link," which is precisely the distinction a librarian needs before deleting. Render the three arms separately; never render their sum.
+    Advisory, not a lock: this is a standalone pre-delete read that takes no lock, so any of the three counts may move, in either direction, before a subsequent `DELETE /library/{id}` actually runs (`jobs/legacy-linkage-resolve` re-links this same data every 30 minutes; ordinary catalog editing can re-link or un-link a play's `album_id`/`rotation_id` by hand at any time).
+
+    """
+
+    direct: int = Field(
+        ...,
+        description="Plays linked via `flowsheet.album_id`; unlinked (not deleted) by the delete.\n",
+    )
+    rotation_linked: int = Field(
+        ...,
+        description="Plays reachable only via `flowsheet.rotation_id` -> `rotation.album_id`; unlinked by the delete's rotation cascade. Excludes any play already counted in `direct`.\n",
+    )
+    legacy_linked: int = Field(
+        ...,
+        description="Plays naming the release only by a bare `flowsheet.legacy_release_id`, awaiting `jobs/legacy-linkage-resolve`. Deleting STRANDS whatever is still in this arm at delete time permanently rather than unlinking it — see the schema description above for why this is exactly the count that must never be folded into a total.\n",
+    )
+
+
+class CatalogDeleteActor(BaseModel):
+    """
+    Attribution for a catalog delete. Carries no email — `GET /library/deleted` is not a listed permitted read site for a PII email (see this file's `docs/pii.md`-equivalent discipline on the Backend side), so callers resolve `user_id` through roster admin instead.
+
+    """
+
+    user_id: str | None = None
+    role: str | None = None
+
+
+class CatalogDeleteEntity(BaseModel):
+    """
+    One captured entity in a delete batch — the artist or release itself, or a resolved dependent, in FK order (parent before any child that references it).
+
+    """
+
+    entity_kind: str | None = None
+    table: str | None = None
+    row: dict[str, Any] | None = Field(
+        None, description="The deleted parent row itself, every non-generated column."
+    )
+    children: dict[str, int] | None = Field(
+        None,
+        description="Child table name -> COUNT of rows that referenced the deleted parent, never the rows themselves. The archive's own storage holds the full unprojected child rows so a restore has every column it needs, but this listing is read by any `catalog: ['write']` principal, not by whoever has a legitimate need to see e.g. another DJ's bin contents or review text.\n",
+    )
+
+
+class CatalogDeleteBatch(BaseModel):
+    """
+    One page row of `GET /library/deleted` (WXYC/Backend-Service#2561, merged) — every row `captureCatalogDeleteSnapshot` wrote under one `batch_id`. Every batch holds exactly one entity today: the release delete captures one release, and `DELETE /library/artists/{id}` (WXYC/Backend-Service#2562, shipped) refuses outright with a 409 `artist_has_releases` rather than capturing the artist alongside any release it holds. `entities` is always ordered parent before child (an artist before any library row that references it), the same ordering every batch in this archive keeps, even though no writer today produces more than one entity for it to order.
+
+    """
+
+    batch_id: UUID
+    restorable: bool = Field(
+        ...,
+        description="Whether `POST /library/deleted/{batchId}/restore` can EVER bring this batch back (WXYC/Backend-Service#2616), computed off the same restore-plan set the restore's `409 unrestorable_kind` refusal reads, so the two cannot drift.\n\n`false` when any entity's `entity_kind` has no replay plan OR that entity's captured envelope is missing its row. An `artist` batch reads `false` on the first count today: the delete does capture a snapshot, but an artist's shelf slot has no tombstone and needs its own conflict probe, so no replay plan exists for it. The envelope half is the same corruption the restore endpoint's own 500 guards against, so this field answers for envelope health, not just `entity_kind`. A batch holding several entities is restorable only if every one of them is, since the restore refuses the whole batch on the first kind it cannot replay — and a batch whose rows read back empty is `false` rather than vacuously `true`. A `library` batch with an intact envelope reads `true`.\n\n`true` is NOT a promise that a restore attempt will succeed — it means this batch's kind has a working replay plan and a parseable envelope, nothing more. The envelope half is settled here, at listing time, against an immutable capture, so a batch that reads `true` cannot go on to fail on a corrupt envelope; it can still answer `already_restored`, `resolution_required` (a shelf-slot conflict a client must resolve), or `lock_unavailable`. `false` is the hard guarantee: the endpoint refuses every such batch with `409 unrestorable_kind` before any row lock or write.\n",
+    )
+    captured_at: AwareDatetime
+    actor: CatalogDeleteActor
+    entities: list[CatalogDeleteEntity]
+    unrecoverable: list[str] = Field(
+        ...,
+        description="Names the dependents no envelope ever captures, so a restore cannot bring them back. It depends on what kind of entity the batch holds (`entities[].entity_kind`) — a release and an artist lose different tables, not one constant list.\nFor a `library` batch: `album_metadata`, `library_identity`, `library_identity_source`, `uncovered_release_search_markers`, `album_review_submissions`.\nFor an `artist` batch: `artist_search_alias`, `artist_similar_artists`, `artist_station_plays`, `concerts`, `concert_performers`.\n",
+    )
+
+
+class DeletedArchivePage(BaseModel):
+    """
+    `GET /library/deleted`'s 200. An empty archive is a 200 with `total: 0`, not a 404.
+
+    """
+
+    results: list[CatalogDeleteBatch]
+    total: int
+    page: int
+    totalPages: int
+
+
+class RestoredEntity(BaseModel):
+    """
+    One top-level entity `POST /library/deleted/{batchId}/restore` re-inserted, in FK order (parent before any child that references it). The row comes back under its ORIGINAL primary key — a restore reinserts the captured row rather than minting a new id — which is why `entity_id` is the same value the archive listing reported for it.
+
+    """
+
+    entity_kind: str = Field(
+        ...,
+        description="The archive row's queryable label, matching `CatalogDeleteEntity.entity_kind`.\n",
+    )
+    table: str = Field(
+        ...,
+        description="The table the row was re-inserted into. This, not `entity_kind`, is what names the rows.\n",
+    )
+    entity_id: int = Field(
+        ...,
+        description="The restored row's primary key — the captured id, unchanged.\n",
+    )
+    relocated_code_number: int | None = Field(
+        ...,
+        description="The call number the card actually came back under, and non-null ONLY when the `next_free_code` resolution ran because the original slot was taken. `null` means the original slot was free and the captured `code_number` was re-used as-is. The archive record keeps the ORIGINAL code either way: this is what the live row carries now, not a correction to history.\n",
+    )
+    children: dict[str, int] = Field(
+        ...,
+        description="Child table name to the number of rows replayed under this entity, mirroring `CatalogDeleteEntity.children` from the listing. A table with no captured rows is present with `0` rather than omitted, the same absent-versus-empty distinction the capture itself keeps.\n",
+    )
+
+
+class RestoreBatchResponse(BaseModel):
+    """
+    `POST /library/deleted/{batchId}/restore`'s 200 (WXYC/Backend-Service#2585). The parent row and every captured child row were re-inserted inside one transaction.
+
+    **The relocation result is per entity, not per batch.** Whether the `next_free_code` resolution had to run is reported on each entity's `relocated_code_number`, because the answer can differ between entities of one batch: only the entities whose own slot was taken move. There is no batch-level "resolution applied" field — read `entities[].relocated_code_number` and treat any non-null value as "this card came back somewhere else".
+
+    """
+
+    batch_id: UUID
+    entities: list[RestoredEntity]
+
+
+class RestoreSlotConflict(BaseModel):
+    """
+    One captured entity whose original call-number slot is held by a different release at restore time. The slot is the genre-scoped tuple `(artist_id, genre_id, code_number, upper(coalesce(code_volume_letters, '')))` — never the genre-blind `(artist_id, code_number)` pair, which reports collisions between releases filed in different genre sections.
+
+    Carries no `code_letters`: the shelf letters belong to the artist, not to the release, so a client that needs them for display reads them from the artist the `artist_id` names.
+
+    """
+
+    entity_id: int = Field(
+        ...,
+        description="The archive row's `entity_id` — the `library.id` the card held when it was deleted, and the id it would come back under.\n",
+    )
+    artist_id: int
+    genre_id: int
+    code_number: int = Field(
+        ...,
+        description="The card's ORIGINAL call number, still on the archive record whichever arm the caller picks.\n",
+    )
+    code_volume_letters: str | None = Field(...)
+    occupied_by_library_id: int = Field(
+        ...,
+        description="`library.id` of the release holding that slot right now — the one fact that lets a librarian go look at what is in the way.\n",
+    )
+    next_free_code_number: int = Field(
+        ...,
+        description="The call number the `next_free_code` resolution would file this card under instead.\n",
+    )
+
+
+class Reason5(StrEnum):
+    resolution_required = "resolution_required"
+
+
+class RestoreResolutionRequiredRefusal(BaseModel):
+    """
+    `POST /library/deleted/{batchId}/restore`'s **400** when at least one captured card's original call-code slot is occupied and the request supplied no `resolution`. Never relocated silently and never refused silently (decision 2026-09-17, mockup screen 6 in `plans/classic-md-interface/mockups/delete-and-restore.html`): this body names every conflict so a client can offer the choice, then retry with `resolution` set.
+
+    **A 400 rather than a 409**, unlike the other refusals on this path, because the request is incomplete rather than in conflict with server state: the same batch restores successfully the moment `resolution` is supplied. Type this branch — a client that falls back to the bare `ApiErrorResponse` shape here discards `conflicts` and has nothing to render the question from.
+
+    """
+
+    message: str
+    reason: Reason5
+    conflicts: list[RestoreSlotConflict]
+
+
+class Reason6(StrEnum):
+    restore_declined = "restore_declined"
+
+
+class RestoreDeclinedRefusal(BaseModel):
+    """
+    `POST /library/deleted/{batchId}/restore`'s 409 when the caller sent `resolution: 'decline'` on a batch whose slot is taken. The whole batch is aborted rather than relocated or partially restored, and nothing was written — the card stays in the archive and can be restored later.
+
+    `conflicts` is repeated here, identical to the 400's, so a client that declined can still show which slot it declined over without holding the earlier response.
+
+    """
+
+    message: str
+    reason: Reason6
+    conflicts: list[RestoreSlotConflict]
+
+
+class Reason7(StrEnum):
+    already_restored = "already_restored"
+
+
+class RestoreAlreadyRestoredRefusal(BaseModel):
+    """
+    `POST /library/deleted/{batchId}/restore`'s 409 when the batch is already back in the catalog. This is the ordinary answer to a double-click or a retry after a timeout, not an error state: the rows are present, so there is nothing to do and nothing was written.
+
+    Detected two ways, which is why it can fire even when the row does not carry its original id any more: the restore probes the captured primary key AND the captured `legacy_release_id`, so a release that came back through a library-etl pass under a new `library.id` still reports as present rather than being inserted a second time.
+
+    Distinct from the code-conflict branch and must not be handled as one — prompting for a call-number decision on a batch that is already fully restored is the failure mode a lenient decoder produces here.
+
+    """
+
+    message: str
+    reason: Reason7
+    entity_ids: list[int] = Field(
+        ..., description="The captured `entity_id`s already present in the catalog.\n"
+    )
+
+
+class Reason8(StrEnum):
+    unrestorable_kind = "unrestorable_kind"
+
+
+class RestoreUnrestorableKindRefusal(BaseModel):
+    """
+    `POST /library/deleted/{batchId}/restore`'s 409 when the batch holds an `entity_kind` with no restore plan (WXYC/Backend-Service#2616) — an `artist` batch today. Permanent, not retryable: `GET /library/deleted`'s `restorable` field already read `false` for this same batch, off the same restore-plan set, so a client never has to press the button to learn this.
+
+    """
+
+    message: str
+    reason: Reason8
+    entity_kind: str
 
 
 class BinEntry(BaseModel):
@@ -4030,6 +4538,10 @@ class AlbumDetail(BaseModel):
     code_artist_number: int = Field(
         ...,
         description="Joined from `genre_artist_crossreference.artist_genre_code` — the artist's number *within* this release's genre, so the same artist has a different one per genre. Part of the call number, not an id.\n",
+    )
+    code_volume_letters: constr(max_length=4) | None = Field(
+        None,
+        description="`library.code_volume_letters`, varchar(4). Writable via `UpdateAlbumRequest.code_volume_letters` since BS#2564; see that field's description for the null-clearing rule this nullability exists to support.\n",
     )
     format_name: str = Field(..., description="Joined from `format.format_name`.")
     genre_name: str = Field(
