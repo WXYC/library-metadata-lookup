@@ -14,7 +14,7 @@ in the production discogs-cache, just under release ids LML did not bind.
 ``resolve_sibling_artwork`` recovers that cover from another pressing of the
 same album via the release's ``master_id``, as the rung between the bound
 release's own cover and the artist-image fallback in
-``lookup.artwork._resolve_fallback_artwork``.
+``lookup.fallback_artwork._resolve_fallback_artwork``.
 
 **Ordering relative to LML#1242's never-asked re-ask.** This rung must run
 strictly AFTER ``_resolve_fallback_artwork`` has asked ``get_release`` for an
@@ -95,7 +95,7 @@ makes that true rather than merely stated.
 
    **A breaker shed is NOT handled here.** ``get_release`` re-raises one
    (LML#755 FIX 1) and the guard lives at the cascade boundary in
-   ``lookup.artwork._resolve_fallback_artwork``, so every rung is covered by
+   ``lookup.fallback_artwork._resolve_fallback_artwork``, so every rung is covered by
    one catch rather than each remembering its own. ``get_master`` needs no
    coverage at all: it swallows a shed into ``None`` via a bare
    ``except Exception`` -- the asymmetry ``scripts/drain_master_api_tail.py``
@@ -126,7 +126,7 @@ would turn every cache hit into a live round-trip to compare against it.
 rung is gated by the caller on
 ``settings.lml_resolve_sibling_pressing_artwork`` (default ``False``), which
 is NOT this module's concern to check -- see
-``lookup.artwork._resolve_fallback_artwork``.
+``lookup.fallback_artwork._resolve_fallback_artwork``.
 
 The *original* reason was viability: ``idx_release_master_id`` did not exist
 on the prod ``release`` table (WXYC/discogs-etl#412 -- a copy-swap rebuild

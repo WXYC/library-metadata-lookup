@@ -1386,7 +1386,7 @@ class DiscogsService:
             require_artwork_answer: LML#1237. When ``True``, narrows the
                 LML#542 widened cache-hit predicate back down for the one
                 caller whose entire question is the artwork
-                (``lookup.artwork._resolve_fallback_artwork``): a cache row
+                (``lookup.fallback_artwork._resolve_fallback_artwork``): a cache row
                 that carries a tracklist but has never been asked about
                 artwork (``artwork_checked_at IS NULL``) is treated as a
                 MISS instead of a hit, so it falls through to a live Discogs
@@ -1875,7 +1875,7 @@ class DiscogsService:
 
         A saturation-breaker shed degrades to ``None`` here rather than
         propagating (LML#1049): this is a best-effort artwork-fallback helper
-        (sole caller: ``lookup.artwork._resolve_fallback_artwork``, which
+        (sole caller: ``lookup.fallback_artwork._resolve_fallback_artwork``, which
         already treats ``None`` as "no fallback image this time" and does no
         caching of its own), so "couldn't ask" and "asked, no image" are both
         safe to collapse to ``None`` at this boundary — unlike

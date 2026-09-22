@@ -32,7 +32,8 @@ from generated.api_models import (
     DiscogsTrackReleasesResponse,
     TrackMatchSource,
 )
-from lookup.artwork import _resolve_fallback_artwork, fetch_artwork_for_items
+from lookup.artwork import fetch_artwork_for_items
+from lookup.fallback_artwork import _resolve_fallback_artwork
 from lookup.matching import MAX_SEARCH_RESULTS, artist_matches_item, filter_results_by_artist
 from lookup.orchestrator import (
     build_context_message,

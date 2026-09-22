@@ -54,7 +54,7 @@ from wxyc_etl.text import is_compilation_artist, to_match_form
 
 from entity.compilation_track_location import set_up_compilation_track_location_schema
 from entity.sources import PgSource
-from lookup.artwork import _resolve_fallback_artwork
+from lookup.fallback_artwork import _resolve_fallback_artwork
 from scripts._lib.release_matching import (
     CompAlbum,
     exact_match,
@@ -281,7 +281,7 @@ async def build_compilation_track_location(
 
     ``discogs_service`` is a live ``DiscogsService`` wired to the shared
     Discogs rate bucket (LML#879) for the artwork precompute
-    (``lookup/artwork.py:_resolve_fallback_artwork``); pass ``None`` to skip
+    (``lookup/fallback_artwork.py:_resolve_fallback_artwork``); pass ``None`` to skip
     artwork resolution entirely (rows still insert with ``artwork_url =
     NULL``), which is how the test suite exercises the match+insert path
     without a live Discogs dependency.

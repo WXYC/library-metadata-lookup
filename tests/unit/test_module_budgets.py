@@ -62,6 +62,13 @@ MODULE_BUDGETS: dict[str, int] = {
     # bind Discogs results". Three call sites, no import cycle. Do that
     # instead of raising this again.
     "lookup/artwork.py": 550,
+    # LML#1290 prep: `_resolve_fallback_artwork` + `_artwork_rungs` moved out of
+    # `lookup/artwork.py` (524 -> 406) at the boundary this file's comment above
+    # prescribed, rather than raising that budget a second time. 141 lines measured;
+    # 1.3x = 183.3 -> 200. `lookup/artwork.py` keeps 550: 1.3 x 406 = 527.8, whose
+    # smallest multiple of 50 at or above is still 550, so the formula's answer did
+    # not change and lowering it would only manufacture a false ceiling.
+    "lookup/fallback_artwork.py": 200,
     "lookup/caller_reason.py": 100,
     "lookup/candidate_memo.py": 150,
     "lookup/concurrency.py": 200,
