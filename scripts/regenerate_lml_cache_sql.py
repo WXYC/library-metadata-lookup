@@ -349,7 +349,7 @@ _MODULES: dict[str, SidecarSpec] = {
 -- credit is admitted. `discogs_release_id` is the comp's matched Discogs
 -- release (art re-resolution key); `> 0` mirrors the LML#401/#518 sentinel
 -- guard (release ids start at 1). `artwork_url` is precomputed
--- (`lookup/artwork.py:_resolve_fallback_artwork`) so a hit never needs a
+-- (`lookup/fallback_artwork.py:_resolve_fallback_artwork`) so a hit never needs a
 -- live Discogs call to render art; NULL when the release has no cover and no
 -- artist-image fallback.""",
             "CREATE INDEX IF NOT EXISTS idx_compilation_track_location_reverse": """\

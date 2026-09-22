@@ -624,7 +624,7 @@ class Settings(BaseSettings):
         default=False,
         description=(
             "When True, the artwork fallback cascade (_resolve_fallback_artwork in "
-            "lookup/artwork.py) tries a sibling pressing of the same album -- via "
+            "lookup/fallback_artwork.py) tries a sibling pressing of the same album -- via "
             "the release's master_id, resolve_sibling_artwork in "
             "lookup/sibling_artwork.py -- between the release's own cover (which "
             "LML#1242's require_artwork_answer re-ask must have already asked "

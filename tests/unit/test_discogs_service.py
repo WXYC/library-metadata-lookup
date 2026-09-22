@@ -1299,7 +1299,7 @@ class TestGetRelease:
         """LML#1237. The LML#542 widening (above) made a tracklist-bearing row a
         cache HIT even with ``artwork_checked_at IS NULL`` -- correct for
         ``get_release`` in general, but it means the artwork-resolution caller
-        (``lookup.artwork._resolve_fallback_artwork``) reads that row's NULL
+        (``lookup.fallback_artwork._resolve_fallback_artwork``) reads that row's NULL
         ``artwork_url`` as "this release has no cover" without ever asking
         Discogs. ``require_artwork_answer=True`` narrows the predicate back
         down for exactly that caller: a row that has never been checked for
@@ -3847,7 +3847,7 @@ class TestGetArtistImageDelegation:
     async def test_breaker_shed_degrades_to_none(self, service):
         """LML#1049 call site (``discogs/service.py:1725``): ``get_artist_image``
         is a best-effort artist-image fallback (its sole caller,
-        ``lookup.artwork._resolve_fallback_artwork``, treats ``None`` as "no
+        ``lookup.fallback_artwork._resolve_fallback_artwork``, treats ``None`` as "no
         fallback image this time"). Now that ``get_artist_details`` re-raises a
         breaker shed instead of swallowing it, this delegator catches the shed
         itself and degrades to ``None`` -- matching its documented ``str | None``
