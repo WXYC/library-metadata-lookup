@@ -13,11 +13,10 @@ on the search path). Extracted verbatim from ``lookup/orchestrator.py``
 
 import asyncio
 import logging
-from collections.abc import Iterable
 
 from wxyc_etl.text import is_compilation_artist
+from wxyc_fastapi.observability import get_cache_stats_recorder
 
-from clients.streaming.matching import find_best_typed_match
 from config.settings import get_settings
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
 from discogs.service import DiscogsService
@@ -28,7 +27,12 @@ from lookup.artist_resolution import (
 )
 from lookup.fallback_artwork import _resolve_fallback_artwork
 from lookup.matching import is_self_titled, map_library_format_to_discogs
-from lookup.override_floor import pin_clears_floor
+from lookup.override_floor import (
+    PIN_YIELDED_CARRIED_STAT_KEY,
+    PIN_YIELDED_MATCHER_STAT_KEY,
+    _floor_candidates,
+    pin_clears_floor,
+)
 from lookup.release_resolution import ResolvedRelease, resolve_release_for_track_cached
 from lookup.rowless import ROWLESS_LIBRARY_ID, ROWLESS_NO_ALBUM_CONFIDENCE
 
@@ -47,40 +51,6 @@ compilations to None at the 80/80 floor (LML#478 round-2 finding).
 Module-public (no underscore prefix) so ``scripts/measure_artwork_match_floor.py``
 can import the same constants the runtime path uses — keeping the
 measurement's compilation handling provably-aligned with production."""
-
-
-def _floor_candidates(
-    candidates: Iterable[DiscogsSearchResult],
-    *,
-    artist_variants: list[str],
-    album_variants: list[str],
-) -> DiscogsSearchResult | None:
-    """The LML#478 80/80 floor as this module applies it — one call, two callers.
-
-    Named for LML#1290 so ``lookup.override_floor.pin_clears_floor`` can grade a
-    pin through the *same* match class the matcher is held to, rather than
-    re-expressing it.
-
-    **Deliberately NOT ``lookup.typed_pair_floor.floor_best_typed_pair``.** That
-    module documents itself as "one implementation, two callers" of the
-    ARTIST_PLUS_ALBUM class; this is a third and a *different* class — candidate
-    artist axis over raw ``r.artist_variants()`` where the shared one adds the
-    LML#1206 suffix-stripped forms (a strict superset), and a bare ``release_id``
-    tie-break where the shared one ranks exact raw credits first. Folding them
-    changes the non-pinned search path for every lookup, so it is tracked as
-    WXYC/library-metadata-lookup#1339 and must not ride here. Query-side variants
-    are *lists*, which the shared helper's string signature cannot take anyway.
-    """
-    return find_best_typed_match(
-        candidates,
-        query_artist=artist_variants,
-        query_title=album_variants,
-        artist_fn=lambda r: r.artist_variants(),
-        title_fn=lambda r: r.album,
-        # LML#1097: deterministic tie-break by release_id, mirroring
-        # release_resolution.py's (-score, release_id) sort key.
-        key_fn=lambda r: r.release_id,
-    )
 
 
 async def _bind_resolved_release(
@@ -355,6 +325,7 @@ async def fetch_artwork_for_items(
                 # alone it would admit every album-ranked carry-through. Here it
                 # makes that degrade's exclusion explicit rather than incidental.
                 if found_on_compilation and resolved is not None and resolved.track_confirmed:
+                    get_cache_stats_recorder().record(PIN_YIELDED_CARRIED_STAT_KEY)
                     return await _bind_resolved_release(
                         discogs_service,
                         resolved,
@@ -529,6 +500,10 @@ async def fetch_artwork_for_items(
                             allow_release_resolution_fallback=allow_release_resolution_fallback,
                         )
                 return None
+            if demoted_pin is not None:
+                # Row 3: the matcher's answer replaces the pin. With row 2 this is
+                # the whole binding delta the flag's rollout note says to watch.
+                get_cache_stats_recorder().record(PIN_YIELDED_MATCHER_STAT_KEY)
             if not result.artwork_url:
                 fallback = await _resolve_fallback_artwork(
                     discogs_service,

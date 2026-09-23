@@ -74,11 +74,11 @@ MODULE_BUDGETS: dict[str, int] = {
     # budget a second time — the boundary the comment above prescribes. The floor
     # itself stays with its caller and is passed in, because the gate's whole
     # correctness rests on the pin and the matcher being scored by ONE function.
-    # 86 lines measured; 1.3x = 111.8 -> 150. `lookup/artwork.py` keeps 550:
+    # 154 lines measured; 1.3x = 200.2 -> 250. `lookup/artwork.py` keeps 550:
     # 1.3 x 547 = 711 would argue for more, but the ceiling is deliberately
     # under-granted and the next growth there has a named seam — `_floor_candidates`
     # plus the variant-derivation block in `fetch_one` that feeds it.
-    "lookup/override_floor.py": 150,
+    "lookup/override_floor.py": 250,
     "lookup/caller_reason.py": 100,
     "lookup/candidate_memo.py": 150,
     "lookup/concurrency.py": 200,

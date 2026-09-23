@@ -467,3 +467,56 @@ class TestCandidateShapeParity:
 
         assert pin.artist == "Some Artist"
         assert pin.artist_credits is None
+
+
+@pytest.mark.asyncio
+class TestDegenerateCardRow:
+    """A query-side short-circuit is not a failed grading.
+
+    ``find_best_typed_match`` drops empty/whitespace query variants and returns
+    ``None`` when either axis has nothing usable left -- *before* it scores a
+    single candidate. Reading that as "the pin failed" would demote a pin on a
+    grading that never ran, and on decision-table row 2 it silently discards a
+    hand-verified pin in favour of the carried release. Defective card rows are
+    exactly the population this gate is built to be conservative about.
+    """
+
+    async def test_card_with_no_artist_keeps_the_pin_over_a_carried_release(
+        self, floor_gate_on, monkeypatch
+    ):
+        monkeypatch.setenv("LML_RESOLVE_COMPILATION_RELEASE", "true")
+        get_settings.cache_clear()
+        svc = _service()
+        carried = ResolvedRelease(
+            release_id=_CARRIED_RELEASE_ID,
+            release_url=f"https://www.discogs.com/release/{_CARRIED_RELEASE_ID}",
+            is_compilation=False,
+            album_title=_CARD_TITLE,
+            track_confirmed=True,
+        )
+        item = make_library_item(id=_LIBRARY_ID, artist="   ", title=_CARD_TITLE)
+
+        results = await fetch_artwork_for_items(
+            [item],
+            svc,
+            {_LIBRARY_ID: carried},
+            release_overrides={_LIBRARY_ID: _PIN_RELEASE_ID},
+            found_on_compilation=True,
+        )
+
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.release_id == _PIN_RELEASE_ID
+        svc.cache_service.get_release_lean.assert_not_awaited()
+
+    async def test_card_with_no_title_keeps_the_pin(self, floor_gate_on):
+        svc = _service()
+        item = make_library_item(id=_LIBRARY_ID, artist=_CARD_ARTIST, title="")
+
+        results = await fetch_artwork_for_items(
+            [item], svc, release_overrides={_LIBRARY_ID: _PIN_RELEASE_ID}
+        )
+
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.release_id == _PIN_RELEASE_ID
