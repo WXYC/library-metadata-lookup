@@ -390,3 +390,80 @@ class TestExemptionInvariant:
                 "property behind `release_overrides_validated` no longer holds; the "
                 "exemption must become a tagged map before this widens."
             )
+
+
+class TestCandidateShapeParity:
+    """The pin and a matcher candidate must present the SAME artist axis.
+
+    ``get_release_lean`` (the grading read) and ``search_releases`` (every
+    candidate the pin is compared against) disagree about the scalar ``artist``
+    field: the former is the first ``extra = 0`` credit alone, the latter the
+    ``string_agg`` of all of them. Copying the scalar through would leave the
+    pin's candidate-side axis strictly narrower than every real candidate's --
+    the mirror image of the query-side bias the shared variant lists exist to
+    prevent. Measured on the 61,046-pin corpus, 554 pins (7.8% of floor
+    failures) flip on this difference alone.
+    """
+
+    def test_multi_credit_release_presents_the_joined_credit_like_the_cache_row(self):
+        from discogs.models import DiscogsSearchResult
+        from generated.api_models import DiscogsArtistCredit
+
+        metadata = ReleaseMetadataResponse(
+            release_id=1,
+            title="Genevieve",
+            # What `get_release_lean` puts here: the FIRST credit only.
+            artist="Fust",
+            release_url="https://www.discogs.com/release/1",
+            artists=[
+                DiscogsArtistCredit(name="Fust"),
+                DiscogsArtistCredit(name="Merce Lemon"),
+            ],
+        )
+        # What `search_releases` yields for the same release.
+        cache_row = {
+            "release_id": 1,
+            "title": "Genevieve",
+            "artist_name": "Fust, Merce Lemon",
+            "artist_credits": ["Fust", "Merce Lemon"],
+        }
+
+        pin = DiscogsSearchResult.from_release_metadata(metadata)
+        candidate = DiscogsSearchResult.from_cache_row(cache_row)
+
+        assert pin.artist == candidate.artist == "Fust, Merce Lemon"
+        assert pin.artist_variants() == candidate.artist_variants()
+
+    def test_single_credit_release_is_unchanged(self):
+        from discogs.models import DiscogsSearchResult
+        from generated.api_models import DiscogsArtistCredit
+
+        metadata = ReleaseMetadataResponse(
+            release_id=2,
+            title="On Your Own Love Again",
+            artist="Jessica Pratt",
+            release_url="https://www.discogs.com/release/2",
+            artists=[DiscogsArtistCredit(name="Jessica Pratt")],
+        )
+
+        pin = DiscogsSearchResult.from_release_metadata(metadata)
+
+        assert pin.artist == "Jessica Pratt"
+
+    def test_creditless_row_falls_back_to_the_scalar(self):
+        """A cache row with no ``release_artist`` children still has to grade --
+        the scalar is all there is, and an empty join would read as a tombstone."""
+        from discogs.models import DiscogsSearchResult
+
+        metadata = ReleaseMetadataResponse(
+            release_id=3,
+            title="Some Album",
+            artist="Some Artist",
+            release_url="https://www.discogs.com/release/3",
+            artists=[],
+        )
+
+        pin = DiscogsSearchResult.from_release_metadata(metadata)
+
+        assert pin.artist == "Some Artist"
+        assert pin.artist_credits is None
