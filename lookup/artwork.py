@@ -13,6 +13,7 @@ on the search path). Extracted verbatim from ``lookup/orchestrator.py``
 
 import asyncio
 import logging
+from collections.abc import Iterable
 
 from wxyc_etl.text import is_compilation_artist
 
@@ -27,6 +28,7 @@ from lookup.artist_resolution import (
 )
 from lookup.fallback_artwork import _resolve_fallback_artwork
 from lookup.matching import is_self_titled, map_library_format_to_discogs
+from lookup.override_floor import pin_clears_floor
 from lookup.release_resolution import ResolvedRelease, resolve_release_for_track_cached
 from lookup.rowless import ROWLESS_LIBRARY_ID, ROWLESS_NO_ALBUM_CONFIDENCE
 
@@ -45,6 +47,40 @@ compilations to None at the 80/80 floor (LML#478 round-2 finding).
 Module-public (no underscore prefix) so ``scripts/measure_artwork_match_floor.py``
 can import the same constants the runtime path uses — keeping the
 measurement's compilation handling provably-aligned with production."""
+
+
+def _floor_candidates(
+    candidates: Iterable[DiscogsSearchResult],
+    *,
+    artist_variants: list[str],
+    album_variants: list[str],
+) -> DiscogsSearchResult | None:
+    """The LML#478 80/80 floor as this module applies it — one call, two callers.
+
+    Named for LML#1290 so ``lookup.override_floor.pin_clears_floor`` can grade a
+    pin through the *same* match class the matcher is held to, rather than
+    re-expressing it.
+
+    **Deliberately NOT ``lookup.typed_pair_floor.floor_best_typed_pair``.** That
+    module documents itself as "one implementation, two callers" of the
+    ARTIST_PLUS_ALBUM class; this is a third and a *different* class — candidate
+    artist axis over raw ``r.artist_variants()`` where the shared one adds the
+    LML#1206 suffix-stripped forms (a strict superset), and a bare ``release_id``
+    tie-break where the shared one ranks exact raw credits first. Folding them
+    changes the non-pinned search path for every lookup, so it is tracked as
+    WXYC/library-metadata-lookup#1339 and must not ride here. Query-side variants
+    are *lists*, which the shared helper's string signature cannot take anyway.
+    """
+    return find_best_typed_match(
+        candidates,
+        query_artist=artist_variants,
+        query_title=album_variants,
+        artist_fn=lambda r: r.artist_variants(),
+        title_fn=lambda r: r.album,
+        # LML#1097: deterministic tie-break by release_id, mirroring
+        # release_resolution.py's (-score, release_id) sort key.
+        key_fn=lambda r: r.release_id,
+    )
 
 
 async def _bind_resolved_release(
@@ -116,6 +152,7 @@ async def fetch_artwork_for_items(
     allow_release_resolution_fallback: bool = True,
     found_on_compilation: bool = False,
     release_overrides: dict[int, int] | None = None,
+    release_overrides_validated: bool = False,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Fetch artwork for multiple library items in parallel.
 
@@ -152,13 +189,28 @@ async def fetch_artwork_for_items(
     costs no extra Discogs fan-out (unlike the flag-gated lazy
     ``resolve_release_for_track`` fallback below).
 
+    ``release_overrides_validated`` (LML#1290): the pins in ``release_overrides``
+    were derived THIS request by a probe that already validated them (the LML#1332
+    shelf rebind), rather than read from the catalog-pin table. Such pins are
+    exempt from the override floor — the probe exists precisely to bypass it. One
+    boolean rather than a per-id tag because the map is all-or-nothing by
+    construction: ``lookup/validation.py``'s ``Step3bResult`` narrows
+    ``library_results`` to the single shelf row it pinned, so the orchestrator's
+    prefetch always takes its full-coverage lane and returns those pins verbatim.
+    A test pins that narrowing; if it ever widens, the boolean stops being sound
+    and this must become a tagged map.
+
     ``release_overrides`` (LML#850): a ``library_id -> discogs_release_id`` map of
     **hand-verified** pins the orchestrator prefetched for this request (empty /
     ``None`` when the ``lml_library_release_override`` flag is off, so this is a
     no-op by default). A pinned library row binds its release BEFORE the
     trust-bind and fuzzy paths — a human override is the most-trusted signal and
     wins even over a carried release; it also skips the Discogs ``search``, so an
-    override hit *reduces* per-request work.
+    override hit *reduces* per-request work. **Both claims are conditional once
+    ``lml_override_requires_floor`` is on** (LML#1290): a pin that fails the
+    80/80 floor yields to a track-validated carried release, or to the floored
+    search — which it then pays for. It is still never *dropped*; see that flag
+    and ``lookup/override_floor.py``.
     """
     if not discogs_service:
         return [(item, None) for item in items]
@@ -169,12 +221,76 @@ async def fetch_artwork_for_items(
     # per-item search title), which would shadow this request-level value.
     request_album = album
     settings = get_settings()
+    require_override_floor = settings.lml_override_requires_floor
+    # LML#1290 grades the pin off the LOCAL cache only — never the read-through's
+    # API leg — so a breaker shed cannot reach ``fetch_one``'s catch-all and
+    # discard a whole item. ``getattr`` mirrors ``lookup/album_level_match.py``'s
+    # access idiom; ``LookupServices.discogs_cache`` is a separate handle whose
+    # identity with this one is not established, so it is deliberately not used.
+    cache_service = getattr(discogs_service, "cache_service", None)
     resolve_compilation_release = settings.lml_resolve_compilation_release
     resolve_nonlibrary_release = settings.lml_resolve_nonlibrary_release
     resolve_artist_canonical = settings.lml_resolve_artist_canonical
 
     async def fetch_one(item: LibraryItem) -> DiscogsSearchResult | None:
         try:
+            # LML#1290 hoist: the seam read, the album/artist derivation and the
+            # query-side variant lists are built HERE, above the override branch,
+            # rather than at the search below. The override floor grades the pin
+            # against the very lists the matcher will use, and scoring one side on
+            # a wider set than the other would bias the gate systematically. The
+            # derivation depends only on ``item`` and ``resolved``, so the move is
+            # free: string work with no I/O, on a path that may return early.
+            #
+            # The widened seam carries a ResolvedRelease; its album_title is the
+            # value the seam used to carry as a bare string. Falls back to the
+            # library row's own title when no release was resolved for this id.
+            resolved = discogs_titles.get(item.id)
+
+            album = resolved.album_title if resolved is not None else item.title
+
+            # Self-titled albums stored as "S/t" should use the artist name
+            # for Discogs search instead of the abbreviation
+            if is_self_titled(album or ""):
+                album = item.artist
+
+            # The *track* artist (pre-compilation-form mutation). The lazy
+            # release-resolution fallback validates the per-track credit, so it
+            # must probe with this — never the bare "Various" search form below.
+            track_artist = item.alternate_artist_name or item.artist or ""
+
+            artist = track_artist
+            if is_compilation_artist(artist):
+                artist = COMPILATION_ARTIST_SEARCH_FORM
+
+            # Query variants:
+            # - Artist: the compilation search uses bare "Various" because
+            #   that's the form Discogs's search endpoint accepts, but
+            #   Discogs's canonical artist field for compilations is often
+            #   "Various Artists" (sometimes with a "(N)" disambig suffix).
+            #   Score against both forms. Numeric disambigs clear via
+            #   token_sort_ratio's tolerance; descriptive disambigs
+            #   ("Brazilian Soul" etc.) are a known floor-rejection edge
+            #   case — accept the loss in exchange for the floor's gain.
+            # - Album: when discogs_titles[item.id] overrides the library
+            #   title with a long Discogs-canonical form (compilation rescue
+            #   path), Discogs's own search results may carry just the short
+            #   library-side title. Score against both. Don't readmit a
+            #   self-titled trigger ("S/t" etc.) as a variant — that would
+            #   let a wrong-release candidate with album="S/t" clear the
+            #   floor trivially.
+            artist_variants = [artist]
+            if artist == COMPILATION_ARTIST_SEARCH_FORM:
+                artist_variants.append(COMPILATION_ARTIST_CANONICAL_FORM)
+            album_variants = [album or ""]
+            if item.title and item.title != album and not is_self_titled(item.title):
+                album_variants.append(item.title)
+
+            # Set when a pin was graded and failed: the item then bypasses the
+            # unfloored trust-binds below and takes the floored search, falling
+            # back to the pin if the matcher finds nothing (decision-table row 4).
+            demoted_pin: ResolvedRelease | None = None
+
             # LML#850: a hand-verified library-release override is the most-
             # trusted signal — consult it FIRST, before the LML#604 trust-bind
             # and the LML#478 artist-floor fuzzy search. On a hit, trust-bind
@@ -182,7 +298,8 @@ async def fetch_artwork_for_items(
             # the pinned release's cover and downstream ``enrich_one`` pulls its
             # tracklist), skipping the fuzzy ``search`` entirely — an override
             # hit costs one cached ``get_release``, not a search + N-candidate
-            # floor. ``album_title`` stays the library row's own title so the
+            # floor — unless ``lml_override_requires_floor`` demotes it, which
+            # adds one lean cache read always and the search on a failure. ``album_title`` stays the library row's own title so the
             # surfaced album keeps the catalog naming; the pin only redirects the
             # release id (and thus the tracklist). ``> 0`` mirrors the DB CHECK;
             # a malformed 0/negative pin can never reach the ``release_id=0``
@@ -195,18 +312,56 @@ async def fetch_artwork_for_items(
                     is_compilation=False,
                     album_title=item.title or "",
                 )
-                return await _bind_resolved_release(
-                    discogs_service,
-                    override_release,
-                    item,
-                    album=request_album,
-                    allow_release_resolution_fallback=allow_release_resolution_fallback,
-                )
-
-            # The widened seam carries a ResolvedRelease; its album_title is the
-            # value the seam used to carry as a bare string. Falls back to the
-            # library row's own title when no release was resolved for this id.
-            resolved = discogs_titles.get(item.id)
+                # LML#1290: a catalog pin must clear the same floor every
+                # non-pinned candidate clears (30.8% of 61,046 do not). Skipped
+                # for same-request-derived pins — the LML#1332 shelf-rebind probe
+                # exists precisely TO bypass this floor, and re-imposing it there
+                # lands on the release_id=0 sentinel with no artwork or tracklist.
+                if not require_override_floor or release_overrides_validated:
+                    return await _bind_resolved_release(
+                        discogs_service,
+                        override_release,
+                        item,
+                        album=request_album,
+                        allow_release_resolution_fallback=allow_release_resolution_fallback,
+                    )
+                if await pin_clears_floor(
+                    cache_service,
+                    override_release_id,
+                    floor=_floor_candidates,
+                    artist_variants=artist_variants,
+                    album_variants=album_variants,
+                ):
+                    return await _bind_resolved_release(
+                        discogs_service,
+                        override_release,
+                        item,
+                        album=request_album,
+                        allow_release_resolution_fallback=allow_release_resolution_fallback,
+                    )
+                # Demoted, not dropped. A pin failing the *title* floor is no
+                # evidence against a release ``validate_release_for_track``
+                # confirmed carries the track, so a track-validated carried
+                # release wins outright — routing past it would hand the
+                # decision back to the unvalidated title pick, verbatim the
+                # LML#956 divergence ("Greatest hits of the 50s & 60s" binding
+                # Plaza House's 13332759 over the validated 605487).
+                #
+                # ``track_confirmed`` is ANDed in as a guard, not used alone: it
+                # defaults to True and is False only on the LML#1318 degrade, so
+                # alone it would admit every album-ranked carry-through. Here it
+                # makes that degrade's exclusion explicit rather than incidental.
+                if found_on_compilation and resolved is not None and resolved.track_confirmed:
+                    return await _bind_resolved_release(
+                        discogs_service,
+                        resolved,
+                        item,
+                        album=request_album,
+                        allow_release_resolution_fallback=allow_release_resolution_fallback,
+                    )
+                # Otherwise the floored search decides — and if it decides
+                # nothing, the pin is re-bound below rather than dropped.
+                demoted_pin = override_release
 
             # Carried-release trust-and-bind: the search strategy already
             # resolved and validated this release this same request, so bind it
@@ -230,7 +385,12 @@ async def fetch_artwork_for_items(
                 and item.id == ROWLESS_LIBRARY_ID
                 and allow_release_resolution_fallback
             )
-            if bind_carried and resolved is not None:
+            # ``demoted_pin is None``: a failed pin already yielded to any
+            # track-validated release above, so a carry reaching here is
+            # unvalidated and has no claim over the floored search. Without it
+            # the demoted pin is replaced by another unfloored confidence-1.0
+            # bind (LML#1188's shape).
+            if bind_carried and resolved is not None and demoted_pin is None:
                 return await _bind_resolved_release(
                     discogs_service,
                     resolved,
@@ -255,7 +415,12 @@ async def fetch_artwork_for_items(
             # lml_resolve_compilation_release (that flag was off at prod runtime).
             # The row-less (id==0) carry-through is bound by the flag-gated
             # bind_carried branch above, so it is excluded here.
-            if found_on_compilation and resolved is not None and item.id != ROWLESS_LIBRARY_ID:
+            if (
+                found_on_compilation
+                and resolved is not None
+                and item.id != ROWLESS_LIBRARY_ID
+                and demoted_pin is None
+            ):
                 return await _bind_resolved_release(
                     discogs_service,
                     resolved,
@@ -263,22 +428,6 @@ async def fetch_artwork_for_items(
                     album=request_album,
                     allow_release_resolution_fallback=allow_release_resolution_fallback,
                 )
-
-            album = resolved.album_title if resolved is not None else item.title
-
-            # Self-titled albums stored as "S/t" should use the artist name
-            # for Discogs search instead of the abbreviation
-            if is_self_titled(album or ""):
-                album = item.artist
-
-            # The *track* artist (pre-compilation-form mutation). The lazy
-            # release-resolution fallback validates the per-track credit, so it
-            # must probe with this — never the bare "Various" search form below.
-            track_artist = item.alternate_artist_name or item.artist or ""
-
-            artist = track_artist
-            if is_compilation_artist(artist):
-                artist = COMPILATION_ARTIST_SEARCH_FORM
 
             response = await discogs_service.search(
                 DiscogsSearchRequest(
@@ -293,42 +442,27 @@ async def fetch_artwork_for_items(
             # artwork for releases that share a title across multiple albums
             # (LML#478, e.g. Noura Mint Seymali's "Hebebeb (Zrag)" on both
             # *Tzenni* and *Yenbett*).
-            #
-            # Query variants:
-            # - Artist: the compilation search uses bare "Various" because
-            #   that's the form Discogs's search endpoint accepts, but
-            #   Discogs's canonical artist field for compilations is often
-            #   "Various Artists" (sometimes with a "(N)" disambig suffix).
-            #   Score against both forms. Numeric disambigs clear via
-            #   token_sort_ratio's tolerance; descriptive disambigs
-            #   ("Brazilian Soul" etc.) are a known floor-rejection edge
-            #   case — accept the loss in exchange for the floor's gain.
-            # - Album: when discogs_titles[item.id] overrides the library
-            #   title with a long Discogs-canonical form (compilation rescue
-            #   path), Discogs's own search results may carry just the short
-            #   library-side title. Score against both. Don't readmit a
-            #   self-titled trigger ("S/t" etc.) as a variant — that would
-            #   let a wrong-release candidate with album="S/t" clear the
-            #   floor trivially.
-            artist_variants = [artist]
-            if artist == COMPILATION_ARTIST_SEARCH_FORM:
-                artist_variants.append(COMPILATION_ARTIST_CANONICAL_FORM)
-            album_variants = [album or ""]
-            if item.title and item.title != album and not is_self_titled(item.title):
-                album_variants.append(item.title)
-            result = find_best_typed_match(
+            result = _floor_candidates(
                 # None = degraded Discogs call (LML#918); score an empty set,
                 # which falls into the same "no match" path as an empty response.
                 response.results if response is not None else [],
-                query_artist=artist_variants,
-                query_title=album_variants,
-                artist_fn=lambda r: r.artist_variants(),
-                title_fn=lambda r: r.album,
-                # LML#1097: deterministic tie-break by release_id, mirroring
-                # release_resolution.py's (-score, release_id) sort key.
-                key_fn=lambda r: r.release_id,
+                artist_variants=artist_variants,
+                album_variants=album_variants,
             )
             if result is None:
+                # LML#1290 row 4: the matcher found nothing either — the defective
+                # card row, where it scores against the same broken strings the pin
+                # failed. Re-bind rather than drop: dropping turns a correct binding
+                # into a no-match, and no row of the table may create one that does
+                # not already occur. Before the lazy fallback, so the table stays total.
+                if demoted_pin is not None:
+                    return await _bind_resolved_release(
+                        discogs_service,
+                        demoted_pin,
+                        item,
+                        album=request_album,
+                        allow_release_resolution_fallback=allow_release_resolution_fallback,
+                    )
                 # A found-on-compilation in-library row that carries a validated
                 # release is already trust-bound above (before this re-search), so
                 # no such row reaches here — the remaining found-on-compilation
@@ -360,7 +494,8 @@ async def fetch_artwork_for_items(
                     probe_artist = track_artist
                     swapped = False
                     if resolve_artist_canonical:
-                        cache_service = getattr(discogs_service, "cache_service", None)
+                        # Same handle the override floor uses, resolved once per
+                        # request above (LML#1290) instead of re-derived per item.
                         outcome = await resolve_canonical_artist(
                             track_artist, cache_service=cache_service
                         )

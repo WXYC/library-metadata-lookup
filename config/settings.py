@@ -606,7 +606,10 @@ class Settings(BaseSettings):
             "pinned release BEFORE the trust-bind and the artist-floor fuzzy search. "
             "A hand-verified human override is the most-trusted signal, so it wins "
             "even over a carried release; an override hit also short-circuits the "
-            "fuzzy search + its Discogs call. The pinned release then flows through "
+            "fuzzy search + its Discogs call. Both of those claims -- winning over a "
+            "carried release, and short-circuiting the search -- become CONDITIONAL "
+            "when lml_override_requires_floor is also True; see that flag. "
+            "The pinned release then flows through "
             "enrichment on the normal title gate: a genuine library-album lookup "
             "(request album == the catalog row title, as the dj-site picker and BS "
             "flowsheet-linkage send) passes it and the pin's tracklist surfaces; a "
@@ -618,6 +621,35 @@ class Settings(BaseSettings):
             "byte-for-byte. Ship dark; seed the table, then flip True in Railway "
             "after the staging sample verifies. Fully reversible: DELETE the "
             "source-stamped rows + flip False. See WXYC/library-metadata-lookup#850."
+        ),
+    )
+    lml_override_requires_floor: bool = Field(
+        default=False,
+        description=(
+            "When True, a library-release override pin must clear the same LML#478 "
+            "80/80 ARTIST_PLUS_ALBUM floor every non-pinned candidate clears before "
+            "it is bound. A pin audit measured 30.8% of the 61,046 pins as unable to "
+            "clear it -- the override exempts all of them by construction, which is "
+            "how a 2002 catalog card (Grace Jones, Nightclubbing) came to serve a "
+            "2014 pressing. On a floor failure the pin is DEMOTED, never dropped: a "
+            "track-validated carried release wins if one exists, else the floored "
+            "matcher's answer, else the pin stands. No row of that table produces a "
+            "no-match that does not already occur, because dropping a floor-failing "
+            "pin would regress correct pins on defective card rows -- a card with its "
+            "artist and title swapped and both misspelled fails the floor while its "
+            "pin is right, and the matcher scores against that same broken row. "
+            "Grading reads the pin from the local cache only "
+            "(DiscogsCacheService.get_release_lean), never the read-through's API "
+            "leg, so a Discogs outage cannot demote a pin; every degrade -- no cache "
+            "wired, no row, a read failure, or a LML#510 tombstone's empty identifier "
+            "sentinels -- keeps the pin. Same-request-derived pins (the LML#1332 "
+            "shelf-rebind probe, which exists precisely TO bypass this floor) are "
+            "exempt and never graded. Costs one lean PG read per pinned row, plus a "
+            "fuzzy search only on a floor failure. No effect unless "
+            "lml_library_release_override is also True, and none on /lookup/bulk, "
+            "where the prefetch is skipped entirely. Ship dark; flip in staging and "
+            "watch the binding delta before prod. See "
+            "WXYC/library-metadata-lookup#1290."
         ),
     )
     lml_resolve_sibling_pressing_artwork: bool = Field(

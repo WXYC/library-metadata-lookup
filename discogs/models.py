@@ -341,6 +341,38 @@ class DiscogsSearchResult(BaseModel):
             confidence=confidence,
         )
 
+    @classmethod
+    def from_release_metadata(cls, metadata: ReleaseMetadataResponse) -> DiscogsSearchResult:
+        """Build a candidate from a hydrated release (LML#1290).
+
+        Sibling of :meth:`from_cache_row`, for the caller that has a release in
+        hand rather than a search row: the override floor grades a hand-verified
+        pin by scoring the pinned release as a single candidate against the
+        card's query variants, and ``find_best_typed_match`` consumes
+        ``DiscogsSearchResult`` members (``artist_variants()`` / ``album``).
+
+        ``artists[]`` maps to ``artist_credits`` for the same reason
+        ``from_cache_row`` maps the query's aggregated credits: the LML#784
+        artist axis scores ``artist`` **plus** those variants, so leaving them
+        unset would make the pin's candidate-side axis strictly narrower than
+        every real candidate's and bias the gate toward demoting pins. Empty
+        collapses to ``None``, matching the API arm's shape.
+
+        Does NOT guard the LML#510 tombstone (``title = ""`` / ``artist = ""``):
+        that is the caller's decision, because "could not read this release" and
+        "read a 404 marker" want the same answer at the *policy* layer (keep the
+        pin) and this mapping has no policy. See
+        ``lookup.artwork._pin_clears_floor``.
+        """
+        return cls(
+            release_id=metadata.release_id,
+            release_url=metadata.release_url,
+            artist=metadata.artist,
+            artist_credits=[c.name for c in metadata.artists] or None,
+            album=metadata.title,
+            artwork_url=metadata.artwork_url,
+        )
+
     def artist_variants(self) -> list[str | None]:
         """Artist-axis scoring variants: the joined credit plus the PG arm's
         per-credit entries (LML#784). Max-over these lets a single-credit
