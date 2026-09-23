@@ -998,19 +998,27 @@ async def _step_fetch_artwork(
             #
             # LML#1290: pins the LML#1332 shelf-rebind probe derived THIS request
             # are exempt from the override floor — that probe exists precisely to
-            # bypass it. One boolean suffices because the map is all-or-nothing:
-            # ``Step3bResult`` narrows ``library_results`` to the single shelf row
-            # it pinned (``lookup/validation.py``), so the prefetch below always
-            # takes its full-coverage lane and hands those pins back verbatim
-            # rather than re-reading the catalog table. ``test_step3b_release_
-            # overrides_imply_single_shelf_row`` pins that narrowing; if it ever
-            # widens, this must become a tagged map.
-            overrides_are_validated = bool(state.release_overrides)
+            # bypass it. ``Step3bResult`` narrows ``library_results`` to the single
+            # shelf row it pinned (``lookup/validation.py``), so the prefetch below
+            # always takes its full-coverage lane and hands those pins back
+            # verbatim; ``test_step3b_release_overrides_imply_single_shelf_row``
+            # pins that narrowing.
             override_map = await _prefetch_release_overrides(
                 state.library_results,
                 services.discogs_cache_pg,
                 allow_release_resolution_fallback=services.allow_release_resolution_fallback,
                 prefetched=state.release_overrides,
+            )
+            # Derived from the map that came BACK, not from the fact that the
+            # probe produced pins: those coincide only while the full-coverage
+            # lane holds. If coverage were ever partial the prefetch falls
+            # through to the catalog table, and asserting "validated" over that
+            # map would exempt every catalog pin on the request — the one failure
+            # this gate exists to prevent. This form is false the moment the map
+            # carries anything the probe did not put there.
+            overrides_are_validated = bool(override_map) and all(
+                state.release_overrides.get(library_id) == release_id
+                for library_id, release_id in override_map.items()
             )
             for _ in state.library_results:
                 services.telemetry.record_api_call("discogs")

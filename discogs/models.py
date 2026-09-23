@@ -374,7 +374,7 @@ class DiscogsSearchResult(BaseModel):
         that is the caller's decision, because "could not read this release" and
         "read a 404 marker" want the same answer at the *policy* layer (keep the
         pin) and this mapping has no policy. See
-        ``lookup.artwork._pin_clears_floor``.
+        ``lookup.override_floor.pin_clears_floor``.
         """
         credits = [c.name for c in metadata.artists]
         return cls(

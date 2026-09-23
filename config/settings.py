@@ -628,8 +628,10 @@ class Settings(BaseSettings):
         description=(
             "When True, a library-release override pin must clear the same LML#478 "
             "80/80 ARTIST_PLUS_ALBUM floor every non-pinned candidate clears before "
-            "it is bound. Measured on the full corpus: 18.0% of gradeable pins fail "
-            "that floor, and demoting them changes 590 bindings (1.0% of 61,046) -- "
+            "it is bound. Measured on the full corpus: of 61,046 pins, 20,520 point at "
+            "a release absent from the discogs cache and 892 at an absent card, leaving "
+            "39,634 gradeable; 7,125 of those (18.0%) fail the floor, and demoting them "
+            "changes 590 bindings (1.0% of the corpus) -- "
             "pins on the RIGHT artist and a plainly WRONG album, e.g. card 1790 "
             "Massive Attack / 'No Protection' pinned to 'Ritual Spirit' (title axis "
             "29.6). This floor scores artist and title ONLY, so it cannot separate "
