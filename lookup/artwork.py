@@ -313,7 +313,10 @@ async def fetch_artwork_for_items(
                     album_title=item.title or "",
                 )
                 # LML#1290: a catalog pin must clear the same floor every
-                # non-pinned candidate clears (30.8% of 61,046 do not). Skipped
+                # non-pinned candidate clears (18.0% of gradeable pins do
+                # not; demoting them changes 590 bindings). The floor scores
+                # artist and title only, so it catches a WRONG ALBUM, never a
+                # wrong pressing of the right one — see LML#1340. Skipped
                 # for same-request-derived pins — the LML#1332 shelf-rebind probe
                 # exists precisely TO bypass this floor, and re-imposing it there
                 # lands on the release_id=0 sentinel with no artwork or tracklist.

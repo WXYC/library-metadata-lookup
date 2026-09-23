@@ -351,12 +351,24 @@ class DiscogsSearchResult(BaseModel):
         card's query variants, and ``find_best_typed_match`` consumes
         ``DiscogsSearchResult`` members (``artist_variants()`` / ``album``).
 
-        ``artists[]`` maps to ``artist_credits`` for the same reason
-        ``from_cache_row`` maps the query's aggregated credits: the LML#784
-        artist axis scores ``artist`` **plus** those variants, so leaving them
-        unset would make the pin's candidate-side axis strictly narrower than
-        every real candidate's and bias the gate toward demoting pins. Empty
-        collapses to ``None``, matching the API arm's shape.
+        **``artist`` is rebuilt from ``artists[]``, NOT copied from
+        ``metadata.artist``, and that is the whole point of this method.** The
+        two sources disagree: ``get_release_lean`` sets the scalar ``artist`` to
+        the FIRST ``extra = 0`` credit alone, while ``search_releases`` — which
+        produces every candidate the pin is compared against — sets it to
+        ``string_agg(artist_name, ', ' ORDER BY artist_name)`` over the same
+        rows. Copying the scalar would leave the pin's candidate-side artist
+        axis missing the joined form that every real candidate carries, so a
+        query typed as the joined credit ("Merce Lemon & Fust") could clear
+        against a matcher candidate and fail against the pin. Measured on the
+        61,046-pin corpus: 554 pins (7.8% of floor failures) flip on this
+        difference alone. ``artists`` is already the ``extra = 0`` set in
+        ``artist_name`` order, so the join reproduces the aggregate exactly.
+
+        ``artists[]`` also maps to ``artist_credits`` for the same reason
+        ``from_cache_row`` maps the query's ``array_agg``: the LML#784 artist
+        axis scores ``artist`` **plus** those variants. Empty collapses to
+        ``None``, matching the API arm's shape.
 
         Does NOT guard the LML#510 tombstone (``title = ""`` / ``artist = ""``):
         that is the caller's decision, because "could not read this release" and
@@ -364,11 +376,13 @@ class DiscogsSearchResult(BaseModel):
         pin) and this mapping has no policy. See
         ``lookup.artwork._pin_clears_floor``.
         """
+        credits = [c.name for c in metadata.artists]
         return cls(
             release_id=metadata.release_id,
             release_url=metadata.release_url,
-            artist=metadata.artist,
-            artist_credits=[c.name for c in metadata.artists] or None,
+            # Mirrors ``_CREDIT_AGG_LATERAL``'s ``string_agg(..., ', ')``.
+            artist=", ".join(credits) if credits else metadata.artist,
+            artist_credits=credits or None,
             album=metadata.title,
             artwork_url=metadata.artwork_url,
         )
