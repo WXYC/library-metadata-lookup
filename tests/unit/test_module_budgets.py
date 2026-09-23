@@ -69,6 +69,16 @@ MODULE_BUDGETS: dict[str, int] = {
     # smallest multiple of 50 at or above is still 550, so the formula's answer did
     # not change and lowering it would only manufacture a false ceiling.
     "lookup/fallback_artwork.py": 200,
+    # LML#1290: `pin_clears_floor` (the override gate's grading read + degrade
+    # contract) moved out of `lookup/artwork.py` rather than raising that file's
+    # budget a second time — the boundary the comment above prescribes. The floor
+    # itself stays with its caller and is passed in, because the gate's whole
+    # correctness rests on the pin and the matcher being scored by ONE function.
+    # 86 lines measured; 1.3x = 111.8 -> 150. `lookup/artwork.py` keeps 550:
+    # 1.3 x 547 = 711 would argue for more, but the ceiling is deliberately
+    # under-granted and the next growth there has a named seam — `_floor_candidates`
+    # plus the variant-derivation block in `fetch_one` that feeds it.
+    "lookup/override_floor.py": 150,
     "lookup/caller_reason.py": 100,
     "lookup/candidate_memo.py": 150,
     "lookup/concurrency.py": 200,

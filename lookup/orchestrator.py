@@ -995,6 +995,17 @@ async def _step_fetch_artwork(
             # prefetch is one query (flag-gated, off by default, and skipped on
             # the bulk drain) — an override hit then short-circuits the Discogs
             # search in fetch_one, so a hit reduces per-request work.
+            #
+            # LML#1290: pins the LML#1332 shelf-rebind probe derived THIS request
+            # are exempt from the override floor — that probe exists precisely to
+            # bypass it. One boolean suffices because the map is all-or-nothing:
+            # ``Step3bResult`` narrows ``library_results`` to the single shelf row
+            # it pinned (``lookup/validation.py``), so the prefetch below always
+            # takes its full-coverage lane and hands those pins back verbatim
+            # rather than re-reading the catalog table. ``test_step3b_release_
+            # overrides_imply_single_shelf_row`` pins that narrowing; if it ever
+            # widens, this must become a tagged map.
+            overrides_are_validated = bool(state.release_overrides)
             override_map = await _prefetch_release_overrides(
                 state.library_results,
                 services.discogs_cache_pg,
@@ -1012,6 +1023,7 @@ async def _step_fetch_artwork(
                 allow_release_resolution_fallback=services.allow_release_resolution_fallback,
                 found_on_compilation=state.found_on_compilation,
                 release_overrides=override_map,
+                release_overrides_validated=overrides_are_validated,
             )
 
     if state.serve_blocked_probe_pair is not None:
