@@ -20,6 +20,7 @@ import time
 
 import aiosqlite
 import asyncpg
+import httpx
 from rapidfuzz import fuzz
 
 logging.basicConfig(
@@ -47,23 +48,57 @@ Common patterns to fix:
 - Strip label names prepended to titles: "Warp - Artificial Intelligence" → "Artificial Intelligence"
 - If the entry is clearly not a real album (just a catalog ID, radio station promo, test pressing, etc.), return "SKIP" for both artist and title
 
-Return ONLY a JSON array of objects with "original_artist", "original_title", "canonical_artist", "canonical_title" keys. No explanation."""
+Return one object per input entry, in the same order."""
 
 USER_TEMPLATE = """Canonicalize these album entries:
 
 {entries_json}"""
 
 
+# The API enforces the response shape, so nothing downstream strips markdown
+# fences or has to survive a JSONDecodeError.
+RESULT_SCHEMA = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "original_artist": {"type": "string"},
+                        "original_title": {"type": "string"},
+                        "canonical_artist": {"type": "string"},
+                        "canonical_title": {"type": "string"},
+                    },
+                    "required": [
+                        "original_artist",
+                        "original_title",
+                        "canonical_artist",
+                        "canonical_title",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["results"],
+        "additionalProperties": False,
+    },
+}
+
+
 async def call_haiku(
-    client: object,
+    client: httpx.AsyncClient,
     entries: list[dict[str, str]],
     semaphore: asyncio.Semaphore,
 ) -> list[dict]:
-    """Send a batch of artist+title pairs to Claude Haiku for canonicalization."""
-    import httpx
+    """Send a batch of artist+title pairs to Claude Haiku for canonicalization.
 
-    assert isinstance(client, httpx.AsyncClient)
-
+    Retries only transport-level failures. A malformed body is no longer one
+    of them: `output_config` makes the response schema-valid or an error, so a
+    JSONDecodeError here is a bug to surface rather than an attempt to burn.
+    """
     entries_json = json.dumps(entries, indent=2)
     async with semaphore:
         for attempt in range(3):
@@ -79,6 +114,7 @@ async def call_haiku(
                         "model": MODEL,
                         "max_tokens": 4096,
                         "system": SYSTEM_PROMPT,
+                        "output_config": {"format": RESULT_SCHEMA},
                         "messages": [
                             {
                                 "role": "user",
@@ -89,24 +125,18 @@ async def call_haiku(
                     timeout=60.0,
                 )
                 resp.raise_for_status()
-                data = resp.json()
-                text = data["content"][0]["text"]
-
-                # Parse JSON from response (handle markdown code blocks)
-                text = text.strip()
-                if text.startswith("```"):
-                    text = re.sub(r"^```(?:json)?\n?", "", text)
-                    text = re.sub(r"\n?```$", "", text)
-
-                return json.loads(text)
+                return json.loads(resp.json()["content"][0]["text"])["results"]
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 529 and attempt < 2:
-                    wait = 2 ** (attempt + 1)
-                    log.warning(f"API overloaded, retrying in {wait}s...")
-                    await asyncio.sleep(wait)
-                    continue
+                if e.response.status_code in (429, 529) or e.response.status_code >= 500:
+                    if attempt < 2:
+                        wait = 2 ** (attempt + 1)
+                        log.warning(
+                            f"API returned {e.response.status_code}, retrying in {wait}s..."
+                        )
+                        await asyncio.sleep(wait)
+                        continue
                 raise
-            except Exception:
+            except httpx.TransportError:
                 if attempt < 2:
                     await asyncio.sleep(2)
                     continue
@@ -153,8 +183,6 @@ async def main(args: argparse.Namespace) -> None:
     skipped = 0
     errors = 0
     processed = 0
-
-    import httpx
 
     async with httpx.AsyncClient() as client:
 
