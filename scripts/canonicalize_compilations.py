@@ -14,7 +14,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 
 import asyncpg
 import httpx
@@ -43,15 +42,45 @@ Common patterns to fix:
 - Fix typos and misspellings
 - If the title is clearly not a real album (just a catalog ID, radio station promo, etc.), return "SKIP"
 
-Return ONLY a JSON array of objects with "original" and "canonical" keys. No explanation."""
+Return one object per input title, in the same order."""
 
 USER_TEMPLATE = """Canonicalize these compilation album titles:
 
 {titles_json}"""
 
 
+# The API enforces the response shape, so nothing downstream strips markdown
+# fences or has to survive a JSONDecodeError.
+RESULT_SCHEMA = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "original": {"type": "string"},
+                        "canonical": {"type": "string"},
+                    },
+                    "required": ["original", "canonical"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["results"],
+        "additionalProperties": False,
+    },
+}
+
+
 async def call_haiku(client: httpx.AsyncClient, titles: list[str]) -> list[dict]:
-    """Send a batch of titles to Claude Haiku for canonicalization."""
+    """Send a batch of titles to Claude Haiku for canonicalization.
+
+    `output_config` makes the response schema-valid or an error, so there is
+    no markdown fence to strip and no parse failure to recover from.
+    """
     titles_json = json.dumps(titles, indent=2)
     resp = await client.post(
         "https://api.anthropic.com/v1/messages",
@@ -64,6 +93,7 @@ async def call_haiku(client: httpx.AsyncClient, titles: list[str]) -> list[dict]
             "model": MODEL,
             "max_tokens": 4096,
             "system": SYSTEM_PROMPT,
+            "output_config": {"format": RESULT_SCHEMA},
             "messages": [
                 {"role": "user", "content": USER_TEMPLATE.format(titles_json=titles_json)}
             ],
@@ -71,16 +101,7 @@ async def call_haiku(client: httpx.AsyncClient, titles: list[str]) -> list[dict]
         timeout=60.0,
     )
     resp.raise_for_status()
-    data = resp.json()
-    text = data["content"][0]["text"]
-
-    # Parse JSON from response (handle markdown code blocks)
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\n?", "", text)
-        text = re.sub(r"\n?```$", "", text)
-
-    return json.loads(text)
+    return json.loads(resp.json()["content"][0]["text"])["results"]
 
 
 async def main(args: argparse.Namespace) -> None:
