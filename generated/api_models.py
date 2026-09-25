@@ -723,6 +723,10 @@ class UpdateAlbumRequest(BaseModel):
     format_id: int | None = None
     artist_id: int | None = None
     alternate_artist_name: str | None = None
+    album_artist: str | None = Field(
+        None,
+        description="Credited album artist on a compilation card (BS#2004). Omit to leave the stored value alone; `null` or an empty string clears it.\n",
+    )
     disc_quantity: int | None = None
     code_number: conint(ge=1, le=32767) | None = Field(
         None,
@@ -2008,7 +2012,7 @@ class Delta(IntEnum):
 
 class SongLikeDelta(BaseModel):
     """
-    One increment or decrement to a song's public like tally. Carries the song's identity and nothing whatsoever about who liked it — see `POST /likes/tally` for why no listener key exists anywhere in this contract.
+    One increment or decrement to a song's public like tally. Carries the song's identity and nothing whatsoever about who liked it — see `POST /likes/tally` for why this tally endpoint stores no listener key of any kind, and the `# Listener request replies` section below for the contract's one documented departure from that stance.
     """
 
     song_key: str = Field(
@@ -2058,6 +2062,69 @@ class SongLikeTallyResponse(BaseModel):
     resolved: int = Field(
         ...,
         description="Of `applied`, how many carried or matched a WXYC catalog artist id. Diagnostic only: it describes catalog coverage, not the caller.",
+    )
+
+
+class Provider(StrEnum):
+    """
+    The push provider the token was issued by. `fcm` is reserved for the Android fast-follow — no server accepts it in v1.
+    """
+
+    apns = "apns"
+    fcm = "fcm"
+
+
+class Environment(StrEnum):
+    """
+    Debug builds register `sandbox` tokens. This column exists so a sandbox token is never wrongly invalidated by production APNs.
+    """
+
+    production = "production"
+    sandbox = "sandbox"
+
+
+class PushTokenRegistration(BaseModel):
+    """
+    Request/delete body for `PUT` / `DELETE /listener/push-token`. Keys the registration on `(provider, token)`.
+    """
+
+    provider: Provider = Field(
+        ...,
+        description="The push provider the token was issued by. `fcm` is reserved for the Android fast-follow — no server accepts it in v1.",
+    )
+    token: str = Field(..., description="The opaque provider-issued push token.")
+    environment: Environment = Field(
+        ...,
+        description="Debug builds register `sandbox` tokens. This column exists so a sandbox token is never wrongly invalidated by production APNs.",
+    )
+    bundle_id: str = Field(
+        ..., description="The app's bundle identifier, which becomes the `apns-topic`."
+    )
+
+
+class ListenerRequestReply(BaseModel):
+    """
+    One DJ reply addressed to a listener's song/shout-out request.
+    """
+
+    request_id: UUID = Field(..., description="The request this reply answers.")
+    reply_id: UUID = Field(..., description="This reply's own identity.")
+    body: constr(min_length=1, max_length=500) = Field(..., description="The reply text.")
+    sent_at: AwareDatetime = Field(..., description="When the reply was sent.")
+    on_air_dj_name: str | None = Field(
+        None,
+        description="The flowsheet's on-air DJ name, stamped at send time. `null` for confirmed automation or when no name was available to stamp. Provenance only, never an authorization input — the listener-facing card does not render it.",
+    )
+
+
+class ListenerRequestRepliesResponse(BaseModel):
+    """
+    Response body for `GET /listener/request-replies`.
+    """
+
+    replies: list[ListenerRequestReply] = Field(
+        ...,
+        description="Replies addressed to the caller. Empty when nothing is addressed to them.",
     )
 
 
@@ -2431,6 +2498,68 @@ class LookupEmailResponse(BaseModel):
     email: str | None = Field(...)
 
 
+class UpdateIdentityRequest(BaseModel):
+    """
+    Body for POST /auth/wxyc/update-identity — a WXYC-custom route (see the path's own comment), not a better-auth one. Both properties are optional individually but at least one must be present; a body carrying neither is a 400. Only an ABSENT key means "leave unchanged": blank is NOT a clear and an explicit `null` is NOT absent — the handler 400s on both, because these are the two identity fields the settings form marks non-clearable and a blank handle would leave the public on-air name stale rather than empty.
+    Values are TRIMMED before validation and storage, which has two client-visible consequences: `maxLength` is enforced against the trimmed value, so a 260-character value with trailing spaces is accepted by the server even though a validator generated from this schema rejects it; and the 200 echoes the trimmed value, so a client diffing the echo against what it sent may see a difference on a perfectly successful write.
+
+    """
+
+    realName: constr(max_length=255) | None = Field(
+        None,
+        description="The DJ's legal name — PII (docs/pii.md), never rendered to a public surface. Maps to auth_user.real_name.\n",
+    )
+    djName: constr(max_length=255) | None = Field(
+        None,
+        description='The on-air HANDLE, not a legal name — this is the value public surfaces display. Maps to auth_user.dj_name. The literal "Anonymous" (case-insensitive) is rejected: resolveDjDisplayName treats it as unusable, so accepting it would leave dj_name and the derived auth_user.name in disagreement.\n',
+    )
+
+
+class UpdateIdentityAck(Enum):
+    """
+    Always `true` — present so a generated TypeScript client gets a literal rather than a bare boolean. NAMED at top level rather than declared inline on UpdateIdentityResponse.status, and that is not style: the Python generator (datamodel-code-generator) emits an unnamed inline enum as a bare top-level class numbered by document order, so an inline `enum: [true]` here lands as `Status1` and silently renumbers the pre-existing AutoDJAck.status enum to `Status2` — a rename of an unrelated committed type in every consumer that vendors the generated models. Same trap OTPType documents; same fix the DeviceAuth error codes use.
+
+    """
+
+    boolean_True = True
+
+
+class UpdateIdentityResponse(BaseModel):
+    """
+    Echoes back only the fields the request actually wrote, so a client can tell a partial submission from a full one. The echoed values are the TRIMMED ones the server stored, which will differ from what was sent if the input carried leading or trailing whitespace.
+
+    """
+
+    status: UpdateIdentityAck
+    userId: str
+    realName: str | None = None
+    djName: str | None = None
+
+
+class UpdateIdentityErrorCode(StrEnum):
+    """
+    Machine-readable failure reason from POST /auth/wxyc/update-identity. NAMED at top level rather than inlined on UpdateIdentityErrorResponse.code — see UpdateIdentityAck's description for the Python-generator trap that makes an inline enum here a bare `Code` class plus a silent renumbering of unrelated types. The DeviceAuth error codes above follow the same convention.
+
+    """
+
+    UNAUTHORIZED = "UNAUTHORIZED"
+    FORBIDDEN = "FORBIDDEN"
+    INVALID_REQUEST = "INVALID_REQUEST"
+    INVALID_DJ_NAME = "INVALID_DJ_NAME"
+    UPDATE_FAILED = "UPDATE_FAILED"
+
+
+class UpdateIdentityErrorResponse(BaseModel):
+    """
+    `{error, code}` — the shape POST /auth/wxyc/update-identity's own Express handler answers with. Distinct from AuthPlainErrorResponse (`{error}` only, no code) and from both better-auth shapes. `code` is machine-readable and stable; `error` is display text.
+    `code` is REQUIRED because every response that uses this schema carries one. The handler's only code-less error body is the generic 500 from its Express catch, and that response points at AuthPlainErrorResponse instead — so a generated client never has to unwrap an optional that is guaranteed in practice.
+
+    """
+
+    error: str
+    code: UpdateIdentityErrorCode
+
+
 class OTPType(StrEnum):
     """
     The `type` values better-auth's email-otp plugin schema declares. WXYC's OTP sign-in flow always sends "sign-in". "change-email" is declared by the plugin's own schema but always 400s on POST /auth/email-otp/send-verification-otp — a dedicated /email-otp/request-email-change route exists for it. Named rather than left as an inline enum on SendLoginCodeRequest.type: an unnamed inline enum is emitted by the Python generator (datamodel-code-generator) as a bare `Type` class, silently renumbering (`Type1`, `Type2`, ...) every other unnamed inline enum in the document depending on declaration order — see the issue #379 review finding that named this one.
@@ -2486,7 +2615,7 @@ class AuthRateLimitedResponse(BaseModel):
 
 class AuthPlainErrorResponse(BaseModel):
     """
-    `{error: string}` — the shape Backend-Service's own Express layer answers with, distinct from both of better-auth's own shapes (`{message, code}` on AuthErrorResponse; `{message}` with no code on AuthRateLimitedResponse). Two sources share it: the WXYC-custom /auth/wxyc/lookup-email route (apps/auth/app.ts lookupEmailHandler, `res.json({error: ...})`) and the express-rate-limit mutation limiter (apps/auth/app.ts authMutationRateLimit — 10 requests / 15 min, keyed on X-Real-IP, SHARED across all nine mount prefixes it's attached to via one reused middleware instance — `message: {error: ...}`). Those nine prefixes are NOT all in this section: six are (/auth/sign-in, /auth/sign-up, /auth/email-otp/send-verification-otp, /auth/forget-password, /auth/wxyc/lookup-email, /auth/wxyc/complete-onboarding) and three are device-authorization paths from the section above (/auth/device/code, /auth/device/approve, /auth/device/deny). The budget is one bucket across all nine, so device traffic and sign-in traffic from the same X-Real-IP consume each other's allowance — which the control room, sharing one egress address, can reach in ordinary use. THREE different roles depending on the operation: on FIVE of the six 429-declaring operations below, this is the SECOND layer — better-auth's own tighter, per-path AuthRateLimitedResponse limiter (3 requests per 10-60s, depending on path) is what a client meets first in practice, since its window is far easier to exhaust than this shared 10-per-15-min budget, and a client reaches this shape directly only by avoiding the internal limiter (e.g. spacing requests out) while still accumulating past 10 requests across the shared budget. On the sixth, POST /auth/wxyc/lookup-email, this is the ONLY layer — that operation never reaches better-auth's internal limiter at all (see its own 429 description), so its 429 is always this shape, never a "second" layer reached after a first. On the three device- authorization operations this is likewise the ONLY layer, for the opposite reason to lookup-email's: those DO reach better-auth's internal limiter, but `/device/*` matches none of its special rules and falls through to the general 100-per-10s default, which this 10-per-15-min bucket always exhausts first — see AuthRateLimitedResponse's device paragraph. `express-rate-limit@8.6.2` (apps/auth's pinned version) also sets the standard `Retry-After` header (plus `RateLimit` / `RateLimit-Policy`, from its `standardHeaders: 'draft-7'` config) on every 429 this schema answers — verified against node_modules/express-rate-limit/dist/index.cjs.
+    `{error: string}` — the shape Backend-Service's own Express layer answers with, distinct from both of better-auth's own shapes (`{message, code}` on AuthErrorResponse; `{message}` with no code on AuthRateLimitedResponse). Two sources share it: the WXYC-custom /auth/wxyc/lookup-email route (apps/auth/app.ts lookupEmailHandler, `res.json({error: ...})`) and the express-rate-limit mutation limiter (apps/auth/app.ts authMutationRateLimit — 10 requests / 15 min, keyed on X-Real-IP, SHARED across all nine mount prefixes it's attached to via one reused middleware instance — `message: {error: ...}`). A THIRD source joined them: `updateUserRateLimit` (apps/auth/app.ts — 300 requests / 60 s, same X-Real-IP key, a SEPARATE instance and budget), which bounds POST /auth/update-user and POST /auth/wxyc/update-identity. Do not size retry backoff for those two from the 10-per-15-min figure below — it is the wrong bucket by more than an order of magnitude. POST /auth/wxyc/update-identity also answers this shape on its 500; its other errors use UpdateIdentityErrorResponse. Those nine prefixes are NOT all in this section: six are (/auth/sign-in, /auth/sign-up, /auth/email-otp/send-verification-otp, /auth/forget-password, /auth/wxyc/lookup-email, /auth/wxyc/complete-onboarding) and three are device-authorization paths from the section above (/auth/device/code, /auth/device/approve, /auth/device/deny). The budget is one bucket across all nine, so device traffic and sign-in traffic from the same X-Real-IP consume each other's allowance — which the control room, sharing one egress address, can reach in ordinary use. THREE different roles depending on the operation: on FIVE of the six 429-declaring operations below, this is the SECOND layer — better-auth's own tighter, per-path AuthRateLimitedResponse limiter (3 requests per 10-60s, depending on path) is what a client meets first in practice, since its window is far easier to exhaust than this shared 10-per-15-min budget, and a client reaches this shape directly only by avoiding the internal limiter (e.g. spacing requests out) while still accumulating past 10 requests across the shared budget. On the sixth, POST /auth/wxyc/lookup-email, this is the ONLY layer — that operation never reaches better-auth's internal limiter at all (see its own 429 description), so its 429 is always this shape, never a "second" layer reached after a first. On the three device- authorization operations this is likewise the ONLY layer, for the opposite reason to lookup-email's: those DO reach better-auth's internal limiter, but `/device/*` matches none of its special rules and falls through to the general 100-per-10s default, which this 10-per-15-min bucket always exhausts first — see AuthRateLimitedResponse's device paragraph. `express-rate-limit@8.6.2` (apps/auth's pinned version) also sets the standard `Retry-After` header (plus `RateLimit` / `RateLimit-Policy`, from its `standardHeaders: 'draft-7'` config) on every 429 this schema answers — verified against node_modules/express-rate-limit/dist/index.cjs.
 
     """
 
