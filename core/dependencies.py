@@ -206,6 +206,8 @@ async def _build_discogs_pool() -> asyncpg.Pool | None:
             timeout=10,
         )
         logger.info("Discogs cache pool connected")
+        global _last_built_discogs_pool
+        _last_built_discogs_pool = pool
         return pool
     except Exception as e:
         logger.warning(f"Failed to create Discogs cache pool: {type(e).__name__}: {e}")
@@ -221,6 +223,25 @@ async def _build_discogs_pool() -> asyncpg.Pool | None:
 # ``PgSource(dsn=...)`` on the same DSN — a second-pool window that
 # uncoordinated FD exhaustion + #357's racy-init audit both flagged.
 get_discogs_pool, close_discogs_pool = async_singleton(_build_discogs_pool)
+
+# Last pool `_build_discogs_pool` handed back, for observers that must not
+# *cause* a pool. `async_singleton` caches only a non-None instance, so calling
+# the getter when the factory returns None (API-only mode, or the database
+# unreachable at boot) re-runs the factory every time -- which turns a caller
+# on a timer into a pool builder on a timer. Nothing here is a lifecycle
+# handle: read it, never close it.
+_last_built_discogs_pool: asyncpg.Pool | None = None
+
+
+def peek_discogs_pool() -> asyncpg.Pool | None:
+    """The discogs-cache pool if one has been built, without building one.
+
+    For gauges and diagnostics only (LML#1354's memory profiler). Returns
+    ``None`` before the first successful build and after `close_discogs_pool`,
+    and may briefly return a closed pool during shutdown -- a reader must
+    tolerate its accessors raising.
+    """
+    return _last_built_discogs_pool
 
 
 async def _build_discogs_service() -> DiscogsService | None:
