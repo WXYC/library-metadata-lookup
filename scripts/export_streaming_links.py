@@ -13,15 +13,15 @@ see ``_has_match_provenance`` for the one such refusal it makes.
 This script only ever READS streaming_availability.db, structurally -- see the
 ``mode=ro`` open in ``main`` for why that is the open mode rather than a convention.
 
-Callers (both pass ``--dry-run`` or not, but neither tolerates this script mutating
-the artifact):
+Callers, neither of which tolerates this script mutating the artifact:
 
-- ``discogs-etl/scripts/sync-library.sh``, in the daily library sync. Its
-  ``tests/e2e/test_sync_library_e2e.py`` also loads ``main`` dynamically.
-- this repo's ``.github/workflows/refresh-streaming.yml`` "Verify export" step, which
-  runs between the pipeline writing the artifact and ``POST /admin/upload-streaming-db``
-  pushing it back to the canonical bucket -- so a read-write open here could have
-  repaired-then-uploaded a silently altered artifact.
+- ``discogs-etl/scripts/sync-library.sh``, in the daily library sync, WITHOUT
+  ``--dry-run``. Its ``tests/e2e/test_sync_library_e2e.py`` also loads ``main``
+  dynamically.
+- this repo's ``.github/workflows/refresh-streaming.yml`` "Verify export" step, WITH
+  ``--dry-run``. It runs between the pipeline writing the artifact and
+  ``POST /admin/upload-streaming-db`` pushing it back to the canonical bucket -- so a
+  read-write open here could have repaired-then-uploaded a silently altered artifact.
 
 Usage:
     .venv/bin/python scripts/export_streaming_links.py [--library-db PATH] [--streaming-db PATH] [--dry-run]
@@ -44,8 +44,14 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# The two `albums` columns that record what a stored spotify_url was matched
-# against. A row with neither is unauditable without re-fetching the Spotify page.
+# The two `albums` columns that record what a stored spotify_url was matched against.
+# A row with neither records no comparison at all: it may still carry a
+# `spotify_confidence` score, but a score with no record of the strings that produced
+# it cannot be audited without re-fetching the Spotify page.
+#
+# Entries must stay lowercase ASCII -- they are the target `_ascii_fold` compares
+# declared column names against, and a mixed-case entry here would silently fail the
+# subset check and leave the gate inert.
 SPOTIFY_PROVENANCE_COLUMNS = ("spotify_matched_artist", "spotify_matched_title")
 
 
@@ -106,15 +112,22 @@ def _has_match_provenance(matched_artist: str | None, matched_title: str | None)
 
 
 def _ascii_fold(name: str) -> str:
-    """Lowercase `name` the way SQLite folds identifiers: ASCII only.
+    """Lowercase `name` only when it is pure ASCII, for comparison against an ASCII target.
 
-    SQLite resolves column names case-insensitively, but only over A-Z. Python's
-    ``str.casefold()`` folds the full Unicode range and ``str.lower()`` nearly does,
-    so either would over-match: ``ſpotify_matched_artist`` casefolds equal to
-    ``spotify_matched_artist`` (and U+212A KELVIN SIGN lowercases to ``k``). The gate
-    would then activate on a column the SELECT cannot resolve, turning the documented
-    inert fallback into a hard crash in the daily sync. Folding only ASCII keeps
-    "the gate activates" and "the column can be queried" the same predicate.
+    NOT a faithful model of SQLite's identifier folding, which is per-character: this
+    is all-or-nothing on the whole string, so a mixed name like ``ſpotify_Matched_Artist``
+    comes back untouched where SQLite would still fold its ASCII half. That is
+    sufficient here for a structural reason worth stating, since it is what makes the
+    helper safe rather than merely adequate: the only targets are the pure-ASCII
+    ``SPOTIFY_PROVENANCE_COLUMNS``, and SQLite's fold never maps a non-ASCII byte onto
+    an ASCII one, so no non-ASCII declared name can ever fold onto one of them. The
+    comparison therefore cannot fail open OR crash. Do not reuse this against a
+    non-ASCII target without revisiting that.
+
+    Python's own folds are what this avoids: ``str.casefold()`` maps U+017F onto ``s``
+    and ``str.lower()`` maps U+212A onto ``k``, either of which would make the gate
+    activate on a column the SELECT cannot resolve -- turning the documented inert
+    fallback into a hard crash in the daily sync.
     """
     return name.lower() if name.isascii() else name
 
@@ -144,17 +157,20 @@ def main(args: argparse.Namespace) -> None:
         log.error(f"Streaming database {args.streaming_db} does not exist; skipping export")
         return
 
-    # Read-ONLY on purpose, and structurally rather than by convention. Opening a
-    # SQLite file read-write performs hot-journal rollback at open time, so if the
-    # upstream streaming pipeline died mid-transaction, merely connecting would
-    # mutate the bucket-canonical artifact. `mode=ro` refuses instead of silently
-    # repairing a file that is expensive to recollect.
+    # Read-ONLY on purpose, and structurally rather than by convention. If the upstream
+    # streaming pipeline died mid-transaction it leaves a hot journal, and a read-write
+    # handle rolls that journal back -- mutating the bucket-canonical artifact, a file
+    # expensive enough to recollect that CLAUDE.md names it. (Measured: the rollback
+    # fires on the FIRST READ, not at connect; connect itself leaves the file
+    # byte-identical either way. The distinction matters only for where the error
+    # surfaces, not for whether the mutation happens.)
     #
     # The trade, stated because it is a new failure mode in a cross-repo daily job:
-    # where a read-write open used to roll the journal back and carry on, this now
-    # raises at the first read. That is the intended direction for a precious
-    # artifact -- a loud failed sync is recoverable, a silently altered artifact is
-    # not -- but it does mean a stray journal beside the artifact fails the run.
+    # where a read-write handle used to roll the journal back and carry on, this now
+    # raises at the first read and the file stays byte-identical. That is the intended
+    # direction for a precious artifact -- a loud failed sync is recoverable, a
+    # silently altered artifact is not -- but it does mean a stray hot journal beside
+    # the artifact fails the run rather than being quietly repaired.
     #
     # `as_uri()` rather than an f-string: a `#`, `?` or `%` in the path is
     # significant inside a URI, and interpolating it raw makes SQLite end the path
@@ -167,7 +183,7 @@ def main(args: argparse.Namespace) -> None:
     # database cannot answer the question", NOT "no row has provenance" -- reading
     # it the second way would strip every Spotify URL from such a file.
     album_columns = _table_columns(sa, "albums")
-    provenance_gate_active = {_ascii_fold(c) for c in SPOTIFY_PROVENANCE_COLUMNS} <= album_columns
+    provenance_gate_active = set(SPOTIFY_PROVENANCE_COLUMNS) <= album_columns
     if provenance_gate_active:
         provenance_select = ", ".join(SPOTIFY_PROVENANCE_COLUMNS)
     else:
@@ -175,9 +191,13 @@ def main(args: argparse.Namespace) -> None:
             f"albums table lacks {' / '.join(SPOTIFY_PROVENANCE_COLUMNS)}; "
             "the Spotify match-provenance gate is inert for this database"
         )
-        # Derived, not hardcoded "NULL, NULL": the SELECT's column count has to track
-        # the constant, or adding a third provenance column crashes the row unpack on
-        # the gate-ACTIVE path only -- the one path the legacy fixtures never take.
+        # Derived rather than a hardcoded "NULL, NULL" so both branches select the same
+        # column count. To be clear about what that does and does not buy: the row
+        # unpack below still names ten locals, so adding a third provenance column
+        # breaks either way. What this changes is that it then breaks on BOTH paths
+        # instead of only the gate-active one -- which is the path no legacy fixture
+        # and no cross-repo caller exercises, so the break would otherwise pass CI and
+        # surface in the daily production sync.
         provenance_select = ", ".join("NULL" for _ in SPOTIFY_PROVENANCE_COLUMNS)
 
     # Get all albums with at least one streaming URL
@@ -216,6 +236,15 @@ def main(args: argparse.Namespace) -> None:
         # ever compared. Spotify-only on purpose: cross-artist URL sharing in what is
         # SERVED is a Spotify anomaly (1.78%, vs Apple 0.13% and Discogs 0.40%), and
         # every other service's URL for the same row is left untouched.
+        #
+        # ROUTED, deliberately not closed here: this predicate keys on provenance being
+        # ABSENT, so it says nothing about a row whose provenance is present but
+        # ONE-AXIS. Sibling LML#1353's drain work introduces exactly that shape -- a
+        # title-only acceptance that DOES record what it compared -- which passes this
+        # gate and is then served as a two-axis `verified`. Catching it needs a signal
+        # this table does not carry, and hard-coding the sibling's status vocabulary
+        # here would couple the two merge orders, so it belongs to the serve seam
+        # alongside the `verified` demotion rather than to this refusal.
         if (
             provenance_gate_active
             and spotify
@@ -331,13 +360,11 @@ def main(args: argparse.Namespace) -> None:
     log.info(f"Library release IDs with streaming links (total): {len(links)}")
     sa.close()
 
-    # Per-service coverage on BOTH paths, not only --dry-run. This is the daily sync's
-    # only visibility into what the gate produced: no upload guard can see
-    # `streaming_links.spotify_url` (sync-library.sh's floor counts apple_music_url,
-    # /admin/upload-library-db's relative guard measures library_rows, and
-    # /admin/upload-streaming-db measures the artifact this script never writes), so a
-    # provenance column that is present but unpopulated would otherwise strip Spotify
-    # wholesale and exit 0 silently. `spotify_url: 0` in the log is the tell.
+    # Per-service coverage on BOTH paths, not only --dry-run. NOTHING downstream
+    # guards `streaming_links.spotify_url` -- see the three upload/floor guards
+    # enumerated in docs/scripts.md, none of which can observe this column -- so a
+    # provenance column that is present but unpopulated would strip Spotify wholesale
+    # and exit 0 silently. This log is the daily sync's only tell: `spotify_url: 0`.
     service_counts: Counter[str] = Counter()
     for entry in links.values():
         for k in entry:
