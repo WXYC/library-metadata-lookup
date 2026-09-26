@@ -289,10 +289,21 @@ class ResultsDB:
                 vocabulary. ``not_found`` does not match the prefix.
 
         Returns:
-            The number of rows written -- 0 when ``skip_if_resolved`` declined, and
-            0 for a service this table has no column family for.
+            The number of rows written -- 0 when ``skip_if_resolved`` declined.
+
+        Raises:
+            ValueError: for a service this table has no column family for, matching
+                ``StreamingCatalogDao.update_result``'s behaviour on the same input.
+                Returning 0 instead meant a caller with a typo'd service token
+                ("apple_music" for "apple") wrote nothing, counted every album a
+                miss, and finished cleanly -- a whole drain run that reports as
+                complete while persisting nothing.
         """
         assert self._db is not None
+        if service not in ("spotify", "apple", "deezer"):
+            raise ValueError(
+                f"unknown streaming service {service!r}: update_result accepts spotify/apple/deezer"
+            )
         async with self._write_lock:
             now = datetime.now(UTC).isoformat()
             rowcount = 0
