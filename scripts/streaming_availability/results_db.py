@@ -276,13 +276,17 @@ class ResultsDB:
         Sorrow" beside a URL resolving to "Silk Torpedo" (LML#1353).
 
         Args:
-            skip_if_resolved: Decline the write when this service is already
-                ``found`` for the album. A caller whose answer is weaker than a
-                guarded 80/80 match passes True: the row it would overwrite cost a
-                rate-limited round trip (the line ``reset_misses_to_pending``
-                already holds on the reset path), and the PG mirror's
-                found-demotion trigger raises on exactly that transition, so the
-                write would fail later at upload time instead.
+            skip_if_resolved: Decline the write when this service already holds a
+                collected answer for the album. A caller whose answer is weaker
+                than a guarded 80/80 match passes True: the row it would overwrite
+                cost a rate-limited round trip (the line
+                ``reset_misses_to_pending`` already holds on the reset path), and
+                the PG mirror's found-demotion trigger raises on exactly that
+                transition, so the write would fail later at upload time instead.
+                Spelled ``NOT LIKE 'found%'`` so the whole collected family is
+                covered — ``found`` and LML#1353's ``found_title_only``, and any
+                later sibling — without this module restating the decision layer's
+                vocabulary. ``not_found`` does not match the prefix.
 
         Returns:
             The number of rows written -- 0 when ``skip_if_resolved`` declined, and
@@ -293,7 +297,7 @@ class ResultsDB:
             now = datetime.now(UTC).isoformat()
             rowcount = 0
             if service == "spotify":
-                guard = " AND spotify_status != 'found'" if skip_if_resolved else ""
+                guard = " AND spotify_status NOT LIKE 'found%'" if skip_if_resolved else ""
                 cursor = await self._db.execute(
                     f"""UPDATE albums SET
                        spotify_status = ?, spotify_url = ?, spotify_id = ?,
@@ -313,7 +317,7 @@ class ResultsDB:
                 )
                 rowcount = cursor.rowcount
             elif service == "apple":
-                guard = " AND apple_status != 'found'" if skip_if_resolved else ""
+                guard = " AND apple_status NOT LIKE 'found%'" if skip_if_resolved else ""
                 cursor = await self._db.execute(
                     f"""UPDATE albums SET
                        apple_status = ?, apple_url = ?,
@@ -324,7 +328,7 @@ class ResultsDB:
                 )
                 rowcount = cursor.rowcount
             elif service == "deezer":
-                guard = " AND deezer_status != 'found'" if skip_if_resolved else ""
+                guard = " AND deezer_status NOT LIKE 'found%'" if skip_if_resolved else ""
                 cursor = await self._db.execute(
                     f"""UPDATE albums SET
                        deezer_status = ?, deezer_url = ?,

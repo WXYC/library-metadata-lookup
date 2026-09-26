@@ -258,6 +258,57 @@ class TestUpdateResultSkipIfResolved:
         assert rows[0]["deezer_checked_at"]
 
     @pytest.mark.asyncio
+    async def test_declines_to_overwrite_a_title_only_row_too(self, db):
+        """A second drain pass must not replace a collected URL with a lateral one.
+
+        Phase 2 of the compilation drain selects on `spotify_status = 'skipped'`
+        alone, so a re-run re-queries a row already at `deezer_status =
+        'found_title_only'`. Whatever the service returns that time is not better
+        evidence, and the row it would replace was collected at API cost.
+        """
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.update_result(
+            album_id,
+            "deezer",
+            "found_title_only",
+            url="https://www.deezer.com/album/first",
+            confidence=88.0,
+            matched_artist="Various Artists",
+            matched_title="Aluminum Tunes",
+        )
+        landed = await db.update_result(
+            album_id,
+            "deezer",
+            "found_title_only",
+            url="https://www.deezer.com/album/second",
+            confidence=81.0,
+            matched_artist="Various Artists",
+            matched_title="Aluminum Tunez",
+            skip_if_resolved=True,
+        )
+        assert landed == 0
+        rows = await db.get_all_results()
+        assert rows[0]["deezer_url"] == "https://www.deezer.com/album/first"
+
+    @pytest.mark.asyncio
+    async def test_a_not_found_row_is_not_treated_as_resolved(self, db):
+        """`not_found` must not match the collected-status family."""
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.update_result(album_id, "deezer", "not_found")
+        landed = await db.update_result(
+            album_id,
+            "deezer",
+            "found_title_only",
+            url="https://www.deezer.com/album/1",
+            skip_if_resolved=True,
+        )
+        assert landed == 1
+
+    @pytest.mark.asyncio
     async def test_default_still_overwrites(self, db):
         """Every existing caller keeps the unconditional write it was written for."""
         album_id = await self._found_album(db)
