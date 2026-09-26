@@ -548,11 +548,12 @@ The Phase 1 narrowing that remains is deliberate and costs recall: a compilation
 
 **`found_title_only`.** A title-only acceptance is written to `{service}_status` as `found_title_only`, never `found`, so `{service}_confidence` has exactly one meaning per row: the score of the axes the row names. It is also the predicate a serve-side gate can filter on — note that `scripts/export_streaming_links.py`'s album-level export is `spotify_url IS NOT NULL` today, with no status or provenance condition. A title-only decision will not overwrite a row already at `found` (`ResultsDB.update_result(..., skip_if_resolved=True)`): a guarded match outranks a one-axis one, and the mirrored PG table raises on that demotion.
 
-**Readers of `{service}_status` that predate the new value** and are *not* taught it here — a `found_title_only` row is invisible to each. Tracked in [LML#1358](https://github.com/WXYC/library-metadata-lookup/issues/1358); the rollup is the one that actively regresses the artifact rather than merely skipping it:
+`phase_album_rollup` in `scripts/track_streaming/__main__.py` **is** taught the value, and is the only reader changed here: it sets `spotify_status = 'found'` for every album whose tracks fully resolve, carrying no url, confidence or provenance, so promoting a title-only row relabelled a one-axis album match as a guarded one while leaving its one-axis confidence in place. Its predicate is now `NOT LIKE 'found%'`. Track resolution is evidence about tracks and cannot upgrade the album's own match. It had to change here rather than as follow-up work, because it runs over exactly the population this drain writes.
+
+**The other readers of `{service}_status` are *not* taught the value** — a `found_title_only` row is simply invisible to each. Tracked in [LML#1358](https://github.com/WXYC/library-metadata-lookup/issues/1358):
 
 | site | effect |
 |---|---|
-| `scripts/track_streaming/__main__.py:439` `phase_album_rollup` | promotes `found_title_only` → `found` on the first rollup after the drain, leaving the one-axis confidence and provenance in place — the "confidence without axes" row this fix removes. Reachable: its compilation extraction selects exactly `is_compilation = 1` |
 | `scripts/track_streaming/__main__.py:157` local streaming index (`= 'found'` per service) | a compilation whose only streaming presence is title-only never has its tracks resolved |
 | `ResultsDB.get_deezer_hits_pending_spotify` and its PG twin `catalog_dao.py:395` | a title-only Deezer hit doesn't cascade into the Spotify pass |
 | `scripts/streaming_availability/report.py:92` | reporting drift |
