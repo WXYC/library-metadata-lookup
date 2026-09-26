@@ -10,11 +10,18 @@ after a host + well-formedness check only (LML#1352). So this script is the last
 place that can refuse a URL for which no match evidence exists at all --
 see ``_has_match_provenance`` for the one such refusal it makes.
 
-This script only ever READS streaming_availability.db, and enforces that by opening
-it ``mode=ro`` rather than by containing no UPDATE. That file is the single
-bucket-canonical copy of rate-limited Apple/Spotify/Deezer results and is expensive
-to recollect, and a read-write open would silently roll back a hot journal left by a
-crashed upstream run.
+This script only ever READS streaming_availability.db, structurally -- see the
+``mode=ro`` open in ``main`` for why that is the open mode rather than a convention.
+
+Callers (both pass ``--dry-run`` or not, but neither tolerates this script mutating
+the artifact):
+
+- ``discogs-etl/scripts/sync-library.sh``, in the daily library sync. Its
+  ``tests/e2e/test_sync_library_e2e.py`` also loads ``main`` dynamically.
+- this repo's ``.github/workflows/refresh-streaming.yml`` "Verify export" step, which
+  runs between the pipeline writing the artifact and ``POST /admin/upload-streaming-db``
+  pushing it back to the canonical bucket -- so a read-write open here could have
+  repaired-then-uploaded a silently altered artifact.
 
 Usage:
     .venv/bin/python scripts/export_streaming_links.py [--library-db PATH] [--streaming-db PATH] [--dry-run]
@@ -27,6 +34,8 @@ import json
 import logging
 import os
 import sqlite3
+from collections import Counter
+from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,53 +53,90 @@ def _has_match_provenance(matched_artist: str | None, matched_title: str | None)
     """Does this row record anything about what its spotify_url was matched against?
 
     True when *either* provenance field carries a non-blank value. The gate is
-    deliberately this weak. Measured on the production artifact (2026-09-25) over
-    the 46,907 `albums` rows with a non-empty spotify_url:
+    deliberately this weak.
+
+    The census below partitions the column on PROVENANCE ONLY. It is deliberately
+    silent about whether the URL is well-shaped or even on a Spotify host -- a
+    separate and larger defect class, owned by the serve seam's per-service host
+    check and by the sibling album-shape guard. Read it as "what evidence does the
+    row carry", not as an account of the column's health.
+
+    Measured on the production artifact (2026-09-25) over the 46,907 `albums` rows
+    with a non-empty spotify_url:
 
     - 28,238 rows (60.2%) hold a real artist and title. They pass.
     - 18,281 rows (39.0%) hold a writer *tag* rather than an artist
       (``backfill-wiki (spotify)``, ``llm+wikidata``, ``web-search (spotify)``, ...)
       and an empty title -- the one eight-day 2026-04 campaign described in
       LML#1353. Their measured defect is URL *shape* (they are Spotify artist
-      pages), which is fixed at the serve seam, not absent provenance. Nulling 39%
-      of Spotify coverage on a provenance technicality is not warranted by
-      anything measured, so one non-blank field is enough here.
+      pages), which is fixed at the serve seam, not absent provenance. Gating them
+      would null 39% of the artifact's STORED spotify_url rows on a provenance
+      technicality -- a smaller number of *served* URLs, since the serve seam
+      already nulls the off-host ones, but not a number anything measured
+      justifies. So one non-blank field is enough here.
     - 388 rows (0.83%) hold neither. 363 of those are *every* compilation row in
-      the artifact carrying a Spotify URL, written by the title-only override in
-      ``scripts/search_unmatched_compilations.py`` that discards the provenance it
-      computed (LML#1353). An audit of all 363 against Spotify's public og tags
-      found ~18 of the 28 lowest-scoring were plainly the wrong album --
-      ``Simple Machines`` -> Shinedown "Simple Man", ``Sweet Lies`` -> Anita Baker
-      "Sweet Love". Those are the rows this returns False for.
+      the artifact carrying a Spotify URL, written by
+      ``scripts/search_unmatched_compilations.py``, whose single Spotify UPDATE omits
+      the provenance columns on BOTH its match paths -- the title-only fallback
+      additionally computes a ``matched_title`` and then discards it (LML#1353). An
+      audit of all 363 against Spotify's public og tags found ~18 of the 28
+      LOWEST-SCORING were plainly the wrong album -- ``Simple Machines`` ->
+      Shinedown "Simple Man", ``Sweet Lies`` -> Anita Baker "Sweet Love". Only that
+      bottom band was audited, so that ratio is not a precision estimate for the
+      whole 388. Those are the rows this returns False for.
 
     Why negative evidence rather than the identity cross-check LML#1352 suggests
     first: an agreement test against ``entity.release_identity`` needs *positive*
     evidence that this population mostly lacks -- 96.0% of the 21,093 ``/album/``
     URLs Backend-Service serves have no matcher row at all in
     ``lml_cache.album_streaming_url_cache`` -- so it would demote essentially
-    everything and delete ~20,000 working links. And an 80/80 string floor cannot
-    be the gate either: per LML#1147 the artist axis carries no signal for shelf
-    credits, so it false-rejects correct links (Lower Dens/Nootropics,
-    Don Covay's expanded credit, the Kollektion 04 curator credit). "No record of
-    what was compared" is the only claim that can be made without either.
+    everything and delete ~20,000 working links.
+
+    A string floor is not available at this seam for a structural reason rather than
+    an accuracy one: the export never reads ``display_artist``/``display_title``, so
+    there is nothing here to score the stored provenance AGAINST. (An earlier draft
+    justified this with three named shelf-credit shapes as 80/80 false-rejects. That
+    was wrong and is not repeated: scored with this repo's own ``score_match``, all
+    three come out 100/100 and an 80/80 floor would accept them. The artist axis
+    genuinely does carry little signal for V/A and curator credits -- that is
+    LML#1147 -- but these three do not demonstrate it.) "No record of what was
+    compared" is the only claim this seam can make.
     """
     return bool((matched_artist or "").strip()) or bool((matched_title or "").strip())
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    """Casefolded column names of `table`, or an empty set if it does not exist.
+def _ascii_fold(name: str) -> str:
+    """Lowercase `name` the way SQLite folds identifiers: ASCII only.
 
-    Casefolded because SQLite resolves column names case-insensitively while
-    ``PRAGMA table_info`` reports whatever case they were DECLARED in. A
-    case-sensitive comparison would fail open on a re-declared artifact: the gate
-    would go inert on a database whose columns it could in fact have read.
+    SQLite resolves column names case-insensitively, but only over A-Z. Python's
+    ``str.casefold()`` folds the full Unicode range and ``str.lower()`` nearly does,
+    so either would over-match: ``ſpotify_matched_artist`` casefolds equal to
+    ``spotify_matched_artist`` (and U+212A KELVIN SIGN lowercases to ``k``). The gate
+    would then activate on a column the SELECT cannot resolve, turning the documented
+    inert fallback into a hard crash in the daily sync. Folding only ASCII keeps
+    "the gate activates" and "the column can be queried" the same predicate.
+    """
+    return name.lower() if name.isascii() else name
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """ASCII-folded column names of `table`, or an empty set if it does not exist.
+
+    Folded because ``PRAGMA table_info`` reports whatever case a column was DECLARED
+    in, while the SELECT that reads it resolves case-insensitively. A case-sensitive
+    comparison would fail open on a re-declared artifact: the gate would go inert on
+    a database whose columns it could in fact have read.
 
     Deliberately NOT imported from ``routers/admin.py``, which holds a twin of this
     helper: ``discogs-etl/scripts/sync-library.sh`` runs this script under that
     repo's bare venv, where importing the FastAPI-dependent ``routers`` package
-    would fail. Deduplicating the two would break the daily library sync.
+    would fail. Deduplicating the two would break the daily library sync. Note the
+    twin is NOT folded, so do not read this fix as covering both -- there the same
+    fail-open makes ``_streaming_coverage`` read three URL columns as 0 and
+    ``POST /admin/upload-streaming-db`` 409 a healthy artifact. Tracked separately;
+    it is not in this change's diff.
     """
-    return {row[1].casefold() for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    return {_ascii_fold(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
 def main(args: argparse.Namespace) -> None:
@@ -101,17 +147,27 @@ def main(args: argparse.Namespace) -> None:
     # Read-ONLY on purpose, and structurally rather than by convention. Opening a
     # SQLite file read-write performs hot-journal rollback at open time, so if the
     # upstream streaming pipeline died mid-transaction, merely connecting would
-    # mutate the bucket-canonical artifact. `mode=ro` turns that into a loud refusal
-    # instead of a silent repair of a file that is expensive to recollect.
-    sa = sqlite3.connect(f"file:{args.streaming_db}?mode=ro", uri=True)
-    lib = sqlite3.connect(args.library_db)
+    # mutate the bucket-canonical artifact. `mode=ro` refuses instead of silently
+    # repairing a file that is expensive to recollect.
+    #
+    # The trade, stated because it is a new failure mode in a cross-repo daily job:
+    # where a read-write open used to roll the journal back and carry on, this now
+    # raises at the first read. That is the intended direction for a precious
+    # artifact -- a loud failed sync is recoverable, a silently altered artifact is
+    # not -- but it does mean a stray journal beside the artifact fails the run.
+    #
+    # `as_uri()` rather than an f-string: a `#`, `?` or `%` in the path is
+    # significant inside a URI, and interpolating it raw makes SQLite end the path
+    # early, drop `mode=ro` into an unparsed fragment, and open a TRUNCATED path
+    # READ-WRITE -- losing exactly the guarantee this line exists to make.
+    sa = sqlite3.connect(Path(args.streaming_db).resolve().as_uri() + "?mode=ro", uri=True)
 
     # The provenance gate reads two columns that older/fixture-shaped databases do
     # not have (discogs-etl's sync e2e fixture is one). Absent columns mean "this
     # database cannot answer the question", NOT "no row has provenance" -- reading
     # it the second way would strip every Spotify URL from such a file.
     album_columns = _table_columns(sa, "albums")
-    provenance_gate_active = {c.casefold() for c in SPOTIFY_PROVENANCE_COLUMNS} <= album_columns
+    provenance_gate_active = {_ascii_fold(c) for c in SPOTIFY_PROVENANCE_COLUMNS} <= album_columns
     if provenance_gate_active:
         provenance_select = ", ".join(SPOTIFY_PROVENANCE_COLUMNS)
     else:
@@ -119,7 +175,10 @@ def main(args: argparse.Namespace) -> None:
             f"albums table lacks {' / '.join(SPOTIFY_PROVENANCE_COLUMNS)}; "
             "the Spotify match-provenance gate is inert for this database"
         )
-        provenance_select = "NULL, NULL"
+        # Derived, not hardcoded "NULL, NULL": the SELECT's column count has to track
+        # the constant, or adding a third provenance column crashes the row unpack on
+        # the gate-ACTIVE path only -- the one path the legacy fixtures never take.
+        provenance_select = ", ".join("NULL" for _ in SPOTIFY_PROVENANCE_COLUMNS)
 
     # Get all albums with at least one streaming URL
     rows = sa.execute(f"""
@@ -195,7 +254,12 @@ def main(args: argparse.Namespace) -> None:
             f"absent match provenance: {spotify_skipped_no_provenance}"
         )
 
-    log.info(f"Library release IDs with streaming links (album-level): {len(links)}")
+    # Non-empty entries only: the gate can leave a release with an entry and no URL,
+    # so a bare len(links) here would not share a denominator with the total below.
+    log.info(
+        "Library release IDs with streaming links (album-level): "
+        f"{sum(1 for entry in links.values() if entry)}"
+    )
 
     # Supplement with track-level results for singles and compilations
     #
@@ -241,11 +305,23 @@ def main(args: argparse.Namespace) -> None:
     # Drop it rather than inserting an all-NULL streaming_links row: that row would
     # read as "on streaming" to /admin/upload-library-db's streaming diff
     # (`_get_streaming_ids` selects library_id with no URL predicate) while carrying
-    # no link at all. The gate is the main way to get here but not the only one: the
-    # SELECT above filters on IS NOT NULL while the assignments above test
+    # no link at all.
+    #
+    # Applies regardless of `provenance_gate_active`: an all-NULL row is wrong
+    # whatever emptied it. The gate is the main way to get here but not the only one
+    # -- the SELECT above filters on IS NOT NULL while the assignments test
     # truthiness, so a row whose URL columns are empty STRINGS already reached this
-    # path before this change. Hence the neutral wording below -- the drop is not
-    # attributed to the gate, since it cannot tell the two apart.
+    # path. That cohort measured zero on the 2026-09-25 artifact, so in practice
+    # these are gate casualties; the wording stays neutral because the code cannot
+    # tell the two apart.
+    #
+    # ROUTED, not handled here: dropping a library_id is itself a signal. The LML#1313
+    # streaming webhook turns `old_ids - new_ids` into `{on_streaming: false}` for
+    # Backend-Service, which is a cross-repo flip for every release the gate empties,
+    # and `on_streaming: null` (the honest value for a row just declared unauditable)
+    # is in the wire contract but never emitted. Left to the serve-seam decision along
+    # with the `verified` demotion, since both want a provenance signal this table
+    # does not carry.
     empty = [lib_id for lib_id, entry in links.items() if not entry]
     for lib_id in empty:
         del links[lib_id]
@@ -255,18 +331,28 @@ def main(args: argparse.Namespace) -> None:
     log.info(f"Library release IDs with streaming links (total): {len(links)}")
     sa.close()
 
-    if args.dry_run:
-        # Show stats
-        from collections import Counter
+    # Per-service coverage on BOTH paths, not only --dry-run. This is the daily sync's
+    # only visibility into what the gate produced: no upload guard can see
+    # `streaming_links.spotify_url` (sync-library.sh's floor counts apple_music_url,
+    # /admin/upload-library-db's relative guard measures library_rows, and
+    # /admin/upload-streaming-db measures the artifact this script never writes), so a
+    # provenance column that is present but unpopulated would otherwise strip Spotify
+    # wholesale and exit 0 silently. `spotify_url: 0` in the log is the tell.
+    service_counts: Counter[str] = Counter()
+    for entry in links.values():
+        for k in entry:
+            service_counts[k] += 1
+    log.info("Service coverage:")
+    for service, count in service_counts.most_common():
+        log.info(f"  {service}: {count:,}")
 
-        service_counts: Counter[str] = Counter()
-        for entry in links.values():
-            for k in entry:
-                service_counts[k] += 1
-        log.info("Service coverage:")
-        for service, count in service_counts.most_common():
-            log.info(f"  {service}: {count:,}")
+    if args.dry_run:
         return
+
+    # Opened here rather than at the top so --dry-run genuinely writes nothing: a
+    # connect() creates the file, which left a 0-byte library.db beside the artifact
+    # whenever the documented sizing command ran in a fresh directory.
+    lib = sqlite3.connect(args.library_db)
 
     # Create/replace streaming_links table in library.db
     lib.execute("DROP TABLE IF EXISTS streaming_links")

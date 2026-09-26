@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import sqlite3
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -766,12 +767,18 @@ class TestSpotifyProvenanceGate:
         ids=["both-null", "both-empty", "both-whitespace"],
     )
     def test_absent_provenance_skips_spotify_url(self, tmp_path, matched_artist, matched_title):
-        """The three blankness shapes that are distinct computations.
+        """The three blankness shapes worth distinguishing, for two different reasons.
+
+        `("   ", "\\t")` is the only case that makes `.strip()` do work, so it is the
+        one that pins "whitespace counts as blank". `(None, None)` and `("", "")`
+        reduce to the same `("" ).strip()` evaluation and so cannot fail
+        independently of each other in the predicate -- they are both kept because
+        they pin the SQLite round-trip instead: that a column written NULL and a
+        column written `''` both come back as something the gate reads as blank.
 
         `(None, "")` and `("", None)` are deliberately absent: the predicate is
-        ``(x or "").strip()`` per axis, so they reduce to the same two evaluations
-        as `("", "")` and could not fail independently of it. The production row
-        this gate was written for is pinned separately, by
+        per-axis and symmetric, so they add no evaluation the above do not already
+        cover. The production row this gate was written for is pinned separately, by
         `test_row_52656_married_to_the_mob_regression`.
         """
         library_db = _export(
@@ -830,7 +837,32 @@ class TestSpotifyProvenanceGate:
             "https://soundcloud.com/va/married-to-the-mob",
         )
 
-    def test_full_provenance_exports_spotify_url(self, tmp_path):
+    @pytest.mark.parametrize(
+        "matched_artist,matched_title",
+        [
+            ("Stereolab", "Aluminum Tunes"),
+            ("backfill-wiki (spotify)", ""),
+            ("llm+wikidata", None),
+            (None, "On Your Own Love Again"),
+        ],
+        ids=["both-axes", "artist-tag-parenthesized", "artist-tag-bare", "title-only"],
+    )
+    def test_one_non_blank_axis_is_enough_to_export(self, tmp_path, matched_artist, matched_title):
+        """The three ways to satisfy the OR: both axes, artist alone, title alone.
+
+        Provenance is "entirely absent" only when BOTH fields are blank, so each of
+        these must export. The two artist-tag cases are the cohort LML#1353 calls the
+        writer-tag rows: they hold a writer tag rather than an artist in
+        `spotify_matched_artist` and nothing in `spotify_matched_title`. The gate is
+        deliberately NOT widened to them -- their measured defect is URL *shape*
+        (Spotify artist pages), fixed at the serve seam by the sibling branch
+        `fix/streaming-link-album-shape-guard`, not absent provenance.
+
+        Two representative tag shapes rather than the whole roster, since the gate
+        never inspects the value: one carries a parenthesized service suffix and one
+        does not. The full measured vocabulary is recorded in
+        `_has_match_provenance`'s docstring.
+        """
         library_db = _export(
             tmp_path,
             [
@@ -840,65 +872,12 @@ class TestSpotifyProvenanceGate:
                     "display_title": "Aluminum Tunes",
                     "library_ids": json.dumps([701]),
                     "spotify_url": "https://open.spotify.com/album/aluminum-tunes",
-                    "spotify_matched_artist": "Stereolab",
-                    "spotify_matched_title": "Aluminum Tunes",
+                    "spotify_matched_artist": matched_artist,
+                    "spotify_matched_title": matched_title,
                 }
             ],
         )
         assert _streaming_link(library_db, 701) == "https://open.spotify.com/album/aluminum-tunes"
-
-    @pytest.mark.parametrize("source_tag", ["backfill-wiki (spotify)", "llm+wikidata"])
-    def test_source_tag_without_matched_title_still_exports(self, tmp_path, source_tag):
-        """The gate is NOT widened to the 18,281 tag rows (LML#1353's second problem).
-
-        Those rows hold a writer tag rather than an artist in `spotify_matched_artist`
-        and nothing in `spotify_matched_title`. Their measured defect is URL *shape*
-        (Spotify artist pages), fixed at the serve seam by the sibling branch
-        `fix/streaming-link-album-shape-guard` -- not absent provenance. Nulling 39%
-        of Spotify coverage on a provenance technicality is not warranted by anything
-        measured, so one non-empty field is enough to pass this gate.
-
-        Two representative tag shapes, not the whole roster: the gate never inspects
-        the value, so more tags would exercise the same branch. One carries a
-        parenthesized service suffix and one does not; the full measured vocabulary
-        is recorded in `_has_match_provenance`'s docstring.
-        """
-        library_db = _export(
-            tmp_path,
-            [
-                {
-                    "id": 1,
-                    "display_artist": "Juana Molina",
-                    "display_title": "DOGA",
-                    "library_ids": json.dumps([702]),
-                    "spotify_url": "https://open.spotify.com/album/doga",
-                    "spotify_matched_artist": source_tag,
-                    "spotify_matched_title": "",
-                }
-            ],
-        )
-        assert _streaming_link(library_db, 702) == "https://open.spotify.com/album/doga"
-
-    def test_matched_title_alone_still_exports(self, tmp_path):
-        """Provenance is "entirely absent" only when BOTH fields are empty."""
-        library_db = _export(
-            tmp_path,
-            [
-                {
-                    "id": 1,
-                    "display_artist": "Jessica Pratt",
-                    "display_title": "On Your Own Love Again",
-                    "library_ids": json.dumps([703]),
-                    "spotify_url": "https://open.spotify.com/album/on-your-own-love-again",
-                    "spotify_matched_artist": None,
-                    "spotify_matched_title": "On Your Own Love Again",
-                }
-            ],
-        )
-        assert (
-            _streaming_link(library_db, 703)
-            == "https://open.spotify.com/album/on-your-own-love-again"
-        )
 
     def test_row_52656_married_to_the_mob_regression(self, tmp_path):
         """The production case a DJ hit on 2026-09-25 (LML#1352).
@@ -939,9 +918,13 @@ class TestSpotifyProvenanceGate:
             ],
         )
         conn = sqlite3.connect(library_db)
-        urls = [r[0] for r in conn.execute("SELECT spotify_url FROM streaming_links").fetchall()]
+        rows = conn.execute("SELECT library_id, spotify_url FROM streaming_links").fetchall()
         conn.close()
-        assert "https://open.spotify.com/album/0JSLTbVe6Z70EQkOLL0WPi" not in urls
+        # Explicit about the end state rather than only asserting an absence: a bare
+        # `url not in urls` would also pass if streaming_links were empty for some
+        # unrelated reason. This row's only URL was the gated one, so the table is
+        # empty -- and that is asserted, not assumed.
+        assert rows == []
 
     @pytest.mark.parametrize(
         "album_id,library_id,display_artist,display_title,matched_artist,matched_title,url",
@@ -1089,32 +1072,62 @@ class TestSpotifyProvenanceGate:
         assert _streaming_link(library_db, 1201) is None
         assert "inert" not in caplog.text
 
-    @pytest.mark.parametrize("gated_row_first", [True, False], ids=["gated-first", "gated-second"])
-    def test_a_shared_library_id_keeps_the_provenance_bearing_url(self, tmp_path, gated_row_first):
+    @pytest.mark.parametrize(
+        "gated_id,good_id", [(1, 2), (2, 1)], ids=["gated-first", "gated-last"]
+    )
+    def test_a_shared_library_id_keeps_the_provenance_bearing_url(
+        self, tmp_path, gated_id, good_id
+    ):
         """One library_id covered by both a gated and a provenance-bearing album row.
 
         The gate runs inside the first-URL-wins merge loop, so its placement relative
         to that merge decides the outcome for a shared `library_id`. The good URL must
         win in either row order: gating must null the bad row's contribution rather
         than let it occupy the slot the good row would fill.
+
+        The order is varied by `albums.id`, NOT by insertion order: `id INTEGER PRIMARY
+        KEY` *is* the SQLite rowid and the export's SELECT has no ORDER BY, so rows come
+        back in rowid order and inserting them the other way round would be a no-op
+        parametrize. Production's common shape is the gated row LAST -- the gated
+        compilations carry high ids (the pinned case is 52656).
+
+        Asserts the WHOLE row, not just the Spotify column, because this fixture is
+        also the shape in which one `streaming_links` row gets composed from two
+        different albums: Spotify from the good row, Apple from the row just judged
+        unauditable. That cross-row merge is pre-existing first-wins behavior which
+        this Spotify-only gate does not change, and the assertion below records it
+        rather than leaving the reader to assume the shared-id case is fully covered.
         """
         gated = {
-            "id": 1,
+            "id": gated_id,
             "library_ids": json.dumps([1301]),
             "spotify_url": "https://open.spotify.com/album/unverifiable",
             "spotify_matched_artist": None,
             "spotify_matched_title": None,
+            "apple_url": "https://music.apple.com/album/from-the-unauditable-row",
         }
-        verifiable = {
-            "id": 2,
+        good = {
+            "id": good_id,
             "library_ids": json.dumps([1301]),
             "spotify_url": "https://open.spotify.com/album/aluminum-tunes",
             "spotify_matched_artist": "Stereolab",
             "spotify_matched_title": "Aluminum Tunes",
+            "apple_url": "https://music.apple.com/album/from-the-good-row",
         }
-        albums = [gated, verifiable] if gated_row_first else [verifiable, gated]
-        library_db = _export(tmp_path, albums)
-        assert _streaming_link(library_db, 1301) == "https://open.spotify.com/album/aluminum-tunes"
+        library_db = _export(tmp_path, sorted([gated, good], key=lambda a: a["id"]))
+        conn = sqlite3.connect(library_db)
+        row = conn.execute(
+            "SELECT spotify_url, apple_music_url FROM streaming_links WHERE library_id = 1301"
+        ).fetchone()
+        conn.close()
+        # Spotify always resolves to the provenance-bearing row's URL. Apple follows
+        # plain first-wins over rowid order, so the lower id supplies it either way.
+        expected_apple = (
+            "https://music.apple.com/album/from-the-unauditable-row"
+            if gated_id < good_id
+            else "https://music.apple.com/album/from-the-good-row"
+        )
+        assert row == ("https://open.spotify.com/album/aluminum-tunes", expected_apple)
 
     def test_gate_leaves_no_all_null_streaming_links_row(self, tmp_path):
         """A row whose only URL was the gated Spotify one is dropped, not blanked."""
@@ -1234,6 +1247,16 @@ class TestSpotifyProvenanceGate:
         rate-limited Apple/Spotify/Deezer results. The gate decides what to *export*;
         it must not repair, null or otherwise touch the source. Hash the file rather
         than trusting the absence of an UPDATE by inspection.
+
+        The hash is the only assertion here on purpose. Earlier revisions also
+        asserted no `-wal`/`-journal` sidecar was left behind; both were vacuous and
+        one was wrong. The artifact is in `delete` journal mode (so is this fixture),
+        where a rollback journal is created and removed inside a write transaction and
+        is therefore absent after ANY clean run, including one that rewrote every row;
+        and a delete-mode database never produces a `-wal` at all. Worse, a `mode=ro`
+        open of a WAL-mode database legitimately CREATES `-wal`/`-shm`, so the `-wal`
+        assertion would have fired on the open mode the module docstring calls safe.
+        `test_streaming_db_is_opened_read_only` carries that guarantee instead.
         """
         import hashlib
 
@@ -1267,19 +1290,14 @@ class TestSpotifyProvenanceGate:
         main(args)
 
         assert hashlib.sha256(streaming_db.read_bytes()).hexdigest() == before
-        assert not (tmp_path / "streaming.db-wal").exists()
-        assert not (tmp_path / "streaming.db-journal").exists()
 
     def test_streaming_db_is_opened_read_only(self, tmp_path):
         """ "Never written" must be structural, not a happy-path observation.
 
-        The sha256 test above only proves no write happened to a cleanly-closed
-        file. Opening a SQLite database read-WRITE also performs hot-journal
-        rollback on open, so if the upstream streaming pipeline died mid-transaction,
-        merely connecting would mutate the bucket-canonical artifact -- a file
-        CLAUDE.md classes as expensive-to-recollect. Asserting the handle refuses
-        writes pins the guarantee to the open mode rather than to this script
-        happening to contain no UPDATE.
+        The sha256 test above only proves no write happened on that particular run.
+        Asserting that the handle itself refuses writes pins the guarantee to the open
+        mode instead -- see the `connect` call in `main` for why that mode is the one
+        that matters, and for the trade it accepts. Not restated here.
         """
         streaming_db = str(tmp_path / "streaming.db")
         library_db = str(tmp_path / "library.db")
@@ -1319,3 +1337,192 @@ class TestSpotifyProvenanceGate:
                 probe.execute("CREATE TABLE write_probe (x)")
         finally:
             probe.close()
+
+    def test_read_only_open_survives_a_path_that_looks_like_a_uri(self, tmp_path):
+        """A `#` or `?` in the path must not silently discard `mode=ro`.
+
+        The artifact is opened through a `file:` URI, and a bare f-string
+        interpolation makes the path's own punctuation significant: SQLite ends the
+        path at `#`, parses `mode=ro` as a fragment it never reads, opens a TRUNCATED
+        path READ-WRITE and creates a stray database there. `os.path.exists` at the
+        top of main() and the URI open would then be using different path grammars,
+        and the run dies with a misleading `no such table: albums`. Percent-encoding
+        the path keeps the read-only guarantee true for any path a caller can pass.
+        """
+        weird = tmp_path / "wxyc#2026?v=1"
+        weird.mkdir()
+        streaming_db = str(weird / "streaming.db")
+        library_db = str(weird / "library.db")
+        _create_provenance_streaming_db(
+            streaming_db,
+            [
+                {
+                    "id": 1,
+                    "library_ids": json.dumps([1501]),
+                    "spotify_url": "https://open.spotify.com/album/aluminum-tunes",
+                    "spotify_matched_artist": "Stereolab",
+                    "spotify_matched_title": "Aluminum Tunes",
+                }
+            ],
+        )
+        sqlite3.connect(library_db).close()
+
+        real_connect = sqlite3.connect
+        calls: list[tuple] = []
+
+        def _tracking_connect(*a, **kw):
+            calls.append((a, kw))
+            return real_connect(*a, **kw)
+
+        args = argparse.Namespace(library_db=library_db, streaming_db=streaming_db, dry_run=False)
+        with patch("scripts.export_streaming_links.sqlite3.connect", _tracking_connect):
+            main(args)
+
+        # The export still works through the awkward path...
+        assert _streaming_link(library_db, 1501) == "https://open.spotify.com/album/aluminum-tunes"
+        # ...and the handle it used was genuinely read-only.
+        streaming_calls = [c for c in calls if "streaming" in str(c[0][0])]
+        assert streaming_calls
+        a, kw = streaming_calls[0]
+        probe = real_connect(*a, **kw)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                probe.execute("CREATE TABLE write_probe (x)")
+        finally:
+            probe.close()
+        # No stray database was created beside the truncated path.
+        assert not (tmp_path / "wxyc").exists()
+
+    def test_column_match_folds_ascii_only_like_sqlite(self, tmp_path, caplog):
+        """Case-folding must match SQLite's rule, which is ASCII-only.
+
+        Python's `str.casefold()` folds the full Unicode range, so a column declared
+        `ſpotify_matched_artist` (LATIN SMALL LETTER LONG S) would compare EQUAL to
+        `spotify_matched_artist` and activate the gate -- whereupon the SELECT SQLite
+        actually runs raises `no such column`, trading the documented inert fallback
+        for a hard crash in the daily sync. `str.lower()` has the same defect via
+        U+212A KELVIN SIGN. Folding only ASCII keeps "activates" and "can be queried"
+        the same predicate.
+        """
+        streaming_db = str(tmp_path / "streaming.db")
+        library_db = str(tmp_path / "library.db")
+        sa = sqlite3.connect(streaming_db)
+        sa.execute("""
+            CREATE TABLE albums (
+                id INTEGER PRIMARY KEY,
+                library_ids TEXT,
+                spotify_url TEXT,
+                "ſpotify_matched_artist" TEXT,
+                "ſpotify_matched_title" TEXT,
+                apple_url TEXT,
+                deezer_url TEXT,
+                bandcamp_url TEXT,
+                tidal_url TEXT,
+                youtube_music_url TEXT,
+                soundcloud_url TEXT
+            )
+        """)
+        sa.execute(
+            "INSERT INTO albums (id, library_ids, spotify_url) VALUES (?, ?, ?)",
+            (1, json.dumps([1601]), "https://open.spotify.com/album/aluminum-tunes"),
+        )
+        sa.commit()
+        sa.close()
+        sqlite3.connect(library_db).close()
+
+        args = argparse.Namespace(library_db=library_db, streaming_db=streaming_db, dry_run=False)
+        with caplog.at_level(logging.WARNING):
+            main(args)
+
+        # Gate stays inert (the columns are NOT the ones it needs) rather than crashing.
+        assert _streaming_link(library_db, 1601) == "https://open.spotify.com/album/aluminum-tunes"
+        assert "inert" in caplog.text
+
+    def test_dry_run_does_not_create_a_library_db(self, tmp_path):
+        """`--dry-run` is documented as "stats only, writes nothing".
+
+        The library.db handle used to be opened before the dry-run return, so the
+        sizing command in docs/scripts.md left a 0-byte library.db beside the
+        artifact. A later non-dry run against that stray file produces a library.db
+        with a `streaming_links` table and no `library` table, which
+        /admin/upload-library-db rejects as an invalid database.
+        """
+        streaming_db = str(tmp_path / "streaming.db")
+        library_db = str(tmp_path / "library.db")
+        _create_provenance_streaming_db(
+            streaming_db,
+            [
+                {
+                    "id": 1,
+                    "library_ids": json.dumps([1701]),
+                    "spotify_url": "https://open.spotify.com/album/aluminum-tunes",
+                    "spotify_matched_artist": "Stereolab",
+                    "spotify_matched_title": "Aluminum Tunes",
+                }
+            ],
+        )
+        args = argparse.Namespace(library_db=library_db, streaming_db=streaming_db, dry_run=True)
+        main(args)
+        assert not Path(library_db).exists()
+
+    def test_write_path_logs_service_coverage(self, tmp_path, caplog):
+        """The daily sync needs a per-service baseline, not only `--dry-run`.
+
+        A present-but-unpopulated provenance column makes the gate strip up to 100% of
+        Spotify coverage, and no upload guard can see it: `STREAMING_APPLE_FLOOR`
+        counts `apple_music_url`, /admin/upload-library-db's relative guard measures
+        `library_rows`, and /admin/upload-streaming-db measures the artifact this
+        script never writes. Logging the produced coverage on the write path is what
+        leaves `spotify_url: 0` in the sync log for an operator to see.
+        """
+        albums = [
+            {
+                "id": 1,
+                "library_ids": json.dumps([1801]),
+                "spotify_url": "https://open.spotify.com/album/unverifiable",
+                "spotify_matched_artist": None,
+                "spotify_matched_title": None,
+                "apple_url": "https://music.apple.com/album/verifiable",
+            }
+        ]
+        with caplog.at_level(logging.INFO):
+            library_db = _export(tmp_path, albums, dry_run=False)
+
+        assert _streaming_link(library_db, 1801) is None
+        assert "Service coverage" in caplog.text
+        assert "apple_music_url: 1" in caplog.text
+        # The whole point: the gated service reads zero on the WRITE path.
+        assert "spotify_url" not in caplog.text.split("Service coverage")[1]
+
+    def test_empty_string_url_row_is_dropped_even_with_full_provenance(self, tmp_path):
+        """The empty-entry drop is a SECOND behavior change, and this is its other half.
+
+        The drop is not conditional on the gate: the SELECT admits a row on
+        `IS NOT NULL` while the merge tests truthiness, so a row whose URLs are empty
+        STRINGS produces an empty entry that the gate never touched. Before this
+        change such a release was inserted as an all-NULL `streaming_links` row; now
+        it is dropped. That is the intended direction -- an all-NULL row reads as "on
+        streaming" to `_get_streaming_ids`, which has no URL predicate -- but it
+        applies to rows unrelated to the provenance gate, so it is pinned separately
+        rather than left to be inferred from the gated cases.
+
+        Measured at zero on the 2026-09-25 production artifact, so this is about
+        keeping the behavior honest, not about a live population.
+        """
+        library_db = _export(
+            tmp_path,
+            [
+                {
+                    "id": 1,
+                    "library_ids": json.dumps([1901]),
+                    "spotify_url": "",
+                    "apple_url": "",
+                    "spotify_matched_artist": "Stereolab",
+                    "spotify_matched_title": "Aluminum Tunes",
+                }
+            ],
+        )
+        conn = sqlite3.connect(library_db)
+        rows = conn.execute("SELECT library_id FROM streaming_links").fetchall()
+        conn.close()
+        assert rows == []
