@@ -187,6 +187,20 @@ class TestUpdateResult:
         assert stats["apple"]["found"] == 1
 
     @pytest.mark.asyncio
+    async def test_an_unsupported_service_is_refused(self, db):
+        """Loud, like the PG twin, instead of a silent whole-drain no-op.
+
+        `StreamingCatalogDao.update_result` already raises for a service it has no
+        column family for. Returning 0 here instead meant a caller with a typo'd
+        service ("apple_music" for "apple") wrote nothing, reported every album a
+        miss, and finished cleanly — the write path's worst failure shape.
+        """
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        with pytest.raises(ValueError, match="apple_music"):
+            await db.update_result(rows[0]["id"], "apple_music", "found", url="https://x.test/1")
+
+    @pytest.mark.asyncio
     async def test_reports_the_rows_it_landed_on(self, db):
         await db.insert_albums([_make_album()])
         rows = await db.get_pending("spotify", limit=10)

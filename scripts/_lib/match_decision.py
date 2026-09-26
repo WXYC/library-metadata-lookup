@@ -54,11 +54,14 @@ owes its miss handlers).
 Deliberately NOT in scope, and both worth knowing before reading a
 ``found_title_only`` row as corroborated:
 
-* A guarded ``find_best_match`` accept is recorded as ``found`` even when its
-  artist score was itself a V/A-prefix clear in the LML#1139 band. Retrofitting
-  the guard onto the *accept* path would change the 60% of the artifact that the
+* A guarded accept against a *real* query credit is recorded as ``found`` even
+  when its artist score was a marginal LML#1139-band prefix clear (83.87-85.71).
+  Retrofitting the guard onto that path would change the 60% of the artifact the
   matcher approved, which is a different decision on a different population than
-  this fix.
+  this fix. Note what is *not* in that exemption: a V/A **query** credit never
+  reaches the guarded pass at all (see ``decide_service_match``), because there
+  the artist score is a tautology on the caller's own sentinel rather than a
+  marginal clear on data.
 * Scoping the relaxation to the V/A-on-V/A class does not make that class
   *well* discriminated — it makes the artist axis's silence explicit. The title
   is then the only discriminator, and compilation titles are heavily reused
@@ -75,6 +78,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+
+from wxyc_etl.text import is_compilation_artist
 
 from clients.streaming.matching import (
     _EXTRACTION_ERRORS,
@@ -176,6 +181,14 @@ def best_title_only_candidate[T](
         a broken Phase 1 as a clean zero-match run and push the whole compilation
         population at the rate-limited streaming APIs (LML#376).
     """
+    # ``score_match("", "")`` is 100 by rapidfuzz convention, and the normalizer
+    # strips whitespace first, so a blank title on either side would be *accepted*
+    # at maximum confidence and written as ``found_title_only`` with an empty
+    # ``matched_title`` — a row recording total certainty about nothing. Both
+    # siblings drop empty query strings for this reason; the candidate side is
+    # dropped per-row below.
+    if not query_title or not query_title.strip():
+        return None
     normalized_query_artist = normalize_for_comparison(query_artist or "")
     best: tuple[T, float] | None = None
     best_key = ""
@@ -196,6 +209,8 @@ def best_title_only_candidate[T](
         if not va_artist_axis_is_uninformative(
             normalized_query_artist, normalize_for_comparison(candidate_artist or "")
         ):
+            continue
+        if not candidate_title or not candidate_title.strip():
             continue
         title_score = score_match(query_title, candidate_title)
         if title_score < floor:
@@ -223,50 +238,91 @@ def decide_service_match(
     id_fn: Callable[[dict], str] | None = None,
     title_only_floor: float = SCORE_MATCH_ACCEPTANCE_FLOOR,
 ) -> ServiceMatch | None:
-    """Decide one service lane: guarded 80/80 first, then the V/A title-only relaxation.
+    """Decide one service lane, by the same partition ``search_discogs_by_title`` uses.
 
-    Returns None when neither admits a candidate — in which case the caller
-    records nothing, leaving the row for a later pass rather than persisting a
-    link it cannot justify.
+    A V/A query credit takes the title axis alone; a real recovered name takes the
+    guarded 80/80 matcher. Returns None when neither admits a candidate — in which
+    case the caller records nothing, leaving the row for a later pass rather than
+    persisting a link it cannot justify.
+
+    Raises:
+        KeyError | IndexError | TypeError | AttributeError: when a non-empty
+        ``results`` is passed and *every* row fails extraction (LML#376). This
+        function owns that verdict rather than delegating it to the matchers,
+        because it hands them a filtered list and the question is about the
+        response as received — see the pre-pass below.
     """
-    # Drop the candidates that have no URL *before* scoring. Every URL extractor
-    # in play defaults to ``""`` on a missing key, and ``''`` is not NULL: it
-    # clears ``export_streaming_links.py``'s ``spotify_url IS NOT NULL`` export
-    # gate and then violates the PG mirror's ``url <> ''`` CHECK when the artifact
-    # is seeded. Filtering here rather than on the winner matters because
-    # ``find_best_match`` returns exactly one: a region-restricted album with no
-    # ``external_urls.spotify`` would otherwise take the runner-up that also
-    # cleared 80/80 — and the relaxation, which only runs when the guarded pass
-    # found nothing — down with it. A row whose ``url_fn`` *raises* is kept, so
-    # the per-row extraction guards below stay the only place that judges a
-    # malformed row.
+    # One pass over the response as received, for two reasons that pull against
+    # each other.
+    #
+    # Candidates with no URL are excluded from scoring. Every URL extractor in
+    # play defaults to ``""`` on a missing key, and ``''`` is not NULL: it clears
+    # ``export_streaming_links.py``'s ``spotify_url IS NOT NULL`` export gate and
+    # then violates the PG mirror's ``url <> ''`` CHECK when the artifact is
+    # seeded. They have to go before scoring rather than after, because
+    # ``find_best_match`` returns exactly one winner: a region-restricted album
+    # with no ``external_urls.spotify`` would otherwise take down the runner-up
+    # that also cleared 80/80 — and the relaxation, which only runs when the
+    # guarded pass found nothing — with it.
+    #
+    # But the matchers decide "systemic break" by whether *every row they see*
+    # failed extraction, so handing them a filtered subset lets one sparse row
+    # become "every row" and abort a lane that was merely full of URL-less
+    # candidates. So the verdict is computed here, over ``results``, and the
+    # matchers receive only rows already known to extract cleanly.
     playable = []
+    failures = 0
+    last_error: Exception | None = None
     for item in results:
         try:
-            if not url_fn(item):
-                continue
-        except _EXTRACTION_ERRORS:
-            pass
-        playable.append(item)
-
-    guarded = find_best_match(
-        playable,
-        query_artist,
-        query_title,
-        artist_fn=artist_fn,
-        title_fn=title_fn,
-        url_fn=url_fn,
-        id_fn=id_fn,
-    )
-    if guarded is not None:
-        return ServiceMatch(
-            url=guarded["url"],
-            confidence=guarded["confidence"],
-            matched_artist=guarded["matched_artist"],
-            matched_title=guarded["matched_title"],
-            axes=AXES_ARTIST_AND_TITLE,
-            service_item_id=guarded.get("id"),
+            url = url_fn(item)
+            artist_fn(item)
+            title_fn(item)
+        except _EXTRACTION_ERRORS as exc:
+            failures += 1
+            last_error = exc
+            logger.warning("Skipping malformed result row in decide_service_match: %s", exc)
+            continue
+        if url:
+            playable.append(item)
+    if last_error is not None and failures == len(results):
+        raise last_error
+    if results and not playable:
+        # Well-formed rows, none with a URL. Usually a genuinely unplayable
+        # response; also what a renamed URL field looks like, since every
+        # extractor here reaches through ``.get`` and returns "" rather than
+        # raising. Logged so a whole-population zero-match run is not silent.
+        logger.warning(
+            "No candidate in a %d-row response carried a URL — possible extractor drift",
+            len(results),
         )
+
+    # Which axes may decide is a property of the *query* credit, exactly as in
+    # ``search_discogs_by_title``. For a V/A credit the guarded pass must not run:
+    # the query side is the caller's V/A sentinel rather than catalog data, so a
+    # candidate credited exactly "Various" scores 100 against it for free — not a
+    # marginal LML#1139 prefix clear but a tautology on a string we supplied — and
+    # would be recorded as a two-axis ``found``. That is the population most likely
+    # to be a wrong V/A link, so it is the one that most needs the one-axis marker.
+    if not is_compilation_artist(normalize_for_comparison(query_artist)):
+        guarded = find_best_match(
+            playable,
+            query_artist,
+            query_title,
+            artist_fn=artist_fn,
+            title_fn=title_fn,
+            url_fn=url_fn,
+            id_fn=id_fn,
+        )
+        if guarded is not None:
+            return ServiceMatch(
+                url=guarded["url"],
+                confidence=guarded["confidence"],
+                matched_artist=guarded["matched_artist"],
+                matched_title=guarded["matched_title"],
+                axes=AXES_ARTIST_AND_TITLE,
+                service_item_id=guarded.get("id"),
+            )
 
     relaxed = best_title_only_candidate(
         playable,

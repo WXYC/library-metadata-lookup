@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
+from clients.streaming.matching import _EXTRACTION_ERRORS, SCORE_MATCH_ACCEPTANCE_FLOOR
 from scripts._lib.match_decision import (
     AXES_ARTIST_AND_TITLE,
     AXES_ARTIST_ONLY,
@@ -194,6 +194,33 @@ class TestBestTitleOnlyCandidate:
             is None
         )
 
+    @pytest.mark.parametrize(
+        ("query_title", "candidate_title"),
+        [("", ""), ("   ", ""), ("Nuggets", ""), ("", "Nuggets")],
+        ids=["both-empty", "whitespace-query", "empty-candidate", "empty-query"],
+    )
+    def test_an_empty_title_is_never_a_match(self, query_title, candidate_title):
+        """``score_match("", "")`` is 100 by rapidfuzz convention — both siblings
+        guard this and this one must too.
+
+        Otherwise a blank title on either side is *accepted* at confidence 100 and
+        written as ``found_title_only`` with an empty ``matched_title``: a row
+        recording maximum certainty about nothing, which is the shape LML#1353
+        exists to remove rather than to mint.
+        """
+        rows = [_spotify_row("Various Artists", candidate_title)]
+        assert (
+            best_title_only_candidate(
+                rows,
+                query_artist="Various",
+                query_title=query_title,
+                artist_fn=_SPOTIFY_ARTIST,
+                title_fn=_SPOTIFY_TITLE,
+                key_fn=_SPOTIFY_URL,
+            )
+            is None
+        )
+
 
 class TestServiceMatchStatus:
     def test_an_axes_value_with_no_status_is_refused(self):
@@ -282,6 +309,80 @@ class TestDecideServiceMatch:
             )
             is None
         )
+
+    @pytest.mark.parametrize("candidate_credit", ["Various", "Soundtrack"])
+    def test_a_va_query_credit_never_reports_two_axes(self, candidate_credit):
+        """The query credit is our sentinel, not catalog data, so scoring it lies.
+
+        ``VA_QUERY_CREDIT`` is what the drain substitutes when
+        ``build_compilation_query`` recovered no artist at all. A candidate
+        credited *exactly* ``Various`` then scores 100 on the artist axis against
+        it for free — not a marginal LML#1139 prefix clear but a tautology on a
+        string we supplied — and would be recorded as ``artist+title``/``found``.
+        That is the population most likely to be a wrong V/A link, so it is
+        exactly the one that must carry the one-axis marker. The Phase 1 lane
+        branches around this; the streaming lanes must too.
+        """
+        rows = [_spotify_row(candidate_credit, "Blues Masters, Vol. 1")]
+        decision = decide_service_match(
+            rows,
+            query_artist=candidate_credit,
+            query_title="Blues Masters, Vol. 1",
+            **_spotify_kwargs(),
+        )
+        assert decision is not None
+        assert decision.axes == AXES_TITLE_ONLY
+        assert decision.status == STATUS_FOUND_TITLE_ONLY
+
+    def test_a_real_query_credit_still_reports_two_axes(self):
+        """The other half of the partition: a named credit gates on both axes."""
+        rows = [_spotify_row("Jessica Pratt", "On Your Own Love Again")]
+        decision = decide_service_match(
+            rows,
+            query_artist="Jessica Pratt",
+            query_title="On Your Own Love Again",
+            **_spotify_kwargs(),
+        )
+        assert decision is not None
+        assert decision.axes == AXES_ARTIST_AND_TITLE
+        assert decision.status == STATUS_FOUND
+
+    def test_one_sparse_row_does_not_abort_a_lane_of_url_less_rows(self):
+        """The URL filter must not shrink the systemic-break denominator.
+
+        ``find_best_match`` re-raises when *every* row it sees fails extraction.
+        Handing it a URL-filtered subset lets a single sparse row become "every
+        row", so a response that is mostly well-formed-but-URL-less aborts the
+        whole lane instead of skipping one candidate. The verdict has to be
+        computed over the response as received.
+        """
+        url_less_a = {"id": "a", "name": "Blues Masters, Vol. 1", "artists": [{"name": "Various"}]}
+        url_less_b = {"id": "b", "name": "Blues Masters, Vol. 2", "artists": [{"name": "Various"}]}
+        sparse_with_url = {
+            "id": "c",
+            "name": "Blues Masters, Vol. 1",
+            "artists": None,
+            "external_urls": {"spotify": "https://open.spotify.com/album/c"},
+        }
+        assert (
+            decide_service_match(
+                [url_less_a, url_less_b, sparse_with_url],
+                query_artist="Various",
+                query_title="Blues Masters, Vol. 1",
+                **_spotify_kwargs(),
+            )
+            is None
+        )
+
+    def test_every_row_failing_extraction_still_re_raises(self):
+        """The signal itself survives: a wholly-malformed response is systemic."""
+        with pytest.raises(_EXTRACTION_ERRORS):
+            decide_service_match(
+                [{"artists": None}, {"artists": None}],
+                query_artist="Various",
+                query_title="Nuggets",
+                **_spotify_kwargs(),
+            )
 
     def test_a_url_less_top_candidate_does_not_sink_the_lane(self):
         """Filtered before scoring, not after the winner is picked.
