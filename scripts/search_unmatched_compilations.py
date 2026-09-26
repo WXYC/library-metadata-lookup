@@ -13,14 +13,21 @@ import asyncio
 import logging
 import os
 from argparse import ArgumentParser
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 import aiosqlite
 
 from clients.streaming.matching import (
-    find_best_match,
     normalize_album_title,
-    score_match,
     strip_format_suffix,
+)
+from scripts._lib.match_decision import (
+    AXES_TITLE_ONLY,
+    ServiceMatch,
+    best_title_only_candidate,
+    decide_service_match,
+    update_service_match,
 )
 from scripts._lib.runtime import set_up_script_runtime
 from scripts._lib.signals import ShutdownFlag
@@ -40,9 +47,40 @@ _SPOTIFY_TITLE = lambda r: r.get("name", "")  # noqa: E731
 _SPOTIFY_URL = lambda r: r.get("external_urls", {}).get("spotify", "")  # noqa: E731
 _SPOTIFY_ID = lambda r: r.get("id", "")  # noqa: E731
 
+# The credit every lane scores against when ``build_compilation_query`` found no
+# artist at all — the row is ``is_compilation = 1`` filed under a shelf
+# convention, so the V/A sentinel is what the query side actually means.
+VA_QUERY_CREDIT = "Various"
 
-async def search_discogs_by_title(pool, title: str) -> dict | None:
-    """Search Discogs PG cache by title. Returns best match or None."""
+# This lane's historical title floor, below the shared 80 acceptance floor.
+# LML#1353 changes which candidates may be judged on the title axis alone, not
+# where that axis's bar sits, so the number is preserved as it was found.
+DISCOGS_TITLE_FLOOR = 70.0
+
+
+async def search_discogs_by_title(
+    pool, title: str, *, query_artist: str = VA_QUERY_CREDIT
+) -> dict | None:
+    """Search the Discogs PG cache by title. Returns the best match or None.
+
+    This lane has no artist gate at all: it took the best title score above 70
+    whatever the release was credited to, which is how a compilation search lands
+    on a named artist's same-titled album (LML#1353). The scan now runs through
+    ``best_title_only_candidate``, which admits a one-axis judgement only where
+    the artist axis is uninformative — both the shelf credit and the Discogs
+    release credit are V/A credits, and "Various" is Discogs's own primary credit
+    for a compilation.
+
+    ``query_artist`` defaults to the V/A sentinel because callers pass rows whose
+    ``display_artist`` ``build_compilation_query`` already reduced to a filing
+    convention. A caller that *did* recover a real artist name passes it, and the
+    relaxation then declines: the artist axis carries information there and this
+    lane has no way to check it.
+
+    Unlike the streaming lanes, ``albums`` has no ``discogs_confidence`` column,
+    so the returned score is log-only; ``axes`` names what it measured so no
+    reader can take it for a two-axis confidence.
+    """
     normalized = normalize_album_title(title)
     if not normalized:
         return None
@@ -72,21 +110,78 @@ async def search_discogs_by_title(pool, title: str) -> dict | None:
     if not rows:
         return None
 
-    # Score by title similarity (should be high for exact matches)
-    best = None
-    best_score = 0.0
-    for row in rows:
-        title_score = score_match(title, row["title"])
-        if title_score > best_score:
-            best_score = title_score
-            best = {
-                "release_id": row["id"],
-                "title": row["title"],
-                "artist": row["artist_name"],
-                "confidence": title_score,
-            }
+    winner = best_title_only_candidate(
+        rows,
+        query_artist=query_artist,
+        query_title=title,
+        artist_fn=lambda r: r["artist_name"],
+        title_fn=lambda r: r["title"],
+        key_fn=lambda r: str(r["id"]),
+        floor=DISCOGS_TITLE_FLOOR,
+    )
+    if winner is None:
+        return None
+    release, title_score = winner
+    return {
+        "release_id": release["id"],
+        "title": release["title"],
+        "artist": release["artist_name"],
+        "confidence": title_score,
+        "axes": AXES_TITLE_ONLY,
+    }
 
-    return best if best and best_score >= 70 else None
+
+@dataclass(frozen=True)
+class StreamingLane:
+    """One streaming service's search call and result extractors."""
+
+    service: str
+    search: Callable[[str, str], Awaitable[list[dict]]]
+    artist_fn: Callable[[dict], str]
+    title_fn: Callable[[dict], str]
+    url_fn: Callable[[dict], str]
+    id_fn: Callable[[dict], str] | None = None
+    # What to send as the *search* artist term when the row carries no artist at
+    # all. Preserved per-lane as found: Deezer was queried with an empty term and
+    # Spotify with the literal "Various Artists". It is a recall knob on the
+    # query, not part of the match decision — both lanes score against
+    # ``VA_QUERY_CREDIT``.
+    search_credit: str = ""
+
+
+async def resolve_lane(
+    lane: StreamingLane,
+    db: aiosqlite.Connection,
+    *,
+    album_id: int,
+    search_artist: str | None,
+    search_title: str,
+    dry_run: bool,
+) -> ServiceMatch | None:
+    """Search one lane for an album and record the decision with its provenance.
+
+    Returns the decision, or None when neither the guarded 80/80 matcher nor the
+    V/A title-only relaxation admitted a candidate. Nothing is written in that
+    case: the row keeps its ``skipped`` status and stays available to a later
+    pass, which is the right outcome for a candidate no axis can justify.
+    """
+    results = await lane.search(
+        search_artist or lane.search_credit, strip_format_suffix(search_title)
+    )
+    decision = decide_service_match(
+        results,
+        query_artist=search_artist or VA_QUERY_CREDIT,
+        query_title=search_title,
+        artist_fn=lane.artist_fn,
+        title_fn=lane.title_fn,
+        url_fn=lane.url_fn,
+        id_fn=lane.id_fn,
+    )
+    if decision is None:
+        return None
+    if not dry_run:
+        await update_service_match(db, album_id=album_id, service=lane.service, match=decision)
+    return decision
 
 
 async def run(args) -> None:
@@ -126,10 +221,12 @@ async def run(args) -> None:
                 if _shutdown.requested:
                     break
 
-                _, search_title = build_compilation_query(
+                search_artist, search_title = build_compilation_query(
                     row["display_artist"], row["display_title"]
                 )
-                match = await search_discogs_by_title(pool, search_title)
+                match = await search_discogs_by_title(
+                    pool, search_title, query_artist=search_artist or VA_QUERY_CREDIT
+                )
 
                 if match:
                     discogs_found += 1
@@ -147,11 +244,12 @@ async def run(args) -> None:
                             ),
                         )
                     logger.debug(
-                        "Discogs: %s → %s (%s, %.0f%%)",
+                        "Discogs: %s → %s (%s, %.0f%% on the %s axis)",
                         row["display_title"],
                         match["title"],
                         match["artist"],
                         match["confidence"],
+                        match["axes"],
                     )
                 else:
                     discogs_misses.append(row)
@@ -199,6 +297,28 @@ async def run(args) -> None:
 
         spotify = SpotifyClient(client_id, client_secret)
 
+    lanes = [
+        StreamingLane(
+            service="deezer",
+            search=deezer.search_album,
+            artist_fn=_DEEZER_ARTIST,
+            title_fn=_DEEZER_TITLE,
+            url_fn=_DEEZER_URL,
+        )
+    ]
+    if spotify:
+        lanes.append(
+            StreamingLane(
+                service="spotify",
+                search=spotify.search_album,
+                artist_fn=_SPOTIFY_ARTIST,
+                title_fn=_SPOTIFY_TITLE,
+                url_fn=_SPOTIFY_URL,
+                id_fn=_SPOTIFY_ID,
+                search_credit="Various Artists",
+            )
+        )
+
     streaming_found = 0
     streaming_miss = 0
 
@@ -212,83 +332,30 @@ async def run(args) -> None:
             )
             found = False
 
-            # Deezer album search
-            try:
-                results = await deezer.search_album(
-                    search_artist or "", strip_format_suffix(search_title)
-                )
-                match = find_best_match(
-                    results,
-                    search_artist or "Various",
-                    search_title,
-                    artist_fn=_DEEZER_ARTIST,
-                    title_fn=_DEEZER_TITLE,
-                    url_fn=_DEEZER_URL,
-                )
-                # For compilations, relax artist check — just need title match
-                if not match and results:
-                    for r in results:
-                        title_score = score_match(search_title, _DEEZER_TITLE(r))
-                        if title_score >= 80:
-                            match = {
-                                "url": _DEEZER_URL(r),
-                                "confidence": title_score,
-                                "matched_title": _DEEZER_TITLE(r),
-                            }
-                            break
-                if match:
-                    found = True
-                    if not args.dry_run:
-                        await db.execute(
-                            "UPDATE albums SET deezer_status = 'found', deezer_url = ?, deezer_confidence = ? WHERE id = ?",
-                            (match["url"], match["confidence"], row["id"]),
-                        )
-            except Exception:
-                logger.warning("Deezer error for %s", row["display_title"])
-
-            # Spotify album search
-            if spotify:
+            for lane in lanes:
                 try:
-                    results = await spotify.search_album(
-                        search_artist or "Various Artists",
-                        strip_format_suffix(search_title),
+                    decision = await resolve_lane(
+                        lane,
+                        db,
+                        album_id=row["id"],
+                        search_artist=search_artist,
+                        search_title=search_title,
+                        dry_run=args.dry_run,
                     )
-                    match = find_best_match(
-                        results,
-                        search_artist or "Various",
-                        search_title,
-                        artist_fn=_SPOTIFY_ARTIST,
-                        title_fn=_SPOTIFY_TITLE,
-                        url_fn=_SPOTIFY_URL,
-                        id_fn=_SPOTIFY_ID,
-                    )
-                    if not match and results:
-                        for r in results:
-                            title_score = score_match(search_title, _SPOTIFY_TITLE(r))
-                            if title_score >= 80:
-                                match = {
-                                    "url": _SPOTIFY_URL(r),
-                                    "id": _SPOTIFY_ID(r),
-                                    "confidence": title_score,
-                                    "matched_title": _SPOTIFY_TITLE(r),
-                                }
-                                break
-                    if match:
-                        found = True
-                        if not args.dry_run:
-                            await db.execute(
-                                """UPDATE albums SET spotify_status = 'found',
-                                   spotify_url = ?, spotify_id = ?, spotify_confidence = ?
-                                   WHERE id = ?""",
-                                (
-                                    match["url"],
-                                    match.get("id"),
-                                    match["confidence"],
-                                    row["id"],
-                                ),
-                            )
                 except Exception:
-                    logger.warning("Spotify error for %s", row["display_title"])
+                    logger.warning("%s error for %s", lane.service, row["display_title"])
+                    continue
+                if decision is not None:
+                    found = True
+                    logger.debug(
+                        "%s: %s → %s (%s, %.0f%% on the %s axis)",
+                        lane.service,
+                        row["display_title"],
+                        decision.matched_title,
+                        decision.matched_artist,
+                        decision.confidence,
+                        decision.axes,
+                    )
 
             if found:
                 streaming_found += 1

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from scripts._lib.match_decision import AXES_ARTIST_ONLY, AXES_TITLE_ONLY
 from scripts.discogs_rematch import (
     pass1_title_search,
     pass2_fuzzy_artist_search,
@@ -45,6 +46,25 @@ class TestPass1TitleSearch:
         result = await pass1_title_search(pool, row)
         assert result is not None
         assert result["release_id"] == 99999
+
+    @pytest.mark.asyncio
+    async def test_reports_the_axis_its_score_measured(self):
+        """Pass 1's score is an artist score; pass 2's is a title score (LML#1353).
+
+        Both land in a field called ``confidence``, which a reader takes for a
+        two-axis match confidence unless the row says otherwise.
+        """
+        pool = AsyncMock()
+        pool.fetch.return_value = [
+            {
+                "id": 99999,
+                "title": "Got To Be The Way It Is",
+                "artist_name": "Sharon Jones & The Dap-Kings",
+            }
+        ]
+        result = await pass1_title_search(pool, _make_row())
+        assert result is not None
+        assert result["axes"] == AXES_ARTIST_ONLY
 
     @pytest.mark.asyncio
     async def test_no_match_returns_none(self):
@@ -146,6 +166,7 @@ class TestPass2FuzzyArtistSearch:
         result = await pass2_fuzzy_artist_search(pool, row)
         assert result is not None
         assert result["release_id"] == 44444
+        assert result["axes"] == AXES_TITLE_ONLY
 
     @pytest.mark.asyncio
     async def test_no_artist_match_returns_none(self):
