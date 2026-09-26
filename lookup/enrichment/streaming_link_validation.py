@@ -28,15 +28,13 @@ slot + wall-clock on a live probe.
 **LML#1352 deliberately reverses that declination for ``spotify_url``, on one
 axis: the path kind.** The field must now name a release — an album or a track
 page (``url_is_spotify_album_or_track``; that function documents why the track
-kind counts) — not merely be a URL on a Spotify host. A 2026-09-25 pull of the
-artifact found ~6.2k of its 46,907 populated ``spotify_url`` values pointing at
-an artist, playlist, user or podcast page, or at an id-less ``/album``, and 100%
-of the artist-shaped ones carry no match provenance at all
-(``spotify_matched_artist`` holds a strategy name like ``backfill-wiki
-(spotify)``) — so the guard removes one April-2026 campaign that resolved
-*artists* into an album column and touches nothing properly matched. Per-shape
-counts are pinned as the accept/reject table in
-``tests/unit/test_streaming_link_validation.py``.
+kind counts) — not merely be a URL on a Spotify host. It removes one April-2026
+enrichment campaign that resolved *artists* into an album column and touches
+nothing properly matched. The production census — per-shape counts, how much of
+it is this guard's to suppress rather than the host check's, and why the sibling
+provenance gate LML#1355 shares none of this population — is the accept/reject
+table in ``tests/unit/test_streaming_link_validation.py``, which is where it
+lives; do not restate it here.
 
 Serving those was not a soft failure: ``item.py``'s ``_slot_urls`` /
 ``_RESOLUTION_PROVING_URL_SERVICES`` force ``streaming_status.spotify =
@@ -44,8 +42,14 @@ Serving those was not a soft failure: ``item.py``'s ``_slot_urls`` /
 confirmed album match, and ``verified`` is terminal. Which makes the
 consequence the LML#1295 review weighed as a cost the *point* for this field:
 a suppressed ``spotify_url`` falls through to the post-process's cache-UPSERT /
-mint leg, which resolves an album page for the REQUEST's (artist, album) and
-whose verdict a later leg can still supersede.
+mint leg, which resolves an album page for the REQUEST's (artist, album). Read
+that as re-resolution, not repair: once the warm it schedules records a genuine
+miss, ``streaming_url_postprocess.py`` reports ``absent`` for ``miss_ttl``, and
+``absent`` is terminal in Backend-Service's ``mergeStreamingField``. These
+requests' artist is a filing convention (``Soundtracks - M``), so that warm
+systematically misses and the cohort ends at a blank button reported as a
+definitive negative — better than a confident wrong link (LML#1144), but not
+supersession. ROUTED on LML#1352 with the ``verified`` demotion.
 
 Three scope facts, all routed on #1352 rather than handled here, because each
 lives at another layer: LML#1352's *reported* Mob/Money value is album-shaped
