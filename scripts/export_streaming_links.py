@@ -74,12 +74,30 @@ def _has_match_provenance(matched_artist: str | None, matched_title: str | None)
     - 18,281 rows (39.0%) hold a writer *tag* rather than an artist
       (``backfill-wiki (spotify)``, ``llm+wikidata``, ``web-search (spotify)``, ...)
       and an empty title -- the one eight-day 2026-04 campaign described in
-      LML#1353. Their measured defect is URL *shape* (they are Spotify artist
-      pages), which is fixed at the serve seam, not absent provenance. Gating them
-      would null 39% of the artifact's STORED spotify_url rows on a provenance
-      technicality -- a smaller number of *served* URLs, since the serve seam
-      already nulls the off-host ones, but not a number anything measured
-      justifies. So one non-blank field is enough here.
+      LML#1353. Gating them would null 39% of the artifact's STORED spotify_url
+      rows on a provenance technicality, which is not a number anything measured
+      justifies, so one non-blank field is enough here. Their *shape* splits three
+      ways, and only the first two are anybody's shape problem:
+
+      - 7,826 (42.8% of the cohort) are not on a Spotify host at all
+        (``music.apple.com`` 2,043, ``www.deezer.com`` 764, then Bandcamp
+        subdomains, YouTube and Tidal -- another service's URL in a Spotify
+        column). The serve seam's pre-existing host check already suppresses
+        every one of these.
+      - 6,251 (34.2%) are on-host but not release-shaped, overwhelmingly
+        ``/artist/``. This is exactly the population the sibling guard LML#1356
+        suppresses, and it is that guard's whole incremental effect.
+      - 4,204 (23.0%) are properly album/track-shaped. No shape check touches
+        them, so for this quarter of the cohort the writer tag is the only
+        defect: they pass the host check, the sibling shape guard AND this gate,
+        and are served as ``verified`` on a strategy name. ROUTED on LML#1352,
+        not closed here -- catching them needs a positive judgement about what a
+        writer tag is worth, which is the confidence-floor question, not the
+        does-any-evidence-exist question this predicate asks.
+
+      An earlier draft of this docstring asserted the cohort's defect simply *was*
+      URL shape. That holds for 77% of it and is wrong for the 4,204; the
+      three-way split above is the measured version.
     - 388 rows (0.83%) hold neither. 363 of those are *every* compilation row in
       the artifact carrying a Spotify URL, written by
       ``scripts/search_unmatched_compilations.py``, whose single Spotify UPDATE omits
@@ -90,6 +108,15 @@ def _has_match_provenance(matched_artist: str | None, matched_title: str | None)
       Shinedown "Simple Man", ``Sweet Lies`` -> Anita Baker "Sweet Love". Only that
       bottom band was audited, so that ratio is not a precision estimate for the
       whole 388. Those are the rows this returns False for.
+
+    The two gates do not overlap at all, which is why each is independently
+    necessary. Every one of the 388 rows this refuses is properly album/track-shaped,
+    so LML#1356's shape guard catches none of them; and every one of the 14,077
+    non-release-shaped values in the column carries provenance, so this predicate
+    catches none of those. The cross-tab has three populated cells and an empty
+    fourth -- no value is both unshaped and provenance-less. Neither PR can be
+    described as a subset of the other, and landing either alone leaves its own
+    cell served.
 
     Why negative evidence rather than the identity cross-check LML#1352 suggests
     first: an agreement test against ``entity.release_identity`` needs *positive*
