@@ -548,15 +548,16 @@ The Phase 1 narrowing that remains is deliberate and costs recall: a compilation
 
 **`found_title_only`.** A title-only acceptance is written to `{service}_status` as `found_title_only`, never `found`, so `{service}_confidence` has exactly one meaning per row: the score of the axes the row names. It is also the predicate a serve-side gate can filter on — note that `scripts/export_streaming_links.py`'s album-level export is `spotify_url IS NOT NULL` today, with no status or provenance condition. A title-only decision will not overwrite a row already at `found` (`ResultsDB.update_result(..., skip_if_resolved=True)`): a guarded match outranks a one-axis one, and the mirrored PG table raises on that demotion.
 
-**Readers of `{service}_status` that predate the new value**, tracked in [LML#1358](https://github.com/WXYC/library-metadata-lookup/issues/1358) and *not* taught it here — a `found_title_only` row is invisible to the first four and newly visible to the fifth:
+**Readers of `{service}_status` that predate the new value** and are *not* taught it here — a `found_title_only` row is invisible to each. Tracked in [LML#1358](https://github.com/WXYC/library-metadata-lookup/issues/1358); the rollup is the one that actively regresses the artifact rather than merely skipping it:
 
 | site | effect |
 |---|---|
+| `scripts/track_streaming/__main__.py:439` `phase_album_rollup` | promotes `found_title_only` → `found` on the first rollup after the drain, leaving the one-axis confidence and provenance in place — the "confidence without axes" row this fix removes. Reachable: its compilation extraction selects exactly `is_compilation = 1` |
 | `scripts/track_streaming/__main__.py:157` local streaming index (`= 'found'` per service) | a compilation whose only streaming presence is title-only never has its tracks resolved |
-| `scripts/track_streaming/__main__.py:439` `phase_album_rollup` | promotes `found_title_only` → `found` on the first rollup after the drain, erasing the label |
 | `ResultsDB.get_deezer_hits_pending_spotify` and its PG twin `catalog_dao.py:395` | a title-only Deezer hit doesn't cascade into the Spotify pass |
 | `scripts/streaming_availability/report.py:92` | reporting drift |
-| `scripts/spotify_artist_catalog.py:98` (`!= 'found'`) | now *selects* these rows, and `:207` rewrites them to `found` with no provenance columns — the LML#1353 defect, on a row this drain just repaired |
+
+(`scripts/spotify_artist_catalog.py:98` tests `!= 'found'` and so would select these rows, but it also filters `is_compilation = 0` and this drain writes only `is_compilation = 1` rows, so it cannot reach them.)
 
 `discogs_status` deliberately has no such value: `albums` has no `discogs_confidence` column, so nothing there persists a score to disambiguate. `scripts/discogs_rematch.py` is the same shape at one remove — its passes score one axis each (pass 1 artist, pass 2 title) and report which in an `axes` field, but neither is a title-only acceptance and neither persists the number.
 

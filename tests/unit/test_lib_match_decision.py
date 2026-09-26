@@ -19,9 +19,11 @@ import pytest
 from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
 from scripts._lib.match_decision import (
     AXES_ARTIST_AND_TITLE,
+    AXES_ARTIST_ONLY,
     AXES_TITLE_ONLY,
     STATUS_FOUND,
     STATUS_FOUND_TITLE_ONLY,
+    ServiceMatch,
     best_title_only_candidate,
     decide_service_match,
 )
@@ -193,6 +195,26 @@ class TestBestTitleOnlyCandidate:
         )
 
 
+class TestServiceMatchStatus:
+    def test_an_axes_value_with_no_status_is_refused(self):
+        """Derivation, not an ``else``: the pair must not be able to drift.
+
+        ``AXES_ARTIST_ONLY`` is in this module's vocabulary (``discogs_rematch``
+        reports it), and an ``else`` branch would persist it as
+        ``found_title_only`` — a status asserting a title comparison that never
+        happened.
+        """
+        match = ServiceMatch(
+            url="https://open.spotify.com/album/x",
+            confidence=90.0,
+            matched_artist="Stereolab",
+            matched_title="Aluminum Tunes",
+            axes=AXES_ARTIST_ONLY,
+        )
+        with pytest.raises(KeyError):
+            _ = match.status
+
+
 class TestDecideServiceMatch:
     def test_guarded_match_reports_both_axes(self):
         rows = [_spotify_row("Jessica Pratt", "On Your Own Love Again")]
@@ -260,6 +282,61 @@ class TestDecideServiceMatch:
             )
             is None
         )
+
+    def test_a_url_less_top_candidate_does_not_sink_the_lane(self):
+        """Filtered before scoring, not after the winner is picked.
+
+        ``find_best_match`` returns one winner. If a URL-less candidate can win,
+        a region-restricted Spotify album with no ``external_urls.spotify`` takes
+        the runner-up that also cleared 80/80 — and the relaxation, which only
+        runs when the guarded pass found nothing — down with it.
+        """
+        best_but_url_less = {
+            "id": "restricted",
+            "name": "On Your Own Love Again",
+            "artists": [{"name": "Jessica Pratt"}],
+        }
+        runner_up = _spotify_row("Jessica Pratt", "On Your Own Love", "playable")
+        decision = decide_service_match(
+            [best_but_url_less, runner_up],
+            query_artist="Jessica Pratt",
+            query_title="On Your Own Love Again",
+            **_spotify_kwargs(),
+        )
+        assert decision is not None
+        assert decision.url == "https://open.spotify.com/album/playable"
+        assert decision.matched_title == "On Your Own Love"
+
+    def test_a_malformed_id_does_not_abort_the_relaxed_path(self):
+        """``find_best_match`` extracts the id inside its own guard; so must this.
+
+        The reachable shape needs a second row that extracts cleanly, because a
+        response where *every* row is id-sparse is a systemic break the guarded
+        pass re-raises on before the relaxation is reached. Here the guarded pass
+        skips the id-sparse row, rejects the other on the artist axis and returns
+        None — and the relaxation then picks the very row it skipped. Without the
+        guard that raises into the caller's blanket ``except Exception``, which
+        discards the whole lane's response over one missing field.
+        """
+        id_sparse = {
+            "name": "Nuggets",
+            "artists": [{"name": "Various Artists"}],
+            "external_urls": {"spotify": "https://open.spotify.com/album/nuggets"},
+        }
+        well_formed = _spotify_row("Various Artists", "Something Else Entirely", "other")
+        decision = decide_service_match(
+            [well_formed, id_sparse],
+            query_artist="Various",
+            query_title="Nuggets",
+            artist_fn=_SPOTIFY_ARTIST,
+            title_fn=_SPOTIFY_TITLE,
+            url_fn=_SPOTIFY_URL,
+            id_fn=lambda r: r["id"],
+        )
+        assert decision is not None
+        assert decision.axes == AXES_TITLE_ONLY
+        assert decision.matched_title == "Nuggets"
+        assert decision.service_item_id is None
 
     @pytest.mark.parametrize(
         ("candidate_artist", "query_artist"),

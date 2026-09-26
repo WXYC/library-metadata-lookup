@@ -254,10 +254,15 @@ async def run(args) -> None:
     if args.db_path != ":memory:" and not os.path.exists(args.db_path):
         raise SystemExit(f"no streaming-availability artifact at {args.db_path!r}")
 
-    # Opened through its owner so ``_migrate`` runs: the provenance columns this
-    # drain now writes are ALTERs that an older artifact file may not have, and a
-    # raw connect would fail every write with an OperationalError the per-lane
-    # handler would report as the streaming service being down.
+    # Opened through its owner because the write goes through
+    # ``ResultsDB.update_result``, which owns this column family. ``connect`` also
+    # runs ``_migrate``, which covers the Deezer provenance columns on an older
+    # artifact — but *not* ``spotify_matched_artist``/``_title``/``_checked_at``,
+    # which exist only in ``_SCHEMA``'s no-op ``CREATE TABLE IF NOT EXISTS``. On an
+    # artifact predating those, a Spotify write raises and the per-lane handler
+    # logs it as a Spotify error; the prod artifact has them (it already holds
+    # rows with stale spotify provenance), so this is a gap in ``_migrate``'s list
+    # rather than a live failure. Tracked in LML#1358.
     results_db = ResultsDB(args.db_path)
     await results_db.connect()
     db = results_db._db

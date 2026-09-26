@@ -51,11 +51,23 @@ not this, so the LML#842 port has to add it (which is the "conditional writes,
 skip services already resolved" that DAO's own module docstring already says PR D
 owes its miss handlers).
 
-Deliberately NOT in scope: a guarded ``find_best_match`` accept is recorded as
-``found`` even when its artist score was itself a V/A-prefix clear in the
-LML#1139 band. Retrofitting the guard onto the *accept* path would change the
-60% of the artifact that the matcher approved, which is a different decision on
-a different population than this fix.
+Deliberately NOT in scope, and both worth knowing before reading a
+``found_title_only`` row as corroborated:
+
+* A guarded ``find_best_match`` accept is recorded as ``found`` even when its
+  artist score was itself a V/A-prefix clear in the LML#1139 band. Retrofitting
+  the guard onto the *accept* path would change the 60% of the artifact that the
+  matcher approved, which is a different decision on a different population than
+  this fix.
+* Scoping the relaxation to the V/A-on-V/A class does not make that class
+  *well* discriminated — it makes the artist axis's silence explicit. The title
+  is then the only discriminator, and compilation titles are heavily reused
+  ("Blues Masters, Vol. 1" names a dozen unrelated V/A albums). The recorded
+  provenance for such a row is ``matched_artist = "Various Artists"`` and a
+  ``matched_title`` identical to the query, which *reads* like corroboration and
+  is not; that is what ``found_title_only`` exists to say out loud. A second
+  discriminator (year, label, track count) is the real fix and needs data this
+  lane does not fetch.
 """
 
 from __future__ import annotations
@@ -87,6 +99,16 @@ STATUS_FOUND = "found"
 # only the title was compared" without re-fetching the service page.
 STATUS_FOUND_TITLE_ONLY = "found_title_only"
 
+# Explicit rather than a two-branch conditional: ``AXES_ARTIST_ONLY`` is in the
+# vocabulary above, and an ``else`` would persist it as ``found_title_only`` —
+# a status asserting a title comparison that never happened. The point of
+# deriving the status from the axes is that the pair cannot drift, which a total
+# mapping holds and a fallback does not.
+_STATUS_BY_AXES = {
+    AXES_ARTIST_AND_TITLE: STATUS_FOUND,
+    AXES_TITLE_ONLY: STATUS_FOUND_TITLE_ONLY,
+}
+
 
 @dataclass(frozen=True)
 class ServiceMatch:
@@ -101,8 +123,13 @@ class ServiceMatch:
 
     @property
     def status(self) -> str:
-        """The status to persist. ``found`` requires both axes, by construction."""
-        return STATUS_FOUND if self.axes == AXES_ARTIST_AND_TITLE else STATUS_FOUND_TITLE_ONLY
+        """The status to persist. ``found`` requires both axes, by construction.
+
+        Raises:
+            KeyError: for an axes value with no status of its own, rather than
+                silently recording the wrong one (see ``_STATUS_BY_AXES``).
+        """
+        return _STATUS_BY_AXES[self.axes]
 
 
 def best_title_only_candidate[T](
@@ -202,8 +229,28 @@ def decide_service_match(
     records nothing, leaving the row for a later pass rather than persisting a
     link it cannot justify.
     """
+    # Drop the candidates that have no URL *before* scoring. Every URL extractor
+    # in play defaults to ``""`` on a missing key, and ``''`` is not NULL: it
+    # clears ``export_streaming_links.py``'s ``spotify_url IS NOT NULL`` export
+    # gate and then violates the PG mirror's ``url <> ''`` CHECK when the artifact
+    # is seeded. Filtering here rather than on the winner matters because
+    # ``find_best_match`` returns exactly one: a region-restricted album with no
+    # ``external_urls.spotify`` would otherwise take the runner-up that also
+    # cleared 80/80 — and the relaxation, which only runs when the guarded pass
+    # found nothing — down with it. A row whose ``url_fn`` *raises* is kept, so
+    # the per-row extraction guards below stay the only place that judges a
+    # malformed row.
+    playable = []
+    for item in results:
+        try:
+            if not url_fn(item):
+                continue
+        except _EXTRACTION_ERRORS:
+            pass
+        playable.append(item)
+
     guarded = find_best_match(
-        results,
+        playable,
         query_artist,
         query_title,
         artist_fn=artist_fn,
@@ -212,7 +259,7 @@ def decide_service_match(
         id_fn=id_fn,
     )
     if guarded is not None:
-        match = ServiceMatch(
+        return ServiceMatch(
             url=guarded["url"],
             confidence=guarded["confidence"],
             matched_artist=guarded["matched_artist"],
@@ -220,29 +267,32 @@ def decide_service_match(
             axes=AXES_ARTIST_AND_TITLE,
             service_item_id=guarded.get("id"),
         )
-    else:
-        relaxed = best_title_only_candidate(
-            results,
-            query_artist=query_artist,
-            query_title=query_title,
-            artist_fn=artist_fn,
-            title_fn=title_fn,
-            key_fn=url_fn,
-            floor=title_only_floor,
-        )
-        if relaxed is None:
-            return None
-        candidate, title_score = relaxed
-        match = ServiceMatch(
-            url=url_fn(candidate),
-            confidence=title_score,
-            matched_artist=artist_fn(candidate),
-            matched_title=title_fn(candidate),
-            axes=AXES_TITLE_ONLY,
-            service_item_id=id_fn(candidate) if id_fn is not None else None,
-        )
-    # Every URL extractor in play defaults to ``""`` on a missing key, and ``''``
-    # is not NULL: it clears ``export_streaming_links.py``'s ``spotify_url IS NOT
-    # NULL`` export gate and then violates the PG mirror's ``url <> ''`` CHECK
-    # when the artifact is seeded. A candidate with no link is not a decision.
-    return match if match.url else None
+
+    relaxed = best_title_only_candidate(
+        playable,
+        query_artist=query_artist,
+        query_title=query_title,
+        artist_fn=artist_fn,
+        title_fn=title_fn,
+        key_fn=url_fn,
+        floor=title_only_floor,
+    )
+    if relaxed is None:
+        return None
+    candidate, title_score = relaxed
+    try:
+        service_item_id = id_fn(candidate) if id_fn is not None else None
+    except _EXTRACTION_ERRORS:
+        # ``find_best_match`` extracts the id inside its own per-row guard, so a
+        # row sparse in only that field is skipped rather than fatal. Here the row
+        # has already cleared the title axis, so losing the id beats raising into
+        # the caller's blanket handler and discarding the whole response.
+        service_item_id = None
+    return ServiceMatch(
+        url=url_fn(candidate),
+        confidence=title_score,
+        matched_artist=artist_fn(candidate),
+        matched_title=title_fn(candidate),
+        axes=AXES_TITLE_ONLY,
+        service_item_id=service_item_id,
+    )
