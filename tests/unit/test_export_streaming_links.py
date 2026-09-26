@@ -650,3 +650,521 @@ class TestCommitBehavior:
 
         # With 10,001 rows and commits every 10,000, we expect at least 2 commits
         assert tracking_lib.commit_count > 1
+
+
+# ---------------------------------------------------------------------------
+# Spotify match-provenance gate (LML#1352 / LML#1353)
+# ---------------------------------------------------------------------------
+
+# The `albums` columns the production artifact carries, in the order used by the
+# helper below. Deliberately a *subset* of the real schema (results_db.py holds
+# the full one) -- just enough that the provenance gate has something to read
+# and the display columns make a fixture legible.
+_PROVENANCE_ALBUMS_DDL = """
+    CREATE TABLE albums (
+        id INTEGER PRIMARY KEY,
+        display_artist TEXT,
+        display_title TEXT,
+        library_ids TEXT,
+        is_compilation INTEGER NOT NULL DEFAULT 0,
+        spotify_status TEXT,
+        spotify_url TEXT,
+        spotify_confidence REAL,
+        spotify_matched_artist TEXT,
+        spotify_matched_title TEXT,
+        spotify_checked_at TEXT,
+        apple_url TEXT,
+        deezer_url TEXT,
+        bandcamp_url TEXT,
+        tidal_url TEXT,
+        youtube_music_url TEXT,
+        soundcloud_url TEXT
+    )
+"""
+
+
+def _create_provenance_streaming_db(path, albums, track_results=None):
+    """Create a streaming_availability.db whose `albums` table carries provenance.
+
+    `albums` is a list of dicts keyed by column name; anything omitted is NULL.
+    `track_results`, when given, creates the supplement table too.
+    """
+    sa = sqlite3.connect(path)
+    sa.execute(_PROVENANCE_ALBUMS_DDL)
+    for album in albums:
+        cols = ", ".join(album)
+        placeholders = ", ".join("?" for _ in album)
+        sa.execute(
+            f"INSERT INTO albums ({cols}) VALUES ({placeholders})",  # noqa: S608 (test fixture)
+            tuple(album.values()),
+        )
+    if track_results is not None:
+        sa.execute("""
+            CREATE TABLE track_results (
+                id INTEGER PRIMARY KEY,
+                album_id INTEGER NOT NULL,
+                resolution_status TEXT,
+                spotify_url TEXT,
+                deezer_url TEXT
+            )
+        """)
+        for track in track_results:
+            cols = ", ".join(track)
+            placeholders = ", ".join("?" for _ in track)
+            sa.execute(
+                f"INSERT INTO track_results ({cols}) VALUES ({placeholders})",  # noqa: S608
+                tuple(track.values()),
+            )
+    sa.commit()
+    sa.close()
+
+
+def _export(tmp_path, albums, track_results=None, dry_run=False):
+    """Run main() over a provenance-shaped fixture; return the library.db path."""
+    streaming_db = str(tmp_path / "streaming.db")
+    library_db = str(tmp_path / "library.db")
+    _create_provenance_streaming_db(streaming_db, albums, track_results)
+    sqlite3.connect(library_db).close()
+    args = argparse.Namespace(library_db=library_db, streaming_db=streaming_db, dry_run=dry_run)
+    main(args)
+    return library_db
+
+
+def _streaming_link(library_db, library_id, column="spotify_url"):
+    conn = sqlite3.connect(library_db)
+    try:
+        row = conn.execute(
+            f"SELECT {column} FROM streaming_links WHERE library_id = ?",  # noqa: S608
+            (library_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
+
+
+class TestSpotifyProvenanceGate:
+    """A spotify_url with no record of what was matched must not be exported.
+
+    See LML#1352: `lookup/enrichment/item.py` serves the exported URL and labels it
+    `streaming_status.spotify = "verified"`. A row whose `spotify_matched_artist`
+    and `spotify_matched_title` are both absent carries no record of what was ever
+    compared, so nothing downstream can audit it -- and 363 of them are every
+    compilation row in the artifact that has a Spotify URL (LML#1353).
+    """
+
+    @pytest.mark.parametrize(
+        "matched_artist,matched_title",
+        [
+            (None, None),
+            ("", ""),
+            (None, ""),
+            ("", None),
+            ("   ", "\t"),
+        ],
+        ids=["both-null", "both-empty", "null-and-empty", "empty-and-null", "both-whitespace"],
+    )
+    def test_absent_provenance_skips_spotify_url(self, tmp_path, matched_artist, matched_title):
+        library_db = _export(
+            tmp_path,
+            [
+                {
+                    "id": 1,
+                    "display_artist": "Soundtracks - M",
+                    "display_title": "Married to the Mob",
+                    "library_ids": json.dumps([601]),
+                    "is_compilation": 1,
+                    "spotify_url": "https://open.spotify.com/album/wrong-album",
+                    "spotify_confidence": 89.47,
+                    "spotify_matched_artist": matched_artist,
+                    "spotify_matched_title": matched_title,
+                    "apple_url": "https://music.apple.com/album/married-to-the-mob",
+                }
+            ],
+        )
+        assert _streaming_link(library_db, 601) is None
+
+    def test_absent_provenance_leaves_other_services_alone(self, tmp_path):
+        """The gate is Spotify-only: every other service's URL for the row survives."""
+        library_db = _export(
+            tmp_path,
+            [
+                {
+                    "id": 1,
+                    "display_artist": "Soundtracks - M",
+                    "display_title": "Married to the Mob",
+                    "library_ids": json.dumps([601]),
+                    "is_compilation": 1,
+                    "spotify_url": "https://open.spotify.com/album/wrong-album",
+                    "spotify_matched_artist": None,
+                    "spotify_matched_title": None,
+                    "apple_url": "https://music.apple.com/album/married-to-the-mob",
+                    "deezer_url": "https://www.deezer.com/album/married-to-the-mob",
+                    "bandcamp_url": "https://various.bandcamp.com/album/married-to-the-mob",
+                    "tidal_url": "https://tidal.com/album/married-to-the-mob",
+                    "youtube_music_url": "https://music.youtube.com/married-to-the-mob",
+                    "soundcloud_url": "https://soundcloud.com/va/married-to-the-mob",
+                }
+            ],
+        )
+        conn = sqlite3.connect(library_db)
+        row = conn.execute(
+            "SELECT spotify_url, apple_music_url, deezer_url, bandcamp_url, tidal_url, "
+            "youtube_music_url, soundcloud_url FROM streaming_links WHERE library_id = 601"
+        ).fetchone()
+        conn.close()
+        assert row == (
+            None,
+            "https://music.apple.com/album/married-to-the-mob",
+            "https://www.deezer.com/album/married-to-the-mob",
+            "https://various.bandcamp.com/album/married-to-the-mob",
+            "https://tidal.com/album/married-to-the-mob",
+            "https://music.youtube.com/married-to-the-mob",
+            "https://soundcloud.com/va/married-to-the-mob",
+        )
+
+    def test_full_provenance_exports_spotify_url(self, tmp_path):
+        library_db = _export(
+            tmp_path,
+            [
+                {
+                    "id": 1,
+                    "display_artist": "Stereolab",
+                    "display_title": "Aluminum Tunes",
+                    "library_ids": json.dumps([701]),
+                    "spotify_url": "https://open.spotify.com/album/aluminum-tunes",
+                    "spotify_matched_artist": "Stereolab",
+                    "spotify_matched_title": "Aluminum Tunes",
+                }
+            ],
+        )
+        assert _streaming_link(library_db, 701) == "https://open.spotify.com/album/aluminum-tunes"
+
+    @pytest.mark.parametrize(
+        "source_tag",
+        [
+            "backfill-wiki (spotify)",
+            "llm+wikidata",
+            "web-search (spotify)",
+            "vector-search (spotify)",
+            "musicbrainz",
+        ],
+    )
+    def test_source_tag_without_matched_title_still_exports(self, tmp_path, source_tag):
+        """The gate is NOT widened to the 18,281 tag rows (LML#1353's second problem).
+
+        Those rows hold a writer tag rather than an artist in `spotify_matched_artist`
+        and nothing in `spotify_matched_title`. Their measured defect is URL *shape*
+        (Spotify artist pages), fixed at the serve seam by the sibling branch
+        `fix/streaming-link-album-shape-guard` -- not absent provenance. Nulling 39%
+        of Spotify coverage on a provenance technicality is not warranted by anything
+        measured, so one non-empty field is enough to pass this gate.
+        """
+        library_db = _export(
+            tmp_path,
+            [
+                {
+                    "id": 1,
+                    "display_artist": "Juana Molina",
+                    "display_title": "DOGA",
+                    "library_ids": json.dumps([702]),
+                    "spotify_url": "https://open.spotify.com/album/doga",
+                    "spotify_matched_artist": source_tag,
+                    "spotify_matched_title": "",
+                }
+            ],
+        )
+        assert _streaming_link(library_db, 702) == "https://open.spotify.com/album/doga"
+
+    def test_matched_title_alone_still_exports(self, tmp_path):
+        """Provenance is "entirely absent" only when BOTH fields are empty."""
+        library_db = _export(
+            tmp_path,
+            [
+                {
+                    "id": 1,
+                    "display_artist": "Jessica Pratt",
+                    "display_title": "On Your Own Love Again",
+                    "library_ids": json.dumps([703]),
+                    "spotify_url": "https://open.spotify.com/album/on-your-own-love-again",
+                    "spotify_matched_artist": None,
+                    "spotify_matched_title": "On Your Own Love Again",
+                }
+            ],
+        )
+        assert (
+            _streaming_link(library_db, 703)
+            == "https://open.spotify.com/album/on-your-own-love-again"
+        )
+
+    def test_row_52656_married_to_the_mob_regression(self, tmp_path):
+        """The production case a DJ hit on 2026-09-25 (LML#1352).
+
+        artifact row `albums.id = 52656`: display_artist "Soundtracks - M",
+        display_title "Married to the Mob", is_compilation 1, spotify_confidence
+        89.4736842105263, provenance columns all NULL, and a spotify_url pointing at
+        Speaker Knockerz' "Married to the Money" (2013).
+        """
+        library_db = _export(
+            tmp_path,
+            [
+                {
+                    "id": 52656,
+                    "display_artist": "Soundtracks - M",
+                    "display_title": "Married to the Mob",
+                    "library_ids": json.dumps([60671]),
+                    "is_compilation": 1,
+                    "spotify_status": "found",
+                    "spotify_url": "https://open.spotify.com/album/0JSLTbVe6Z70EQkOLL0WPi",
+                    "spotify_confidence": 89.4736842105263,
+                    "spotify_matched_artist": None,
+                    "spotify_matched_title": None,
+                    "spotify_checked_at": None,
+                }
+            ],
+        )
+        conn = sqlite3.connect(library_db)
+        urls = [r[0] for r in conn.execute("SELECT spotify_url FROM streaming_links").fetchall()]
+        conn.close()
+        assert "https://open.spotify.com/album/0JSLTbVe6Z70EQkOLL0WPi" not in urls
+
+    @pytest.mark.parametrize(
+        "album_id,library_id,display_artist,display_title,matched_artist,matched_title,url",
+        [
+            (
+                53632,
+                53632001,
+                "Lower Dens",
+                "Nootropics",
+                "Lower Dens",
+                "Nootropics",
+                "https://open.spotify.com/album/nootropics",
+            ),
+            (
+                18555,
+                18555001,
+                "Don Covay & the Jefferson Lemon Blues Band",
+                "The House of Blue Lights",
+                "Don Covay & The Jefferson Lemon Blues Band",
+                "House of the Blue Lights",
+                "https://open.spotify.com/album/house-of-the-blue-lights",
+            ),
+            (
+                56785,
+                56785001,
+                "Richard Fearless",
+                "Kollektion 04: bureau B",
+                "Richard Fearless",
+                "Kollektion 04: Bureau B",
+                "https://open.spotify.com/album/kollektion-04-bureau-b",
+            ),
+        ],
+        ids=["lower-dens-nootropics", "don-covay-blue-lights", "kollektion-04"],
+    )
+    def test_artist_axis_mismatch_shapes_survive(
+        self,
+        tmp_path,
+        album_id,
+        library_id,
+        display_artist,
+        display_title,
+        matched_artist,
+        matched_title,
+        url,
+    ):
+        """Correct links whose artist string disagrees with the WXYC shelf credit.
+
+        LML#1147: for compilations, curator credits and expanded credits the artist
+        axis carries no usable signal, so an 80/80 floor at this seam would false-
+        reject these three. The provenance gate must not touch them -- all three have
+        full provenance and confidence 100 in the artifact. LML#1352's acceptance
+        criteria require this pin.
+        """
+        library_db = _export(
+            tmp_path,
+            [
+                {
+                    "id": album_id,
+                    "display_artist": display_artist,
+                    "display_title": display_title,
+                    "library_ids": json.dumps([library_id]),
+                    "spotify_status": "found",
+                    "spotify_url": url,
+                    "spotify_confidence": 100.0,
+                    "spotify_matched_artist": matched_artist,
+                    "spotify_matched_title": matched_title,
+                    "spotify_checked_at": "2026-04-18T12:09:00",
+                }
+            ],
+        )
+        assert _streaming_link(library_db, library_id) == url
+
+    def test_gate_logs_the_skipped_count(self, tmp_path, caplog):
+        """The daily sync must leave evidence of what the gate removed."""
+        albums = [
+            {
+                "id": i,
+                "library_ids": json.dumps([800 + i]),
+                "spotify_url": f"https://open.spotify.com/album/{i}",
+                "spotify_matched_artist": None,
+                "spotify_matched_title": None,
+            }
+            for i in range(3)
+        ]
+        with caplog.at_level(logging.INFO):
+            _export(tmp_path, albums)
+        assert "3" in caplog.text
+        assert "provenance" in caplog.text.lower()
+
+    def test_gate_leaves_no_all_null_streaming_links_row(self, tmp_path):
+        """A row whose only URL was the gated Spotify one is dropped, not blanked."""
+        library_db = _export(
+            tmp_path,
+            [
+                {
+                    "id": 1,
+                    "library_ids": json.dumps([901]),
+                    "spotify_url": "https://open.spotify.com/album/unverifiable",
+                    "spotify_matched_artist": "",
+                    "spotify_matched_title": "",
+                }
+            ],
+        )
+        conn = sqlite3.connect(library_db)
+        count = conn.execute("SELECT COUNT(*) FROM streaming_links").fetchone()[0]
+        conn.close()
+        assert count == 0
+
+    def test_gate_is_inert_on_a_schema_without_provenance_columns(self, tmp_path, caplog):
+        """A legacy/fixture `albums` table without the provenance columns still exports.
+
+        discogs-etl's `tests/e2e/test_sync_library_e2e.py` builds exactly that shape
+        and asserts the Spotify URL lands in `streaming_links`. Treating "column
+        absent" as "provenance absent" would strip every URL from such a database.
+        """
+        streaming_db = str(tmp_path / "streaming.db")
+        library_db = str(tmp_path / "library.db")
+        _create_streaming_db(
+            streaming_db,
+            [
+                (
+                    json.dumps([1001]),
+                    "https://open.spotify.com/album/stereolab-aluminum",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            ],
+        )
+        sqlite3.connect(library_db).close()
+        args = argparse.Namespace(library_db=library_db, streaming_db=streaming_db, dry_run=False)
+        with caplog.at_level(logging.WARNING):
+            main(args)
+
+        assert (
+            _streaming_link(library_db, 1001) == "https://open.spotify.com/album/stereolab-aluminum"
+        )
+        assert "provenance" in caplog.text.lower()
+
+    def test_dry_run_reports_coverage_after_the_gate(self, tmp_path, caplog):
+        """--dry-run's service coverage counts the gated row out, so the delta is visible."""
+        albums = [
+            {
+                "id": 1,
+                "library_ids": json.dumps([1101]),
+                "spotify_url": "https://open.spotify.com/album/unverifiable",
+                "spotify_matched_artist": None,
+                "spotify_matched_title": None,
+                "apple_url": "https://music.apple.com/album/verifiable",
+            },
+            {
+                "id": 2,
+                "library_ids": json.dumps([1102]),
+                "spotify_url": "https://open.spotify.com/album/verifiable",
+                "spotify_matched_artist": "Sessa",
+                "spotify_matched_title": "Pequena Vertigem de Amor",
+            },
+        ]
+        with caplog.at_level(logging.INFO):
+            _export(tmp_path, albums, dry_run=True)
+
+        assert "spotify_url: 1" in caplog.text
+        assert "apple_music_url: 1" in caplog.text
+
+    def test_gate_does_not_block_the_track_level_supplement(self, tmp_path):
+        """DEFERRED, pinned so it cannot drift silently (LML#1353).
+
+        The track supplement writes a `/track/`-shaped `tr.spotify_url` into the
+        *album* field `entry["spotify_url"]`, which is the origin of the 841
+        `/track/` values Backend-Service serves (WXYC/Backend-Service#2689). Gating
+        the album-level URL leaves that slot open, so a gated row with a resolved
+        track can be refilled from the supplement. Whether it should be is a
+        coverage decision routed separately -- this test records the behavior as it
+        stands rather than changing it.
+        """
+        library_db = _export(
+            tmp_path,
+            [
+                {
+                    "id": 52656,
+                    "library_ids": json.dumps([60671]),
+                    "spotify_url": "https://open.spotify.com/album/0JSLTbVe6Z70EQkOLL0WPi",
+                    "spotify_matched_artist": None,
+                    "spotify_matched_title": None,
+                }
+            ],
+            track_results=[
+                {
+                    "id": 1,
+                    "album_id": 52656,
+                    "resolution_status": "api_match",
+                    "spotify_url": "https://open.spotify.com/track/a-real-track",
+                }
+            ],
+        )
+        assert _streaming_link(library_db, 60671) == "https://open.spotify.com/track/a-real-track"
+
+    def test_streaming_db_is_never_written(self, tmp_path):
+        """The artifact is precious and read-only to this script.
+
+        `streaming_availability.db` is the single bucket-canonical copy of
+        rate-limited Apple/Spotify/Deezer results. The gate decides what to *export*;
+        it must not repair, null or otherwise touch the source. Hash the file rather
+        than trusting the absence of an UPDATE by inspection.
+        """
+        import hashlib
+
+        streaming_db = tmp_path / "streaming.db"
+        library_db = str(tmp_path / "library.db")
+        _create_provenance_streaming_db(
+            str(streaming_db),
+            [
+                {
+                    "id": 52656,
+                    "library_ids": json.dumps([60671]),
+                    "spotify_url": "https://open.spotify.com/album/0JSLTbVe6Z70EQkOLL0WPi",
+                    "spotify_matched_artist": None,
+                    "spotify_matched_title": None,
+                },
+                {
+                    "id": 53632,
+                    "library_ids": json.dumps([53632001]),
+                    "spotify_url": "https://open.spotify.com/album/nootropics",
+                    "spotify_matched_artist": "Lower Dens",
+                    "spotify_matched_title": "Nootropics",
+                },
+            ],
+        )
+        before = hashlib.sha256(streaming_db.read_bytes()).hexdigest()
+        sqlite3.connect(library_db).close()
+
+        args = argparse.Namespace(
+            library_db=library_db, streaming_db=str(streaming_db), dry_run=False
+        )
+        main(args)
+
+        assert hashlib.sha256(streaming_db.read_bytes()).hexdigest() == before
+        assert not (tmp_path / "streaming.db-wal").exists()
+        assert not (tmp_path / "streaming.db-journal").exists()
