@@ -9,6 +9,8 @@ artist, so the artist axis is informative and scored 30.77.
 
 from __future__ import annotations
 
+import logging
+import signal
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -23,6 +25,7 @@ from scripts._lib.match_decision import (
     STATUS_FOUND,
     STATUS_FOUND_TITLE_ONLY,
 )
+from scripts._lib.signals import ShutdownFlag
 from scripts.search_unmatched_compilations import (
     _DEEZER_ARTIST,
     _DEEZER_TITLE,
@@ -32,6 +35,7 @@ from scripts.search_unmatched_compilations import (
     run,
     search_discogs_by_title,
 )
+from scripts.streaming_availability.errors import StreamingServiceRoutingError
 from scripts.streaming_availability.results_db import _SCHEMA, ResultsDB
 
 
@@ -390,3 +394,137 @@ class TestResolveLane:
         row = await _album(db)
         assert row["deezer_status"] == "skipped"
         assert row["deezer_url"] is None
+
+
+class TestPhaseTwoTransientErrorsAreNotFatal:
+    """The LML#376 loudness must not swallow the per-album tolerance it sits on.
+
+    ``update_result`` raises for a service token it has no column family for --
+    a programming error in the lane table, which the drain re-raises rather than
+    logging. But ``SpotifyClient.search_album`` raises ``ValueError`` on two
+    ordinary runtime paths too: ``int(resp.headers.get("Retry-After", "5"))``
+    against a legal HTTP-date form, and ``resp.json()`` (``JSONDecodeError`` is a
+    ``ValueError`` subclass) against a non-JSON 200 body from a proxy
+    interstitial. Discriminating on the bare builtin let hour three of a drain die
+    on a 429.
+    """
+
+    @staticmethod
+    def _seed_two(path) -> None:
+        conn = sqlite3.connect(path)
+        conn.executescript(_SCHEMA)
+        conn.execute(
+            """INSERT INTO albums (id, normalized_artist, normalized_title, display_artist,
+                   display_title, library_ids, formats, is_compilation, spotify_status,
+                   deezer_status)
+               VALUES (52656, 'soundtracks m', 'married to the mob', 'Soundtracks - M',
+                   'Married to the Mob', '[60671]', '[]', 1, 'skipped', 'skipped')"""
+        )
+        conn.commit()
+        conn.close()
+
+    @pytest.mark.asyncio
+    async def test_a_date_form_retry_after_does_not_abort_the_run(self, tmp_path, monkeypatch):
+        """A transient Spotify condition costs its lane, not the whole population."""
+        artifact = tmp_path / "streaming_availability.db"
+        self._seed_two(artifact)
+        monkeypatch.delenv("DATABASE_URL_DISCOGS", raising=False)
+        monkeypatch.setenv("SPOTIFY_CLIENT_ID", "id")
+        monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "secret")
+        monkeypatch.setattr(
+            "scripts.search_unmatched_compilations._shutdown",
+            ShutdownFlag(logger=logging.getLogger("t"), unit="item", log_force_quit=False),
+        )
+
+        class GoodDeezer:
+            async def search_album(self, artist, title):
+                return [_deezer_row("Various Artists", "Married to the Mob", album_id=7)]
+
+            async def close(self):
+                return None
+
+        class FlakySpotify:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def search_album(self, artist, title):
+                # Exactly what `int("Wed, 21 Oct 2015 07:28:00 GMT")` produces.
+                raise ValueError(
+                    "invalid literal for int() with base 10: 'Wed, 21 Oct 2015 07:28:00 GMT'"
+                )
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr("clients.streaming.deezer.DeezerClient", GoodDeezer)
+        monkeypatch.setattr("clients.streaming.spotify.SpotifyClient", FlakySpotify)
+        args = SimpleNamespace(
+            db_path=str(artifact), limit=10, dry_run=False, discogs_only=False, max_streaming=10
+        )
+
+        await run(args)
+
+        conn = sqlite3.connect(artifact)
+        status, url = conn.execute(
+            "SELECT deezer_status, deezer_url FROM albums WHERE id = 52656"
+        ).fetchone()
+        conn.close()
+        assert status.startswith("found"), "the healthy lane must still have been written"
+        assert url == "https://www.deezer.com/album/7"
+
+    @pytest.mark.asyncio
+    async def test_a_misaddressed_service_token_still_aborts(self, db):
+        """The other half: the programming error the re-raise exists for stays loud."""
+        lane = _lane([_deezer_row("Various Artists", "Married to the Mob")])
+        lane = StreamingLane(
+            service="apple_music",  # the typo `update_result` refuses: "apple" is the token
+            search=lane.search,
+            artist_fn=_DEEZER_ARTIST,
+            title_fn=_DEEZER_TITLE,
+            url_fn=_DEEZER_URL,
+        )
+        with pytest.raises(StreamingServiceRoutingError):
+            await resolve_lane(
+                lane,
+                db,
+                album_id=52656,
+                search_artist="Various Artists",
+                search_title="Married to the Mob",
+                dry_run=False,
+            )
+
+    def test_the_routing_error_is_still_a_value_error(self):
+        """Subclassing keeps every documented ``Raises: ValueError`` caller honest."""
+        assert issubclass(StreamingServiceRoutingError, ValueError)
+
+    @pytest.mark.asyncio
+    async def test_a_shutdown_mid_lane_exits_clean_rather_than_raising(self, tmp_path, monkeypatch):
+        """SIGINT is a deliberate early stop, not an errored source.
+
+        The LML#376 raise fires on "errored and recorded nothing", which is also
+        the shape of an operator interrupting Phase 2 before the first match.
+        ``ShutdownFlag`` exists to provide a clean early stop; a traceback is not
+        one.
+        """
+        artifact = tmp_path / "streaming_availability.db"
+        self._seed_two(artifact)
+        monkeypatch.delenv("DATABASE_URL_DISCOGS", raising=False)
+        monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
+        monkeypatch.delenv("SPOTIFY_CLIENT_SECRET", raising=False)
+        flag = ShutdownFlag(logger=logging.getLogger("t"), unit="item", log_force_quit=False)
+        monkeypatch.setattr("scripts.search_unmatched_compilations._shutdown", flag)
+
+        class InterruptedDeezer:
+            async def search_album(self, artist, title):
+                flag.handle(signal.SIGINT, None)
+                raise RuntimeError("connection reset")
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr("clients.streaming.deezer.DeezerClient", InterruptedDeezer)
+        args = SimpleNamespace(
+            db_path=str(artifact), limit=10, dry_run=False, discogs_only=False, max_streaming=10
+        )
+
+        await run(args)  # must not raise

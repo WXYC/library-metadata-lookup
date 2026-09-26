@@ -10,6 +10,7 @@ import aiosqlite
 
 from clients.streaming.matching import normalize_album_title, normalize_artist_name
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
+from scripts.streaming_availability.errors import StreamingServiceRoutingError
 
 #: SQL ``LIKE`` pattern for the statuses that mean "an answer was collected for
 #: this service" -- ``found`` and LML#1353's ``found_title_only``. A prefix rather
@@ -333,7 +334,7 @@ class ResultsDB:
         """
         assert self._db is not None
         if service not in ("spotify", "apple", "deezer"):
-            raise ValueError(
+            raise StreamingServiceRoutingError(
                 f"unknown streaming service {service!r}: update_result accepts spotify/apple/deezer"
             )
         async with self._write_lock:

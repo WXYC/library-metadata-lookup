@@ -33,6 +33,7 @@ from scripts._lib.match_decision import (
 )
 from scripts._lib.runtime import set_up_script_runtime
 from scripts._lib.signals import ShutdownFlag
+from scripts.streaming_availability.errors import StreamingServiceRoutingError
 from scripts.streaming_availability.results_db import ResultsDB
 from scripts.track_streaming.compilation_search import build_compilation_query
 
@@ -427,10 +428,16 @@ async def run(args) -> None:
                         search_title=search_title,
                         dry_run=args.dry_run,
                     )
-                except ValueError:
-                    # An unsupported service token is a programming error in the
+                except StreamingServiceRoutingError:
+                    # A mis-addressed service token is a programming error in the
                     # lane table, not a per-album condition. ``update_result``
                     # raises it precisely so it cannot become a silent no-op.
+                    #
+                    # Narrower than the ``ValueError`` this first caught, because
+                    # that also caught two ordinary Spotify runtime conditions --
+                    # ``int()`` on a date-form ``Retry-After`` and ``resp.json()``
+                    # on a non-JSON 200 body (see ``streaming_availability.errors``)
+                    # -- and turned a 429 in hour three into a dead run.
                     raise
                 except Exception as exc:
                     # exc_info because the write surface is wide now: a schema
@@ -483,7 +490,10 @@ async def run(args) -> None:
     # extraction, so reporting that as "0 streaming matches" is the one outcome the
     # verdict was added to prevent. Raised after the clients are closed, and before
     # the summary, so the run cannot look complete.
-    if lane_error is not None and not streaming_found:
+    # ``_shutdown.requested`` excluded: an operator interrupting Phase 2 before the
+    # first match produces the same "errored and recorded nothing" shape, and
+    # ``ShutdownFlag`` exists to make that stop clean. A traceback is not a clean stop.
+    if lane_error is not None and not streaming_found and not _shutdown.requested:
         raise lane_error
 
     logger.info(
