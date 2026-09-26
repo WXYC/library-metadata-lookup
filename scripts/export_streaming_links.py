@@ -10,9 +10,11 @@ after a host + well-formedness check only (LML#1352). So this script is the last
 place that can refuse a URL for which no match evidence exists at all --
 see ``_has_match_provenance`` for the one such refusal it makes.
 
-This script only ever READS streaming_availability.db. That file is the single
-bucket-canonical copy of rate-limited Apple/Spotify/Deezer results and is
-expensive to recollect; nothing here opens it for write.
+This script only ever READS streaming_availability.db, and enforces that by opening
+it ``mode=ro`` rather than by containing no UPDATE. That file is the single
+bucket-canonical copy of rate-limited Apple/Spotify/Deezer results and is expensive
+to recollect, and a read-write open would silently roll back a hot journal left by a
+crashed upstream run.
 
 Usage:
     .venv/bin/python scripts/export_streaming_links.py [--library-db PATH] [--streaming-db PATH] [--dry-run]
@@ -76,8 +78,19 @@ def _has_match_provenance(matched_artist: str | None, matched_title: str | None)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    """Column names of `table`, or an empty set if it does not exist."""
-    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    """Casefolded column names of `table`, or an empty set if it does not exist.
+
+    Casefolded because SQLite resolves column names case-insensitively while
+    ``PRAGMA table_info`` reports whatever case they were DECLARED in. A
+    case-sensitive comparison would fail open on a re-declared artifact: the gate
+    would go inert on a database whose columns it could in fact have read.
+
+    Deliberately NOT imported from ``routers/admin.py``, which holds a twin of this
+    helper: ``discogs-etl/scripts/sync-library.sh`` runs this script under that
+    repo's bare venv, where importing the FastAPI-dependent ``routers`` package
+    would fail. Deduplicating the two would break the daily library sync.
+    """
+    return {row[1].casefold() for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
 def main(args: argparse.Namespace) -> None:
@@ -85,7 +98,12 @@ def main(args: argparse.Namespace) -> None:
         log.error(f"Streaming database {args.streaming_db} does not exist; skipping export")
         return
 
-    sa = sqlite3.connect(args.streaming_db)
+    # Read-ONLY on purpose, and structurally rather than by convention. Opening a
+    # SQLite file read-write performs hot-journal rollback at open time, so if the
+    # upstream streaming pipeline died mid-transaction, merely connecting would
+    # mutate the bucket-canonical artifact. `mode=ro` turns that into a loud refusal
+    # instead of a silent repair of a file that is expensive to recollect.
+    sa = sqlite3.connect(f"file:{args.streaming_db}?mode=ro", uri=True)
     lib = sqlite3.connect(args.library_db)
 
     # The provenance gate reads two columns that older/fixture-shaped databases do
@@ -93,7 +111,7 @@ def main(args: argparse.Namespace) -> None:
     # database cannot answer the question", NOT "no row has provenance" -- reading
     # it the second way would strip every Spotify URL from such a file.
     album_columns = _table_columns(sa, "albums")
-    provenance_gate_active = set(SPOTIFY_PROVENANCE_COLUMNS) <= album_columns
+    provenance_gate_active = {c.casefold() for c in SPOTIFY_PROVENANCE_COLUMNS} <= album_columns
     if provenance_gate_active:
         provenance_select = ", ".join(SPOTIFY_PROVENANCE_COLUMNS)
     else:
@@ -168,8 +186,13 @@ def main(args: argparse.Namespace) -> None:
                 entry["soundcloud_url"] = soundcloud
 
     if provenance_gate_active:
+        # ALBUM ROWS, not exported URLs. The two differ: a row can carry an empty
+        # `library_ids`, several rows can share a `library_id`, and the track
+        # supplement below can refill a slot this gate emptied. Treat it as "how
+        # much the gate fired", not as the `streaming_links.spotify_url` delta.
         log.info(
-            f"Spotify URLs skipped for absent match provenance: {spotify_skipped_no_provenance}"
+            "Album rows whose spotify_url was skipped for "
+            f"absent match provenance: {spotify_skipped_no_provenance}"
         )
 
     log.info(f"Library release IDs with streaming links (album-level): {len(links)}")
@@ -217,13 +240,17 @@ def main(args: argparse.Namespace) -> None:
     # A release whose only URL was a gated Spotify one now has an empty entry.
     # Drop it rather than inserting an all-NULL streaming_links row: that row would
     # read as "on streaming" to /admin/upload-library-db's streaming diff
-    # (`_get_streaming_ids`) while carrying no link at all. Unreachable without the
-    # gate, since the SELECT above guarantees every album row has at least one URL.
+    # (`_get_streaming_ids` selects library_id with no URL predicate) while carrying
+    # no link at all. The gate is the main way to get here but not the only one: the
+    # SELECT above filters on IS NOT NULL while the assignments above test
+    # truthiness, so a row whose URL columns are empty STRINGS already reached this
+    # path before this change. Hence the neutral wording below -- the drop is not
+    # attributed to the gate, since it cannot tell the two apart.
     empty = [lib_id for lib_id, entry in links.items() if not entry]
     for lib_id in empty:
         del links[lib_id]
     if empty:
-        log.info(f"Library release IDs left with no URLs after the provenance gate: {len(empty)}")
+        log.info(f"Library release IDs dropped for carrying no URL at all: {len(empty)}")
 
     log.info(f"Library release IDs with streaming links (total): {len(links)}")
     sa.close()
