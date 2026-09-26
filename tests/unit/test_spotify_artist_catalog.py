@@ -127,3 +127,110 @@ class TestGetArtistAlbums:
         assert mock_http.post.call_count == 2
         last_call = mock_http.get.call_args_list[-1]
         assert last_call.kwargs["headers"]["Authorization"] == "Bearer fresh-token"
+
+
+class TestPersistMatchesRecordsProvenance:
+    """The write must survive ``export_streaming_links``'s LML#1352 provenance gate.
+
+    This script computes the Spotify album name it matched (``best_name``) and the
+    score it matched at, then discarded both -- the same defect LML#1353 found in
+    the compilation drain's title-only fallback. Harmless until the export learned
+    to refuse a ``spotify_url`` carrying no provenance: from then on every URL this
+    script resolves would be gated out of ``library.db`` silently, and a release
+    whose only URL came from here would be dropped from the export altogether,
+    which the LML#1313 webhook turns into ``on_streaming: false`` downstream.
+
+    ``spotify_matched_artist`` is deliberately left NULL: the script matches within
+    one Spotify artist's catalog and never extracts the album's own credit, so
+    there is no artist value here that would not be invented.
+    """
+
+    @pytest.mark.asyncio
+    async def test_writes_the_matched_title_and_confidence_it_computed(self, tmp_path):
+        import aiosqlite
+
+        from scripts.export_streaming_links import _has_match_provenance
+        from scripts.spotify_artist_catalog import persist_matches
+        from scripts.streaming_availability.results_db import _SCHEMA
+
+        path = tmp_path / "streaming_availability.db"
+        async with aiosqlite.connect(path) as db:
+            await db.executescript(_SCHEMA)
+            await db.execute(
+                """INSERT INTO albums (id, normalized_artist, normalized_title,
+                       display_artist, display_title, library_ids, formats,
+                       is_compilation, spotify_status)
+                   VALUES (401, 'stereolab', 'aluminum tunes', 'Stereolab',
+                       'Aluminum Tunes', '[9001]', '[]', 0, 'not_found')"""
+            )
+            await db.commit()
+
+            written = await persist_matches(
+                db,
+                [
+                    {
+                        "id": 401,
+                        "artist": "Stereolab",
+                        "title": "Aluminum Tunes",
+                        "spotify_url": "https://open.spotify.com/album/alb1",
+                        "matched_title": "Aluminum Tunes (Switched On Volume 3)",
+                        "score": 82,
+                    }
+                ],
+            )
+            assert written == 1
+
+            cursor = await db.execute(
+                "SELECT spotify_status, spotify_url, spotify_matched_artist, "
+                "spotify_matched_title, spotify_confidence FROM albums WHERE id = 401"
+            )
+            status, url, m_artist, m_title, confidence = await cursor.fetchone()
+
+        assert status == "found"
+        assert url == "https://open.spotify.com/album/alb1"
+        assert m_title == "Aluminum Tunes (Switched On Volume 3)"
+        assert confidence == 82
+        assert m_artist is None, "no artist credit is extracted here; do not invent one"
+        assert _has_match_provenance(m_artist, m_title), (
+            "the export's provenance gate must accept what this script writes"
+        )
+
+    @pytest.mark.asyncio
+    async def test_still_declines_an_album_already_resolved(self, tmp_path):
+        """The ``spotify_status != 'found'`` guard is load-bearing and must survive."""
+        import aiosqlite
+
+        from scripts.spotify_artist_catalog import persist_matches
+        from scripts.streaming_availability.results_db import _SCHEMA
+
+        path = tmp_path / "streaming_availability.db"
+        async with aiosqlite.connect(path) as db:
+            await db.executescript(_SCHEMA)
+            await db.execute(
+                """INSERT INTO albums (id, normalized_artist, normalized_title,
+                       display_artist, display_title, library_ids, formats,
+                       is_compilation, spotify_status, spotify_url)
+                   VALUES (402, 'stereolab', 'dots and loops', 'Stereolab',
+                       'Dots and Loops', '[9002]', '[]', 0, 'found',
+                       'https://open.spotify.com/album/keep')"""
+            )
+            await db.commit()
+
+            await persist_matches(
+                db,
+                [
+                    {
+                        "id": 402,
+                        "artist": "Stereolab",
+                        "title": "Dots and Loops",
+                        "spotify_url": "https://open.spotify.com/album/overwrite",
+                        "matched_title": "Dots and Loops",
+                        "score": 100,
+                    }
+                ],
+            )
+
+            cursor = await db.execute("SELECT spotify_url FROM albums WHERE id = 402")
+            (url,) = await cursor.fetchone()
+
+        assert url == "https://open.spotify.com/album/keep"

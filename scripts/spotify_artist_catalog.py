@@ -89,6 +89,52 @@ def normalize_title(title: str) -> str:
     return t
 
 
+_PERSIST_SQL = (
+    "UPDATE albums SET spotify_status = 'found', spotify_url = ?, "
+    "spotify_matched_title = ?, spotify_confidence = ? "
+    "WHERE id = ? AND spotify_status != 'found'"
+)
+
+
+async def persist_matches(db: aiosqlite.Connection, results: list[dict]) -> int:
+    """Write resolved Spotify URLs back to the artifact, with their provenance.
+
+    Records the Spotify album name the fuzzy match landed on and the score it
+    landed at -- both already computed above and previously thrown away, the same
+    discard LML#1353 found in the compilation drain's title-only fallback.
+
+    That provenance is now load-bearing rather than merely nice to have:
+    ``scripts/export_streaming_links.py``'s LML#1352 gate refuses a
+    ``spotify_url`` whose match provenance is entirely absent, so without these
+    two columns every URL this script resolves would be dropped from
+    ``library.db`` silently -- and for a release whose only streaming URL came
+    from here, dropped from the export altogether, which the LML#1313 webhook
+    reports to Backend-Service as ``on_streaming: false``.
+
+    ``spotify_matched_artist`` stays NULL on purpose. The match runs inside one
+    Spotify artist's catalog (the ID came from the Wikidata P1902 mapping) and the
+    album's own credit is never read off the response, so any artist value written
+    here would be the query's, not the match's. The gate needs one non-blank
+    field, and ``matched_title`` is the one this script actually establishes.
+
+    The ``spotify_status != 'found'`` predicate is preserved verbatim: a row
+    already holding a collected answer cost a rate-limited round trip, and the PG
+    mirror's found-demotion trigger would raise on it at upload time anyway.
+
+    Returns:
+        The number of rows the UPDATE statements were issued for. Rows the
+        ``!= 'found'`` predicate declined are included in the count -- it reports
+        matches persisted, not rows changed.
+    """
+    for r in results:
+        await db.execute(
+            _PERSIST_SQL,
+            (r["spotify_url"], r["matched_title"], r["score"], r["id"]),
+        )
+    await db.commit()
+    return len(results)
+
+
 async def main(args: argparse.Namespace) -> None:
     # Load not-on-streaming albums
     async with aiosqlite.connect(SQLITE_PATH) as db:
@@ -202,14 +248,8 @@ async def main(args: argparse.Namespace) -> None:
 
     if results:
         async with aiosqlite.connect(SQLITE_PATH) as db:
-            for r in results:
-                await db.execute(
-                    "UPDATE albums SET spotify_status = 'found', spotify_url = ? "
-                    "WHERE id = ? AND spotify_status != 'found'",
-                    (r["spotify_url"], r["id"]),
-                )
-            await db.commit()
-            log.info(f"Updated {len(results)} albums in database")
+            written = await persist_matches(db, results)
+            log.info(f"Updated {written} albums in database")
 
         async with aiosqlite.connect(SQLITE_PATH) as db:
             row = await db.execute_fetchall(
