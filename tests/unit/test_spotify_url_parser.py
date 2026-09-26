@@ -225,11 +225,19 @@ class TestUrlIsSpotifyAlbumOrTrack:
             f"https://open.spotify.com/album/%2e%2e/artist/{_VALID_ID}",
             # Backslash-spelled, which WHATWG folds to a path separator for the
             # http(s) special schemes -- so the dot segment has to be looked
-            # for across BOTH separators. With the separator set ({/, \}) and
-            # the double-dot spellings (the percent-encodings of "..") both
-            # closed by the URL spec, this is the last spelling of the bypass,
-            # not the next one in a series. ``release/host_matching.py``
-            # documents the same differential for the authority position.
+            # for across BOTH separators. ``release/host_matching.py`` documents
+            # the same differential for the authority position.
+            #
+            # This is the LAST spelling of the bypass, not the next one in a
+            # series. Exactly three normalizations stand between
+            # ``urlparse(url).path`` and the path a client fetches, and each is
+            # now accounted for: ASCII tab/LF/CR removal, which ``urlparse``
+            # itself performs (verified: ``urlparse(".../album/.<TAB>./artist/X")
+            # .path == "/album/../artist/X"``, so a hidden dot segment is
+            # already revealed by the time the guard looks); the separator set,
+            # closed at {/, \} by the spec; and the double-dot spellings, closed
+            # at the percent-encodings of ".." and folded by one ``unquote``.
+            # A fourth spelling would need a fourth normalization to exist.
             f"https://open.spotify.com/album/..\\artist/{_VALID_ID}",
             # Spotify's routes are case-sensitive, so an uppercased path kind
             # 404s. The measured locale rows are all lowercase, so neither leg
