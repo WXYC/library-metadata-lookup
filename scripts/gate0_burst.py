@@ -47,6 +47,12 @@ Usage::
     LML_API_KEY=... python scripts/gate0_burst.py \\
         --host https://<staging-domain> --concurrency 3 --total 12 --warm --json
 
+    # Paced corpus replay: one cycle of the 143-query golden corpus, one
+    # request every 30s, as a steady load source for the LML#1354 memory soak
+    LML_API_KEY=... python scripts/gate0_burst.py \\
+        --host https://<staging-domain> --queries-file tests/e2e/golden/cases.json \\
+        --pace-seconds 30 --concurrency 1
+
 Environment variables are loaded automatically from ``.env`` if present.
 ``--api-key`` defaults to ``$LML_API_KEY``.
 """
@@ -60,6 +66,7 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -78,6 +85,24 @@ HEALTH_PATH = "/health"
 # supervision -- see the Gate 0 runbook in docs/deployment.md.
 _MAX_SAFE_CONCURRENCY = 5
 _MAX_SAFE_TOTAL = 30
+
+# The built-in burst's request count when --total is not given. Only
+# --queries-file moves it (to the corpus length); resolving the built-in path
+# to len(GATE0_QUERIES) instead would quietly drop the documented Gate 0 burst
+# from 12 requests to 3, i.e. a p95 over three samples.
+_DEFAULT_BURST_TOTAL = 12
+
+# --pace-seconds at or above this lifts _MAX_SAFE_TOTAL (LML#1354 soak driver).
+# A run paced this slowly is not a burst: one worker issues at most 6 requests
+# a minute, inside staging's Discogs limiter, so a full 143-case corpus cycle
+# is safe where a 143-request burst would not be. Below it the cap still
+# applies, and the --concurrency rail applies either way -- pacing bounds the
+# per-worker rate, not the aggregate fan-out.
+_PACED_RUN_MIN_SECONDS = 10.0
+
+# The LookupRequest field names a --queries-file case may contribute to the
+# POST body. Everything else a corpus carries is its own assertion machinery.
+_QUERY_FIELDS = ("artist", "album", "song", "raw_message")
 
 # Representative WXYC query set for Gate 0 (LML#983). The first entry is the
 # exact compilation-track query from the issue trace -- the Wave B
@@ -103,6 +128,89 @@ GATE0_QUERIES: list[dict[str, str | None]] = [
         "album": "On Your Own Love Again",
     },
 ]
+
+
+def load_queries_file(path: str) -> list[dict[str, str | None]]:
+    """Read a replay corpus from JSON, in ``tests/e2e/golden/cases.json``'s shape.
+
+    That file is a top-level *list* of case objects. This takes each case's
+    ``query`` sub-object (``artist`` / ``album`` / ``song``) as the request body
+    and its ``id`` as the report label; every sibling key the corpus carries for
+    its own assertions -- ``shape``, ``expect``, ``requires_rows``, ``settings``
+    -- is dropped, so only :data:`_QUERY_FIELDS` can reach the wire.
+
+    Why this corpus: its 143 queries are stratified to production's query-shape
+    mix (``docs/testing.md``, "Golden corpus"), where :data:`GATE0_QUERIES` is
+    three hand-picked probes. That makes it the realistic load source the
+    LML#1354 memory soak wants. It is *only* a load source here -- nothing in
+    this script reads ``expect``, because the corpus is recorded against a
+    seeded catalog and a replay against a live host is not an assertion.
+
+    Raises ``ValueError``, naming the path, on anything unusable: a missing or
+    unreadable file, malformed JSON, a non-list top level, a case with no usable
+    ``query``, or an empty corpus. One exception type for all of them, because
+    they are all the same operator error -- a wrong ``--queries-file`` -- and
+    ``main`` only ever prints the message.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except OSError as exc:
+        raise ValueError(f"--queries-file {path!r} could not be read: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--queries-file {path!r} is not valid JSON: {exc}") from exc
+
+    if not isinstance(raw, list):
+        raise ValueError(f"--queries-file {path!r} must hold a JSON list of cases")
+
+    queries: list[dict[str, str | None]] = []
+    for position, case in enumerate(raw):
+        raw_query = case.get("query") if isinstance(case, dict) else None
+        query: dict[str, str | None] = (
+            {k: str(v) for k, v in raw_query.items() if k in _QUERY_FIELDS and v}
+            if isinstance(raw_query, dict)
+            else {}
+        )
+        if not query:
+            raise ValueError(
+                f"--queries-file {path!r} case {position} carries no usable 'query' "
+                f"fields ({', '.join(_QUERY_FIELDS)})"
+            )
+        queries.append({"label": str(case.get("id") or f"case-{position}"), **query})
+
+    if not queries:
+        raise ValueError(f"--queries-file {path!r} holds no cases")
+    return queries
+
+
+def resolve_run_shape(
+    *, queries_file: str | None, total: int | None, warm: bool | None
+) -> tuple[list[dict[str, str | None]], int, bool]:
+    """Resolve the query set, request count and prewarm flag from the raw CLI args.
+
+    Two defaults change meaning under ``--queries-file``, for one reason: a
+    corpus replay is a *cycle over the file*, not a burst over three probes.
+
+    - ``--total`` defaults to the corpus length, so one invocation is exactly
+      one pass. Without ``--queries-file`` it stays at
+      :data:`_DEFAULT_BURST_TOTAL`, the documented built-in burst size. (143 cases at ``--pace-seconds 30`` is the ~72-minute cycle the
+      soak drives in an outer shell loop; left at the burst default of 12 it
+      would silently replay only the first 12 cases forever.)
+    - ``--warm`` defaults **off**. The prewarm pass is deliberately *unpaced* --
+      one sequential live ``/lookup`` per distinct query. Three of those is the
+      LML#983 warm-one/cold-others setup the flag exists for; 143 of them is an
+      unpaced burst straight through the shared Discogs budget that the pacing
+      exists to respect.
+
+    An explicit ``--total`` / ``--warm`` / ``--no-warm`` always wins.
+    """
+    queries = load_queries_file(queries_file) if queries_file else GATE0_QUERIES
+    return (
+        queries,
+        total if total is not None else (len(queries) if queries_file else _DEFAULT_BURST_TOTAL),
+        warm if warm is not None else queries_file is None,
+    )
+
 
 # The two Server-Timing legs Gate 0 cares about (LML#907/#946): the
 # middleware-appended total wall clock and the process-global event-loop-lag
@@ -266,7 +374,13 @@ def is_shed_response(status_code: int, body: dict[str, Any] | None) -> bool:
 
 
 def check_burst_size_within_safe_bounds(
-    *, concurrency: int, total: int, smoke: bool, warm: bool
+    *,
+    concurrency: int,
+    total: int,
+    smoke: bool,
+    warm: bool,
+    pace_seconds: float = 0.0,
+    prewarm_count: int | None = None,
 ) -> str | None:
     """Return an error message if the requested burst risks the shared Discogs
     budget, or ``None`` if it's within the safe default envelope.
@@ -278,10 +392,17 @@ def check_burst_size_within_safe_bounds(
     copy-pasted flag fire an oversized wave at the prod-shared breaker.
 
     The ``--warm`` prewarm pass fires one extra live ``/lookup`` per distinct
-    query (``len(GATE0_QUERIES)``) *before* the ``total``-sized burst, so the
-    ceiling is checked against the true live-request count (``total`` +
-    prewarm) -- otherwise the rail would understate the real Discogs load by
-    that many calls.
+    query *before* the ``total``-sized burst, so the ceiling is checked against
+    the true live-request count (``total`` + prewarm) -- otherwise the rail
+    would understate the real Discogs load by that many calls. ``prewarm_count``
+    says how many distinct queries are actually in play; it defaults to
+    ``len(GATE0_QUERIES)`` and a ``--queries-file`` run passes its corpus size.
+
+    ``pace_seconds`` at or above :data:`_PACED_RUN_MIN_SECONDS` lifts the
+    ``--total`` ceiling and nothing else. The ceiling exists to stop a *burst*
+    draining the shared budget, and a request every 10s or slower is not one;
+    the ``--concurrency`` ceiling is untouched, because pacing is per worker and
+    so bounds the per-worker rate rather than the aggregate fan-out.
     """
     if smoke:
         return None
@@ -291,7 +412,18 @@ def check_burst_size_within_safe_bounds(
             f"({_MAX_SAFE_CONCURRENCY}); staging shares prod's Discogs token and "
             "breaker. Pass --force to override, under supervision."
         )
-    prewarm = len(GATE0_QUERIES) if warm else 0
+    prewarm = (len(GATE0_QUERIES) if prewarm_count is None else prewarm_count) if warm else 0
+    if pace_seconds >= _PACED_RUN_MIN_SECONDS:
+        # Pacing vouches for the burst leg only -- the prewarm pass is unpaced
+        # by construction, so it is still checked against the ceiling.
+        if prewarm > _MAX_SAFE_TOTAL:
+            return (
+                f"--warm fires {prewarm} unpaced live /lookup calls before the paced "
+                f"burst, over the safe default ceiling ({_MAX_SAFE_TOTAL}); "
+                "--pace-seconds does not cover the prewarm pass. Pass --no-warm, or "
+                "--force under supervision."
+            )
+        return None
     effective_total = total + prewarm
     if effective_total > _MAX_SAFE_TOTAL:
         prewarm_note = f" (+{prewarm} prewarm)" if prewarm else ""
@@ -414,6 +546,9 @@ async def run_burst(
     warm: bool,
     smoke: bool,
     timeout: float,
+    pace_seconds: float = 0.0,
+    queries: list[dict[str, str | None]] | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> BurstResult:
     """Fire the Gate 0 burst and return every :class:`RequestOutcome`.
 
@@ -424,14 +559,25 @@ async def run_burst(
     shape rather than starting every worker stone cold.
 
     The concurrent burst then fires ``total`` requests (round-robin over
-    :data:`GATE0_QUERIES`, or all ``GET /health`` under ``--smoke``) through a
-    pool of ``concurrency`` workers pulling from a shared queue. The pool
-    stops pulling new work the instant any outcome is a shed response
-    (:func:`is_shed_response`) -- already in-flight requests are allowed to
-    finish (their data is still useful), but no new request is issued.
+    ``queries``, defaulting to :data:`GATE0_QUERIES`, or all ``GET /health``
+    under ``--smoke``) through a pool of ``concurrency`` workers pulling from a
+    shared queue. The pool stops pulling new work the instant any outcome is a
+    shed response (:func:`is_shed_response`) -- already in-flight requests are
+    allowed to finish (their data is still useful), but no new request is
+    issued.
+
+    ``pace_seconds`` turns the burst into a paced replay: each worker waits
+    that long *between* its own requests, never before its first or after its
+    last, so N requests through one worker cost ``(N - 1) * pace_seconds``.
+    Pacing is per worker, so the aggregate rate is ``concurrency /
+    pace_seconds``. The abort rail is re-checked after every wait -- a shed
+    another worker saw during a 30-second sleep stops this one before it fires
+    again. ``sleep`` is injected so a test can assert the pacing without
+    spending it.
     """
     result = BurstResult()
     abort_event = asyncio.Event()
+    query_set = GATE0_QUERIES if queries is None else queries
 
     # Narrowed once, up front: mypy can't see through the closure below that
     # `api_key` is non-None just from an `assert` inside this scope. At
@@ -443,7 +589,7 @@ async def run_burst(
 
     async with httpx.AsyncClient() as client:
         if warm and not smoke:
-            for query in GATE0_QUERIES:
+            for query in query_set:
                 outcome = await _fire_lookup(client, host, resolved_api_key, query, timeout)
                 result.prewarm_outcomes.append(outcome)
                 if outcome.shed:
@@ -460,22 +606,28 @@ async def run_burst(
             work_items = [{"label": "health"}] * total
         else:
             for i in range(total):
-                work_items.append(GATE0_QUERIES[i % len(GATE0_QUERIES)])
+                work_items.append(query_set[i % len(query_set)])
 
         queue: asyncio.Queue[dict[str, str | None]] = asyncio.Queue()
         for item in work_items:
             queue.put_nowait(item)
 
         async def worker() -> None:
+            fired = False
             while not queue.empty() and not abort_event.is_set():
                 try:
                     query = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
+                if fired and pace_seconds > 0:
+                    await sleep(pace_seconds)
+                    if abort_event.is_set():
+                        return
                 if smoke:
                     outcome = await _fire_health(client, host, timeout)
                 else:
                     outcome = await _fire_lookup(client, host, resolved_api_key, query, timeout)
+                fired = True
                 result.outcomes.append(outcome)
                 if outcome.shed:
                     abort_event.set()
@@ -589,12 +741,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Bearer token; defaults to $LML_API_KEY",
     )
     parser.add_argument("--concurrency", type=int, default=3, help="Concurrent workers (default 3)")
-    parser.add_argument("--total", type=int, default=12, help="Total requests to fire (default 12)")
+    parser.add_argument(
+        "--total",
+        type=int,
+        default=None,
+        help="Total requests to fire (default 12, or the --queries-file corpus length)",
+    )
     parser.add_argument(
         "--warm",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Sequential prewarm pass (one hit per query) before the concurrent burst (default on)",
+        default=None,
+        help="Sequential prewarm pass (one hit per query) before the concurrent burst "
+        "(default on; off under --queries-file, where the unpaced pass would be a burst)",
+    )
+    parser.add_argument(
+        "--queries-file",
+        default=None,
+        help="Replay a JSON query corpus instead of the three built-in probes, in "
+        "tests/e2e/golden/cases.json's shape: a list of cases, each case's 'query' "
+        "becoming the request body and its 'id' the label.",
+    )
+    parser.add_argument(
+        "--pace-seconds",
+        type=float,
+        default=0.0,
+        help="Seconds each worker waits between its own requests (default 0 = burst). "
+        f"At {_PACED_RUN_MIN_SECONDS:g}s or above the --total safety ceiling lifts -- "
+        "a paced run is not a burst.",
     )
     parser.add_argument(
         "--smoke",
@@ -634,9 +807,22 @@ def main() -> None:
         print("ERROR: --api-key or $LML_API_KEY is required (unless --smoke)", file=sys.stderr)
         sys.exit(1)
 
+    try:
+        queries, total, warm = resolve_run_shape(
+            queries_file=args.queries_file, total=args.total, warm=args.warm
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     if not args.force:
         bounds_error = check_burst_size_within_safe_bounds(
-            concurrency=args.concurrency, total=args.total, smoke=args.smoke, warm=args.warm
+            concurrency=args.concurrency,
+            total=total,
+            smoke=args.smoke,
+            warm=warm,
+            pace_seconds=args.pace_seconds,
+            prewarm_count=len(queries),
         )
         if bounds_error:
             print(f"ERROR: {bounds_error}", file=sys.stderr)
@@ -647,10 +833,12 @@ def main() -> None:
             host=args.host,
             api_key=args.api_key,
             concurrency=args.concurrency,
-            total=args.total,
-            warm=args.warm,
+            total=total,
+            warm=warm,
             smoke=args.smoke,
             timeout=args.timeout,
+            pace_seconds=args.pace_seconds,
+            queries=queries,
         )
     )
 
