@@ -154,7 +154,20 @@ MODULE_BUDGETS: dict[str, int] = {
     # out of item.py from the start (same posture as search_urls.py above) --
     # a pure function of the links dict with no dependency on enrich_one's
     # control flow. 1.3x its ~63-line measured size -> 100.
-    "lookup/enrichment/streaming_link_validation.py": 100,
+    #
+    # LML#1352: 98 -> 143 measured, raised 100 -> 150 for the spotify_url
+    # album-path-kind check. Read the search_urls.py entry above before
+    # raising this again: the growth here is the same kind, documentation the
+    # budget mechanism cannot tell from behavior. The executable delta is one
+    # import, a one-entry dispatch dict and three lines in `_validate`; the
+    # other ~35 are the module docstring recording WHY this reverses the
+    # LML#1295 review's explicit declination to add a check to this field,
+    # and the artifact census that justifies it. Granted the smallest
+    # multiple of 50 at or above the measurement rather than a re-derived
+    # 1.3x (which would license 200) -- so the rule for the next person is
+    # about the BODY: a fourth per-field check belongs in its own module
+    # (the seam is the dispatch dicts plus `_validate`), not appended here.
+    "lookup/enrichment/streaming_link_validation.py": 150,
     # LML#1053: the per-service streaming-status merge, extracted out of
     # item.py to stay under its own ceiling above — a pure function with no
     # dependency on enrich_one's control flow. 1.3x its ~70-line measured

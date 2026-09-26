@@ -258,6 +258,65 @@ class TestSpotifyBandcampStreamingStatus:
         assert enriched.streaming_status.bandcamp is None
 
     @pytest.mark.asyncio
+    async def test_spotify_artist_page_override_is_neither_served_nor_verified(self):
+        """LML#1352: an artist page in the album column reaches no consumer.
+
+        The 2026-09-25 production case: a "Married to the Mob" lookup served
+        this artist page in ``spotify_url`` and labelled it
+        ``streaming_status.spotify = "verified"``, because ``_slot_urls`` +
+        ``_RESOLUTION_PROVING_URL_SERVICES`` force ``verified`` on any non-null
+        Spotify slot and the only gate upstream was a host check. Suppressing
+        the override to ``None`` costs nothing here and buys the
+        ``streaming_url_postprocess`` cache/mint leg a chance to resolve the
+        actual album page.
+        """
+        item = make_library_item(id=42, artist="Soundtracks - M", title="Married to the Mob")
+        artwork = make_discogs_result(
+            release_id=1, artist="Soundtracks - M", album="Married to the Mob"
+        )
+        artist_page = "https://open.spotify.com/artist/7CaUk9xCxdXAmmqQn3PLR7"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": artist_page,
+                "apple_music_url": None,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Married to the Mob",
+            artist="Soundtracks - M",
+            year=1988,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album="Married to the Mob",
+            library_db=library_db,
+        )
+        _, enriched = results[0]
+        assert enriched.spotify_url is None
+        # With the override suppressed and no probe / post-process leg
+        # configured here, Spotify reports nothing at all rather than
+        # ``verified`` — the omitted-not-absent contract, which is why the
+        # whole ``streaming_status`` map is None on this path. Read defensively
+        # so the assertion stays honest if a later leg starts populating it.
+        spotify_status = (
+            enriched.streaming_status.spotify if enriched.streaming_status is not None else None
+        )
+        assert spotify_status != StreamingResolutionStatus.verified
+
+    @pytest.mark.asyncio
     async def test_bandcamp_verified_via_librarian_override(self):
         item = make_library_item(id=42, artist="Juana Molina", title="DOGA")
         artwork = make_discogs_result(release_id=1, artist="Juana Molina", album="DOGA")

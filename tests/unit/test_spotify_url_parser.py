@@ -1,4 +1,4 @@
-"""Unit tests for ``release.spotify_url_parser.spotify_album_id_from_url``.
+"""Unit tests for ``release/spotify_url_parser.py``'s two album questions.
 
 The lookup post-process mints ``entity.release_identity.spotify_album_id``
 from a freshly-resolved Spotify album URL. The cache registry's
@@ -12,13 +12,25 @@ ID" and skips the mint) rather than poisoning the entity graph.
 This is a *distinct* parser from the loose ``_spotify_album_id_from_url``
 in ``release/orchestrator.py`` (regex ``[A-Za-z0-9]+``), which feeds the
 release-resolve endpoint's identifier merge and is out of scope here.
+
+``url_is_spotify_album`` (LML#1352) is the module's second album question and
+deliberately a different one: "is this an album *page*", asked at the serve
+seam (``lookup/enrichment/streaming_link_validation.py``), where nothing is
+keyed on an extracted ID and the only failure mode worth guarding is a
+non-album path kind. It shares the host + locale + ``album/`` grammar with the
+extractor and stops there — no 22-char base62 floor. See
+``TestUrlIsSpotifyAlbum`` for why the two must not be collapsed.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from release.spotify_url_parser import spotify_album_id_from_url, url_has_spotify_host
+from release.spotify_url_parser import (
+    spotify_album_id_from_url,
+    url_has_spotify_host,
+    url_is_spotify_album,
+)
 
 # A canonical 22-char base62 Spotify album ID.
 _VALID_ID = "1A2GTWGt0LBTGQAyA3OKAf"
@@ -38,6 +50,12 @@ class TestSpotifyAlbumIdFromUrl:
             (f"https://open.spotify.com/album/{_VALID_ID}#anchor", _VALID_ID),
             # http (not https) still resolves — the host anchor is what matters.
             (f"http://open.spotify.com/album/{_VALID_ID}", _VALID_ID),
+            # LML#1352 widened the grammar with the web player's locale prefix.
+            # It is a presentation segment: the album ID after it is the same
+            # ID the bare URL carries, so extracting it can only turn a skipped
+            # mint into a correct one, never into a wrong one.
+            (f"https://open.spotify.com/intl-de/album/{_VALID_ID}", _VALID_ID),
+            (f"https://open.spotify.com/intl-pt-br/album/{_VALID_ID}", _VALID_ID),
         ],
     )
     def test_extracts_id_from_album_url(self, url, expected):
@@ -102,3 +120,60 @@ class TestUrlHasSpotifyHost:
     )
     def test_false_for_non_spotify_hosts(self, url):
         assert url_has_spotify_host(url) is False
+
+
+class TestUrlIsSpotifyAlbum:
+    """LML#1352: the serve-seam album-*page* predicate.
+
+    Kept separate from :func:`spotify_album_id_from_url` on purpose. The
+    extractor's 22-char base62 floor exists because the mint path keys
+    ``entity.release_identity`` on what it returns, so a malformed ID must
+    surface as "no ID" rather than poison the graph. This predicate keys
+    nothing — it decides whether a librarian-curated URL is handed to a
+    browser — so importing that floor here would null a ``/album/<odd-id>``
+    value for a reason that has no consequence at this seam, against the
+    ticket's explicit constraint that the guard must not silently drop links
+    it has no evidence against. Path kind is the axis with evidence behind it
+    (6,143 artist pages, 989 tracks); ID charset is not.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"https://open.spotify.com/album/{_VALID_ID}",
+            f"https://open.spotify.com/album/{_VALID_ID}?si=abc123",
+            f"https://open.spotify.com/album/{_VALID_ID}/",
+            f"https://open.spotify.com/intl-de/album/{_VALID_ID}",
+            f"https://open.spotify.com/intl-pt-br/album/{_VALID_ID}",
+            f"http://open.spotify.com/album/{_VALID_ID}",
+            # No 22-char floor here — see the class docstring.
+            "https://open.spotify.com/album/oyola-id",
+        ],
+    )
+    def test_true_for_album_pages(self, url):
+        assert url_is_spotify_album(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"https://open.spotify.com/artist/{_VALID_ID}",
+            f"https://open.spotify.com/track/{_VALID_ID}",
+            f"https://open.spotify.com/playlist/{_VALID_ID}",
+            f"https://open.spotify.com/user/{_VALID_ID}",
+            f"https://open.spotify.com/show/{_VALID_ID}",
+            # An ``/album`` path with nothing after it.
+            "https://open.spotify.com/album",
+            "https://open.spotify.com/album/",
+            "https://open.spotify.com/album/?si=abc",
+            # Album path, wrong host.
+            f"https://www.deezer.com/album/{_VALID_ID}",
+            f"https://open.spotify.com.evil.test/album/{_VALID_ID}",
+            # An album segment that is not the first path segment.
+            f"https://open.spotify.com/user/x/album/{_VALID_ID}",
+            None,
+            "",
+            "not a url",
+        ],
+    )
+    def test_false_for_non_album_pages(self, url):
+        assert url_is_spotify_album(url) is False
