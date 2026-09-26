@@ -676,3 +676,40 @@ uv run python -m scripts.rebaseline_golden_corpus --format-only
 ```
 
 `psycopg` is not a project dependency — the builder imports it lazily and tells you to `uv run --with 'psycopg[binary]'` if it is missing. The re-baseliner needs nothing beyond the dev extra.
+
+## Streaming-Links Export (`scripts/export_streaming_links.py`)
+
+Copies `streaming_availability.db`'s per-service album URLs into `library.db`'s `streaming_links` table, which `/lookup` then serves. It is invoked by another repo: `discogs-etl/scripts/sync-library.sh` runs it in the daily library sync, and `discogs-etl/tests/e2e/test_sync_library_e2e.py` dynamically loads its `main`. It only ever **reads** the streaming artifact (the single bucket-canonical copy of rate-limited Apple/Spotify/Deezer results); `tests/unit/test_export_streaming_links.py` hashes the file across a run to keep that a checked fact rather than an inference.
+
+```sh
+# stats only, writes nothing -- the coverage numbers a gate change should be sized against
+uv run python scripts/export_streaming_links.py --dry-run \
+  --library-db library.db --streaming-db streaming_availability.db
+```
+
+### The Spotify match-provenance gate (LML#1352 / LML#1353)
+
+`lookup/enrichment/item.py` serves whatever lands in `streaming_links` and labels it `streaming_status.spotify = "verified"` after a host + well-formedness check only, so this export is the last place a URL with **no match evidence at all** can be refused. The gate: skip an `albums.spotify_url` when **both** `spotify_matched_artist` and `spotify_matched_title` are NULL-or-blank (whitespace counts as blank). One non-blank field is enough to pass. Every other service's URL on the same row is untouched, and rows that carry provenance are untouched.
+
+Measured on the 2026-09-25 production artifact, over the 46,907 `albums` rows with a non-empty `spotify_url`:
+
+| provenance | n | % | gate |
+|---|---|---|---|
+| real `matched_artist` **and** `matched_title` | 28,238 | 60.2% | exported |
+| a writer **tag** in `matched_artist` (`backfill-wiki (spotify)`, `llm+wikidata`, `web-search (spotify)`, …), empty title | 18,281 | 39.0% | exported |
+| **both blank** | **388** | **0.83%** | **skipped** |
+
+The 388 are 363 compilations + 25 non-compilations, and the 363 are *every* compilation row in the artifact with a Spotify URL — all written by the title-only override in `scripts/search_unmatched_compilations.py`, which discards the provenance it computes (LML#1353). Auditing all 363 against Spotify's public og tags found ~18 of the 28 lowest-scoring were plainly the wrong album (`Simple Machines` → Shinedown "Simple Man", `Sweet Lies` → Anita Baker "Sweet Love", `Until the end of the world` → 2Pac "Until The End Of Time"). Row `albums.id = 52656` — "Married to the Mob" resolving to Speaker Knockerz' "Married to the Money" — is the case a DJ hit in the card catalog, and is pinned as a named regression test.
+
+Two deliberate non-choices, both of which a reviewer should expect to see justified rather than repeated:
+
+- **Not an identity cross-check against `entity.release_identity`** (LML#1352's first suggestion). That needs *positive* evidence this population mostly lacks: 96.0% of the 21,093 `/album/` URLs Backend-Service serves have no matcher row at all in `lml_cache.album_streaming_url_cache`, so an agreement test would demote essentially everything and delete ~20,000 working links. The both-blank rule is the negative-evidence complement — it fires only where there is no record of what was ever compared.
+- **Not widened to the 18,281 tag rows.** Their measured defect is URL *shape* (Spotify artist pages), fixed at the serve seam, not absent provenance. Nulling 39% of Spotify coverage on a provenance technicality is not warranted by anything measured.
+
+An 80/80 string floor is not an option either: per LML#1147 the artist axis carries no signal for shelf credits, so it false-rejects correct links. Three such shapes are pinned in the unit tests — Lower Dens/Nootropics, Don Covay's expanded credit, and the Kollektion 04 curator credit — all of which have full provenance and confidence 100 in the artifact and must export unchanged.
+
+**Coverage delta.** Replayed at the census shape above, `streaming_links.spotify_url` goes 46,907 → 46,519, i.e. −388 (−0.827%). That is an upper bound on the loss: `apple_music_url` (the floor `sync-library.sh` asserts) is unaffected, and `POST /admin/upload-streaming-db`'s 5% coverage guard measures the *artifact*, which this script never writes. A release whose only URL was a gated Spotify one is dropped rather than inserted as an all-NULL row, which would otherwise read as "on streaming" to `/admin/upload-library-db`'s streaming diff.
+
+### Known, unchanged: track-level URLs in an album field
+
+The script supplements album URLs from `track_results`, writing a track-shaped `tr.spotify_url` into the **album** field `entry["spotify_url"]`. That is the origin of the 841 `/track/`-shaped values Backend-Service serves ([WXYC/Backend-Service#2689](https://github.com/WXYC/Backend-Service/issues/2689)). **3,638** artifact albums get their `spotify_url` only from this supplement, so removing or reshaping it is a coverage decision rather than a bug fix and is not made here. Note the interaction: a gated album leaves its Spotify slot empty, so a gated row with a resolved track can be refilled from the supplement. A unit test pins that behavior so it cannot drift silently while the decision is pending.
