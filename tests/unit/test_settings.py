@@ -302,3 +302,50 @@ class TestGetSettings:
         s2 = get_settings()
         assert s1 is s2
         get_settings.cache_clear()
+
+
+class TestMemoryProfileSettings:
+    """LML#1354: the memory profiler's four knobs. The mode default is the
+    merge gate — ``off`` means the module is inert on both environments, so
+    landing the profiler is a zero-behaviour change and nothing runs until an
+    operator sets the variable and redeploys."""
+
+    def test_mode_defaults_to_off(self):
+        assert Settings().lml_memory_profile_mode == "off"
+
+    @pytest.mark.parametrize("mode", ["off", "gauges", "tracemalloc"])
+    def test_accepts_the_three_modes(self, mode):
+        assert Settings(lml_memory_profile_mode=mode).lml_memory_profile_mode == mode
+
+    def test_reads_mode_from_env(self, monkeypatch):
+        monkeypatch.setenv("LML_MEMORY_PROFILE_MODE", "gauges")
+        assert Settings().lml_memory_profile_mode == "gauges"
+
+    def test_rejects_an_unknown_mode(self):
+        with pytest.raises(ValidationError):
+            Settings(lml_memory_profile_mode="memray")
+
+    def test_interval_defaults_to_ten_minutes(self):
+        assert Settings().lml_memory_profile_interval_s == 600
+
+    def test_rejects_a_non_positive_interval(self):
+        """A zero interval turns the sampler into a busy loop on the very event
+        loop whose starvation LML already measures (#907)."""
+        with pytest.raises(ValidationError):
+            Settings(lml_memory_profile_interval_s=0)
+
+    def test_top_n_defaults_to_fifteen(self):
+        assert Settings().lml_memory_profile_top_n == 15
+
+    def test_rejects_a_non_positive_top_n(self):
+        with pytest.raises(ValidationError):
+            Settings(lml_memory_profile_top_n=0)
+
+    def test_frames_defaults_to_five(self):
+        assert Settings().lml_memory_profile_frames == 5
+
+    def test_rejects_a_non_positive_frames(self):
+        """``tracemalloc.start(0)`` raises; the bound keeps a misconfiguration
+        from taking the whole lifespan down at boot."""
+        with pytest.raises(ValidationError):
+            Settings(lml_memory_profile_frames=0)

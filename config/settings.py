@@ -772,6 +772,56 @@ class Settings(BaseSettings):
             "WXYC/library-metadata-lookup#907."
         ),
     )
+    lml_memory_profile_mode: Literal["off", "gauges", "tracemalloc"] = Field(
+        default="off",
+        description=(
+            "Memory-profiler mode for the LML#1354 unbounded-RSS hunt; default "
+            "'off', which starts nothing at all — the module is inert and "
+            "landing it is a zero-behaviour change. 'gauges' logs one "
+            "structured INFO line per interval (RSS from /proc/self/statm, open "
+            "fd count, asyncio task count, gc counts, every in-process cache's "
+            "currsize, asyncpg pool size/idle) and is cheap enough for "
+            "production. 'tracemalloc' additionally traces every allocation and "
+            "diffs consecutive snapshots — staging only, because it slows every "
+            "allocation and its trace table is itself RSS on a service whose "
+            "RSS is the billed quantity. Read at boot (a lifespan task over "
+            "@lru_cache'd Settings), so a flip takes effect only on the next "
+            "redeploy — which restarts the process and resets the very ramp "
+            "being measured. See core/memory_profile.py."
+        ),
+    )
+    lml_memory_profile_interval_s: int = Field(
+        default=600,
+        gt=0,
+        description=(
+            "Seconds between memory-profile reports; default 600. Ignored when "
+            "lml_memory_profile_mode is 'off'. Bounded gt=0 because a zero "
+            "interval turns the sampler into a busy loop on the single worker's "
+            "event loop. See WXYC/library-metadata-lookup#1354."
+        ),
+    )
+    lml_memory_profile_top_n: int = Field(
+        default=15,
+        gt=0,
+        description=(
+            "How many allocation sites each 'tracemalloc' report names, per "
+            "ranking (top-N by growth since the previous snapshot, and top-N by "
+            "absolute retained size); default 15. Ignored in 'off' and 'gauges' "
+            "modes. See WXYC/library-metadata-lookup#1354."
+        ),
+    )
+    lml_memory_profile_frames: int = Field(
+        default=5,
+        gt=0,
+        description=(
+            "``nframe`` passed to tracemalloc.start() in 'tracemalloc' mode; "
+            "default 5. Deeper tracebacks separate call paths that share a "
+            "leaf frame, at a linear cost in the trace table's own memory. "
+            "Ignored in 'off' and 'gauges' modes. Bounded gt=0 because "
+            "tracemalloc.start(0) raises, which would take the lifespan down at "
+            "boot. See WXYC/library-metadata-lookup#1354."
+        ),
+    )
     # Persistent streaming-URL cache flags (LML#573). A service is persisted
     # only when BOTH the master kill switch AND its per-service flag are true
     # (AND-gate). The master defaults True and the per-service flags default
