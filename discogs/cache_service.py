@@ -2406,6 +2406,33 @@ class DiscogsCacheService:
     async def write_artist_details(self, details: ArtistDetails) -> None:
         """Write or update artist details in the cache.
 
+        The four child inserts carry a **target-less** ``ON CONFLICT DO
+        NOTHING``. Discogs responses routinely list the same URL, alias,
+        member or name variation twice, and nothing upstream of here
+        de-duplicates those lists. Once WXYC/discogs-etl#433 adds ``UNIQUE``
+        constraints to the child tables, a repeated entry would raise
+        ``unique_violation``, roll back this whole transaction, and leave the
+        artist a permanent cache miss that re-burns Discogs rate budget on
+        every subsequent lookup. The clause collapses a within-response
+        duplicate to one row instead.
+
+        Target-less rather than ``ON CONFLICT (cols)`` on purpose: a named
+        target requires a matching unique index to already exist, so the
+        column form could not ship before that migration — and it has to ship
+        first, because LML staging and production share the one discogs-cache
+        database, leaving no environment where the constraint could land
+        against an unhardened writer. Target-less is valid with no constraint
+        present at all, so this code is correct on both sides of the migration.
+
+        The ``DELETE`` before each insert is load-bearing and must stay:
+        ``DO NOTHING`` keeps the *existing* row, so relying on it in place of
+        the delete would silently stop applying upstream corrections. The one
+        thing the clause does discard is a second row whose key matches but
+        whose other columns differ — two aliases sharing a name under
+        different ids, say. Measured on production 2026-09-25: zero such
+        groups exist, which is also what makes ``(artist_id, alias_name)`` a
+        sound key for #433.
+
         Args:
             details: Artist details to cache
 
@@ -2470,6 +2497,7 @@ class DiscogsCacheService:
                         """
                         INSERT INTO artist_alias (artist_id, alias_id, alias_name)
                         VALUES ($1, $2, $3)
+                        ON CONFLICT DO NOTHING
                         """,
                         [(details.artist_id, a.id, a.name) for a in details.aliases],
                     )
@@ -2483,6 +2511,7 @@ class DiscogsCacheService:
                         """
                         INSERT INTO artist_name_variation (artist_id, name)
                         VALUES ($1, $2)
+                        ON CONFLICT DO NOTHING
                         """,
                         [(details.artist_id, nv) for nv in details.name_variations],
                     )
@@ -2496,6 +2525,7 @@ class DiscogsCacheService:
                         """
                         INSERT INTO artist_member (artist_id, member_id, member_name, active)
                         VALUES ($1, $2, $3, $4)
+                        ON CONFLICT DO NOTHING
                         """,
                         [(details.artist_id, m.id, m.name, m.active) for m in details.members],
                     )
@@ -2509,6 +2539,7 @@ class DiscogsCacheService:
                         """
                         INSERT INTO artist_url (artist_id, url)
                         VALUES ($1, $2)
+                        ON CONFLICT DO NOTHING
                         """,
                         [(details.artist_id, url) for url in details.urls],
                     )
