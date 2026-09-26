@@ -14,7 +14,15 @@ check alone does not catch.
 deliberately do NOT get the well-formedness floor — review found that a new
 floor there silently activates downstream cache/probe behavior outside this
 module's scope (see the module docstring). ``TestHostCheckOnlyFieldsMatchPreLml1295``
-below pins that these two fields behave exactly as they did before this PR.
+below pins that these two fields still behave as they did before LML#1295
+on every axis but the one LML#1352 added.
+
+LML#1352 adds exactly one check to ``spotify_url``: the path must be an
+*album* path. The production artifact holds 6,143 artist pages, 989 tracks,
+13 playlists, 7 user pages, a podcast and 11 id-less ``/album`` values in
+that column, all of which the host check alone admitted and ``item.py`` then
+labelled ``streaming_status.spotify = "verified"``.
+``TestSpotifyAlbumShapeGuard`` pins the accept/reject table.
 
 ``bandcamp_url`` gets a host check like the other four (a 2026-08-11 audit
 found zero of 2,800 curated ``bandcamp_url`` rows off ``bandcamp.com``) — the
@@ -185,3 +193,99 @@ class TestHostCheckOnlyFieldsMatchPreLml1295:
         result = validate_streaming_link_urls(links)
 
         assert result[field] == ""
+
+
+#: A canonical 22-char base62 Spotify ID, reused across path kinds so the only
+#: thing varying in the table below is the path *kind*.
+_SPOTIFY_ID = "1A2GTWGt0LBTGQAyA3OKAf"
+
+#: LML#1352's accept/reject table, keyed by the production shape it models.
+#: Counts are from the 46,907 ``albums`` rows carrying a non-empty
+#: ``spotify_url`` in the 2026-09-25 artifact pull.
+_SPOTIFY_PATH_SHAPES = {
+    # 31,835 rows — the canonical shape, kept.
+    "album": (f"https://open.spotify.com/album/{_SPOTIFY_ID}", True),
+    # 24 rows — the web player's locale prefix (fr 7, it 6, es 6, de 3, pt 2).
+    # Same album page, so kept.
+    "intl-album": (f"https://open.spotify.com/intl-de/album/{_SPOTIFY_ID}", True),
+    # 6,143 rows — the April-2026 enrichment campaign that resolved ARTISTS
+    # and wrote them into an album column. The Mob/Money shape.
+    "artist": (f"https://open.spotify.com/artist/{_SPOTIFY_ID}", False),
+    # 989 rows.
+    "track": (f"https://open.spotify.com/track/{_SPOTIFY_ID}", False),
+    # 13 rows.
+    "playlist": (f"https://open.spotify.com/playlist/{_SPOTIFY_ID}", False),
+    # 7 rows.
+    "user": (f"https://open.spotify.com/user/{_SPOTIFY_ID}", False),
+    # 1 row — a podcast.
+    "show": (f"https://open.spotify.com/show/{_SPOTIFY_ID}", False),
+    # 11 rows — an ``/album`` path carrying no id at all.
+    "album-no-id": ("https://open.spotify.com/album", False),
+    # Same, with the trailing slash the id would have followed.
+    "album-empty-id": ("https://open.spotify.com/album/", False),
+    # Query string but still no id.
+    "album-query-only": ("https://open.spotify.com/album/?si=abc", False),
+}
+
+
+class TestSpotifyAlbumShapeGuard:
+    """LML#1352: ``spotify_url`` must be a Spotify *album* URL, not merely a
+    Spotify URL.
+
+    The host check alone (LML#873) admits every path kind Spotify serves, and
+    ``item.py``'s ``_slot_urls`` / ``_RESOLUTION_PROVING_URL_SERVICES`` then
+    forces ``streaming_status.spotify = "verified"`` for whatever lands in the
+    slot — so an artist page was served in the album slot and labelled a
+    confirmed album match.
+    """
+
+    @pytest.mark.parametrize(
+        ("shape", "url", "kept"),
+        [(shape, url, kept) for shape, (url, kept) in _SPOTIFY_PATH_SHAPES.items()],
+    )
+    def test_only_album_paths_survive(self, shape, url, kept):
+        links = dict(_GENUINE)
+        links["spotify_url"] = url
+
+        result = validate_streaming_link_urls(links)
+
+        assert result["spotify_url"] == (url if kept else None)
+        # The guard is spotify-only: the other four fields are untouched.
+        for other_field in _GENUINE:
+            if other_field != "spotify_url":
+                assert result[other_field] == _GENUINE[other_field]
+
+    def test_off_host_album_path_is_still_suppressed(self):
+        # Regression on the pre-existing host check: the album-shape guard must
+        # not become the ONLY test, or a ``/album/<id>`` path on another host
+        # would pass. 7,892 artifact values are off ``open.spotify.com``
+        # entirely (YouTube, Bandcamp, ...).
+        links = dict(_GENUINE)
+        links["spotify_url"] = f"https://www.deezer.com/album/{_SPOTIFY_ID}"
+
+        assert validate_streaming_link_urls(links)["spotify_url"] is None
+
+    def test_lookalike_host_album_path_is_suppressed(self):
+        links = dict(_GENUINE)
+        links["spotify_url"] = f"https://open.spotify.com.evil.test/album/{_SPOTIFY_ID}"
+
+        assert validate_streaming_link_urls(links)["spotify_url"] is None
+
+    @pytest.mark.parametrize("falsy", [None, ""])
+    def test_falsy_still_passes_through_unchanged(self, falsy):
+        # The module's falsy-passthrough contract is unchanged by LML#1352:
+        # item.py's update-dict ``or None`` coerces '' later, and nulling it
+        # here would be an out-of-band change to that seam.
+        links = dict(_GENUINE)
+        links["spotify_url"] = falsy
+
+        assert validate_streaming_link_urls(links)["spotify_url"] == falsy
+
+    def test_production_mob_money_artist_page_is_suppressed(self):
+        # The exact value the 2026-09-25 report reproduced against: a
+        # "Married to the Mob" lookup served this artist page as the album
+        # link, labelled verified.
+        links = dict(_GENUINE)
+        links["spotify_url"] = "https://open.spotify.com/artist/7CaUk9xCxdXAmmqQn3PLR7"
+
+        assert validate_streaming_link_urls(links)["spotify_url"] is None
