@@ -19,7 +19,7 @@ from pathlib import Path
 
 from scripts._lib.runtime import set_up_script_runtime
 from scripts._lib.signals import ShutdownFlag
-from scripts.streaming_availability.results_db import ResultsDB
+from scripts.streaming_availability.results_db import COLLECTED_STATUS_LIKE, ResultsDB
 from scripts.track_streaming.api_search import search_track_on_services
 from scripts.track_streaming.local_index import LocalStreamingIndex, TrackEntry
 from scripts.track_streaming.track_extractor import (
@@ -436,9 +436,13 @@ async def phase_album_rollup(results_db: ResultsDB) -> tuple[int, int]:
             on_streaming += 1
             # Mark the album on-streaming so album-level readers see the result.
             #
-            # ``NOT LIKE 'found%'`` rather than ``!= 'found'`` so the whole
-            # collected family is left alone, not just ``found`` (LML#1353). This
-            # write carries no url, confidence or provenance, so promoting a
+            # ``NOT LIKE`` the collected-status prefix rather than ``!= 'found'``
+            # so the whole collected family is left alone, not just ``found``
+            # (LML#1353). The pattern is imported rather than spelled again here:
+            # this rule and ``update_result``'s ``skip_if_resolved`` have to mean
+            # the same thing, and the bug being fixed was one site carrying a rule
+            # another site did not. This write carries no url, confidence or
+            # provenance, so promoting a
             # ``found_title_only`` row would relabel a title-axis-only album match
             # as a guarded two-axis one while leaving its one-axis confidence in
             # place — and this rollup runs over exactly that population, since the
@@ -451,7 +455,7 @@ async def phase_album_rollup(results_db: ResultsDB) -> tuple[int, int]:
             # promotion neither creates nor widens it.
             await results_db._db.execute(
                 "UPDATE albums SET spotify_status = 'found' "
-                "WHERE id = ? AND spotify_status NOT LIKE 'found%'",
+                f"WHERE id = ? AND spotify_status NOT LIKE '{COLLECTED_STATUS_LIKE}'",
                 (album_id,),
             )
         else:

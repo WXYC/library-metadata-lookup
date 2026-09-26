@@ -1,6 +1,9 @@
 """Unit tests for scripts/streaming_availability/results_db.py."""
 
+import ast
 import json
+import re
+from pathlib import Path
 
 import aiosqlite
 import pytest
@@ -8,7 +11,7 @@ import pytest_asyncio
 
 from clients.streaming.matching import normalize_album_title, normalize_artist_name
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
-from scripts.streaming_availability.results_db import ResultsDB
+from scripts.streaming_availability.results_db import COLLECTED_STATUS_LIKE, ResultsDB
 
 
 @pytest_asyncio.fixture
@@ -207,6 +210,69 @@ class TestUpdateResult:
         landed = await db.update_result(rows[0]["id"], "spotify", "not_found")
         assert landed == 1
         assert await db.update_result(999999, "spotify", "not_found") == 0
+
+
+class TestCollectedStatusPrefix:
+    """``skip_if_resolved`` matches collected statuses by prefix, not by enumeration.
+
+    That direction is deliberate: over-matching skips a write, which a re-run
+    heals, while an enumeration someone forgets to extend overwrites a collected
+    answer, which nothing heals. The cost is that a status merely *named*
+    ``found_something`` would be protected by accident, so this pins the whole
+    vocabulary against the predicate. Evaluated by SQLite rather than in Python,
+    because the predicate's real semantics (including its ASCII
+    case-insensitivity) are what the guard depends on.
+    """
+
+    COLLECTED = ("found", "found_title_only")
+    NOT_COLLECTED = ("not_found", "pending", "skipped", "error")
+
+    @pytest.mark.asyncio
+    async def test_the_prefix_captures_exactly_the_collected_statuses(self, db):
+        assert db._db is not None
+        for status in self.COLLECTED:
+            cursor = await db._db.execute(f"SELECT ? LIKE '{COLLECTED_STATUS_LIKE}'", (status,))
+            assert (await cursor.fetchone())[0] == 1, f"{status} must be protected"
+        for status in self.NOT_COLLECTED:
+            cursor = await db._db.execute(f"SELECT ? LIKE '{COLLECTED_STATUS_LIKE}'", (status,))
+            assert (await cursor.fetchone())[0] == 0, f"{status} must remain writable"
+
+    def test_the_vocabulary_roster_is_complete(self):
+        """Reverse check: every status this repo writes is classified above.
+
+        A new status that is neither collected nor writable here is one nobody has
+        decided about, and the prefix will have decided for them.
+
+        Two sweeps, because a status reaches the column two ways and a guard that
+        saw only one would be half vacuous: literal SQL assignments/comparisons,
+        and the ``status`` argument of an ``update_result`` call (which is how
+        ``error`` enters, and how any new value most likely would).
+        """
+        written = set(self.COLLECTED) | set(self.NOT_COLLECTED)
+        repo_root = Path(__file__).resolve().parents[2]
+        sql_pattern = re.compile(r"(?:spotify|deezer|apple)_status\s*(?:=|!=)\s*'([a-z_]+)'")
+        from_sql: set[str] = set()
+        from_calls: set[str] = set()
+
+        for path in (repo_root / "scripts").rglob("*.py"):
+            source = path.read_text()
+            from_sql.update(sql_pattern.findall(source))
+            for node in ast.walk(ast.parse(source)):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = node.func.attr if isinstance(node.func, ast.Attribute) else None
+                if name != "update_result" or len(node.args) < 3:
+                    continue
+                status_arg = node.args[2]
+                if isinstance(status_arg, ast.Constant) and isinstance(status_arg.value, str):
+                    from_calls.add(status_arg.value)
+
+        # Vacuity guards: each sweep must still find its known members, so a
+        # drifted pattern fails loudly instead of passing over nothing.
+        assert "found" in from_sql, "SQL sweep found no 'found' — pattern has drifted"
+        assert "error" in from_calls, "call sweep found no 'error' — AST shape has drifted"
+        unclassified = (from_sql | from_calls) - written
+        assert not unclassified, f"unclassified status values: {unclassified}"
 
 
 class TestUpdateResultSkipIfResolved:

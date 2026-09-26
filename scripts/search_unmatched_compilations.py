@@ -16,12 +16,9 @@ from argparse import ArgumentParser
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from wxyc_etl.text import is_compilation_artist
-
 from clients.streaming.matching import (
     find_best_typed_match,
     normalize_album_title,
-    normalize_for_comparison,
     score_match,
     strip_format_suffix,
 )
@@ -32,6 +29,7 @@ from scripts._lib.match_decision import (
     ServiceMatch,
     best_title_only_candidate,
     decide_service_match,
+    query_credit_is_va,
 )
 from scripts._lib.runtime import set_up_script_runtime
 from scripts._lib.signals import ShutdownFlag
@@ -137,7 +135,7 @@ async def search_discogs_by_title(pool, title: str, *, query_artist: str) -> dic
     # it refuses every candidate for a real name, and the guarded matcher would
     # score a vacuous artist axis for a V/A one. Same normalization contract as
     # ``va_artist_axis_is_uninformative``, whose query half this is.
-    if is_compilation_artist(normalize_for_comparison(query_artist)):
+    if query_credit_is_va(query_artist):
         winner = best_title_only_candidate(
             rows,
             query_artist=query_artist,

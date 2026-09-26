@@ -222,6 +222,170 @@ class TestBestTitleOnlyCandidate:
         )
 
 
+_VA_CREDIT = "Various"
+_VA_CANDIDATE = "Various Artists"
+_VA_TITLE = "Nuggets"
+_NAMED_CREDIT = "Jessica Pratt"
+_NAMED_TITLE = "On Your Own Love Again"
+
+
+def _clean(credit: str, title: str, album_id: str) -> dict:
+    return _spotify_row(credit, title, album_id)
+
+
+def _url_less(credit: str, title: str, album_id: str) -> dict:
+    """Well formed on every axis, but the URL extractor yields ``""``."""
+    return {"id": album_id, "name": title, "artists": [{"name": credit}]}
+
+
+def _malformed(album_id: str) -> dict:
+    """``artists`` is None, so ``artist_fn`` raises — a sparse row, with a URL."""
+    return {
+        "id": album_id,
+        "name": "whatever",
+        "artists": None,
+        "external_urls": {"spotify": f"https://open.spotify.com/album/{album_id}"},
+    }
+
+
+class TestDecideServiceMatchSeam:
+    """The pre-pass verdict x the V/A partition, as one table (LML#1353).
+
+    This is the seam three successive fixes each broke a different corner of: the
+    pre-pass owns "is this response usable" on behalf of *both* matchers, and the
+    query credit decides *which* matcher runs. The cross-product of candidate-list
+    shape and query-credit kind is small enough to enumerate, and every regression
+    in this area landed in one of these cells:
+
+    * a URL-less top candidate sinking a lane that had a playable runner-up,
+    * a URL filter shrinking the denominator until one sparse row read as "every
+      row failed" and aborted the lane,
+    * a wholly-URL-less response passing as a clean no-match,
+    * a V/A query credit reaching the guarded matcher and scoring a tautology.
+    """
+
+    @pytest.mark.parametrize(
+        ("credit", "title", "candidate_credit"),
+        [
+            pytest.param(_VA_CREDIT, _VA_TITLE, _VA_CANDIDATE, id="va-credit"),
+            pytest.param(_NAMED_CREDIT, _NAMED_TITLE, _NAMED_CREDIT, id="named-credit"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("shape", "expect"),
+        [
+            pytest.param("empty", "none", id="no-candidates"),
+            pytest.param("all-url-less", "none", id="all-url-less"),
+            pytest.param("some-url-less", "decision", id="some-url-less"),
+            pytest.param("all-clean", "decision", id="all-clean"),
+            pytest.param("all-malformed", "raise", id="all-malformed"),
+            pytest.param("one-malformed-rest-url-less", "none", id="sparse-row-among-url-less"),
+            pytest.param("one-malformed-rest-clean", "decision", id="sparse-row-among-clean"),
+        ],
+    )
+    def test_the_cross_product(self, credit, title, candidate_credit, shape, expect):
+        rows = {
+            "empty": [],
+            "all-url-less": [
+                _url_less(candidate_credit, title, "a"),
+                _url_less(candidate_credit, title, "b"),
+            ],
+            "some-url-less": [
+                _url_less(candidate_credit, title, "a"),
+                _clean(candidate_credit, title, "playable"),
+            ],
+            "all-clean": [
+                _clean(candidate_credit, title, "playable"),
+                _clean(candidate_credit, title, "other"),
+            ],
+            "all-malformed": [_malformed("a"), _malformed("b")],
+            "one-malformed-rest-url-less": [
+                _url_less(candidate_credit, title, "a"),
+                _malformed("b"),
+            ],
+            "one-malformed-rest-clean": [
+                _clean(candidate_credit, title, "playable"),
+                _malformed("b"),
+            ],
+        }[shape]
+
+        if expect == "raise":
+            with pytest.raises(_EXTRACTION_ERRORS):
+                decide_service_match(
+                    rows, query_artist=credit, query_title=title, **_spotify_kwargs()
+                )
+            return
+
+        decision = decide_service_match(
+            rows, query_artist=credit, query_title=title, **_spotify_kwargs()
+        )
+        if expect == "none":
+            assert decision is None
+            return
+
+        assert decision is not None
+        assert decision.url, "a recorded decision always carries a URL"
+        # The partition, not the candidate: a V/A query credit never reports two
+        # axes, a named one always does when the guarded matcher accepted.
+        expected_axes = AXES_TITLE_ONLY if credit == _VA_CREDIT else AXES_ARTIST_AND_TITLE
+        assert decision.axes == expected_axes
+
+
+class TestBlankQueryTautology:
+    """``score_match("", "")`` is 100, and that applies to the artist axis too.
+
+    The relaxed path was guarded against it on the title axis; the guarded path
+    was guarded on neither. A blank credit does not take the V/A branch either --
+    ``is_compilation_artist("")`` is False -- so it falls to the guarded matcher,
+    which scores 100/100 against an equally blank candidate and would record
+    ``artist+title``/``found`` at maximum confidence over nothing at all.
+    """
+
+    @pytest.mark.parametrize(
+        ("query_artist", "query_title"),
+        [("", "Nuggets"), ("   ", "Nuggets"), ("Various", ""), ("Stereolab", "   ")],
+        ids=["blank-artist", "whitespace-artist", "blank-title", "whitespace-title"],
+    )
+    def test_a_blank_query_axis_is_never_a_decision(self, query_artist, query_title):
+        rows = [_spotify_row(query_artist, query_title)]
+        assert (
+            decide_service_match(
+                rows, query_artist=query_artist, query_title=query_title, **_spotify_kwargs()
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        ("candidate_credit", "candidate_title"),
+        [("", ""), ("", _NAMED_TITLE), (_NAMED_CREDIT, "")],
+        ids=["both-blank", "blank-artist", "blank-title"],
+    )
+    def test_a_blank_candidate_axis_is_never_a_decision(self, candidate_credit, candidate_title):
+        """The candidate side of the same hole, on the axis the guarded pass claims.
+
+        The row carries a real URL deliberately: without one the pre-pass's URL
+        filter would drop it and this would pass for the wrong reason, telling us
+        nothing about the blank-axis rule.
+        """
+        rows = [
+            {
+                "id": "x",
+                "name": candidate_title,
+                "artists": [{"name": candidate_credit}],
+                "external_urls": {"spotify": "https://open.spotify.com/album/x"},
+            }
+        ]
+        assert (
+            decide_service_match(
+                rows,
+                query_artist=_NAMED_CREDIT,
+                query_title=_NAMED_TITLE,
+                **_spotify_kwargs(),
+            )
+            is None
+        )
+
+
 class TestServiceMatchStatus:
     def test_an_axes_value_with_no_status_is_refused(self):
         """Derivation, not an ``else``: the pair must not be able to drift.

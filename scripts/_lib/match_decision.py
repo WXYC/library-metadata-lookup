@@ -137,6 +137,23 @@ class ServiceMatch:
         return _STATUS_BY_AXES[self.axes]
 
 
+def query_credit_is_va(query_artist: str) -> bool:
+    """True when the *query* credit is itself a V/A credit.
+
+    This is the query half of ``va_artist_axis_is_uninformative``, and it is the
+    switch every drain lane uses to choose which axes may decide: a V/A credit
+    takes the title axis alone, a recovered real name takes the guarded matcher.
+
+    It lives here, called by both lanes, rather than being spelled out at each —
+    the regression this module has already had once was precisely one lane
+    carrying a rule the other did not, and two copies of a predicate are two
+    things that can drift. Honours the same normalization contract as the full
+    predicate (``to_match_form`` before ``is_compilation_artist``) so the two
+    cannot disagree about what a V/A credit is.
+    """
+    return is_compilation_artist(normalize_for_comparison(query_artist))
+
+
 def best_title_only_candidate[T](
     results: Sequence[T],
     *,
@@ -252,6 +269,17 @@ def decide_service_match(
         because it hands them a filtered list and the question is about the
         response as received — see the pre-pass below.
     """
+    # Nothing to compare on an axis means no decision on any axis.
+    # ``score_match("", "")`` is 100 by rapidfuzz convention and the normalizer
+    # strips whitespace first, so a blank query would be *accepted* at maximum
+    # confidence against an equally blank candidate. ``best_title_only_candidate``
+    # guards its own title axis, but the guarded pass guards neither: a blank
+    # credit is not a V/A credit (``is_compilation_artist("")`` is False), so it
+    # skips the relaxation and lands on ``find_best_match``, which — unlike its
+    # sibling ``find_best_typed_match`` — has no empty-query short-circuit. That
+    # asymmetry is why Phase 1 was safe here and Phase 2 was not.
+    if not query_artist.strip() or not query_title.strip():
+        return None
     # One pass over the response as received, for two reasons that pull against
     # each other.
     #
@@ -304,7 +332,7 @@ def decide_service_match(
     # marginal LML#1139 prefix clear but a tautology on a string we supplied — and
     # would be recorded as a two-axis ``found``. That is the population most likely
     # to be a wrong V/A link, so it is the one that most needs the one-axis marker.
-    if not is_compilation_artist(normalize_for_comparison(query_artist)):
+    if not query_credit_is_va(query_artist):
         guarded = find_best_match(
             playable,
             query_artist,
