@@ -206,7 +206,41 @@ _SPOTIFY_ID = "1A2GTWGt0LBTGQAyA3OKAf"
 
 #: LML#1352's accept/reject table, keyed by the production shape it models.
 #: Counts are from the 46,907 ``albums`` rows carrying a non-empty
-#: ``spotify_url`` in the 2026-09-25 artifact pull.
+#: ``spotify_url`` in the 2026-09-25 artifact pull. This table is the canonical
+#: home for that census -- the module budget entry for
+#: ``lookup/enrichment/streaming_link_validation.py`` says so explicitly, so keep
+#: it here rather than restating it in the module docstring.
+#:
+#: Two totals the per-shape rows below cannot express, both measured by running
+#: ``url_has_spotify_host`` and ``url_is_spotify_album_or_track`` over the column:
+#:
+#: - 14,077 values (30.0%) are outside release shape, but only **6,251 of those
+#:   are this guard's to suppress** (13.3% of the column). The other 7,826 are
+#:   not on a Spotify host at all -- another service's URL sitting in a Spotify
+#:   column, ``music.apple.com`` 2,043 and ``www.deezer.com`` 764 leading, then
+#:   Bandcamp subdomains, YouTube and Tidal -- and the pre-existing host check
+#:   already nulls every one of them, before and after this change. Sizing the
+#:   guard at 14,077 (or at the whole 30.0%) credits it with the host check's
+#:   work.
+#: - The sibling provenance gate LML#1355 shares **none** of this population, so
+#:   neither PR subsumes the other and landing one alone leaves the other's rows
+#:   served. Every one of the 14,077 badly-shaped values carries a writer tag in
+#:   ``spotify_matched_artist`` (``backfill-wiki (spotify)``, ``llm+wikidata``),
+#:   which that gate's ``_has_match_provenance`` counts as provenance PRESENT;
+#:   and all 388 values it refuses are properly album/track-shaped, so this
+#:   predicate keeps every one. The cross-tab has an empty fourth cell: no value
+#:   is both unshaped and provenance-less.
+#:
+#: The per-shape counts below were bucketed on the literal ``open.spotify.com``
+#: while the two totals above use the host predicate, which admits any
+#: ``*.spotify.com`` -- so the rows below cannot sum to 6,251. Of that 6,251,
+#: 6,185 are on ``open.spotify.com`` and 66 are on sibling hosts the per-shape
+#: buckets never counted: ``creators.spotify.com`` 36 and
+#: ``podcasters.spotify.com`` 4 (both ``/pod/`` podcast pages),
+#: ``community.spotify.com`` 15 (``/t5/`` forum threads),
+#: ``newsroom.spotify.com`` 9, ``artists.spotify.com`` 1, ``www.spotify.com`` 1.
+#: See ``test_album_path_on_another_spotify_host_survives`` for why the guard must
+#: not narrow the host to close that gap.
 _SPOTIFY_PATH_SHAPES = {
     # 31,835 rows — the canonical shape, kept.
     "album": (f"https://open.spotify.com/album/{_SPOTIFY_ID}", True),
