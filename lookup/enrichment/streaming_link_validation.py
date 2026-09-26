@@ -41,17 +41,20 @@ counts are pinned as the accept/reject table in
 Serving those was not a soft failure: ``item.py``'s ``_slot_urls`` /
 ``_RESOLUTION_PROVING_URL_SERVICES`` force ``streaming_status.spotify =
 "verified"`` on any non-null Spotify slot, so an artist page was labelled a
-confirmed album match, and ``verified`` is terminal. (LML#1352's *reported*
-Mob/Money value is album-shaped — ``/album/0JSLTbVe6Z70EQkOLL0WPi``, the wrong
-album — so this layer does not close it and is not what its acceptance
-criterion 1 asks for; the shape axis and the provenance axis are different
-defects reached through the same unguarded field.) Which makes the consequence the LML#1295 review weighed as a cost
-the *point* for this field: a suppressed ``spotify_url`` falls through to the
-post-process's cache-UPSERT / mint leg, which resolves an album page for the
-REQUEST's (artist, album) and whose verdict a later leg can still supersede.
-That heals the response, not the installed base — a row Backend-Service has
-already stored as ``verified`` stays wrong until BS demotes it (routed on
-#1352), because its merge treats ``verified`` as terminal too.
+confirmed album match, and ``verified`` is terminal. Which makes the
+consequence the LML#1295 review weighed as a cost the *point* for this field:
+a suppressed ``spotify_url`` falls through to the post-process's cache-UPSERT /
+mint leg, which resolves an album page for the REQUEST's (artist, album) and
+whose verdict a later leg can still supersede.
+
+Three scope facts, all routed on #1352 rather than handled here, because each
+lives at another layer: LML#1352's *reported* Mob/Money value is album-shaped
+(the wrong album, right shape), so the path axis does not close it — that is
+its criterion 1's identity agreement; the fallthrough above does not run on
+``/lookup/bulk``, where ``should_suppress_streaming_warm()`` makes the
+post-process cache-read-only and the rowless warm exemption does not cover
+library rows; and it heals the response, not the rows Backend-Service already
+stored as ``verified``, whose merge treats that status as terminal too.
 
 ``apple_music_url`` stays host-check-only, by measurement rather than
 oversight: all 288 of its populated artifact values are already album URLs, so
