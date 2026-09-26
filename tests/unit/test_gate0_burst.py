@@ -13,24 +13,33 @@ burst is meant to be run, under human supervision, against staging.
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 
 import pytest
 
 from scripts import gate0_burst
 from scripts.gate0_burst import (
     _MAX_SAFE_TOTAL,
+    _PACED_RUN_MIN_SECONDS,
     GATE0_QUERIES,
     RequestOutcome,
     build_report,
     check_burst_size_within_safe_bounds,
     classify_warm_cold,
     is_shed_response,
+    load_queries_file,
+    parse_args,
     parse_server_timing,
     percentile,
     render_human,
+    resolve_run_shape,
     run_burst,
     summarize_durations,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+GOLDEN_CORPUS = REPO_ROOT / "tests" / "e2e" / "golden" / "cases.json"
 
 
 class TestParseServerTiming:
@@ -289,3 +298,401 @@ class TestRenderHuman:
         report = build_report([], 500.0, smoke=False)
         text = render_human(report)
         assert "LML_EMIT_SERVER_TIMING" in text
+
+
+def _write_cases(tmp_path: Path, payload: object) -> str:
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return str(path)
+
+
+class TestLoadQueriesFile:
+    """``--queries-file`` reads the LML#1233 golden corpus (C1b).
+
+    The corpus is a top-level JSON *list* of case objects; the driver wants
+    each case's ``query`` sub-object and its ``id`` as the report label.
+    """
+
+    def test_reads_the_real_golden_corpus(self):
+        queries = load_queries_file(str(GOLDEN_CORPUS))
+        assert len(queries) == 143
+        assert all(q["label"] for q in queries)
+        allowed = {"label", "artist", "song", "album", "raw_message"}
+        for query in queries:
+            assert set(query) <= allowed
+            # Every case carries at least one lookup field, never a bare label.
+            assert set(query) - {"label"}
+
+    def test_uses_the_case_id_as_the_label(self, tmp_path):
+        path = _write_cases(
+            tmp_path,
+            [{"id": "case-juana", "query": {"artist": "Juana Molina", "album": "DOGA"}}],
+        )
+        assert load_queries_file(path) == [
+            {"label": "case-juana", "artist": "Juana Molina", "album": "DOGA"}
+        ]
+
+    def test_drops_corpus_only_keys_that_are_not_lookup_fields(self, tmp_path):
+        """A case carries ``shape``/``expect``/``requires_rows`` siblings and the
+        ``query`` itself is already clean -- but nothing outside the
+        ``LookupRequest`` field names may reach the POST body."""
+        path = _write_cases(
+            tmp_path,
+            [
+                {
+                    "id": "c1",
+                    "shape": "artist_song",
+                    "expect": {"miss_kind": "hit"},
+                    "query": {"artist": "Jessica Pratt", "song": "Back, Baby"},
+                }
+            ],
+        )
+        assert load_queries_file(path) == [
+            {"label": "c1", "artist": "Jessica Pratt", "song": "Back, Baby"}
+        ]
+
+    def test_missing_file_raises_value_error_naming_the_path(self, tmp_path):
+        missing = str(tmp_path / "nope.json")
+        with pytest.raises(ValueError) as excinfo:
+            load_queries_file(missing)
+        assert missing in str(excinfo.value)
+
+    def test_malformed_json_raises_value_error(self, tmp_path):
+        path = tmp_path / "cases.json"
+        path.write_text("[{'not': 'json'},", encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_queries_file(str(path))
+
+    def test_non_list_top_level_raises(self, tmp_path):
+        with pytest.raises(ValueError):
+            load_queries_file(_write_cases(tmp_path, {"cases": []}))
+
+    def test_case_without_a_query_object_raises(self, tmp_path):
+        with pytest.raises(ValueError):
+            load_queries_file(_write_cases(tmp_path, [{"id": "c1", "shape": "artist_only"}]))
+
+    def test_case_whose_query_has_no_lookup_fields_raises(self, tmp_path):
+        with pytest.raises(ValueError):
+            load_queries_file(_write_cases(tmp_path, [{"id": "c1", "query": {"genre": "Rock"}}]))
+
+    def test_empty_corpus_raises(self, tmp_path):
+        with pytest.raises(ValueError):
+            load_queries_file(_write_cases(tmp_path, []))
+
+
+class TestPacedRunLiftsTheTotalCap:
+    """``--pace-seconds`` >= 10 lifts ``_MAX_SAFE_TOTAL``, and nothing else.
+
+    The cap exists to protect the shared Discogs rate budget from a *burst*.
+    A run paced at 10 s or more is not a burst -- it is at most 6 requests a
+    minute per worker, well inside staging's limiter -- so a full 143-case
+    corpus cycle is allowed. Below 10 s the cap still applies.
+    """
+
+    @pytest.mark.parametrize("pace_seconds", [0.0, 1.0, 9.0, 9.999])
+    def test_cap_still_enforced_below_the_threshold(self, pace_seconds):
+        msg = check_burst_size_within_safe_bounds(
+            concurrency=1,
+            total=_MAX_SAFE_TOTAL + 1,
+            smoke=False,
+            warm=False,
+            pace_seconds=pace_seconds,
+        )
+        assert msg is not None
+        assert "total" in msg.lower()
+
+    @pytest.mark.parametrize("pace_seconds", [10.0, 30.0])
+    def test_cap_lifted_at_and_above_the_threshold(self, pace_seconds):
+        assert (
+            check_burst_size_within_safe_bounds(
+                concurrency=1, total=143, smoke=False, warm=False, pace_seconds=pace_seconds
+            )
+            is None
+        )
+
+    def test_threshold_constant_is_ten_seconds(self):
+        assert _PACED_RUN_MIN_SECONDS == 10.0
+
+    def test_concurrency_cap_is_not_lifted_by_pacing(self):
+        """Pacing bounds the per-worker rate, not the fan-out. A paced run at
+        high concurrency is still a burst in aggregate, so that rail stays."""
+        msg = check_burst_size_within_safe_bounds(
+            concurrency=50, total=143, smoke=False, warm=False, pace_seconds=30.0
+        )
+        assert msg is not None
+        assert "concurrency" in msg.lower()
+
+    def test_prewarm_count_follows_the_supplied_query_set(self):
+        """The prewarm pass fires one live /lookup per *distinct query in use*.
+        With a 143-case corpus that is 143 calls, not len(GATE0_QUERIES) -- so
+        the ceiling must be told the real count or it understates the load."""
+        msg = check_burst_size_within_safe_bounds(
+            concurrency=1, total=1, smoke=False, warm=True, prewarm_count=143
+        )
+        assert msg is not None
+        assert "prewarm" in msg.lower()
+
+    def test_default_prewarm_count_is_the_builtin_query_set(self):
+        assert (
+            check_burst_size_within_safe_bounds(concurrency=3, total=12, smoke=False, warm=True)
+            is None
+        )
+
+    def test_pacing_does_not_exempt_the_unpaced_prewarm_pass(self):
+        """``--pace-seconds`` vouches for the burst leg only. The prewarm pass
+        is unpaced by construction -- one sequential live /lookup per distinct
+        query, back to back -- so 143 of them is an oversized burst however
+        slowly the requests after it are spaced."""
+        msg = check_burst_size_within_safe_bounds(
+            concurrency=1, total=143, smoke=False, warm=True, pace_seconds=30.0, prewarm_count=143
+        )
+        assert msg is not None
+        assert "prewarm" in msg.lower()
+
+    def test_paced_run_with_a_small_prewarm_pass_is_still_allowed(self):
+        assert (
+            check_burst_size_within_safe_bounds(
+                concurrency=1, total=143, smoke=False, warm=True, pace_seconds=30.0
+            )
+            is None
+        )
+
+
+class TestResolveRunShape:
+    """``--total`` and ``--warm`` change default with ``--queries-file``."""
+
+    def test_without_a_queries_file_the_builtin_defaults_hold(self):
+        queries, total, warm = resolve_run_shape(queries_file=None, total=12, warm=None)
+        assert queries is GATE0_QUERIES
+        assert total == 12
+        assert warm is True
+
+    def test_builtin_total_still_defaults_to_twelve(self):
+        """Only ``--queries-file`` moves the ``--total`` default.
+
+        Resolving the built-in path to ``len(GATE0_QUERIES)`` would silently
+        drop the documented Gate 0 burst from 12 requests to 3 -- a p95 over
+        three samples instead of twelve -- while ``--help`` and
+        ``docs/scripts.md`` both still promise 12.
+        """
+        queries, total, warm = resolve_run_shape(queries_file=None, total=None, warm=None)
+        assert queries is GATE0_QUERIES
+        assert total == 12
+        assert warm is True
+
+    def test_total_defaults_to_the_corpus_length(self):
+        _, total, _ = resolve_run_shape(queries_file=str(GOLDEN_CORPUS), total=None, warm=None)
+        assert total == 143
+
+    def test_prewarm_defaults_off_for_a_corpus_replay(self):
+        """The prewarm pass is *unpaced*. Three hardcoded probes is the LML#983
+        warm-one/cold-others setup; 143 of them is an unpaced burst straight
+        through the budget the pacing exists to respect."""
+        _, _, warm = resolve_run_shape(queries_file=str(GOLDEN_CORPUS), total=None, warm=None)
+        assert warm is False
+
+    def test_explicit_flags_win_over_both_defaults(self):
+        _, total, warm = resolve_run_shape(queries_file=str(GOLDEN_CORPUS), total=5, warm=True)
+        assert (total, warm) == (5, True)
+
+    def test_builtin_total_default_is_unset_on_the_parser(self):
+        """``--total`` must reach resolve_run_shape as None when the operator
+        did not type it, or the corpus-length default can never fire."""
+        args = parse_args(["--host", "http://x"])
+        assert args.total is None
+        assert args.warm is None
+        assert args.queries_file is None
+        assert args.pace_seconds == 0.0
+
+
+class TestPacing:
+    """``--pace-seconds`` sleeps *between* requests, via an injected sleep.
+
+    No test here may sleep for real -- the injected callable records the
+    requested delay and returns immediately.
+    """
+
+    @staticmethod
+    def _stub_lookup_recording(seen: list[str]):
+        async def _stub(client, host, api_key, query, timeout):
+            seen.append(str(query.get("label")))
+            return RequestOutcome(
+                label=str(query.get("label")),
+                status_code=200,
+                client_wall_ms=1.0,
+                lml_wall_ms=1.0,
+            )
+
+        return _stub
+
+    def test_sleeps_between_requests_but_not_before_the_first_or_after_the_last(self, monkeypatch):
+        slept: list[float] = []
+
+        async def _fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+
+        monkeypatch.setattr(gate0_burst, "_fire_lookup", self._stub_lookup_recording([]))
+
+        result = asyncio.run(
+            run_burst(
+                host="http://x",
+                api_key="k",
+                concurrency=1,
+                total=3,
+                warm=False,
+                smoke=False,
+                timeout=1.0,
+                pace_seconds=30.0,
+                sleep=_fake_sleep,
+            )
+        )
+
+        assert len(result.outcomes) == 3
+        assert slept == [30.0, 30.0]
+
+    def test_no_pacing_by_default(self, monkeypatch):
+        slept: list[float] = []
+
+        async def _fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+
+        monkeypatch.setattr(gate0_burst, "_fire_lookup", self._stub_lookup_recording([]))
+
+        asyncio.run(
+            run_burst(
+                host="http://x",
+                api_key="k",
+                concurrency=1,
+                total=3,
+                warm=False,
+                smoke=False,
+                timeout=1.0,
+                sleep=_fake_sleep,
+            )
+        )
+
+        assert slept == []
+
+    def test_pacing_stops_at_the_shed_abort_rail(self, monkeypatch):
+        """The abort-on-shed rail is unchanged by pacing: a shed stops the run
+        rather than sleeping on into the next request."""
+
+        slept: list[float] = []
+
+        async def _fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+
+        async def _stub_shedding(client, host, api_key, query, timeout):
+            return RequestOutcome(
+                label=str(query.get("label")), status_code=429, client_wall_ms=1.0, shed=True
+            )
+
+        monkeypatch.setattr(gate0_burst, "_fire_lookup", _stub_shedding)
+
+        result = asyncio.run(
+            run_burst(
+                host="http://x",
+                api_key="k",
+                concurrency=1,
+                total=5,
+                warm=False,
+                smoke=False,
+                timeout=1.0,
+                pace_seconds=30.0,
+                sleep=_fake_sleep,
+            )
+        )
+
+        assert result.aborted_on_shed is True
+        assert len(result.outcomes) == 1
+        assert slept == []
+
+    def test_supplied_queries_are_fired_round_robin(self, monkeypatch):
+        seen: list[str] = []
+        monkeypatch.setattr(gate0_burst, "_fire_lookup", self._stub_lookup_recording(seen))
+
+        asyncio.run(
+            run_burst(
+                host="http://x",
+                api_key="k",
+                concurrency=1,
+                total=4,
+                warm=False,
+                smoke=False,
+                timeout=1.0,
+                queries=[
+                    {"label": "a", "artist": "Stereolab"},
+                    {"label": "b", "artist": "Cat Power"},
+                ],
+            )
+        )
+
+        assert seen == ["a", "b", "a", "b"]
+
+    def test_a_shed_during_another_workers_wait_stops_it_before_it_fires_again(self, monkeypatch):
+        """A worker asleep in its pacing wait must not fire when it wakes into
+        an already-aborted run.
+
+        This needs ``concurrency > 1`` to reach at all: with a single worker the
+        ``while`` condition catches a self-shed before the wait is entered, so
+        the abort check *after* the wait is dead code from one worker's point of
+        view. It is the check that matters most in a paced run, because the
+        window it closes is a whole ``--pace-seconds`` wide -- 30 seconds during
+        the LML#1354 soak.
+        """
+        fired: list[str] = []
+        shed_seen = asyncio.Event()
+
+        async def _stub(client, host, api_key, query, timeout):
+            label = str(query.get("label"))
+            fired.append(label)
+            if len(fired) == 2:
+                # The second worker's opening request sheds, while the first
+                # worker is parked in its inter-request wait.
+                shed_seen.set()
+                return RequestOutcome(label=label, status_code=429, client_wall_ms=1.0, shed=True)
+            return RequestOutcome(label=label, status_code=200, client_wall_ms=1.0, lml_wall_ms=1.0)
+
+        async def _fake_sleep(seconds: float) -> None:
+            # Stands in for a 30s wait that the shed lands in the middle of,
+            # without spending it.
+            await shed_seen.wait()
+
+        monkeypatch.setattr(gate0_burst, "_fire_lookup", _stub)
+
+        result = asyncio.run(
+            run_burst(
+                host="http://x",
+                api_key="k",
+                concurrency=2,
+                total=6,
+                warm=False,
+                smoke=False,
+                timeout=1.0,
+                pace_seconds=30.0,
+                queries=[{"label": "a", "artist": "Stereolab"}],
+                sleep=_fake_sleep,
+            )
+        )
+
+        assert result.aborted_on_shed is True
+        assert fired == ["a", "a"], "the parked worker fired after the run had aborted"
+
+    def test_supplied_queries_are_fired_round_robin_across_workers(self, monkeypatch):
+        seen: list[str] = []
+        monkeypatch.setattr(gate0_burst, "_fire_lookup", self._stub_lookup_recording(seen))
+
+        asyncio.run(
+            run_burst(
+                host="http://x",
+                api_key="k",
+                concurrency=2,
+                total=4,
+                warm=False,
+                smoke=False,
+                timeout=1.0,
+                queries=[{"label": "a", "artist": "Stereolab"}],
+            )
+        )
+
+        assert seen == ["a", "a", "a", "a"]
