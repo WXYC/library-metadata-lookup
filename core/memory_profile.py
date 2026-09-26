@@ -116,6 +116,20 @@ def count_tasks() -> int | None:
         return None
 
 
+def _safe(read: Callable[[], Any]) -> Any:
+    """Run a gauge read, or return ``None`` if it raises.
+
+    Every gauge is best-effort for one reason: the nine of them share a log
+    line, so an unguarded read does not lose itself, it loses the other eight.
+    A pool mid-close and a cache registry mutating under iteration are both
+    ordinary, and neither is worth a blank interval.
+    """
+    try:
+        return read()
+    except Exception:
+        return None
+
+
 def collect_gauges(*, pool: Any | None) -> dict[str, Any]:
     """Read every cheap process-level gauge once.
 
@@ -131,11 +145,11 @@ def collect_gauges(*, pool: Any | None) -> dict[str, Any]:
         "open_fds": count_open_fds(),
         "asyncio_tasks": count_tasks(),
         "gc_counts": list(gc.get_count()),
-        "discogs_cache_currsizes": [c.currsize for c in _cache_registry],
+        "discogs_cache_currsizes": _safe(lambda: [c.currsize for c in _cache_registry]) or [],
         "library_artist_cache": getattr(library_db._artist_cache, "currsize", None),
         "library_search_cache": getattr(library_db._search_cache, "currsize", None),
-        "pool_size": pool.get_size() if pool is not None else None,
-        "pool_idle_size": pool.get_idle_size() if pool is not None else None,
+        "pool_size": _safe(pool.get_size) if pool is not None else None,
+        "pool_idle_size": _safe(pool.get_idle_size) if pool is not None else None,
     }
 
 
@@ -197,13 +211,26 @@ async def _default_pool_getter() -> Any | None:
     """The discogs-cache pool, if the lifespan already built one.
 
     Imported lazily to keep this module importable without dragging in the
-    dependency graph, and because the profiler must never be the reason a pool
-    exists — by the time the first interval fires the lifespan has long since
-    built it, so this is a cached-value read.
+    dependency graph, and routed through ``peek_discogs_pool`` rather than the
+    ``get_discogs_pool`` singleton because the profiler must never be the
+    reason a pool exists. That is not hypothetical: ``async_singleton`` caches
+    only a non-``None`` instance, and the pool factory returns ``None`` in
+    API-only mode and when the database is unreachable at boot — so the getter
+    on a timer would re-enter ``asyncpg.create_pool`` (10 s timeout, under the
+    singleton's lock) every interval, and would itself create the pool the
+    moment the database came back.
     """
-    from core.dependencies import get_discogs_pool
+    from core.dependencies import peek_discogs_pool
 
-    return await get_discogs_pool()
+    return peek_discogs_pool()
+
+
+async def _try(getter: Callable[[], Awaitable[Any]]) -> Any:
+    """Await a gauge source, or yield ``None`` if it raises."""
+    try:
+        return await getter()
+    except Exception:
+        return None
 
 
 async def report_once(
@@ -213,13 +240,27 @@ async def report_once(
     previous: Any | None,
     pool_getter: Callable[[], Awaitable[Any | None]],
 ) -> Any | None:
-    """Emit one report line; return the snapshot to keep as ``previous``."""
-    payload = format_report(collect_gauges(pool=await pool_getter()))
-    snapshot: Any | None = None
+    """Emit one report line; return the snapshot to keep as ``previous``.
+
+    Every expensive part is guarded independently so the cheap gauges always
+    reach the log. A pool acquisition failing during a database outage, or a
+    snapshot failing because tracing ran out of room, are exactly the moments
+    the RSS series is worth having — dropping the whole line there would read
+    as "the ramp stopped".
+    """
+    payload = format_report(collect_gauges(pool=await _try(pool_getter)))
+    snapshot: Any | None = previous
     if mode == "tracemalloc":
-        snapshot = tracemalloc.take_snapshot().filter_traces(SNAPSHOT_FILTERS)
-        payload["tracemalloc"] = diff_snapshots(snapshot, previous, top_n=top_n)
-        payload["tracemalloc_overhead_bytes"] = tracemalloc.get_tracemalloc_memory()
+        try:
+            snapshot = tracemalloc.take_snapshot().filter_traces(SNAPSHOT_FILTERS)
+            payload["tracemalloc"] = diff_snapshots(snapshot, previous, top_n=top_n)
+            payload["tracemalloc_overhead_bytes"] = tracemalloc.get_tracemalloc_memory()
+        except Exception as exc:
+            # Keep `previous` as the baseline rather than dropping it: losing
+            # it would cost the *next* interval its growth ranking too, and
+            # widening one diff to span two intervals is the cheaper failure.
+            snapshot = previous
+            payload["tracemalloc_error"] = repr(exc)
     logger.info("memory_profile %s", payload)
     return snapshot
 

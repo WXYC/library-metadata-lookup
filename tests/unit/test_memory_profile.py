@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from types import SimpleNamespace
 
 import pytest
 
 from config.settings import Settings
+from core import memory_profile
 
 
 class _FakePool:
@@ -443,3 +445,136 @@ class TestStartSampler:
         assert task is not None
         await stop_sampler(task)
         assert started == [7]
+
+
+class TestTheCheapGaugesSurviveTheExpensiveOnes:
+    """A report must not be lost because one of its costly parts failed.
+
+    The module's own reasoning is that a dead sampler is silent and silence
+    reads exactly like "the ramp stopped". The same argument applies one level
+    down: if a pool acquisition or a ``tracemalloc`` snapshot can discard the
+    whole line, then the RSS series goes dark during precisely the incident
+    worth measuring -- a database outage, or a profiler running out of room.
+    """
+
+    @staticmethod
+    async def _raising_pool_getter():
+        raise RuntimeError("discogs-cache unreachable")
+
+    @staticmethod
+    async def _no_pool_getter():
+        return None
+
+    def test_a_failing_pool_getter_still_emits_the_other_gauges(self, caplog):
+        with caplog.at_level(logging.INFO, logger="core.memory_profile"):
+            asyncio.run(
+                memory_profile.report_once(
+                    mode="gauges",
+                    top_n=3,
+                    previous=None,
+                    pool_getter=self._raising_pool_getter,
+                )
+            )
+        lines = [r for r in caplog.records if r.getMessage().startswith("memory_profile ")]
+        assert len(lines) == 1
+        assert "gc_counts" in lines[0].getMessage()
+
+    def test_a_pool_whose_accessors_raise_degrades_to_none(self):
+        class _BrokenPool:
+            def get_size(self):
+                raise RuntimeError("pool is closing")
+
+            def get_idle_size(self):
+                raise RuntimeError("pool is closing")
+
+        gauges = memory_profile.collect_gauges(pool=_BrokenPool())
+        assert gauges["pool_size"] is None
+        assert gauges["pool_idle_size"] is None
+        assert gauges["gc_counts"]
+
+    def test_a_failing_snapshot_still_emits_the_gauges(self, caplog, monkeypatch):
+        def _boom():
+            raise RuntimeError("out of room for traces")
+
+        monkeypatch.setattr(memory_profile.tracemalloc, "take_snapshot", _boom)
+        with caplog.at_level(logging.INFO, logger="core.memory_profile"):
+            asyncio.run(
+                memory_profile.report_once(
+                    mode="tracemalloc",
+                    top_n=3,
+                    previous=None,
+                    pool_getter=self._no_pool_getter,
+                )
+            )
+        lines = [r for r in caplog.records if r.getMessage().startswith("memory_profile ")]
+        assert len(lines) == 1
+        assert "rss_mb" in lines[0].getMessage()
+        assert "tracemalloc_error" in lines[0].getMessage()
+
+    def test_a_failing_snapshot_keeps_the_previous_baseline(self, monkeypatch):
+        """Otherwise one bad interval also destroys the *next* diff."""
+        sentinel = object()
+
+        def _boom():
+            raise RuntimeError("out of room for traces")
+
+        monkeypatch.setattr(memory_profile.tracemalloc, "take_snapshot", _boom)
+        kept = asyncio.run(
+            memory_profile.report_once(
+                mode="tracemalloc",
+                top_n=3,
+                previous=sentinel,
+                pool_getter=self._no_pool_getter,
+            )
+        )
+        assert kept is sentinel
+
+
+class TestTheProfilerNeverBuildsThePool:
+    """``async_singleton`` re-invokes its factory whenever the cached value is
+    ``None`` -- it only caches a truthy instance. The discogs pool factory
+    returns ``None`` both in API-only mode and when the database is
+    unreachable, so a getter called on a timer is a pool *builder* on a timer.
+    """
+
+    def test_default_getter_does_not_invoke_the_singleton(self, monkeypatch):
+        import core.dependencies as deps
+
+        calls: list[int] = []
+
+        async def _tripwire():
+            calls.append(1)
+            return None
+
+        monkeypatch.setattr(deps, "get_discogs_pool", _tripwire)
+        result = asyncio.run(memory_profile._default_pool_getter())
+        assert calls == [], "the profiler called the pool-building singleton"
+        assert result is None
+
+    def test_peek_reports_none_when_nothing_has_built_a_pool(self):
+        from core.dependencies import peek_discogs_pool
+
+        assert peek_discogs_pool() is None
+
+    def test_peek_returns_the_pool_once_something_else_has_built_one(self, monkeypatch):
+        """The other half of the contract: a peek that never sees a pool would
+        silence the two pool gauges forever, which reads as "no connection
+        growth" rather than "not measured"."""
+        import core.dependencies as deps
+
+        sentinel = object()
+
+        async def _fake_create_pool(*args, **kwargs):
+            return sentinel
+
+        monkeypatch.setattr(deps.asyncpg, "create_pool", _fake_create_pool)
+        monkeypatch.setattr(deps, "_last_built_discogs_pool", None)
+        monkeypatch.setattr(
+            deps, "get_settings", lambda: SimpleNamespace(database_url_discogs="postgresql://x/y")
+        )
+
+        built = asyncio.run(deps._build_discogs_pool())
+
+        assert built is sentinel
+        assert deps.peek_discogs_pool() is sentinel
+        assert asyncio.run(memory_profile._default_pool_getter()) is sentinel
