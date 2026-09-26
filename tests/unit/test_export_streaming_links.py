@@ -641,7 +641,11 @@ class TestCommitBehavior:
         tracking_lib = _CommitTrackingConnection(sqlite3.connect(library_db))
 
         with patch("scripts.export_streaming_links.sqlite3") as mock_sqlite3:
-            mock_sqlite3.connect = lambda path: real_sa if "streaming" in path else tracking_lib
+            # The streaming artifact is opened with a `file:...?mode=ro` URI plus
+            # uri=True, so this stub has to tolerate the extra kwarg.
+            mock_sqlite3.connect = lambda path, **kw: (
+                real_sa if "streaming" in path else tracking_lib
+            )
 
             main(args)
 
@@ -757,27 +761,31 @@ class TestSpotifyProvenanceGate:
         [
             (None, None),
             ("", ""),
-            (None, ""),
-            ("", None),
             ("   ", "\t"),
         ],
-        ids=["both-null", "both-empty", "null-and-empty", "empty-and-null", "both-whitespace"],
+        ids=["both-null", "both-empty", "both-whitespace"],
     )
     def test_absent_provenance_skips_spotify_url(self, tmp_path, matched_artist, matched_title):
+        """The three blankness shapes that are distinct computations.
+
+        `(None, "")` and `("", None)` are deliberately absent: the predicate is
+        ``(x or "").strip()`` per axis, so they reduce to the same two evaluations
+        as `("", "")` and could not fail independently of it. The production row
+        this gate was written for is pinned separately, by
+        `test_row_52656_married_to_the_mob_regression`.
+        """
         library_db = _export(
             tmp_path,
             [
                 {
                     "id": 1,
-                    "display_artist": "Soundtracks - M",
-                    "display_title": "Married to the Mob",
+                    "display_artist": "Sessa",
+                    "display_title": "Pequena Vertigem de Amor",
                     "library_ids": json.dumps([601]),
-                    "is_compilation": 1,
-                    "spotify_url": "https://open.spotify.com/album/wrong-album",
-                    "spotify_confidence": 89.47,
+                    "spotify_url": "https://open.spotify.com/album/unverifiable",
                     "spotify_matched_artist": matched_artist,
                     "spotify_matched_title": matched_title,
-                    "apple_url": "https://music.apple.com/album/married-to-the-mob",
+                    "apple_url": "https://music.apple.com/album/pequena-vertigem-de-amor",
                 }
             ],
         )
@@ -839,16 +847,7 @@ class TestSpotifyProvenanceGate:
         )
         assert _streaming_link(library_db, 701) == "https://open.spotify.com/album/aluminum-tunes"
 
-    @pytest.mark.parametrize(
-        "source_tag",
-        [
-            "backfill-wiki (spotify)",
-            "llm+wikidata",
-            "web-search (spotify)",
-            "vector-search (spotify)",
-            "musicbrainz",
-        ],
-    )
+    @pytest.mark.parametrize("source_tag", ["backfill-wiki (spotify)", "llm+wikidata"])
     def test_source_tag_without_matched_title_still_exports(self, tmp_path, source_tag):
         """The gate is NOT widened to the 18,281 tag rows (LML#1353's second problem).
 
@@ -858,6 +857,11 @@ class TestSpotifyProvenanceGate:
         `fix/streaming-link-album-shape-guard` -- not absent provenance. Nulling 39%
         of Spotify coverage on a provenance technicality is not warranted by anything
         measured, so one non-empty field is enough to pass this gate.
+
+        Two representative tag shapes, not the whole roster: the gate never inspects
+        the value, so more tags would exercise the same branch. One carries a
+        parenthesized service suffix and one does not; the full measured vocabulary
+        is recorded in `_has_match_provenance`'s docstring.
         """
         library_db = _export(
             tmp_path,
@@ -903,6 +907,18 @@ class TestSpotifyProvenanceGate:
         display_title "Married to the Mob", is_compilation 1, spotify_confidence
         89.4736842105263, provenance columns all NULL, and a spotify_url pointing at
         Speaker Knockerz' "Married to the Money" (2013).
+
+        SCOPED, and the scope is the gate's real limit: this fixture has no
+        `track_results` row, and the track supplement runs AFTER the gate and refills
+        an empty Spotify slot. So this pins "the gated ALBUM-level URL is not
+        exported", not "this release ends up with no Spotify URL" -- see
+        `test_gate_does_not_block_the_track_level_supplement` for the other half. The
+        supplement exists for singles and compilations, which is 363 of the 388 gated
+        rows, so the overlap between the gated rows and `track_results` rows with
+        `resolution_status IN ('local_match','api_match')` is what decides how much of
+        the reported symptom this change actually removes. That number is NOT measured
+        here and is not knowable from this repo; it is routed with the rest of the
+        serve-seam decision rather than assumed to be zero.
         """
         library_db = _export(
             tmp_path,
@@ -999,7 +1015,15 @@ class TestSpotifyProvenanceGate:
         assert _streaming_link(library_db, library_id) == url
 
     def test_gate_logs_the_skipped_count(self, tmp_path, caplog):
-        """The daily sync must leave evidence of what the gate removed."""
+        """The daily sync must leave evidence of what the gate removed.
+
+        The fourth album pins the `and spotify` short-circuit: a row with no
+        spotify_url has nothing for the gate to refuse, so it must not inflate the
+        count even though its provenance is just as absent. Asserting the full
+        message rather than a bare "3" matters because `caplog.text` also carries
+        `Albums with streaming URLs: 4` and a `filename:lineno` per record, so a
+        digit-only assertion passes even when the gate skips nothing.
+        """
         albums = [
             {
                 "id": i,
@@ -1010,10 +1034,87 @@ class TestSpotifyProvenanceGate:
             }
             for i in range(3)
         ]
+        albums.append(
+            {
+                "id": 3,
+                "library_ids": json.dumps([803]),
+                "apple_url": "https://music.apple.com/album/no-spotify-url-at-all",
+                "spotify_matched_artist": None,
+                "spotify_matched_title": None,
+            }
+        )
         with caplog.at_level(logging.INFO):
             _export(tmp_path, albums)
-        assert "3" in caplog.text
-        assert "provenance" in caplog.text.lower()
+        assert "absent match provenance: 3" in caplog.text
+
+    def test_gate_is_active_when_the_columns_are_declared_in_another_case(self, tmp_path, caplog):
+        """SQLite column names are case-insensitive; the gate's column check must be too.
+
+        `PRAGMA table_info` reports whatever case the column was DECLARED in, while
+        the `SELECT` that reads it resolves case-insensitively. A case-sensitive
+        presence check therefore fails open -- the gate goes inert on a database it
+        could in fact have queried, which is the silent-disable path that matters in
+        practice (a re-declared or migrated artifact, not a dropped column).
+        """
+        streaming_db = str(tmp_path / "streaming.db")
+        library_db = str(tmp_path / "library.db")
+        sa = sqlite3.connect(streaming_db)
+        sa.execute("""
+            CREATE TABLE albums (
+                id INTEGER PRIMARY KEY,
+                library_ids TEXT,
+                spotify_url TEXT,
+                Spotify_Matched_Artist TEXT,
+                Spotify_Matched_Title TEXT,
+                apple_url TEXT,
+                deezer_url TEXT,
+                bandcamp_url TEXT,
+                tidal_url TEXT,
+                youtube_music_url TEXT,
+                soundcloud_url TEXT
+            )
+        """)
+        sa.execute(
+            "INSERT INTO albums (id, library_ids, spotify_url) VALUES (?, ?, ?)",
+            (1, json.dumps([1201]), "https://open.spotify.com/album/unverifiable"),
+        )
+        sa.commit()
+        sa.close()
+        sqlite3.connect(library_db).close()
+
+        args = argparse.Namespace(library_db=library_db, streaming_db=streaming_db, dry_run=False)
+        with caplog.at_level(logging.WARNING):
+            main(args)
+
+        assert _streaming_link(library_db, 1201) is None
+        assert "inert" not in caplog.text
+
+    @pytest.mark.parametrize("gated_row_first", [True, False], ids=["gated-first", "gated-second"])
+    def test_a_shared_library_id_keeps_the_provenance_bearing_url(self, tmp_path, gated_row_first):
+        """One library_id covered by both a gated and a provenance-bearing album row.
+
+        The gate runs inside the first-URL-wins merge loop, so its placement relative
+        to that merge decides the outcome for a shared `library_id`. The good URL must
+        win in either row order: gating must null the bad row's contribution rather
+        than let it occupy the slot the good row would fill.
+        """
+        gated = {
+            "id": 1,
+            "library_ids": json.dumps([1301]),
+            "spotify_url": "https://open.spotify.com/album/unverifiable",
+            "spotify_matched_artist": None,
+            "spotify_matched_title": None,
+        }
+        verifiable = {
+            "id": 2,
+            "library_ids": json.dumps([1301]),
+            "spotify_url": "https://open.spotify.com/album/aluminum-tunes",
+            "spotify_matched_artist": "Stereolab",
+            "spotify_matched_title": "Aluminum Tunes",
+        }
+        albums = [gated, verifiable] if gated_row_first else [verifiable, gated]
+        library_db = _export(tmp_path, albums)
+        assert _streaming_link(library_db, 1301) == "https://open.spotify.com/album/aluminum-tunes"
 
     def test_gate_leaves_no_all_null_streaming_links_row(self, tmp_path):
         """A row whose only URL was the gated Spotify one is dropped, not blanked."""
@@ -1168,3 +1269,53 @@ class TestSpotifyProvenanceGate:
         assert hashlib.sha256(streaming_db.read_bytes()).hexdigest() == before
         assert not (tmp_path / "streaming.db-wal").exists()
         assert not (tmp_path / "streaming.db-journal").exists()
+
+    def test_streaming_db_is_opened_read_only(self, tmp_path):
+        """ "Never written" must be structural, not a happy-path observation.
+
+        The sha256 test above only proves no write happened to a cleanly-closed
+        file. Opening a SQLite database read-WRITE also performs hot-journal
+        rollback on open, so if the upstream streaming pipeline died mid-transaction,
+        merely connecting would mutate the bucket-canonical artifact -- a file
+        CLAUDE.md classes as expensive-to-recollect. Asserting the handle refuses
+        writes pins the guarantee to the open mode rather than to this script
+        happening to contain no UPDATE.
+        """
+        streaming_db = str(tmp_path / "streaming.db")
+        library_db = str(tmp_path / "library.db")
+        _create_provenance_streaming_db(
+            streaming_db,
+            [
+                {
+                    "id": 1,
+                    "library_ids": json.dumps([1401]),
+                    "spotify_url": "https://open.spotify.com/album/aluminum-tunes",
+                    "spotify_matched_artist": "Stereolab",
+                    "spotify_matched_title": "Aluminum Tunes",
+                }
+            ],
+        )
+        sqlite3.connect(library_db).close()
+
+        real_connect = sqlite3.connect
+        calls: list[tuple] = []
+
+        def _tracking_connect(*a, **kw):
+            calls.append((a, kw))
+            return real_connect(*a, **kw)
+
+        args = argparse.Namespace(library_db=library_db, streaming_db=streaming_db, dry_run=False)
+        with patch("scripts.export_streaming_links.sqlite3.connect", _tracking_connect):
+            main(args)
+
+        streaming_calls = [c for c in calls if "streaming.db" in str(c[0][0])]
+        assert streaming_calls, "the script never opened the streaming artifact"
+        # Re-open the artifact exactly the way the script did; that handle must
+        # refuse a write. This asserts the open MODE, not a particular URI spelling.
+        a, kw = streaming_calls[0]
+        probe = real_connect(*a, **kw)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                probe.execute("CREATE TABLE write_probe (x)")
+        finally:
+            probe.close()
