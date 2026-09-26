@@ -45,7 +45,11 @@ drain with its own SQL for that write would be a second writer of an invariant
 that module documents (``reset_misses_to_pending``: "every column the answer was
 written into is cleared alongside the status") and would be invisible to the
 LML#842 port of those call sites onto the PG DAO. A weaker-than-guarded decision
-passes ``skip_if_resolved=True`` there.
+passes ``skip_if_resolved=True`` there. That keyword is on the SQLite side only
+so far: ``StreamingCatalogDao.update_result`` mirrors the rest of the surface but
+not this, so the LML#842 port has to add it (which is the "conditional writes,
+skip services already resolved" that DAO's own module docstring already says PR D
+owes its miss handlers).
 
 Deliberately NOT in scope: a guarded ``find_best_match`` accept is recorded as
 ``found`` even when its artist score was itself a V/A-prefix clear in the

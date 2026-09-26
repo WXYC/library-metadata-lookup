@@ -16,11 +16,17 @@ from argparse import ArgumentParser
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from wxyc_etl.text import is_compilation_artist
+
 from clients.streaming.matching import (
+    find_best_typed_match,
     normalize_album_title,
+    normalize_for_comparison,
+    score_match,
     strip_format_suffix,
 )
 from scripts._lib.match_decision import (
+    AXES_ARTIST_AND_TITLE,
     AXES_TITLE_ONLY,
     STATUS_FOUND,
     ServiceMatch,
@@ -60,22 +66,31 @@ DISCOGS_TITLE_FLOOR = 70.0
 async def search_discogs_by_title(pool, title: str, *, query_artist: str) -> dict | None:
     """Search the Discogs PG cache by title. Returns the best match or None.
 
-    This lane is **title-axis-only by construction**, and stays that way: it took
-    the best title score above 70 whatever the release was credited to, which is
-    how a compilation search lands on a named artist's same-titled album
-    (LML#1353), so the scan now runs through ``best_title_only_candidate`` and a
-    named-artist release is refused. Adding a guarded ``find_best_match`` pass in
-    front would be dead code, not a recall gain: the query credit here is a shelf
-    credit, and ``score_match("Various", "Various Artists")`` is 63.6 — under the
-    80 artist floor — so the guarded pass would reject even the V/A releases the
-    relaxation accepts.
+    This lane used to have no artist gate at all: the best title score above 70
+    won whatever the release was credited to, which is how a compilation search
+    lands on a named artist's same-titled album (LML#1353). It now picks its rule
+    from the shelf credit, because ``build_compilation_query`` does not always
+    reduce that credit to a V/A one — its "X mixes various artists" arm and its
+    "real artist misclassified as a compilation" fall-through both return real
+    names:
 
-    That is a real, deliberate narrowing. A compilation whose correct Discogs
-    release is credited to a named entity (a single-composer soundtrack, say) no
-    longer yields a ``discogs_release_id`` here. The loss is recoverable — the row
-    stays a Phase 1 miss and falls through to Phase 2 — and the alternative is a
-    release id whose tracklist belongs to a different record, which every
-    downstream track resolution would then inherit.
+    * **V/A shelf credit** → the title axis alone, at this lane's historical 70
+      floor, and only against V/A-credited releases. The artist axis is *not*
+      scored: the query credit is the ``VA_QUERY_CREDIT`` sentinel, so a release
+      credited exactly "Various" would clear 100 on no information at all and
+      could outrank a better title — LML#1139 on the accept path.
+    * **A recovered real name** → the guarded 80/80 matcher, which is the right
+      gate there and is what a row like "Stereolab / Aluminum Tunes" misfiled as
+      a compilation needs. The relaxation cannot serve it: it requires a V/A
+      credit on both sides and so refuses every candidate.
+
+    The narrowing that remains is deliberate: a compilation whose correct Discogs
+    release is credited to a named entity the shelf credit does *not* name (a
+    single-composer soundtrack under "Soundtracks - M") no longer yields a
+    ``discogs_release_id``. The loss is recoverable — the row stays a Phase 1 miss
+    and falls through to Phase 2 — and the alternative is a release id whose
+    tracklist belongs to a different record, which every downstream track
+    resolution would then inherit.
 
     Unlike the streaming lanes, ``albums`` has no ``discogs_confidence`` column,
     so the returned score is log-only; ``axes`` names what it measured so no
@@ -110,27 +125,53 @@ async def search_discogs_by_title(pool, title: str, *, query_artist: str) -> dic
     if not rows:
         return None
 
-    winner = best_title_only_candidate(
-        rows,
-        query_artist=query_artist,
-        query_title=title,
-        artist_fn=lambda r: r["artist_name"],
-        title_fn=lambda r: r["title"],
-        # One row per primary credit, so a multi-credit release appears several
-        # times under one ``r.id``. The tie-break key has to be total or equal
-        # titles fall back to whatever order the unordered ``LIMIT 20`` returned.
-        key_fn=lambda r: f"{r['id']}|{r['artist_name']}",
-        floor=DISCOGS_TITLE_FLOOR,
-    )
-    if winner is None:
-        return None
-    release, title_score = winner
+    artist_of = lambda r: r["artist_name"]  # noqa: E731
+    title_of = lambda r: r["title"]  # noqa: E731
+    # One row per primary credit, so a multi-credit release appears several times
+    # under one ``r.id``. The tie-break key has to be total, or equal titles fall
+    # back to whatever order the unordered ``LIMIT 20`` returned (LML#1097).
+    key_of = lambda r: f"{r['id']}|{r['artist_name']}"  # noqa: E731
+
+    # Which axes may decide is a property of the *query* credit, and the two
+    # branches are disjoint: the relaxation requires a V/A credit on both sides, so
+    # it refuses every candidate for a real name, and the guarded matcher would
+    # score a vacuous artist axis for a V/A one. Same normalization contract as
+    # ``va_artist_axis_is_uninformative``, whose query half this is.
+    if is_compilation_artist(normalize_for_comparison(query_artist)):
+        winner = best_title_only_candidate(
+            rows,
+            query_artist=query_artist,
+            query_title=title,
+            artist_fn=artist_of,
+            title_fn=title_of,
+            key_fn=key_of,
+            floor=DISCOGS_TITLE_FLOOR,
+        )
+        if winner is None:
+            return None
+        release, score = winner
+        axes = AXES_TITLE_ONLY
+    else:
+        guarded = find_best_typed_match(
+            rows,
+            query_artist=query_artist,
+            query_title=title,
+            artist_fn=artist_of,
+            title_fn=title_of,
+            key_fn=key_of,
+        )
+        if guarded is None:
+            return None
+        release, axes = guarded, AXES_ARTIST_AND_TITLE
+        score = (
+            score_match(query_artist, artist_of(release)) + score_match(title, title_of(release))
+        ) / 2
     return {
         "release_id": release["id"],
         "title": release["title"],
         "artist": release["artist_name"],
-        "confidence": title_score,
-        "axes": AXES_TITLE_ONLY,
+        "confidence": score,
+        "axes": axes,
     }
 
 
@@ -197,16 +238,22 @@ async def resolve_lane(
         skip_if_resolved=decision.status != STATUS_FOUND,
     )
     if not landed:
-        logger.debug(
-            "%s: %s → declined, the row already holds a guarded match",
-            lane.service,
-            search_title,
-        )
+        # Normally the ``skip_if_resolved`` guard declining to demote a guarded
+        # match. Also 0 for an album id that isn't there and for a service with no
+        # column family in ``albums``, so the message doesn't name a single cause.
+        logger.debug("%s: %s → not recorded, the UPDATE matched no row", lane.service, search_title)
         return None
     return decision
 
 
 async def run(args) -> None:
+    # Refuse a path that isn't there rather than creating one. Both SQLite and
+    # ``ResultsDB.connect``'s ``CREATE TABLE IF NOT EXISTS`` will happily answer a
+    # typo with a fresh empty artifact, and the drain would then log "Loaded 0
+    # unmatched compilations" — indistinguishable from a finished run.
+    if args.db_path != ":memory:" and not os.path.exists(args.db_path):
+        raise SystemExit(f"no streaming-availability artifact at {args.db_path!r}")
+
     # Opened through its owner so ``_migrate`` runs: the provenance columns this
     # drain now writes are ALTERs that an older artifact file may not have, and a
     # raw connect would fail every write with an OperationalError the per-lane
