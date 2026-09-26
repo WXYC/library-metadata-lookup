@@ -317,3 +317,79 @@ class TestAppRouterRegistration:
 
         assert app.title is not None
         assert app.version is not None
+
+
+class TestLifespanSamplerWiring:
+    """The lifespan owns two background samplers — the LML#907 event-loop-lag
+    gauge and the LML#1354 memory profiler — and each is gated on its own flag.
+
+    The lag sampler shipped without a wiring test, so a refactor that dropped
+    its ``start_sampler()`` call would have gone unnoticed; both are covered
+    here. For the profiler the assertion that matters is the negative one:
+    with ``LML_MEMORY_PROFILE_MODE`` at its default ``off``, nothing starts.
+    """
+
+    @pytest.mark.asyncio
+    async def test_lag_sampler_starts_and_stops_when_its_flag_is_on(self, mock_settings):
+        import main
+        from main import app, lifespan
+
+        sentinel = object()
+        with (
+            patch.object(main.settings, "lml_event_loop_lag_gauge", True),
+            patch.object(main.settings, "lml_memory_profile_mode", "off"),
+            patch("main.start_sampler", return_value=sentinel) as start,
+            patch("main.stop_sampler", new_callable=AsyncMock) as stop,
+        ):
+            async with lifespan(app):
+                start.assert_called_once()
+            stop.assert_awaited_once_with(sentinel)
+
+    @pytest.mark.asyncio
+    async def test_lag_sampler_does_not_start_when_its_flag_is_off(self, mock_settings):
+        import main
+        from main import app, lifespan
+
+        with (
+            patch.object(main.settings, "lml_event_loop_lag_gauge", False),
+            patch.object(main.settings, "lml_memory_profile_mode", "off"),
+            patch("main.start_sampler") as start,
+            patch("main.stop_sampler", new_callable=AsyncMock) as stop,
+        ):
+            async with lifespan(app):
+                pass
+            start.assert_not_called()
+            stop.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_memory_profiler_does_not_start_in_off_mode(self, mock_settings):
+        import main
+        from main import app, lifespan
+
+        with (
+            patch.object(main.settings, "lml_event_loop_lag_gauge", False),
+            patch.object(main.settings, "lml_memory_profile_mode", "off"),
+            patch("main.start_memory_profile_sampler") as start,
+            patch("main.stop_memory_profile_sampler", new_callable=AsyncMock) as stop,
+        ):
+            async with lifespan(app):
+                pass
+            start.assert_not_called()
+            stop.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["gauges", "tracemalloc"])
+    async def test_memory_profiler_starts_and_stops_in_an_enabled_mode(self, mock_settings, mode):
+        import main
+        from main import app, lifespan
+
+        sentinel = object()
+        with (
+            patch.object(main.settings, "lml_event_loop_lag_gauge", False),
+            patch.object(main.settings, "lml_memory_profile_mode", mode),
+            patch("main.start_memory_profile_sampler", return_value=sentinel) as start,
+            patch("main.stop_memory_profile_sampler", new_callable=AsyncMock) as stop,
+        ):
+            async with lifespan(app):
+                start.assert_called_once()
+            stop.assert_awaited_once_with(sentinel)

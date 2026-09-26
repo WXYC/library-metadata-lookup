@@ -32,6 +32,8 @@ from core.dependencies import (
 )
 from core.event_loop_lag import start_sampler, stop_sampler
 from core.logging import setup_logging
+from core.memory_profile import start_sampler as start_memory_profile_sampler
+from core.memory_profile import stop_sampler as stop_memory_profile_sampler
 from core.observability import drop_fast_pool_reset_spans
 from core.server_timing_middleware import LmlWallTimingMiddleware
 from discogs.router import router as discogs_router
@@ -575,9 +577,27 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Event-loop-lag sampler failed to start; continuing without it")
 
+    # LML#1354: start the memory profiler — the instrumentation for the
+    # unbounded prod RSS ramp (see core/memory_profile.py for the two modes and
+    # why `tracemalloc` is staging-only). Gated on LML_MEMORY_PROFILE_MODE,
+    # whose default `off` starts nothing, so merging this is a zero-behaviour
+    # change. Best-effort, like the lag sampler above: a failure to start must
+    # never block serving.
+    memory_profile_task = None
+    if settings.lml_memory_profile_mode != "off":
+        try:
+            memory_profile_task = start_memory_profile_sampler()
+            logger.info(
+                "Memory profile sampler started (mode=%s)", settings.lml_memory_profile_mode
+            )
+        except Exception:
+            logger.exception("Memory profile sampler failed to start; continuing without it")
+
     yield
 
     logger.info("Shutting down application")
+    if memory_profile_task is not None:
+        await stop_memory_profile_sampler(memory_profile_task)
     if lag_sampler_task is not None:
         await stop_sampler(lag_sampler_task)
     if api_key_cache_task is not None:
