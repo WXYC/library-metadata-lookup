@@ -266,18 +266,40 @@ class ResultsDB:
         confidence: float | None = None,
         matched_artist: str | None = None,
         matched_title: str | None = None,
-    ) -> None:
-        """Update the result for a service (spotify, apple, or deezer)."""
+        skip_if_resolved: bool = False,
+    ) -> int:
+        """Update the result for a service (spotify, apple, or deezer).
+
+        Every column the answer was written into lands in one statement, so a row
+        can never carry a URL from one pass beside a ``matched_title`` from
+        another -- the shape that leaves album 29493 storing matched_title "S.F.
+        Sorrow" beside a URL resolving to "Silk Torpedo" (LML#1353).
+
+        Args:
+            skip_if_resolved: Decline the write when this service is already
+                ``found`` for the album. A caller whose answer is weaker than a
+                guarded 80/80 match passes True: the row it would overwrite cost a
+                rate-limited round trip (the line ``reset_misses_to_pending``
+                already holds on the reset path), and the PG mirror's
+                found-demotion trigger raises on exactly that transition, so the
+                write would fail later at upload time instead.
+
+        Returns:
+            The number of rows written -- 0 when ``skip_if_resolved`` declined, and
+            0 for a service this table has no column family for.
+        """
         assert self._db is not None
         async with self._write_lock:
             now = datetime.now(UTC).isoformat()
+            rowcount = 0
             if service == "spotify":
-                await self._db.execute(
-                    """UPDATE albums SET
+                guard = " AND spotify_status != 'found'" if skip_if_resolved else ""
+                cursor = await self._db.execute(
+                    f"""UPDATE albums SET
                        spotify_status = ?, spotify_url = ?, spotify_id = ?,
                        spotify_confidence = ?, spotify_matched_artist = ?,
                        spotify_matched_title = ?, spotify_checked_at = ?
-                       WHERE id = ?""",
+                       WHERE id = ?{guard}""",
                     (
                         status,
                         url,
@@ -289,25 +311,31 @@ class ResultsDB:
                         album_id,
                     ),
                 )
+                rowcount = cursor.rowcount
             elif service == "apple":
-                await self._db.execute(
-                    """UPDATE albums SET
+                guard = " AND apple_status != 'found'" if skip_if_resolved else ""
+                cursor = await self._db.execute(
+                    f"""UPDATE albums SET
                        apple_status = ?, apple_url = ?,
                        apple_confidence = ?, apple_matched_artist = ?,
                        apple_matched_title = ?, apple_checked_at = ?
-                       WHERE id = ?""",
+                       WHERE id = ?{guard}""",
                     (status, url, confidence, matched_artist, matched_title, now, album_id),
                 )
+                rowcount = cursor.rowcount
             elif service == "deezer":
-                await self._db.execute(
-                    """UPDATE albums SET
+                guard = " AND deezer_status != 'found'" if skip_if_resolved else ""
+                cursor = await self._db.execute(
+                    f"""UPDATE albums SET
                        deezer_status = ?, deezer_url = ?,
                        deezer_confidence = ?, deezer_matched_artist = ?,
                        deezer_matched_title = ?, deezer_checked_at = ?
-                       WHERE id = ?""",
+                       WHERE id = ?{guard}""",
                     (status, url, confidence, matched_artist, matched_title, now, album_id),
                 )
+                rowcount = cursor.rowcount
             await self._db.commit()
+            return rowcount
 
     async def reset_misses_to_pending(self) -> tuple[int, int]:
         """Reset ``not_found`` rows to ``pending`` so a re-pass re-queries them.

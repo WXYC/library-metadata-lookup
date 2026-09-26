@@ -16,21 +16,20 @@ from argparse import ArgumentParser
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-import aiosqlite
-
 from clients.streaming.matching import (
     normalize_album_title,
     strip_format_suffix,
 )
 from scripts._lib.match_decision import (
     AXES_TITLE_ONLY,
+    STATUS_FOUND,
     ServiceMatch,
     best_title_only_candidate,
     decide_service_match,
-    update_service_match,
 )
 from scripts._lib.runtime import set_up_script_runtime
 from scripts._lib.signals import ShutdownFlag
+from scripts.streaming_availability.results_db import ResultsDB
 from scripts.track_streaming.compilation_search import build_compilation_query
 
 logger = logging.getLogger("search_compilations")
@@ -58,24 +57,25 @@ VA_QUERY_CREDIT = "Various"
 DISCOGS_TITLE_FLOOR = 70.0
 
 
-async def search_discogs_by_title(
-    pool, title: str, *, query_artist: str = VA_QUERY_CREDIT
-) -> dict | None:
+async def search_discogs_by_title(pool, title: str, *, query_artist: str) -> dict | None:
     """Search the Discogs PG cache by title. Returns the best match or None.
 
-    This lane has no artist gate at all: it took the best title score above 70
-    whatever the release was credited to, which is how a compilation search lands
-    on a named artist's same-titled album (LML#1353). The scan now runs through
-    ``best_title_only_candidate``, which admits a one-axis judgement only where
-    the artist axis is uninformative — both the shelf credit and the Discogs
-    release credit are V/A credits, and "Various" is Discogs's own primary credit
-    for a compilation.
+    This lane is **title-axis-only by construction**, and stays that way: it took
+    the best title score above 70 whatever the release was credited to, which is
+    how a compilation search lands on a named artist's same-titled album
+    (LML#1353), so the scan now runs through ``best_title_only_candidate`` and a
+    named-artist release is refused. Adding a guarded ``find_best_match`` pass in
+    front would be dead code, not a recall gain: the query credit here is a shelf
+    credit, and ``score_match("Various", "Various Artists")`` is 63.6 — under the
+    80 artist floor — so the guarded pass would reject even the V/A releases the
+    relaxation accepts.
 
-    ``query_artist`` defaults to the V/A sentinel because callers pass rows whose
-    ``display_artist`` ``build_compilation_query`` already reduced to a filing
-    convention. A caller that *did* recover a real artist name passes it, and the
-    relaxation then declines: the artist axis carries information there and this
-    lane has no way to check it.
+    That is a real, deliberate narrowing. A compilation whose correct Discogs
+    release is credited to a named entity (a single-composer soundtrack, say) no
+    longer yields a ``discogs_release_id`` here. The loss is recoverable — the row
+    stays a Phase 1 miss and falls through to Phase 2 — and the alternative is a
+    release id whose tracklist belongs to a different record, which every
+    downstream track resolution would then inherit.
 
     Unlike the streaming lanes, ``albums`` has no ``discogs_confidence`` column,
     so the returned score is log-only; ``axes`` names what it measured so no
@@ -116,7 +116,10 @@ async def search_discogs_by_title(
         query_title=title,
         artist_fn=lambda r: r["artist_name"],
         title_fn=lambda r: r["title"],
-        key_fn=lambda r: str(r["id"]),
+        # One row per primary credit, so a multi-credit release appears several
+        # times under one ``r.id``. The tie-break key has to be total or equal
+        # titles fall back to whatever order the unordered ``LIMIT 20`` returned.
+        key_fn=lambda r: f"{r['id']}|{r['artist_name']}",
         floor=DISCOGS_TITLE_FLOOR,
     )
     if winner is None:
@@ -151,7 +154,7 @@ class StreamingLane:
 
 async def resolve_lane(
     lane: StreamingLane,
-    db: aiosqlite.Connection,
+    results_db: ResultsDB,
     *,
     album_id: int,
     search_artist: str | None,
@@ -160,10 +163,11 @@ async def resolve_lane(
 ) -> ServiceMatch | None:
     """Search one lane for an album and record the decision with its provenance.
 
-    Returns the decision, or None when neither the guarded 80/80 matcher nor the
-    V/A title-only relaxation admitted a candidate. Nothing is written in that
-    case: the row keeps its ``skipped`` status and stays available to a later
-    pass, which is the right outcome for a candidate no axis can justify.
+    Returns the decision only when it was *recorded* (or would have been, under
+    ``--dry-run``), so the caller's hit count and log line describe what actually
+    landed. None means nothing was written and the row stays available to a later
+    pass: either no axis admitted a candidate, or the decision was weaker than a
+    guarded match the row already holds.
     """
     results = await lane.search(
         search_artist or lane.search_credit, strip_format_suffix(search_title)
@@ -177,16 +181,40 @@ async def resolve_lane(
         url_fn=lane.url_fn,
         id_fn=lane.id_fn,
     )
-    if decision is None:
+    if decision is None or dry_run:
+        return decision
+    landed = await results_db.update_result(
+        album_id,
+        lane.service,
+        decision.status,
+        url=decision.url,
+        spotify_id=decision.service_item_id,
+        confidence=decision.confidence,
+        matched_artist=decision.matched_artist,
+        matched_title=decision.matched_title,
+        # A one-axis decision never displaces a guarded 80/80 one. Reachable on
+        # the Deezer lane: Phase 2 selects on ``spotify_status`` alone.
+        skip_if_resolved=decision.status != STATUS_FOUND,
+    )
+    if not landed:
+        logger.debug(
+            "%s: %s → declined, the row already holds a guarded match",
+            lane.service,
+            search_title,
+        )
         return None
-    if not dry_run:
-        await update_service_match(db, album_id=album_id, service=lane.service, match=decision)
     return decision
 
 
 async def run(args) -> None:
-    db = await aiosqlite.connect(args.db_path)
-    db.row_factory = aiosqlite.Row
+    # Opened through its owner so ``_migrate`` runs: the provenance columns this
+    # drain now writes are ALTERs that an older artifact file may not have, and a
+    # raw connect would fail every write with an OperationalError the per-lane
+    # handler would report as the streaming service being down.
+    results_db = ResultsDB(args.db_path)
+    await results_db.connect()
+    db = results_db._db
+    assert db is not None
 
     cursor = await db.execute(
         """SELECT id, display_artist, display_title, discogs_release_id
@@ -202,7 +230,7 @@ async def run(args) -> None:
     logger.info("Loaded %d unmatched compilations", len(rows))
 
     if not rows:
-        await db.close()
+        await results_db.close()
         return
 
     # Phase 1: Discogs title search
@@ -279,7 +307,7 @@ async def run(args) -> None:
         discogs_misses = rows
 
     if _shutdown.requested or args.discogs_only:
-        await db.close()
+        await results_db.close()
         return
 
     # Phase 2: Streaming API search for Discogs misses
@@ -336,14 +364,19 @@ async def run(args) -> None:
                 try:
                     decision = await resolve_lane(
                         lane,
-                        db,
+                        results_db,
                         album_id=row["id"],
                         search_artist=search_artist,
                         search_title=search_title,
                         dry_run=args.dry_run,
                     )
                 except Exception:
-                    logger.warning("%s error for %s", lane.service, row["display_title"])
+                    # exc_info because the write surface is wide now: a schema
+                    # problem and a service outage both land here, and a bare
+                    # message reads as the latter.
+                    logger.warning(
+                        "%s error for %s", lane.service, row["display_title"], exc_info=True
+                    )
                     continue
                 if decision is not None:
                     found = True
@@ -394,7 +427,7 @@ async def run(args) -> None:
         len(rows),
     )
 
-    await db.close()
+    await results_db.close()
 
 
 def main() -> None:
