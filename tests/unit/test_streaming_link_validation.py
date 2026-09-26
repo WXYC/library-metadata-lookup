@@ -214,7 +214,7 @@ _SPOTIFY_PATH_SHAPES = {
     # Same album page, so kept.
     "intl-album": (f"https://open.spotify.com/intl-de/album/{_SPOTIFY_ID}", True),
     # 6,143 rows — the April-2026 enrichment campaign that resolved ARTISTS
-    # and wrote them into an album column. The Mob/Money shape.
+    # and wrote them into an album column.
     "artist": (f"https://open.spotify.com/artist/{_SPOTIFY_ID}", False),
     # 989 rows — KEPT. A track page names a recording on the release, and
     # ``scripts/export_streaming_links.py`` deliberately supplements
@@ -317,10 +317,17 @@ class TestSpotifyAlbumShapeGuard:
 
         assert validate_streaming_link_urls(links)["spotify_url"] == falsy
 
-    def test_production_mob_money_artist_page_is_suppressed(self):
-        # The exact value the 2026-09-25 report reproduced against: a
-        # "Married to the Mob" lookup served this artist page as the album
-        # link, labelled verified.
+    def test_real_artifact_artist_page_is_suppressed(self):
+        # A full artist-page value as the artifact stores it, rather than the
+        # table's synthetic id -- the 22-char id is the axis this guard does
+        # NOT read, so one case pins that a realistic value is judged on its
+        # path alone.
+        #
+        # Deliberately not named for the ticket's production case: LML#1352's
+        # reported Mob/Money value is `/album/0JSLTbVe6Z70EQkOLL0WPi` (the
+        # wrong album, right shape), which this guard passes and its criterion
+        # 1 owns. Suppressing artist pages is a different defect on the same
+        # unguarded field, not that one.
         links = dict(_GENUINE)
         links["spotify_url"] = "https://open.spotify.com/artist/7CaUk9xCxdXAmmqQn3PLR7"
 

@@ -261,14 +261,20 @@ class TestSpotifyBandcampStreamingStatus:
     async def test_spotify_artist_page_override_is_neither_served_nor_verified(self):
         """LML#1352: an artist page in the album column reaches no consumer.
 
-        The 2026-09-25 production case: a "Married to the Mob" lookup served
-        this artist page in ``spotify_url`` and labelled it
-        ``streaming_status.spotify = "verified"``, because ``_slot_urls`` +
-        ``_RESOLUTION_PROVING_URL_SERVICES`` force ``verified`` on any non-null
-        Spotify slot and the only gate upstream was a host check. Suppressing
-        the override to ``None`` costs nothing here and buys the
-        ``streaming_url_postprocess`` cache/mint leg a chance to resolve the
+        Before this ticket an artist page in ``spotify_url`` was served and
+        labelled ``streaming_status.spotify = "verified"``, because
+        ``_slot_urls`` + ``_RESOLUTION_PROVING_URL_SERVICES`` force ``verified``
+        on any non-null Spotify slot and the only gate upstream was a host
+        check. Suppressing the override to ``None`` costs nothing here and buys
+        the ``streaming_url_postprocess`` cache/mint leg a chance to resolve the
         actual album page.
+
+        The ``("Soundtracks - M", "Married to the Mob")`` request is the
+        ticket's reproduction key, but the artifact value here is a substituted
+        artist page: the *reported* value for that lookup is album-shaped
+        (``/album/0JSLTbVe6Z70EQkOLL0WPi``, the wrong album), which this guard
+        passes by design. Criterion 1's identity agreement owns that one — see
+        ``streaming_link_validation``'s module docstring.
         """
         item = make_library_item(id=42, artist="Soundtracks - M", title="Married to the Mob")
         artwork = make_discogs_result(
