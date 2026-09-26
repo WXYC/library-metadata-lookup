@@ -434,9 +434,24 @@ async def phase_album_rollup(results_db: ResultsDB) -> tuple[int, int]:
 
         if summary["on_streaming"]:
             on_streaming += 1
-            # Update albums table so populate-on-streaming.py sees the result
+            # Mark the album on-streaming so album-level readers see the result.
+            #
+            # ``NOT LIKE 'found%'`` rather than ``!= 'found'`` so the whole
+            # collected family is left alone, not just ``found`` (LML#1353). This
+            # write carries no url, confidence or provenance, so promoting a
+            # ``found_title_only`` row would relabel a title-axis-only album match
+            # as a guarded two-axis one while leaving its one-axis confidence in
+            # place — and this rollup runs over exactly that population, since the
+            # compilation drain writes those rows and its own
+            # ``SELECT DISTINCT album_id FROM track_results`` picks them up. Track
+            # resolution is evidence about tracks; it cannot upgrade the album's
+            # own match. A title-only row therefore stays title-only, which does
+            # mean the ``= 'found'`` readers enumerated in ``docs/scripts.md``
+            # still don't see it — that fan-out is LML#1358, and refusing the
+            # promotion neither creates nor widens it.
             await results_db._db.execute(
-                "UPDATE albums SET spotify_status = 'found' WHERE id = ? AND spotify_status != 'found'",
+                "UPDATE albums SET spotify_status = 'found' "
+                "WHERE id = ? AND spotify_status NOT LIKE 'found%'",
                 (album_id,),
             )
         else:
