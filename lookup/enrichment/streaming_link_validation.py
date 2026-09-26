@@ -41,8 +41,11 @@ counts are pinned as the accept/reject table in
 Serving those was not a soft failure: ``item.py``'s ``_slot_urls`` /
 ``_RESOLUTION_PROVING_URL_SERVICES`` force ``streaming_status.spotify =
 "verified"`` on any non-null Spotify slot, so an artist page was labelled a
-confirmed album match (the Mob/Money production case) and ``verified`` is
-terminal. Which makes the consequence the LML#1295 review weighed as a cost
+confirmed album match, and ``verified`` is terminal. (LML#1352's *reported*
+Mob/Money value is album-shaped — ``/album/0JSLTbVe6Z70EQkOLL0WPi``, the wrong
+album — so this layer does not close it and is not what its acceptance
+criterion 1 asks for; the shape axis and the provenance axis are different
+defects reached through the same unguarded field.) Which makes the consequence the LML#1295 review weighed as a cost
 the *point* for this field: a suppressed ``spotify_url`` falls through to the
 post-process's cache-UPSERT / mint leg, which resolves an album page for the
 REQUEST's (artist, album) and whose verdict a later leg can still supersede.
