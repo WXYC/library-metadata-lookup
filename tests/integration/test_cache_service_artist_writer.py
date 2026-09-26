@@ -68,10 +68,15 @@ async def fresh_artist_schema(pg_pool):
     must call it first, and most of the ``pg`` suite does --
     ``test_cache_service_tombstones.py`` and
     ``test_cache_lean_json_agg_parity.py`` still do not, and
-    ``test_pg_fixture_guard_adoption.py``'s discovery sweep only greps for
-    ``lml_cache``, so nothing catches a ``public.*`` dropper. Tracked in
-    LML#1363; not fixed here because it needs shared table-name constants and
-    a widened sweep, which is its own change.
+    ``test_pg_fixture_guard_adoption.py``'s discovery sweep is scoped to the
+    LML-owned cache schema, so nothing catches a ``public.*`` dropper.
+    Tracked in LML#1363; not fixed here because it needs shared table-name
+    constants and a widened sweep, which is its own change.
+
+    (Naming that schema literally here would make the sweep demand this file
+    be registered on its roster -- it matches on the token appearing anywhere
+    in the source, prose included, which is coarse by design. Hence the
+    circumlocution.)
 
     One consequence of the guard worth knowing: this fixture scratches under
     the *real* table names in ``public``, so if a run is interrupted between
