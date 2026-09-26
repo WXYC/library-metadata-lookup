@@ -2270,6 +2270,77 @@ class TestWriteArtistDetailsFetchedAtInvariant:
         )
 
 
+class TestWriteArtistDetailsChildConflictClause:
+    """Pin ``ON CONFLICT DO NOTHING`` on all four ``artist_*`` child inserts.
+
+    WXYC/discogs-etl#433 adds ``UNIQUE`` constraints to the child tables.
+    Discogs lists the same URL / alias / member / name variation twice often
+    enough to matter, so without the clause a repeated entry raises
+    ``unique_violation``, rolls back the whole artist write, and makes that
+    artist a permanent cache miss that re-burns rate budget on every lookup.
+
+    ``tests/integration/test_cache_service_artist_writer.py`` proves the
+    behaviour against real PostgreSQL with the constraints in place. This pin
+    is the cheap guard that fails without a database, so a refactor that
+    drops the clause cannot reach ``main`` on a PostgreSQL-less run.
+
+    It also asserts the clause is **target-less**. ``ON CONFLICT (cols)``
+    needs a matching unique index to exist, which this code cannot assume:
+    the clause must ship *before* the migration, since LML staging and
+    production share one discogs-cache database and there is no environment
+    where the constraint could land against an unhardened writer.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "table",
+        [
+            "artist_alias",
+            "artist_name_variation",
+            "artist_member",
+            "artist_url",
+        ],
+    )
+    async def test_child_insert_carries_on_conflict_do_nothing(
+        self, cache_service, mock_asyncpg_pool, table
+    ):
+        """Each child ``INSERT`` must end in ``ON CONFLICT DO NOTHING``."""
+        details = ArtistDetails(
+            artist_id=77,
+            name="Autechre",
+            name_variations=["Autechre", "Autechre"],
+            aliases=[ArtistRef(id=500, name="Gescom"), ArtistRef(id=500, name="Gescom")],
+            members=[
+                MemberRef(id=501, name="Rob Brown", active=True),
+                MemberRef(id=501, name="Rob Brown", active=True),
+            ],
+            urls=["https://example.invalid/ae", "https://example.invalid/ae"],
+        )
+
+        await cache_service.write_artist_details(details)
+
+        conn = mock_asyncpg_pool._mock_conn
+        child_sql = [call.args[0] for call in conn.executemany.call_args_list]
+        statement = next((sql for sql in child_sql if f"INSERT INTO {table}" in sql), None)
+
+        assert statement is not None, (
+            f"expected an executemany INSERT INTO {table}; got: {child_sql!r}"
+        )
+        assert "ON CONFLICT DO NOTHING" in statement, (
+            f"INSERT INTO {table} must carry ON CONFLICT DO NOTHING. Without it, a "
+            "Discogs response repeating one entry aborts the whole artist write "
+            f"once discogs-etl#433's UNIQUE constraint exists. Got: {statement!r}"
+        )
+        # Target-less: no parenthesised column list between ON CONFLICT and
+        # DO NOTHING. A target would require the index to already exist.
+        assert "ON CONFLICT (" not in statement, (
+            f"INSERT INTO {table} must use a TARGET-LESS ON CONFLICT DO NOTHING. A "
+            "named target needs a matching unique index at parse time, so it cannot "
+            "ship ahead of discogs-etl#433's migration -- and it has to, because "
+            f"staging and prod share one database. Got: {statement!r}"
+        )
+
+
 class TestGetArtistDetailsBulkStubSemantics:
     """Pin the bulk path's stub-vs-real semantics post-#520.
 
