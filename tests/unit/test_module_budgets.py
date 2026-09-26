@@ -155,8 +155,8 @@ MODULE_BUDGETS: dict[str, int] = {
     # a pure function of the links dict with no dependency on enrich_one's
     # control flow. 1.3x its ~63-line measured size -> 100.
     #
-    # LML#1352: 98 -> 133 measured, raised 100 -> 150 for the spotify_url
-    # album-path-kind check. The 100 was derived from a ~63-line file and
+    # LML#1352: 98 -> 138 measured, raised 100 -> 150 for the spotify_url
+    # release-path-kind check. The 100 was derived from a ~63-line file and
     # LML#1295 had already grown it to 98, so this entry arrived at the
     # ticket with 2 lines of headroom -- ANY change to the module moves it,
     # so the raise is not by itself evidence that the growth was prose. The

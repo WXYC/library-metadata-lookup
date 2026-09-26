@@ -232,14 +232,14 @@ async def enrich_one(
         except Exception:
             links = None
         if links:
-            # LML#873's host check (spotify_url / apple_music_url only,
-            # unchanged by LML#1295 -- see streaming_link_validation.py's
-            # module docstring for why) now runs on all five fields, joined
-            # by a well-formedness floor (scheme-relative, bare-host,
-            # embedded control character) on the three LML#1295 added
-            # (youtube_music_url, bandcamp_url, soundcloud_url). Either
-            # check failing is treated the same as "no override", not
-            # surfaced under the wrong field or at all.
+            # LML#873's host check (spotify_url / apple_music_url only) now
+            # runs on all five fields, joined by a well-formedness floor
+            # (scheme-relative, bare-host, embedded control character) on the
+            # three LML#1295 added (youtube_music_url, bandcamp_url,
+            # soundcloud_url) and by LML#1352's release-path-kind check on
+            # spotify_url alone -- see streaming_link_validation.py's module
+            # docstring for that split. Any check failing is treated the same
+            # as "no override", not surfaced under the wrong field or at all.
             validated = validate_streaming_link_urls(links)
             spotify_url = validated["spotify_url"]
             apple_music_override = validated["apple_music_url"]
@@ -453,9 +453,9 @@ async def enrich_one(
         "artist_bio": artist_bio,
         "wikipedia_url": wikipedia_url,
         # spotify_url / apple_music_url keep their '' -> None coercion here:
-        # their seam (validate_streaming_link_urls, above) stayed at LML#873's
-        # host-check-only by design (LML#1295 review), which leaves a falsy
-        # input untouched rather than nulling it, so an empty-string
+        # their seam (validate_streaming_link_urls, above) takes no
+        # well-formedness floor by design (LML#1295 review), which leaves a
+        # falsy input untouched rather than nulling it, so an empty-string
         # streaming_links override (library.db returns the column verbatim)
         # still needs normalizing before the post-process active-filter
         # (`is None`) sees it. bandcamp_url / youtube_music_url no longer need
