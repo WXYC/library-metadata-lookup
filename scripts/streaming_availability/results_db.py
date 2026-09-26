@@ -104,9 +104,23 @@ class ResultsDB:
         self._db: aiosqlite.Connection | None = None
         self._write_lock: asyncio.Lock = asyncio.Lock()
 
-    async def connect(self) -> None:
+    async def connect(self, *, bootstrap: bool = True) -> None:
+        """Open the artifact, ensuring its schema unless told not to.
+
+        Args:
+            bootstrap: When False, skip ``_SCHEMA`` and ``_migrate`` so the
+                connection performs no write at all. For a read-only caller over
+                the canonical ``streaming_availability.db``: the bootstrap is
+                idempotent but not free -- it ``ALTER``s and ``CREATE INDEX``es a
+                single-copy, bucket-backed file, so a ``--dry-run`` preview over a
+                copy pulled from the bucket would otherwise rewrite it. A caller
+                that passes False must not write, since the columns it would write
+                to are exactly the ones the bootstrap ensures.
+        """
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
+        if not bootstrap:
+            return
         await self._db.executescript(_SCHEMA)
         await self._migrate()
         await self._db.commit()
@@ -293,12 +307,18 @@ class ResultsDB:
                 than a guarded 80/80 match passes True: the row it would overwrite
                 cost a rate-limited round trip (the line
                 ``reset_misses_to_pending`` already holds on the reset path), and
-                the PG mirror's found-demotion trigger raises on exactly that
-                transition, so the write would fail later at upload time instead.
-                Spelled ``NOT LIKE 'found%'`` so the whole collected family is
-                covered — ``found`` and LML#1353's ``found_title_only``, and any
-                later sibling — without this module restating the decision layer's
-                vocabulary. ``not_found`` does not match the prefix.
+                the PG mirror's found-demotion trigger raises on a ``found`` row
+                being demoted, so such a write would fail later at upload time
+                instead. Spelled with ``COLLECTED_STATUS_LIKE`` so the whole
+                collected family is covered without this module restating the
+                decision layer's vocabulary; ``not_found`` does not match it.
+
+                Note the asymmetry with the mirror, which is wider here than there:
+                ``entity/streaming_catalog.py``'s trigger tests ``OLD.status =
+                'found'`` only, so in PG a row sitting at ``found_title_only`` can
+                still be demoted without the trigger firing. This guard covers it,
+                the mirror does not, and reconciling them belongs to the LML#842
+                port rather than to a schema change here.
 
         Returns:
             The number of rows written -- 0 when ``skip_if_resolved`` declined.
