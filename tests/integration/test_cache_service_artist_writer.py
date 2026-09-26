@@ -44,25 +44,42 @@ from tests.integration.conftest import skip_if_named_tables_populated
 async def fresh_artist_schema(pg_pool):
     """Bring up the artist parent + child tables LML writes through.
 
-    Mirrors the production discogs-cache shape: ``fetched_at`` is nullable
-    (rebuild stubs land here as NULL) and ``not_found`` defaults to FALSE
-    (LML#510 tombstone column). The writer is responsible for populating
-    ``fetched_at`` on every write -- this fixture deliberately does NOT
-    default it server-side so the test catches any writer that fails to
-    stamp it.
+    Mirrors the production discogs-cache shape in every respect **except
+    uniqueness** (see below): ``fetched_at`` is nullable (rebuild stubs land
+    here as NULL) and ``not_found`` defaults to FALSE (LML#510 tombstone
+    column). The writer is responsible for populating ``fetched_at`` on every
+    write -- this fixture deliberately does NOT default it server-side so the
+    test catches any writer that fails to stamp it.
 
     The four child tables carry the ``UNIQUE`` constraints that
     WXYC/discogs-etl#433 adds to production, **which prod does not have
-    yet**. That is deliberate: this fixture is how LML finds out whether its
-    writer survives the constraint before the constraint exists. Without
-    them the duplicate-collapse test below passes vacuously.
+    yet**. That is the one deliberate divergence: this fixture is how LML
+    finds out whether its writer survives the constraint before the
+    constraint exists, and without them the duplicate-collapse test below
+    passes vacuously. The cost of the divergence, stated so nobody is
+    surprised by it: a regression that manifests only *without* uniqueness --
+    i.e. against today's actual production -- is not reproducible here.
 
     Guarded by ``skip_if_named_tables_populated``, which this fixture was
     missing: it drops five real discogs-cache table names, and on a
     ``DATABASE_URL_TEST`` pointed at the actual cache those hold the artist
     catalogue (~393 MB as of 2026-09-25) that a monthly rebuild takes hours
     to reproduce. The conftest helper's own docstring says dropping fixtures
-    must call it first; the rest of the ``pg`` suite does.
+    must call it first, and most of the ``pg`` suite does --
+    ``test_cache_service_tombstones.py`` and
+    ``test_cache_lean_json_agg_parity.py`` still do not, and
+    ``test_pg_fixture_guard_adoption.py``'s discovery sweep only greps for
+    ``lml_cache``, so nothing catches a ``public.*`` dropper. Tracked in
+    LML#1363; not fixed here because it needs shared table-name constants and
+    a widened sweep, which is its own change.
+
+    One consequence of the guard worth knowing: this fixture scratches under
+    the *real* table names in ``public``, so if a run is interrupted between
+    an insert and the teardown drop (Ctrl-C, SIGKILL), ``public.artist`` holds
+    a row and every test in this module then skips permanently -- and a
+    skipped check satisfies branch protection, so that reads green. If you see
+    this module skipping, drop the leftovers by hand rather than assuming it
+    passed. Scratching in a dedicated schema is the real fix, also LML#1363.
     """
     async with pg_pool.acquire() as conn:
         await skip_if_named_tables_populated(
@@ -288,24 +305,56 @@ async def test_within_response_duplicates_collapse_instead_of_aborting(pg_pool):
     }, f"each duplicated child must collapse to exactly one row; got {counts}"
 
 
+def _artist_after_upstream_corrections() -> ArtistDetails:
+    """The same artist as above, re-fetched after Discogs data changed.
+
+    Every child differs from the first write in a way that a missing
+    ``DELETE`` would strand:
+
+    * ``artist_member`` keeps ``member_id`` 246559 but flips ``active`` to
+      ``False``. The key is ``(artist_id, member_id)``, so this row *conflicts*
+      -- ``DO NOTHING`` without a preceding DELETE keeps the stale
+      ``active = True``. This is the value-level discriminator.
+    * the alias is renamed, the name variation changed, and one URL dropped.
+      Those keys no longer match, so without the DELETE the stale rows simply
+      remain alongside the new ones and the counts go up. Count-level
+      discriminators.
+    """
+    return ArtistDetails(
+        artist_id=2154,
+        name="Stereolab",
+        name_variations=["Stereolab (UK)"],
+        aliases=[
+            ArtistRef(id=53199, name="Groop Played Space Age Bachelor Pad Music (Remastered)")
+        ],
+        members=[MemberRef(id=246559, name="L\u00e6titia Sadier", active=False)],
+        urls=["https://www.discogs.com/artist/2154-Stereolab"],
+    )
+
+
 @pytest.mark.pg
 @pytest.mark.asyncio
-async def test_rehydrating_an_artist_twice_is_idempotent(pg_pool):
-    """Re-writing an artist that already has child rows stays at one row each.
+async def test_rehydration_applies_upstream_corrections(pg_pool):
+    """A re-fetch must replace cached children, not be swallowed by DO NOTHING.
 
-    The realistic production path: LML re-hydrates an artist whose children
-    are already cached. It works because each child table is ``DELETE``d by
-    ``artist_id`` before the insert, so the constraint never sees the old
-    rows. This pins that ordering -- an "optimization" that dropped the
-    DELETE in favour of relying on ``ON CONFLICT DO NOTHING`` would pass the
-    test above and silently stop applying upstream corrections, since
-    ``DO NOTHING`` keeps the *existing* row rather than the new one.
+    This is the test that pins the ``DELETE`` before each child insert. The
+    delete is what makes re-hydration a *replace*; ``ON CONFLICT DO NOTHING``
+    on its own keeps the **existing** row, so dropping the delete and leaning
+    on the clause would silently stop applying upstream corrections -- a
+    renamed alias, a member who left the band, a URL Discogs removed would all
+    be frozen at their first-seen values, forever, with no error anywhere.
+
+    An earlier version of this test wrote byte-identical details twice and
+    asserted the counts stayed at one. That passes with the deletes removed
+    (every row conflicts and is skipped, so the counts are unchanged), which
+    means it pinned nothing. Verified: deleting all four ``DELETE FROM
+    artist_*`` statements left that version green. Hence the mutated second
+    payload -- it fails on both counts and values without the deletes.
     """
     cache = DiscogsCacheService(pg_pool)
-    details = _artist_with_duplicated_children()
 
-    await cache.write_artist_details(details)
-    await cache.write_artist_details(details)
+    await cache.write_artist_details(_artist_with_duplicated_children())
+    await cache.write_artist_details(_artist_after_upstream_corrections())
 
     async with pg_pool.acquire() as conn:
         counts = {
@@ -317,10 +366,35 @@ async def test_rehydrating_an_artist_twice_is_idempotent(pg_pool):
                 "artist_url",
             )
         }
+        member_active = await conn.fetchval(
+            "SELECT active FROM artist_member WHERE artist_id = 2154 AND member_id = 246559"
+        )
+        alias_name = await conn.fetchval(
+            "SELECT alias_name FROM artist_alias WHERE artist_id = 2154"
+        )
+        variation = await conn.fetchval(
+            "SELECT name FROM artist_name_variation WHERE artist_id = 2154"
+        )
+        url = await conn.fetchval("SELECT url FROM artist_url WHERE artist_id = 2154")
 
     assert counts == {
         "artist_alias": 1,
         "artist_name_variation": 1,
         "artist_member": 1,
         "artist_url": 1,
-    }, f"a second write must not accumulate rows; got {counts}"
+    }, (
+        "a re-fetch must REPLACE children, not accumulate alongside them. Higher "
+        f"counts mean the DELETE before each insert is missing. Got {counts}"
+    )
+    assert member_active is False, (
+        "the corrected `active = False` must land. `True` here means the row "
+        "conflicted and ON CONFLICT DO NOTHING kept the stale value -- i.e. the "
+        "DELETE is gone and re-hydration has silently stopped correcting data."
+    )
+    assert alias_name == "Groop Played Space Age Bachelor Pad Music (Remastered)", (
+        f"renamed alias must replace the old one; got {alias_name!r}"
+    )
+    assert variation == "Stereolab (UK)", f"changed name variation must replace; got {variation!r}"
+    assert url == "https://www.discogs.com/artist/2154-Stereolab", (
+        f"replacement URL must be the only one; got {url!r}"
+    )
