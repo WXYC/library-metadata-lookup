@@ -458,6 +458,66 @@ class TestPacedRunLiftsTheTotalCap:
         )
 
 
+class TestPacedRunStillBoundsTheAggregateRate:
+    """Pacing is per worker, so lifting the total cap must not uncap the fleet.
+
+    The per-worker justification for lifting ``_MAX_SAFE_TOTAL`` ("at most
+    6 requests a minute") only holds one worker at a time. ``--concurrency``
+    permits five, so without an aggregate bound a paced run can sustain
+    5 x 6 = 30 live /lookup a minute against the prod-shared Discogs token,
+    indefinitely, with no --force -- roughly double staging's own limiter.
+    """
+
+    @pytest.mark.parametrize(
+        ("concurrency", "pace_seconds"),
+        [(1, 10.0), (1, 30.0), (3, 30.0), (5, 30.0)],
+    )
+    def test_rates_within_the_aggregate_bound_are_allowed(self, concurrency, pace_seconds):
+        assert (
+            check_burst_size_within_safe_bounds(
+                concurrency=concurrency,
+                total=100_000,
+                smoke=False,
+                warm=False,
+                pace_seconds=pace_seconds,
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        ("concurrency", "pace_seconds"),
+        [(5, 10.0), (2, 10.0), (4, 20.0)],
+    )
+    def test_rates_over_the_aggregate_bound_are_refused(self, concurrency, pace_seconds):
+        msg = check_burst_size_within_safe_bounds(
+            concurrency=concurrency,
+            total=100_000,
+            smoke=False,
+            warm=False,
+            pace_seconds=pace_seconds,
+        )
+        assert msg is not None
+        assert "per minute" in msg
+        assert "--force" in msg
+
+    def test_the_documented_soak_command_is_allowed(self):
+        """conc 1 @ 30s over the 143-case corpus -- the LML#1354 driver."""
+        assert (
+            check_burst_size_within_safe_bounds(
+                concurrency=1, total=143, smoke=False, warm=False, pace_seconds=30.0
+            )
+            is None
+        )
+
+    def test_smoke_still_short_circuits_the_aggregate_bound(self):
+        assert (
+            check_burst_size_within_safe_bounds(
+                concurrency=5, total=100_000, smoke=True, warm=False, pace_seconds=10.0
+            )
+            is None
+        )
+
+
 class TestResolveRunShape:
     """``--total`` and ``--warm`` change default with ``--queries-file``."""
 
