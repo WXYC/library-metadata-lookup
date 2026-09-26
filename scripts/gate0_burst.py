@@ -100,6 +100,15 @@ _DEFAULT_BURST_TOTAL = 12
 # per-worker rate, not the aggregate fan-out.
 _PACED_RUN_MIN_SECONDS = 10.0
 
+# Ceiling on a paced run's *aggregate* live-lookup rate, in requests per
+# minute. Lifting _MAX_SAFE_TOTAL is justified per worker ("at most 6 a
+# minute"), but --concurrency permits five of them, so without this a paced
+# run sustains 5 x 6 = 30/min against the prod-shared Discogs token forever,
+# with no --force. 10/min keeps the LML#1354 soak (one worker at 30s = 2/min)
+# and the threshold case (one worker at 10s = 6/min) comfortably inside
+# staging's own 16/min bucket.
+_MAX_SAFE_PACED_RATE_PER_MIN = 10.0
+
 # The LookupRequest field names a --queries-file case may contribute to the
 # POST body. Everything else a corpus carries is its own assertion machinery.
 _QUERY_FIELDS = ("artist", "album", "song", "raw_message")
@@ -399,10 +408,13 @@ def check_burst_size_within_safe_bounds(
     ``len(GATE0_QUERIES)`` and a ``--queries-file`` run passes its corpus size.
 
     ``pace_seconds`` at or above :data:`_PACED_RUN_MIN_SECONDS` lifts the
-    ``--total`` ceiling and nothing else. The ceiling exists to stop a *burst*
-    draining the shared budget, and a request every 10s or slower is not one;
-    the ``--concurrency`` ceiling is untouched, because pacing is per worker and
-    so bounds the per-worker rate rather than the aggregate fan-out.
+    ``--total`` ceiling. The ceiling exists to stop a *burst* draining the
+    shared budget, and a request every 10s or slower is not one. Because
+    pacing is per worker, lifting it in exchange requires an aggregate bound:
+    ``concurrency * 60 / pace_seconds`` must stay within
+    :data:`_MAX_SAFE_PACED_RATE_PER_MIN`, or a five-worker paced run would
+    sustain 30 live lookups a minute indefinitely. The ``--concurrency``
+    ceiling itself is untouched.
     """
     if smoke:
         return None
@@ -414,6 +426,17 @@ def check_burst_size_within_safe_bounds(
         )
     prewarm = (len(GATE0_QUERIES) if prewarm_count is None else prewarm_count) if warm else 0
     if pace_seconds >= _PACED_RUN_MIN_SECONDS:
+        # Pacing bounds the *per-worker* rate, so the fleet rate still needs a
+        # rail of its own -- otherwise lifting the total cap uncaps the run.
+        rate_per_min = concurrency * 60.0 / pace_seconds
+        if rate_per_min > _MAX_SAFE_PACED_RATE_PER_MIN:
+            return (
+                f"--concurrency {concurrency} at --pace-seconds {pace_seconds:g} is "
+                f"{rate_per_min:.0f} live /lookup per minute, over the safe paced "
+                f"ceiling ({_MAX_SAFE_PACED_RATE_PER_MIN:g}/min); pacing bounds the "
+                "per-worker rate, not the fleet. Lower --concurrency or raise "
+                "--pace-seconds, or pass --force under supervision."
+            )
         # Pacing vouches for the burst leg only -- the prewarm pass is unpaced
         # by construction, so it is still checked against the ceiling.
         if prewarm > _MAX_SAFE_TOTAL:
