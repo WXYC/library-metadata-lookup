@@ -568,13 +568,19 @@ On the Discogs lane the equivalent refusal is a compilation whose correct releas
 
 **What the status does and does not buy, today.** It is not a gate anywhere yet: `scripts/export_streaming_links.py`'s album-level export is `WHERE spotify_url IS NOT NULL`, with no status or provenance condition, so a `found_title_only` row still reaches `library.db.streaming_links` and the DJ — now carrying `matched_artist = "Various Artists"` and a `matched_title` identical to the query, which *reads* like corroboration and (see the module docstring) is not. **The entire behavioural protection in this change is the V/A narrowing — refusing to write a named-artist candidate at all.** The status buys legibility, and a predicate a serve-side gate can adopt; it does not itself withhold anything from anyone. Adopting it is [LML#1355](https://github.com/WXYC/library-metadata-lookup/pull/1355)'s call.
 
-`phase_album_rollup` in `scripts/track_streaming/__main__.py` **is** taught the value, and is the only reader changed here: it sets `spotify_status = 'found'` for every album whose tracks fully resolve, carrying no url, confidence or provenance, so promoting a title-only row relabelled a one-axis album match as a guarded one while leaving its one-axis confidence in place. Its predicate is now `NOT LIKE 'found%'`. Track resolution is evidence about tracks and cannot upgrade the album's own match. It had to change here rather than as follow-up work, because it runs over exactly the population this drain writes.
+**Two readers in `scripts/track_streaming/__main__.py` are taught the value here, and they answer opposite questions** — which is the distinction to carry away from this change:
 
-**The other readers of `{service}_status` are *not* taught the value** — a `found_title_only` row is simply invisible to each. Tracked in [LML#1358](https://github.com/WXYC/library-metadata-lookup/issues/1358):
+| reader | predicate | why |
+|---|---|---|
+| `phase_album_rollup` | `NOT LIKE 'found%'` — **don't touch a collected answer** | It sets `spotify_status = 'found'` for every album whose tracks fully resolve, carrying no url, confidence or provenance, so promoting a title-only row relabelled a one-axis album match as a guarded one while leaving its one-axis confidence in place. Track resolution is evidence about *tracks* and cannot upgrade the album's own match |
+| `phase_build_index` | `LIKE 'found%'` — **any collected answer counts** | The index seeds track resolution from the Discogs tracklists of albums known to be on streaming. A title-only album match is still a streaming answer, and its tracklist resolves tracks regardless of how the album's own label was scored |
+
+`found%` means "we have a collected answer, of some axis quality"; bare `found` means "two axes were compared". An index wants the first, a label wants the second. Both had to change here rather than as follow-up work: the rollup because it erased this drain's own output, and the index because leaving it would have been a **coverage regression against `main`** — before this change those rows reached the index as `'found'`, via the very laundering the rollup no longer performs, so leaving it untouched would have dropped V/A compilations out of track resolution entirely.
+
+**The remaining readers of `{service}_status` are *not* taught the value** — a `found_title_only` row is simply invisible to each. Tracked in [LML#1358](https://github.com/WXYC/library-metadata-lookup/issues/1358):
 
 | site | effect |
 |---|---|
-| `scripts/track_streaming/__main__.py:157` local streaming index (`= 'found'` per service) | a compilation whose only streaming presence is title-only never has its tracks resolved |
 | `ResultsDB.get_deezer_hits_pending_spotify` and its PG twin `catalog_dao.py:395` | a title-only Deezer hit doesn't cascade into the Spotify pass |
 | `scripts/streaming_availability/report.py:92` | reporting drift |
 

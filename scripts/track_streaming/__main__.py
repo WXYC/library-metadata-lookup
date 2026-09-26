@@ -151,11 +151,21 @@ async def phase_build_index(results_db: ResultsDB) -> LocalStreamingIndex:
     try:
         # Get on-streaming album IDs with Discogs release IDs
         assert results_db._db is not None
+        # ``LIKE 'found%'`` here, bare ``= 'found'`` for a label: the two ask
+        # different questions and this is the third place the distinction appears
+        # (LML#1353). ``found%`` means "we have a collected answer, of some axis
+        # quality", which is what an index wants — a title-only album match is
+        # still a streaming answer whose tracklist can resolve tracks. Bare
+        # ``found`` means "two axes were compared", which is what a *label* wants,
+        # and is the question ``phase_album_rollup`` must not answer for a row it
+        # did not score.
         cursor = await results_db._db.execute(
-            """SELECT id, discogs_release_id, spotify_url, deezer_url
+            f"""SELECT id, discogs_release_id, spotify_url, deezer_url
                FROM albums
-               WHERE (spotify_status = 'found' OR deezer_status = 'found'
-                      OR apple_status = 'found' OR bandcamp_url IS NOT NULL)
+               WHERE (spotify_status LIKE '{COLLECTED_STATUS_LIKE}'
+                      OR deezer_status LIKE '{COLLECTED_STATUS_LIKE}'
+                      OR apple_status LIKE '{COLLECTED_STATUS_LIKE}'
+                      OR bandcamp_url IS NOT NULL)
                  AND discogs_release_id IS NOT NULL"""
         )
         albums = [dict(row) for row in await cursor.fetchall()]
