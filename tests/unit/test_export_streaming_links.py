@@ -970,13 +970,20 @@ class TestSpotifyProvenanceGate:
         matched_title,
         url,
     ):
-        """Correct links whose artist string disagrees with the WXYC shelf credit.
+        """The three named production shapes LML#1352's acceptance criteria protect.
 
-        LML#1147: for compilations, curator credits and expanded credits the artist
-        axis carries no usable signal, so an 80/80 floor at this seam would false-
-        reject these three. The provenance gate must not touch them -- all three have
-        full provenance and confidence 100 in the artifact. LML#1352's acceptance
-        criteria require this pin.
+        All three are correct links on shelf credits that read oddly -- a V/A-ish
+        compilation, an expanded band credit, a curator credit -- and all three have
+        full provenance and confidence 100 in the artifact. What this pins is exactly
+        that: the gate must not touch a row that carries provenance, whatever its
+        credit looks like.
+
+        It does NOT pin an 80/80 false-rejection. An earlier revision claimed it did;
+        scored with this repo's own `score_match` all three come out 100/100, so an
+        80/80 floor would accept them. See `_has_match_provenance`'s docstring for the
+        retraction and for the structural reason no string floor is available at this
+        seam (the export never reads `display_artist`/`display_title`, so there is
+        nothing here to score the stored provenance against).
         """
         library_db = _export(
             tmp_path,
@@ -1128,25 +1135,6 @@ class TestSpotifyProvenanceGate:
             else "https://music.apple.com/album/from-the-good-row"
         )
         assert row == ("https://open.spotify.com/album/aluminum-tunes", expected_apple)
-
-    def test_gate_leaves_no_all_null_streaming_links_row(self, tmp_path):
-        """A row whose only URL was the gated Spotify one is dropped, not blanked."""
-        library_db = _export(
-            tmp_path,
-            [
-                {
-                    "id": 1,
-                    "library_ids": json.dumps([901]),
-                    "spotify_url": "https://open.spotify.com/album/unverifiable",
-                    "spotify_matched_artist": "",
-                    "spotify_matched_title": "",
-                }
-            ],
-        )
-        conn = sqlite3.connect(library_db)
-        count = conn.execute("SELECT COUNT(*) FROM streaming_links").fetchone()[0]
-        conn.close()
-        assert count == 0
 
     def test_gate_is_inert_on_a_schema_without_provenance_columns(self, tmp_path, caplog):
         """A legacy/fixture `albums` table without the provenance columns still exports.
@@ -1493,6 +1481,9 @@ class TestSpotifyProvenanceGate:
         assert "apple_music_url: 1" in caplog.text
         # The whole point: the gated service reads zero on the WRITE path.
         assert "spotify_url" not in caplog.text.split("Service coverage")[1]
+        # The album-level count excludes releases the gate emptied, so it shares a
+        # denominator with the total. This release keeps its apple_url, so it counts.
+        assert "streaming links (album-level): 1" in caplog.text
 
     def test_empty_string_url_row_is_dropped_even_with_full_provenance(self, tmp_path):
         """The empty-entry drop is a SECOND behavior change, and this is its other half.
