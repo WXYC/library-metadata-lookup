@@ -23,6 +23,7 @@ from clients.streaming.matching import (
     score_match,
     strip_format_suffix,
 )
+from scripts._lib.match_decision import AXES_ARTIST_ONLY, AXES_TITLE_ONLY
 from scripts._lib.runtime import set_up_script_runtime
 from scripts._lib.signals import ShutdownFlag
 
@@ -41,6 +42,13 @@ async def pass1_title_search(pool, row: dict) -> dict | None:
     For enriched-but-unmatched albums where the artist was found but the title
     didn't match. Searches all releases by exact title, then scores the result
     artist against the expected artist with a relaxed threshold.
+
+    The returned ``confidence`` is the **artist** score, which ``axes`` records
+    (LML#1353): the title axis is not scored here at all — the SQL predicate
+    enforces it exactly, unaccented and case-folded — so a bare percentage in a
+    field called ``confidence`` reads as a two-axis match that was never
+    computed. Nothing persists this number; ``_run_pass`` writes only the
+    release id and its artist/title provenance.
     """
     title = strip_format_suffix(row["display_title"])
     if not title:
@@ -86,6 +94,7 @@ async def pass1_title_search(pool, row: dict) -> dict | None:
                     "title": r["title"],
                     "artist": r["artist_name"],
                     "confidence": artist_score,
+                    "axes": AXES_ARTIST_ONLY,
                 }
 
     return best if best and best_score >= ARTIST_THRESHOLD_RELAXED else None
@@ -96,6 +105,13 @@ async def pass2_fuzzy_artist_search(pool, row: dict) -> dict | None:
 
     For not-enriched albums where artist lookup failed entirely. Uses trigram
     similarity to find the artist, then fuzzy-matches titles.
+
+    The returned ``confidence`` is the **title** score, which ``axes`` records
+    (LML#1353). Unlike the compilation drain's relaxation this is not a
+    title-only *acceptance*: the artist axis was already verified against the
+    trigram candidates at ``ARTIST_THRESHOLD_RELAXED`` before any title was
+    scored, so both axes gate the result and only the reported number is
+    one-axis.
     """
     display_artist = row["display_artist"]
     variants = normalize_artist_credit(display_artist)
@@ -147,6 +163,7 @@ async def pass2_fuzzy_artist_search(pool, row: dict) -> dict | None:
                 "title": r["title"],
                 "artist": r["artist_name"],
                 "confidence": title_score,
+                "axes": AXES_TITLE_ONLY,
             }
 
     return best if best and best_score >= TITLE_THRESHOLD else None
@@ -177,13 +194,14 @@ async def _run_pass(
                     (result["release_id"], result["artist"], result["title"], row["id"]),
                 )
             logger.debug(
-                "%s: %s - %s → %s (%s, %.0f%%)",
+                "%s: %s - %s → %s (%s, %.0f%% on the %s axis)",
                 pass_name,
                 row["display_artist"],
                 row["display_title"],
                 result["title"],
                 result["artist"],
                 result["confidence"],
+                result["axes"],
             )
         if i % 500 == 0:
             if not dry_run:
