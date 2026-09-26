@@ -2376,8 +2376,10 @@ class TestStreamingLinksUrlValidation:
     ``bandcamp_url``, ``soundcloud_url``), plus a well-formedness floor
     (scheme-relative, bare-host, embedded control character) those three get
     that a host check alone does not catch. ``spotify_url`` / ``apple_music_url``
-    keep their exact pre-LML#1295 host-only validation — see
-    ``TestSpotifyAppleHostCheckSeamUnchangedByLml1295`` below. A suppressed
+    still take no well-formedness floor — see
+    ``TestSpotifyAppleHostCheckSeamUnchangedByLml1295`` below; LML#1352 added a
+    release-path-kind check to ``spotify_url``, which is a different check and
+    is pinned in ``test_streaming_link_validation.py``. A suppressed
     field among the three added ones falls through to the existing templated
     search-URL fallback, so the response still carries a usable (if
     unverified) URL rather than a corrupt one.
@@ -2594,9 +2596,13 @@ class TestSpotifyAppleHostCheckSeamUnchangedByLml1295:
     out ``None`` flips ``skip_happy_probe`` off in
     ``lookup/enrichment/item.py``, spending an Apple Music quota slot and
     wall-clock on a live probe that an override would otherwise have made
-    unnecessary. Both are out-of-scope L1/cache-semantics changes, so these
-    two fields keep EXACTLY their pre-LML#1295 (LML#873) host-check-only
-    validation. Pinned at this end-to-end seam (rather than only in
+    unnecessary. Both are out-of-scope L1/cache-semantics changes, so neither
+    field takes the well-formedness floor and every malformed-but-correct-host
+    shape below survives as it did before LML#1295. (LML#1352 reversed that
+    declination for ``spotify_url`` on the path-kind axis alone, deliberately,
+    because for THAT field the post-process fallthrough is the point; it does
+    not touch the shapes pinned here, which are all ``/album/`` paths.) Pinned
+    at this end-to-end seam (rather than only in
     ``test_streaming_link_validation.py``) because the regression is only
     observable through these downstream effects, not the validator's return
     value alone.
