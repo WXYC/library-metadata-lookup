@@ -1,4 +1,4 @@
-"""Spotify album-URL parsing: the album ID, and whether a URL is an album page.
+"""Spotify URL parsing: the album ID, and whether a URL names a release at all.
 
 Companion to ``release.apple_music_url_parser``: the streaming-URL cache
 post-process (``lookup/streaming_url_postprocess.py``) mints
@@ -6,9 +6,9 @@ post-process (``lookup/streaming_url_postprocess.py``) mints
 album URL, and the ``spotify_album`` registry entry's ``url_to_external_id``
 extractor is :func:`spotify_album_id_from_url`.
 
-:func:`url_is_spotify_album` (LML#1352) is a second, deliberately different
-album question, asked at the serve seam rather than the mint path — see its
-docstring for the two axes on which it is looser, and why.
+:func:`url_is_spotify_album_or_track` (LML#1352) is a second, deliberately
+different question, asked at the serve seam rather than the mint path — see its
+docstring for the axes on which it is looser, and why.
 
 This is intentionally *stricter* than the loose
 ``release.orchestrator._spotify_album_id_from_url`` (regex ``[A-Za-z0-9]+``)
@@ -39,21 +39,25 @@ SPOTIFY_ALBUM_ID_RE = re.compile(
     r"//open\.spotify\.com/album/([0-9A-Za-z]{22})(?![0-9A-Za-z])",
 )
 
-# Matched against ``urlparse(url).path`` and anchored at the path root, so an
-# ``/album/`` reached later (``/user/x/album/y``) or carried inside a query
-# string cannot pass for an album page. The optional leading segment is the web
-# player's locale prefix — ``intl-de``, or the hyphenated regional variant
+# Matched against ``urlparse(url).path`` and anchored at the path root, so a
+# release kind reached later (``/user/x/album/y``) or carried inside a query
+# string cannot pass for a release page. The optional leading segment is the
+# web player's locale prefix — ``intl-de``, or the hyphenated regional variant
 # ``intl-pt-br``, mirroring the Apple parser's locale group — which the curated
 # ``streaming_links`` artifact carries on hand-pasted URLs (24 rows: fr 7, it 6,
-# es 6, de 3, pt 2) and which names the same album page. One character of
-# non-separator has to follow ``album/``, rejecting an id-less ``/album``,
-# ``/album/`` and ``/album/?si=…`` while admitting any id shape. Host is not in
-# this pattern at all: :func:`url_is_spotify_album` asks
+# es 6, de 3, pt 2) and which names the same page. One character of
+# non-separator has to follow the kind, rejecting an id-less ``/album``,
+# ``/album/`` and ``/album/?si=…`` while admitting any id shape.
+#
+# Case-sensitive on both legs, unlike the Apple parser's ``re.IGNORECASE``:
+# Spotify's routes are case-sensitive and every measured locale row is
+# lowercase, so admitting ``/ALBUM/<id>`` would gate in a shape that 404s —
+# the mirror image of dropping one that resolves. Host is not in this pattern
+# at all: :func:`url_is_spotify_album_or_track` asks
 # :func:`url_has_spotify_host` for that leg instead of carrying a second, and
 # narrower, host literal.
-_SPOTIFY_ALBUM_PATH_RE = re.compile(
-    r"^/(?:intl-[a-z]{2}(?:-[a-z]{2,4})?/)?album/[^/]",
-    re.IGNORECASE,
+_SPOTIFY_RELEASE_PATH_RE = re.compile(
+    r"^/(?:intl-[a-z]{2}(?:-[a-z]{2,4})?/)?(?:album|track)/[^/]",
 )
 
 
@@ -80,42 +84,60 @@ url_has_spotify_host = host_matcher(
     ``spotify_url`` artifact (a Deezer/Apple/Bandcamp URL stored under that
     field name) before it reaches a caller.
 
-    Since LML#1352 that seam pairs this with :func:`url_is_spotify_album`,
-    which supplies the path-kind test this predicate deliberately does not
-    make: on its own it cannot tell an album page from an artist page.
+    Since LML#1352 that seam pairs this with
+    :func:`url_is_spotify_album_or_track`, which supplies the path-kind test
+    this predicate deliberately does not make: on its own it cannot tell a
+    release page from an artist page.
     """,
 )
 
 
-def url_is_spotify_album(url: str | None) -> bool:
-    """True if ``url`` is a Spotify album *page* (``open.spotify.com/album/<id>``).
+def url_is_spotify_album_or_track(url: str | None) -> bool:
+    """True if ``url`` is a Spotify page that names a release: album or track.
 
     The serve-side question (LML#1352), asked by
     ``lookup/enrichment/streaming_link_validation.py`` on the librarian-curated
-    ``streaming_links`` override: is this URL in the album column actually an
-    album?
+    ``streaming_links`` override: does this URL in the album column name the
+    release at all, or is it an artist / playlist / user / podcast page that
+    cannot?
+
+    **Track pages count.** A track page names a recording on the release, and
+    ``scripts/export_streaming_links.py`` deliberately supplements
+    ``spotify_url`` from ``track_results`` (gated on ``resolution_status`` in
+    ``local_match``/``api_match``) for singles and compilations — and only when
+    the album-level URL is absent, so it is that release's ONLY Spotify link.
+    Rejecting the kind would leave those releases with no link at all, LML#573
+    having removed the templated Spotify search fallback.
 
     Stricter than :func:`url_has_spotify_host` on the path and no stricter on
     the host: it reuses that predicate for the host leg, so every Spotify host
     the seam already admits keeps working and only the path kind decides. The
     host check alone admits every path kind Spotify serves, and the artifact's
-    album column measurably holds artist, track, playlist, user and podcast
-    pages.
+    album column measurably holds artist, playlist, user and podcast pages.
 
-    Looser than :func:`spotify_album_id_from_url` on two axes, both on purpose.
-    That extractor's 22-char base62 floor exists because the mint path keys
-    ``entity.release_identity`` on what it returns, so a malformed ID must read
-    as "no ID" rather than poison the entity graph; nothing is keyed on this
-    predicate's answer — it decides whether a URL is handed to a browser — so
-    importing the floor would null a ``/album/<odd-id>`` value for a reason
-    with no consequence at this seam. Path kind is the axis the artifact
-    measurement has evidence on; ID charset is not. And the locale prefix the
-    artifact's hand-pasted URLs carry is in this grammar but not the
-    extractor's, which only ever sees a live-resolved ``external_urls.spotify``.
+    Looser than :func:`spotify_album_id_from_url` on three axes, all on
+    purpose. That extractor's 22-char base62 floor exists because the mint path
+    keys ``entity.release_identity`` on what it returns, so a malformed ID must
+    read as "no ID" rather than poison the entity graph; nothing is keyed on
+    this predicate's answer — it decides whether a URL is handed to a browser —
+    so importing the floor would null a ``/album/<odd-id>`` value for a reason
+    with no consequence at this seam. Path kind is the axis the artifact census
+    has evidence on; ID charset is not. The locale prefix the artifact's
+    hand-pasted URLs carry is in this grammar but not the extractor's, which
+    only ever sees a live-resolved ``external_urls.spotify``. And the track
+    kind is here for the reason above and is not mintable, so the extractor
+    must keep rejecting it.
 
     Guards ``None``/empty input by returning ``False``, like
     :func:`release.host_matching.is_well_formed_web_url`.
     """
     if not url or not url_has_spotify_host(url):
         return False
-    return _SPOTIFY_ALBUM_PATH_RE.match(urlparse(url).path) is not None
+    path = urlparse(url).path
+    if ".." in path.split("/"):
+        # RFC 3986 dot-segment removal pops the kind segment before a browser
+        # requests the URL, so the path this pattern would read is not the path
+        # that gets fetched: ``/album/../artist/<id>`` resolves to the working
+        # artist page. Same bypass class as an album path in the query string.
+        return False
+    return _SPOTIFY_RELEASE_PATH_RE.match(path) is not None

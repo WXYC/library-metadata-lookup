@@ -17,12 +17,12 @@ module's scope (see the module docstring). ``TestHostCheckOnlyFieldsMatchPreLml1
 below pins that these two fields still behave as they did before LML#1295
 on every axis but the one LML#1352 added.
 
-LML#1352 adds exactly one check to ``spotify_url``: the path must be an
-*album* path, because the production artifact's album column holds artist,
-track, playlist, user and podcast pages that the host check alone admitted
-and ``item.py`` then labelled ``streaming_status.spotify = "verified"``.
-``TestSpotifyAlbumShapeGuard``'s table below is the accept/reject pin, one
-row per measured production shape.
+LML#1352 adds exactly one check to ``spotify_url``: the path must name a
+release — an album or a track page — because the production artifact's album
+column holds artist, playlist, user and podcast pages that the host check
+alone admitted and ``item.py`` then labelled ``streaming_status.spotify =
+"verified"``. ``TestSpotifyAlbumShapeGuard``'s table below is the
+accept/reject pin, one row per measured production shape.
 
 ``bandcamp_url`` gets a host check like the other four (a 2026-08-11 audit
 found zero of 2,800 curated ``bandcamp_url`` rows off ``bandcamp.com``) — the
@@ -54,7 +54,7 @@ _HOST_CHECKED_FIELDS = tuple(_GENUINE)
 _WELL_FORMEDNESS_FIELDS = ("youtube_music_url", "bandcamp_url", "soundcloud_url")
 
 # The two fields with no well-formedness floor. "Host-only" describes
-# apple_music_url exactly; spotify_url also carries LML#1352's album-path-kind
+# apple_music_url exactly; spotify_url also carries LML#1352's release-path-kind
 # check, which is a path question and leaves every shape below untouched.
 _HOST_ONLY_FIELDS = ("spotify_url", "apple_music_url")
 
@@ -153,7 +153,7 @@ class TestHostCheckOnlyFieldsMatchPreLml1295:
     malformed-but-correct-host shape below survives here exactly as it did
     before LML#1295. These pin the review finding that adding the floor here
     (as the bounced PR did) is a behavior change beyond this module — see the
-    module docstring. LML#1352's album-path-kind check on ``spotify_url`` is
+    module docstring. LML#1352's release-path-kind check on ``spotify_url`` is
     not that floor and does not touch these shapes; what it may and may not
     suppress is pinned in ``TestSpotifyAlbumShapeGuard``.
     """
@@ -216,8 +216,13 @@ _SPOTIFY_PATH_SHAPES = {
     # 6,143 rows — the April-2026 enrichment campaign that resolved ARTISTS
     # and wrote them into an album column. The Mob/Money shape.
     "artist": (f"https://open.spotify.com/artist/{_SPOTIFY_ID}", False),
-    # 989 rows.
-    "track": (f"https://open.spotify.com/track/{_SPOTIFY_ID}", False),
+    # 989 rows — KEPT. A track page names a recording on the release, and
+    # ``scripts/export_streaming_links.py`` deliberately supplements
+    # ``spotify_url`` from ``track_results`` (``resolution_status`` in
+    # ``local_match``/``api_match``) for singles and compilations, only when
+    # the album-level URL is absent. Suppressing these would leave those
+    # releases with no Spotify link at all.
+    "track": (f"https://open.spotify.com/track/{_SPOTIFY_ID}", True),
     # 13 rows.
     "playlist": (f"https://open.spotify.com/playlist/{_SPOTIFY_ID}", False),
     # 7 rows.
@@ -230,12 +235,20 @@ _SPOTIFY_PATH_SHAPES = {
     "album-empty-id": ("https://open.spotify.com/album/", False),
     # Query string but still no id.
     "album-query-only": ("https://open.spotify.com/album/?si=abc", False),
+    # Not a census shape: a dot segment makes an artist page read as an album
+    # path, and RFC 3986 removal pops the ``album`` segment before the browser
+    # requests it. Kept in this table because the seam is where it would be
+    # served and labelled ``verified``.
+    "artist-behind-dot-segment": (
+        f"https://open.spotify.com/album/../artist/{_SPOTIFY_ID}",
+        False,
+    ),
 }
 
 
 class TestSpotifyAlbumShapeGuard:
-    """LML#1352: ``spotify_url`` must be a Spotify *album* URL, not merely a
-    Spotify URL.
+    """LML#1352: ``spotify_url`` must name a release — an album or a track
+    page — not merely be a Spotify URL.
 
     The host check alone (LML#873) admits every path kind Spotify serves, and
     ``item.py``'s ``_slot_urls`` / ``_RESOLUTION_PROVING_URL_SERVICES`` then
@@ -248,7 +261,7 @@ class TestSpotifyAlbumShapeGuard:
         ("shape", "url", "kept"),
         [(shape, url, kept) for shape, (url, kept) in _SPOTIFY_PATH_SHAPES.items()],
     )
-    def test_only_album_paths_survive(self, shape, url, kept):
+    def test_only_release_paths_survive(self, shape, url, kept):
         links = dict(_GENUINE)
         links["spotify_url"] = url
 

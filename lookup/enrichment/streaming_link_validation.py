@@ -26,15 +26,17 @@ flips ``skip_happy_probe`` off in ``item.py``, spending an Apple Music quota
 slot + wall-clock on a live probe.
 
 **LML#1352 deliberately reverses that declination for ``spotify_url``, on one
-axis: the path kind.** The field must now be a Spotify *album* URL
-(``url_is_spotify_album``), not merely a URL on a Spotify host. A 2026-09-25
-pull of the artifact found 7,152 of its 46,907 populated ``spotify_url`` values
-pointing at an artist, track, playlist, user or podcast page, and 100% of the
-artist-shaped ones carry no match provenance at all (``spotify_matched_artist``
-holds a strategy name like ``backfill-wiki (spotify)``) — so the guard removes
-one April-2026 campaign that resolved *artists* into an album column and
-touches nothing properly matched. Per-shape counts are pinned as the
-accept/reject table in ``tests/unit/test_streaming_link_validation.py``.
+axis: the path kind.** The field must now name a release — an album or a track
+page (``url_is_spotify_album_or_track``; that function documents why the track
+kind counts) — not merely be a URL on a Spotify host. A 2026-09-25 pull of the
+artifact found ~6.2k of its 46,907 populated ``spotify_url`` values pointing at
+an artist, playlist, user or podcast page, or at an id-less ``/album``, and 100%
+of the artist-shaped ones carry no match provenance at all
+(``spotify_matched_artist`` holds a strategy name like ``backfill-wiki
+(spotify)``) — so the guard removes one April-2026 campaign that resolved
+*artists* into an album column and touches nothing properly matched. Per-shape
+counts are pinned as the accept/reject table in
+``tests/unit/test_streaming_link_validation.py``.
 
 Serving those was not a soft failure: ``item.py``'s ``_slot_urls`` /
 ``_RESOLUTION_PROVING_URL_SERVICES`` force ``streaming_status.spotify =
@@ -44,6 +46,9 @@ terminal. Which makes the consequence the LML#1295 review weighed as a cost
 the *point* for this field: a suppressed ``spotify_url`` falls through to the
 post-process's cache-UPSERT / mint leg, which resolves an album page for the
 REQUEST's (artist, album) and whose verdict a later leg can still supersede.
+That heals the response, not the installed base — a row Backend-Service has
+already stored as ``verified`` stays wrong until BS demotes it (routed on
+#1352), because its merge treats ``verified`` as terminal too.
 
 ``apple_music_url`` stays host-check-only, by measurement rather than
 oversight: all 288 of its populated artifact values are already album URLs, so
@@ -71,7 +76,7 @@ from release.apple_music_url_parser import url_has_apple_music_host
 from release.bandcamp_url_parser import url_has_bandcamp_host
 from release.host_matching import is_well_formed_web_url
 from release.soundcloud_url_parser import url_has_soundcloud_host
-from release.spotify_url_parser import url_has_spotify_host, url_is_spotify_album
+from release.spotify_url_parser import url_has_spotify_host, url_is_spotify_album_or_track
 from release.youtube_music_url_parser import url_has_youtube_music_host
 
 #: Per-field host check. Order matches ``lookup/enrichment/item.py``'s own
@@ -108,11 +113,11 @@ def _validate(field: str, url: str | None, host_check: Callable[[str], bool]) ->
         return url
     if not host_check(url):
         return None
-    # LML#1352: spotify_url alone also has to be an ALBUM path. Spelled as a
+    # LML#1352: spotify_url alone also has to name a RELEASE. Spelled as a
     # conditional rather than a per-field table — a second field wanting a
     # path-kind check would want a different question asked of it, and the
     # three well-formedness fields structurally cannot reach this line.
-    if field == "spotify_url" and not url_is_spotify_album(url):
+    if field == "spotify_url" and not url_is_spotify_album_or_track(url):
         return None
     return url
 
@@ -124,8 +129,8 @@ def validate_streaming_link_urls(links: dict[str, str | None]) -> dict[str, str 
     (a missing key reads the same as an explicit ``None``). Returns a dict
     with the same five keys, each either the original URL (unchanged) or
     ``None`` (see the module docstring for which checks apply per field —
-    a host check on all five, a well-formedness floor on three, and an
-    album-path-kind check on ``spotify_url``).
+    a host check on all five, a well-formedness floor on three, and a
+    release-path-kind check on ``spotify_url``).
     """
     return {
         field: _validate(field, links.get(field), host_check)
