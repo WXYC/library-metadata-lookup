@@ -84,6 +84,7 @@ import asyncpg
 from entity.sources import PgSource
 from entity.streaming_catalog import ALLOW_URL_REMOVAL_GUC, set_up_streaming_catalog_schema
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
+from scripts.streaming_availability.errors import StreamingServiceRoutingError
 
 # Legacy service token -> canonical `_SERVICES` slug (the value stored in
 # ``streaming_album_service.service``). The legacy surface says "apple"; the
@@ -238,7 +239,7 @@ def _resolve_pivot_service(service: str) -> str:
     canonical = _SERVICE_ALIASES.get(service, service)
     alias = _PIVOT_ALIAS.get(canonical)
     if alias is None:
-        raise ValueError(
+        raise StreamingServiceRoutingError(
             f"unknown streaming service {service!r}: expected one of "
             "spotify/apple/deezer/bandcamp or the 'discogs' pseudo-service"
         )
@@ -329,12 +330,12 @@ class StreamingCatalogDAO:
         """
         canonical = _SERVICE_ALIASES.get(service, service)
         if canonical == "bandcamp":
-            raise ValueError(
+            raise StreamingServiceRoutingError(
                 "bandcamp results go through update_bandcamp_url / "
                 "mark_bandcamp_not_found, not update_result"
             )
         if canonical not in _UPDATE_RESULT_SERVICES:
-            raise ValueError(
+            raise StreamingServiceRoutingError(
                 f"unknown streaming service {service!r}: update_result accepts spotify/apple/deezer"
             )
         await self._pg.execute(
