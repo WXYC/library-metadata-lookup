@@ -100,13 +100,17 @@ def _has_match_provenance(matched_artist: str | None, matched_title: str | None)
 
     A string floor is not available at this seam for a structural reason rather than
     an accuracy one: the export never reads ``display_artist``/``display_title``, so
-    there is nothing here to score the stored provenance AGAINST. (An earlier draft
-    justified this with three named shelf-credit shapes as 80/80 false-rejects. That
-    was wrong and is not repeated: scored with this repo's own ``score_match``, all
-    three come out 100/100 and an 80/80 floor would accept them. The artist axis
-    genuinely does carry little signal for V/A and curator credits -- that is
-    LML#1147 -- but these three do not demonstrate it.) "No record of what was
-    compared" is the only claim this seam can make.
+    there is nothing here to score the stored provenance AGAINST. That is the entire
+    argument. It is deliberately NOT "a floor would be too permissive here", which
+    would be a claim about scores this seam cannot compute.
+
+    (An earlier draft did argue it that way, citing three named shelf-credit shapes as
+    80/80 false-rejects. Those figures are real but they belong to the serve seam's
+    comparison -- the library credit against the artist a URL resolves to -- not to
+    this one, which only ever sees the artifact's own stored strings. The seam
+    distinction and the artist-axis asymmetry LML#1147 describes live on LML#1352,
+    deliberately not restated here.) "No record of what was compared" is the only
+    claim this seam can make.
     """
     return bool((matched_artist or "").strip()) or bool((matched_title or "").strip())
 

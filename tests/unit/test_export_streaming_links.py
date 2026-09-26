@@ -978,12 +978,12 @@ class TestSpotifyProvenanceGate:
         that: the gate must not touch a row that carries provenance, whatever its
         credit looks like.
 
-        It does NOT pin an 80/80 false-rejection. An earlier revision claimed it did;
-        scored with this repo's own `score_match` all three come out 100/100, so an
-        80/80 floor would accept them. See `_has_match_provenance`'s docstring for the
-        retraction and for the structural reason no string floor is available at this
-        seam (the export never reads `display_artist`/`display_title`, so there is
-        nothing here to score the stored provenance against).
+        It does NOT pin an 80/80 false-rejection, and an earlier revision wrongly said
+        it did. Nothing at this seam can: the export never reads `display_artist`/
+        `display_title`, so there is no pair here to score the stored provenance
+        against. The 80/80 figures that made these three famous come from the serve
+        seam's comparison instead, and LML#1352 carries that distinction. See
+        `_has_match_provenance`'s docstring.
         """
         library_db = _export(
             tmp_path,
