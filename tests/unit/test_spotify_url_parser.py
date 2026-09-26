@@ -174,6 +174,13 @@ class TestUrlIsSpotifyAlbumOrTrack:
             # shape the census never bucketed — the one axis on which this
             # guard can violate #1352's constraint.
             f"https://open.spotify.com/embed/album/{_VALID_ID}",
+            # A backslash that is not part of a dot segment survives. Rejecting
+            # every ``0x5C`` is what ``is_well_formed_web_url`` does, and this
+            # field deliberately does not take that floor -- so the dot-segment
+            # guard has to be targeted at dot segments, or it becomes the floor
+            # arriving by the back door. The folded path 404s, exactly as a
+            # ``/album/<malformed-id>`` value does today.
+            "https://open.spotify.com/album/ab\\cd",
         ],
     )
     def test_true_for_album_pages(self, url):
@@ -216,6 +223,14 @@ class TestUrlIsSpotifyAlbumOrTrack:
             # ("the path the pattern reads is the path that gets fetched") is
             # only true of the unencoded spelling.
             f"https://open.spotify.com/album/%2e%2e/artist/{_VALID_ID}",
+            # Backslash-spelled, which WHATWG folds to a path separator for the
+            # http(s) special schemes -- so the dot segment has to be looked
+            # for across BOTH separators. With the separator set ({/, \}) and
+            # the double-dot spellings (the percent-encodings of "..") both
+            # closed by the URL spec, this is the last spelling of the bypass,
+            # not the next one in a series. ``release/host_matching.py``
+            # documents the same differential for the authority position.
+            f"https://open.spotify.com/album/..\\artist/{_VALID_ID}",
             # Spotify's routes are case-sensitive, so an uppercased path kind
             # 404s. The measured locale rows are all lowercase, so neither leg
             # is matched case-insensitively — admitting a shape that cannot

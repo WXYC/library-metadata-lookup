@@ -63,6 +63,12 @@ _SPOTIFY_RELEASE_PATH_RE = re.compile(
     r"^/(?:intl-[a-z]{2}(?:-[a-z]{2,4})?/)?(?:embed/)?(?:album|track)/[^/]",
 )
 
+# Both path separators WHATWG folds together for the http(s) special schemes.
+# A dot segment has to be looked for across both — see
+# :func:`url_is_spotify_album_or_track` — and the set is closed by the URL spec,
+# there being no third separator.
+_PATH_SEPARATOR_RE = re.compile(r"[/\\]")
+
 
 def spotify_album_id_from_url(url: str) -> str | None:
     """``open.spotify.com/album/<id>`` → ``<id>`` (22-char base62), else ``None``.
@@ -142,15 +148,25 @@ def url_is_spotify_album_or_track(url: str | None) -> bool:
     if not url or not url_has_spotify_host(url):
         return False
     path = urlparse(url).path
-    if any(unquote(segment) == ".." for segment in path.split("/")):
+    if any(unquote(segment) == ".." for segment in _PATH_SEPARATOR_RE.split(path)):
         # Dot-segment removal pops the kind segment before a browser requests
         # the URL, so the path this pattern would read is not the path that
         # gets fetched: ``/album/../artist/<id>`` resolves to the working
         # artist page. Same bypass class as a release path in the query string.
-        # Each segment is percent-decoded first because WHATWG counts
-        # ``%2e%2e``, ``%2E%2E``, ``.%2e`` and ``%2e.`` as double-dot segments
-        # too, while ``urlparse`` leaves all four verbatim. One level of
-        # decoding is the right depth: ``%252e%252e`` decodes to the literal
-        # ``%2e%2e``, which no client treats as a dot segment.
+        #
+        # Two spellings have to be normalized away before the comparison, and
+        # both sets are closed by the URL spec, which is what makes this the
+        # whole class rather than the spellings seen so far. Separators: WHATWG
+        # folds ``\`` to ``/`` for the http(s) special schemes (the path-position
+        # twin of the authority differential ``release/host_matching.py``
+        # documents), and there is no third. Double dots: WHATWG counts
+        # ``%2e%2e``, ``%2E%2E``, ``.%2e`` and ``%2e.`` as double-dot segments,
+        # all of which ``urlparse`` leaves verbatim and one ``unquote`` folds.
+        # One level of decoding is the right depth — ``%252e%252e`` decodes to
+        # the literal ``%2e%2e``, which no client treats as a dot segment.
+        #
+        # Deliberately narrower than rejecting every ``0x5C``: that is
+        # ``is_well_formed_web_url``'s job, and this field does not take that
+        # floor, so a backslash outside a dot segment still passes.
         return False
     return _SPOTIFY_RELEASE_PATH_RE.match(path) is not None

@@ -155,7 +155,7 @@ MODULE_BUDGETS: dict[str, int] = {
     # a pure function of the links dict with no dependency on enrich_one's
     # control flow. 1.3x its ~63-line measured size -> 100.
     #
-    # LML#1352: 98 -> 138 measured, raised 100 -> 150 for the spotify_url
+    # LML#1352: 98 -> 144 measured, raised 100 -> 150 for the spotify_url
     # release-path-kind check. The 100 was derived from a ~63-line file and
     # LML#1295 had already grown it to 98, so this entry arrived at the
     # ticket with 2 lines of headroom -- ANY change to the module moves it,
@@ -169,6 +169,13 @@ MODULE_BUDGETS: dict[str, int] = {
     # so the rule for the next person is about the BODY: a fourth per-field
     # check belongs in its own module (the seam is `_FIELD_HOST_CHECKS` plus
     # `_validate`), not appended here.
+    #
+    # Be aware that leaves only ~6 lines, which is the same thin margin
+    # criticized two paragraphs up. That is deliberate and it is a bet on the
+    # extraction above, not an invitation to shave docstring lines to squeeze
+    # a change in: if a real behavior change needs room here, the formula's
+    # answer for a 144-line file is 200, and taking it deliberately is the
+    # honest move.
     "lookup/enrichment/streaming_link_validation.py": 150,
     # LML#1053: the per-service streaming-status merge, extracted out of
     # item.py to stay under its own ceiling above — a pure function with no
