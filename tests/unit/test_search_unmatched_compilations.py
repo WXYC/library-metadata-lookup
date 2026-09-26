@@ -9,6 +9,7 @@ artist, so the artist axis is informative and scored 30.77.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -26,6 +27,7 @@ from scripts.search_unmatched_compilations import (
     _DEEZER_URL,
     StreamingLane,
     resolve_lane,
+    run,
     search_discogs_by_title,
 )
 from scripts.streaming_availability.results_db import ResultsDB
@@ -46,6 +48,23 @@ class TestSearchDiscogsByTitle:
         assert match is not None
         assert match["release_id"] == 12345
         assert match["axes"] == AXES_TITLE_ONLY
+
+    @pytest.mark.asyncio
+    async def test_a_recovered_artist_name_still_matches_on_both_axes(self):
+        """``build_compilation_query`` does not always reduce to a V/A credit.
+
+        Its ``_ARTIST_PLUS_VA_RE`` arm ("X mixes various artists") and its final
+        "real artist misclassified as a compilation" fall-through both return a
+        real name. For those rows the V/A relaxation is False against every
+        candidate, so without a guarded pass this lane would refuse even an exact
+        artist+title match and lose the ``discogs_release_id`` it had on main.
+        """
+        pool = AsyncMock()
+        pool.fetch.return_value = [{"id": 3, "title": "Aluminum Tunes", "artist_name": "Stereolab"}]
+        match = await search_discogs_by_title(pool, "Aluminum Tunes", query_artist="Stereolab")
+        assert match is not None
+        assert match["release_id"] == 3
+        assert match["axes"] == AXES_ARTIST_AND_TITLE
 
     @pytest.mark.asyncio
     async def test_rejects_a_named_artist_release(self):
@@ -96,6 +115,24 @@ class TestSearchDiscogsByTitle:
         pool = AsyncMock()
         pool.fetch.return_value = []
         assert await search_discogs_by_title(pool, "Aluminum Tunes", query_artist="Various") is None
+
+
+class TestRunArtifactGuard:
+    @pytest.mark.asyncio
+    async def test_refuses_a_db_path_that_does_not_exist(self, tmp_path):
+        """A typo'd ``--db-path`` must not be answered with a fresh empty schema.
+
+        The drain opens the artifact through ``ResultsDB``, whose ``connect`` runs
+        ``CREATE TABLE IF NOT EXISTS`` — so without this guard a mistyped path
+        reports "Loaded 0 unmatched compilations" and looks like a finished run.
+        """
+        missing = tmp_path / "not-the-artifact.db"
+        args = SimpleNamespace(
+            db_path=str(missing), limit=1, dry_run=True, discogs_only=True, max_streaming=1
+        )
+        with pytest.raises(SystemExit, match="not-the-artifact.db"):
+            await run(args)
+        assert not missing.exists()
 
 
 def _deezer_row(artist: str, title: str, album_id: int = 1) -> dict:

@@ -542,11 +542,21 @@ Searches `is_compilation = 1` rows that no other pass has resolved, first agains
 | lane | shape |
 |---|---|
 | Deezer, Spotify (Phase 2) | guarded `find_best_match` first, then the V/A relaxation. Writes through `ResultsDB.update_result` |
-| Discogs cache (Phase 1) | **title axis only, by construction** — no guarded pass, because the query credit is a shelf credit and `score_match("Various", "Various Artists")` is 63.6, under the 80 artist floor, so a guarded pass there would admit nothing. Keeps its own historical 70 title floor |
+| Discogs cache (Phase 1) | picks its rule from the shelf credit, because `build_compilation_query` does not always reduce that credit to a V/A one. **V/A credit** → the title axis alone at this lane's historical 70 floor, and the artist axis is deliberately *not* scored: the query credit is the `Various` sentinel, so a release credited exactly "Various" would clear 100 on no information and could outrank a better title. **A recovered real name** (`_ARTIST_PLUS_VA_RE`, or the "misclassified as a compilation" fall-through) → the guarded 80/80 matcher, which the relaxation cannot serve because it needs a V/A credit on both sides |
 
-The Phase 1 narrowing is deliberate and costs recall: a compilation whose correct Discogs release is credited to a named entity (a single-composer soundtrack) no longer gets a `discogs_release_id`. It stays a Phase 1 miss and falls through to Phase 2, where the alternative — a release id whose tracklist belongs to a different record — would have been inherited by every downstream track resolution.
+The Phase 1 narrowing that remains is deliberate and costs recall: a compilation whose correct Discogs release is credited to a named entity the shelf credit does *not* name (a single-composer soundtrack under "Soundtracks - M") no longer gets a `discogs_release_id`. It stays a Phase 1 miss and falls through to Phase 2, where the alternative — a release id whose tracklist belongs to a different record — would have been inherited by every downstream track resolution.
 
-**`found_title_only`.** A title-only acceptance is written to `{service}_status` as `found_title_only`, never `found`, so `{service}_confidence` has exactly one meaning per row: the score of the axes the row names. It is also the predicate a serve-side gate can filter on — note that `scripts/export_streaming_links.py`'s album-level export is `spotify_url IS NOT NULL` today, with no status or provenance condition. **Any reader that tests `= 'found'` has to be taught this value**; `phase_album_rollup` in `scripts/track_streaming/__main__.py` is not, and promotes it. A title-only decision will not overwrite a row already at `found` (`ResultsDB.update_result(..., skip_if_resolved=True)`): a guarded match outranks a one-axis one, and the mirrored PG table raises on that demotion.
+**`found_title_only`.** A title-only acceptance is written to `{service}_status` as `found_title_only`, never `found`, so `{service}_confidence` has exactly one meaning per row: the score of the axes the row names. It is also the predicate a serve-side gate can filter on — note that `scripts/export_streaming_links.py`'s album-level export is `spotify_url IS NOT NULL` today, with no status or provenance condition. A title-only decision will not overwrite a row already at `found` (`ResultsDB.update_result(..., skip_if_resolved=True)`): a guarded match outranks a one-axis one, and the mirrored PG table raises on that demotion.
+
+**Readers of `{service}_status` that predate the new value**, tracked in [LML#1358](https://github.com/WXYC/library-metadata-lookup/issues/1358) and *not* taught it here — a `found_title_only` row is invisible to the first four and newly visible to the fifth:
+
+| site | effect |
+|---|---|
+| `scripts/track_streaming/__main__.py:157` local streaming index (`= 'found'` per service) | a compilation whose only streaming presence is title-only never has its tracks resolved |
+| `scripts/track_streaming/__main__.py:439` `phase_album_rollup` | promotes `found_title_only` → `found` on the first rollup after the drain, erasing the label |
+| `ResultsDB.get_deezer_hits_pending_spotify` and its PG twin `catalog_dao.py:395` | a title-only Deezer hit doesn't cascade into the Spotify pass |
+| `scripts/streaming_availability/report.py:92` | reporting drift |
+| `scripts/spotify_artist_catalog.py:98` (`!= 'found'`) | now *selects* these rows, and `:207` rewrites them to `found` with no provenance columns — the LML#1353 defect, on a row this drain just repaired |
 
 `discogs_status` deliberately has no such value: `albums` has no `discogs_confidence` column, so nothing there persists a score to disambiguate. `scripts/discogs_rematch.py` is the same shape at one remove — its passes score one axis each (pass 1 artist, pass 2 title) and report which in an `axes` field, but neither is a title-only acceptance and neither persists the number.
 
