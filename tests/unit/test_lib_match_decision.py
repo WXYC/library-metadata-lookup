@@ -1,4 +1,4 @@
-"""Tests for the shared drain match decision + provenance write (LML#1353).
+"""Tests for the shared drain match decision (LML#1353).
 
 The production defect these pin: ``scripts/search_unmatched_compilations.py``
 accepted a candidate the guarded 80/80 matcher had *rejected* on a title-only
@@ -6,13 +6,15 @@ score, stored that title score in the ``confidence`` column, and wrote neither
 ``matched_artist`` nor ``matched_title`` — so album 52656 ("Married to the Mob",
 a 1988 soundtrack) came to carry Speaker Knockerz's "Married to the Money" at
 "89.47% confidence" with empty provenance.
+
+The *write* half is pinned where its owner lives: ``tests/unit/test_results_db.py``
+for ``ResultsDB.update_result``'s conditional write, and
+``tests/unit/test_search_unmatched_compilations.py`` for the lane end to end.
 """
 
 from __future__ import annotations
 
-import aiosqlite
 import pytest
-import pytest_asyncio
 
 from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
 from scripts._lib.match_decision import (
@@ -20,12 +22,9 @@ from scripts._lib.match_decision import (
     AXES_TITLE_ONLY,
     STATUS_FOUND,
     STATUS_FOUND_TITLE_ONLY,
-    ServiceMatch,
     best_title_only_candidate,
     decide_service_match,
-    update_service_match,
 )
-from scripts.streaming_availability.results_db import _SCHEMA
 
 # Spotify-shaped rows, as ``search_unmatched_compilations`` extracts them.
 _SPOTIFY_ARTIST = lambda r: r.get("artists", [{}])[0].get("name", "")  # noqa: E731
@@ -160,6 +159,26 @@ class TestBestTitleOnlyCandidate:
         assert winner is not None
         assert winner[0]["id"] == "abc123"
 
+    def test_every_row_failing_extraction_re_raises(self):
+        """A systemic extractor break must not read as "nothing matched".
+
+        ``search_discogs_by_title`` calls this helper with no guarded pass in
+        front of it, so swallowing a wholly-failed response would report a
+        Discogs-cache column rename as a clean zero-match run and push the entire
+        compilation population at the rate-limited streaming APIs. Same rule, and
+        the same LML#376 reason, as ``find_best_match``'s own re-raise.
+        """
+        rows = [{"wrong": "shape"}, {"also": "wrong"}]
+        with pytest.raises(KeyError):
+            best_title_only_candidate(
+                rows,
+                query_artist="Various",
+                query_title="Nuggets",
+                artist_fn=lambda r: r["artist_name"],
+                title_fn=lambda r: r["title"],
+                key_fn=lambda r: str(r["id"]),
+            )
+
     def test_empty_results(self):
         assert (
             best_title_only_candidate(
@@ -242,142 +261,26 @@ class TestDecideServiceMatch:
             is None
         )
 
-
-@pytest_asyncio.fixture
-async def db():
-    conn = await aiosqlite.connect(":memory:")
-    conn.row_factory = aiosqlite.Row
-    await conn.executescript(_SCHEMA)
-    await conn.execute(
-        """INSERT INTO albums (id, normalized_artist, normalized_title, display_artist,
-               display_title, library_ids, formats, is_compilation, spotify_status,
-               deezer_status)
-           VALUES (52656, 'soundtracks m', 'married to the mob', 'Soundtracks - M',
-               'Married to the Mob', '[60671]', '[]', 1, 'skipped', 'skipped')"""
+    @pytest.mark.parametrize(
+        ("candidate_artist", "query_artist"),
+        [("Various Artists", "Various"), ("Jessica Pratt", "Jessica Pratt")],
+        ids=["title-only", "guarded"],
     )
-    await conn.commit()
-    yield conn
-    await conn.close()
+    def test_a_candidate_with_no_url_is_not_a_decision(self, candidate_artist, query_artist):
+        """Neither path may record a URL-less candidate, on either axis.
 
-
-async def _album(db: aiosqlite.Connection) -> dict:
-    cursor = await db.execute("SELECT * FROM albums WHERE id = 52656")
-    row = await cursor.fetchone()
-    assert row is not None
-    return dict(row)
-
-
-class TestUpdateServiceMatch:
-    """The write is the acceptance criterion: provenance lands with the URL."""
-
-    @pytest.mark.asyncio
-    async def test_title_only_write_carries_full_provenance(self, db):
-        decision = ServiceMatch(
-            url="https://open.spotify.com/album/nuggets",
-            confidence=92.0,
-            matched_artist="Various Artists",
-            matched_title="Nuggets",
-            axes=AXES_TITLE_ONLY,
-            service_item_id="nuggets",
+        ``_SPOTIFY_URL``/``_DEEZER_URL`` default to ``""`` on a missing key, and
+        ``''`` is not NULL: it clears ``export_streaming_links.py``'s
+        ``spotify_url IS NOT NULL`` export gate and then violates the PG mirror's
+        ``url <> ''`` CHECK when the artifact is seeded.
+        """
+        rows = [{"id": "abc123", "name": "Nuggets", "artists": [{"name": candidate_artist}]}]
+        assert (
+            decide_service_match(
+                rows,
+                query_artist=query_artist,
+                query_title="Nuggets",
+                **_spotify_kwargs(),
+            )
+            is None
         )
-        await update_service_match(db, album_id=52656, service="spotify", match=decision)
-        await db.commit()
-
-        row = await _album(db)
-        assert row["spotify_status"] == STATUS_FOUND_TITLE_ONLY
-        assert row["spotify_url"] == "https://open.spotify.com/album/nuggets"
-        assert row["spotify_id"] == "nuggets"
-        assert row["spotify_confidence"] == pytest.approx(92.0)
-        assert row["spotify_matched_artist"] == "Various Artists"
-        assert row["spotify_matched_title"] == "Nuggets"
-        assert row["spotify_checked_at"]
-
-    @pytest.mark.asyncio
-    async def test_a_title_only_row_is_never_found_with_empty_provenance(self, db):
-        """The exact defect: status='found' plus NULL matched_artist/matched_title."""
-        decision = ServiceMatch(
-            url="https://open.spotify.com/album/nuggets",
-            confidence=92.0,
-            matched_artist="Various Artists",
-            matched_title="Nuggets",
-            axes=AXES_TITLE_ONLY,
-        )
-        await update_service_match(db, album_id=52656, service="spotify", match=decision)
-        await db.commit()
-
-        row = await _album(db)
-        assert not (
-            row["spotify_status"] == STATUS_FOUND
-            and not (row["spotify_matched_artist"] and row["spotify_matched_title"])
-        )
-
-    @pytest.mark.asyncio
-    async def test_guarded_write_is_status_found(self, db):
-        decision = ServiceMatch(
-            url="https://open.spotify.com/album/doga",
-            confidence=100.0,
-            matched_artist="Juana Molina",
-            matched_title="DOGA",
-            axes=AXES_ARTIST_AND_TITLE,
-        )
-        await update_service_match(db, album_id=52656, service="spotify", match=decision)
-        await db.commit()
-
-        row = await _album(db)
-        assert row["spotify_status"] == STATUS_FOUND
-        assert row["spotify_matched_artist"] == "Juana Molina"
-
-    @pytest.mark.asyncio
-    async def test_deezer_lane_also_records_provenance(self, db):
-        decision = ServiceMatch(
-            url="https://www.deezer.com/album/1",
-            confidence=88.0,
-            matched_artist="Various Artists",
-            matched_title="Nuggets",
-            axes=AXES_TITLE_ONLY,
-        )
-        await update_service_match(db, album_id=52656, service="deezer", match=decision)
-        await db.commit()
-
-        row = await _album(db)
-        assert row["deezer_status"] == STATUS_FOUND_TITLE_ONLY
-        assert row["deezer_url"] == "https://www.deezer.com/album/1"
-        assert row["deezer_confidence"] == pytest.approx(88.0)
-        assert row["deezer_matched_artist"] == "Various Artists"
-        assert row["deezer_matched_title"] == "Nuggets"
-        assert row["deezer_checked_at"]
-
-    @pytest.mark.asyncio
-    async def test_title_only_never_demotes_an_existing_found_row(self, db):
-        """A guarded match outranks a one-axis one, and PG raises on the demotion."""
-        await db.execute(
-            """UPDATE albums SET spotify_status = 'found',
-               spotify_url = 'https://open.spotify.com/album/right',
-               spotify_matched_artist = 'Various Artists',
-               spotify_matched_title = 'Married to the Mob' WHERE id = 52656"""
-        )
-        decision = ServiceMatch(
-            url="https://open.spotify.com/album/wrong",
-            confidence=89.47,
-            matched_artist="Various",
-            matched_title="Married to the Mob (Soundtrack)",
-            axes=AXES_TITLE_ONLY,
-        )
-        await update_service_match(db, album_id=52656, service="spotify", match=decision)
-        await db.commit()
-
-        row = await _album(db)
-        assert row["spotify_status"] == STATUS_FOUND
-        assert row["spotify_url"] == "https://open.spotify.com/album/right"
-
-    @pytest.mark.asyncio
-    async def test_unknown_service_is_refused(self, db):
-        decision = ServiceMatch(
-            url="https://music.apple.com/album/1",
-            confidence=88.0,
-            matched_artist="Various Artists",
-            matched_title="Nuggets",
-            axes=AXES_TITLE_ONLY,
-        )
-        with pytest.raises(ValueError, match="apple"):
-            await update_service_match(db, album_id=52656, service="apple", match=decision)

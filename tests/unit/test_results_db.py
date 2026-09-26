@@ -186,6 +186,86 @@ class TestUpdateResult:
         stats = await db.get_stats()
         assert stats["apple"]["found"] == 1
 
+    @pytest.mark.asyncio
+    async def test_reports_the_rows_it_landed_on(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        landed = await db.update_result(rows[0]["id"], "spotify", "not_found")
+        assert landed == 1
+        assert await db.update_result(999999, "spotify", "not_found") == 0
+
+
+class TestUpdateResultSkipIfResolved:
+    """The conditional write that lets a caller decline to demote (LML#1353).
+
+    ``reset_misses_to_pending`` already holds the line that a ``found`` row cost a
+    rate-limited round trip and is never re-collected; this is the same line on
+    the write path, and it is what the PG mirror's found-demotion trigger
+    (``entity/streaming_catalog.py``) enforces on the other side of the upload.
+    """
+
+    async def _found_album(self, db) -> int:
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.update_result(
+            album_id,
+            "spotify",
+            "found",
+            url="https://open.spotify.com/album/right",
+            confidence=100.0,
+            matched_artist="Stereolab",
+            matched_title="Aluminum Tunes",
+        )
+        return album_id
+
+    @pytest.mark.asyncio
+    async def test_declines_to_overwrite_a_found_row(self, db):
+        album_id = await self._found_album(db)
+        landed = await db.update_result(
+            album_id,
+            "spotify",
+            "found_title_only",
+            url="https://open.spotify.com/album/wrong",
+            confidence=89.47,
+            matched_artist="Various",
+            matched_title="Aluminum Tunez",
+            skip_if_resolved=True,
+        )
+        assert landed == 0
+        rows = await db.get_all_results()
+        assert rows[0]["spotify_status"] == "found"
+        assert rows[0]["spotify_url"] == "https://open.spotify.com/album/right"
+
+    @pytest.mark.asyncio
+    async def test_writes_an_unresolved_row(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        landed = await db.update_result(
+            rows[0]["id"],
+            "deezer",
+            "found_title_only",
+            url="https://www.deezer.com/album/1",
+            confidence=88.0,
+            matched_artist="Various Artists",
+            matched_title="Aluminum Tunes",
+            skip_if_resolved=True,
+        )
+        assert landed == 1
+        rows = await db.get_all_results()
+        assert rows[0]["deezer_status"] == "found_title_only"
+        assert rows[0]["deezer_matched_artist"] == "Various Artists"
+        assert rows[0]["deezer_checked_at"]
+
+    @pytest.mark.asyncio
+    async def test_default_still_overwrites(self, db):
+        """Every existing caller keeps the unconditional write it was written for."""
+        album_id = await self._found_album(db)
+        landed = await db.update_result(album_id, "spotify", "not_found")
+        assert landed == 1
+        rows = await db.get_all_results()
+        assert rows[0]["spotify_status"] == "not_found"
+
 
 class TestGetStats:
     @pytest.mark.asyncio

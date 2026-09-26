@@ -37,11 +37,15 @@ This module replaces that shape with three properties:
    anyway), and it is a value a reader can filter on — including
    ``scripts/export_streaming_links.py``, whose album-level export gate is
    ``spotify_url IS NOT NULL`` with no status or provenance predicate today.
-   Provenance is written in the *same* UPDATE as the URL, because the artifact
-   already contains rows whose provenance is stale relative to their URL (album
-   29493 stores matched_title "S.F. Sorrow" at confidence 100 beside a URL that
-   resolves to "Silk Torpedo") — the fingerprint of a later pass overwriting one
-   without the other.
+
+A decision is *recorded* through ``ResultsDB.update_result``, which owns the
+``albums`` schema and already writes the whole column family — status, url, id,
+confidence, both provenance columns and ``checked_at`` — in one statement. A
+drain with its own SQL for that write would be a second writer of an invariant
+that module documents (``reset_misses_to_pending``: "every column the answer was
+written into is cleared alongside the status") and would be invisible to the
+LML#842 port of those call sites onto the PG DAO. A weaker-than-guarded decision
+passes ``skip_if_resolved=True`` there.
 
 Deliberately NOT in scope: a guarded ``find_best_match`` accept is recorded as
 ``found`` even when its artist score was itself a V/A-prefix clear in the
@@ -52,11 +56,9 @@ a different population than this fix.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
-
-import aiosqlite
 
 from clients.streaming.matching import (
     _EXTRACTION_ERRORS,
@@ -66,6 +68,8 @@ from clients.streaming.matching import (
     score_match,
     va_artist_axis_is_uninformative,
 )
+
+logger = logging.getLogger(__name__)
 
 # Which axes a recorded score was computed over. Stored via ``status`` rather
 # than as a column of its own (see the module docstring).
@@ -78,12 +82,6 @@ STATUS_FOUND = "found"
 # "the 80/80 matcher approved this" from "the artist axis was uninformative and
 # only the title was compared" without re-fetching the service page.
 STATUS_FOUND_TITLE_ONLY = "found_title_only"
-
-# Per-service column prefixes in ``albums``. The prefix IS the service name for
-# every supported service, so the SQL is built from this whitelist (never from
-# caller input) plus the one service that also carries an item id.
-_SERVICE_PREFIXES = {"spotify", "deezer"}
-_SERVICES_WITH_ITEM_ID = {"spotify"}
 
 
 @dataclass(frozen=True)
@@ -136,21 +134,33 @@ def best_title_only_candidate[T](
         ``(candidate, title_score)`` for the winner, or None when nothing
         qualifies.
 
-    A row whose extractor raises an extraction-shaped error is skipped rather
-    than aborting the scan, mirroring ``find_best_match``'s LML#640 guard — these
-    callers run this function over the *same* rows ``find_best_match`` just
-    scanned, so re-raising here would throw away a whole response that the
-    guarded pass had already survived.
+    Raises:
+        KeyError | IndexError | TypeError | AttributeError: when a non-empty
+        ``results`` is passed and *every* row fails extraction. Mirrors
+        ``find_best_match`` exactly, per row and in the all-rows case: a sparse
+        minority is skipped and logged, but a wholly-failed response is a
+        systemic break (a Discogs-cache column rename, an upstream shape change)
+        and must not read as "nothing matched". ``search_discogs_by_title`` calls
+        this with no guarded pass in front of it, so swallowing that would report
+        a broken Phase 1 as a clean zero-match run and push the whole compilation
+        population at the rate-limited streaming APIs (LML#376).
     """
     normalized_query_artist = normalize_for_comparison(query_artist or "")
     best: tuple[T, float] | None = None
     best_key = ""
+    total = 0
+    extraction_failures = 0
+    last_error: Exception | None = None
     for item in results:
+        total += 1
         try:
             candidate_artist = artist_fn(item)
             candidate_title = title_fn(item)
             candidate_key = key_fn(item)
-        except _EXTRACTION_ERRORS:
+        except _EXTRACTION_ERRORS as exc:
+            extraction_failures += 1
+            last_error = exc
+            logger.warning("Skipping malformed row in best_title_only_candidate: %s", exc)
             continue
         if not va_artist_axis_is_uninformative(
             normalized_query_artist, normalize_for_comparison(candidate_artist or "")
@@ -166,6 +176,8 @@ def best_title_only_candidate[T](
         ):
             best = (item, title_score)
             best_key = candidate_key
+    if last_error is not None and extraction_failures == total:
+        raise last_error
     return best
 
 
@@ -196,7 +208,7 @@ def decide_service_match(
         id_fn=id_fn,
     )
     if guarded is not None:
-        return ServiceMatch(
+        match = ServiceMatch(
             url=guarded["url"],
             confidence=guarded["confidence"],
             matched_artist=guarded["matched_artist"],
@@ -204,76 +216,29 @@ def decide_service_match(
             axes=AXES_ARTIST_AND_TITLE,
             service_item_id=guarded.get("id"),
         )
-
-    relaxed = best_title_only_candidate(
-        results,
-        query_artist=query_artist,
-        query_title=query_title,
-        artist_fn=artist_fn,
-        title_fn=title_fn,
-        key_fn=url_fn,
-        floor=title_only_floor,
-    )
-    if relaxed is None:
-        return None
-    candidate, title_score = relaxed
-    return ServiceMatch(
-        url=url_fn(candidate),
-        confidence=title_score,
-        matched_artist=artist_fn(candidate),
-        matched_title=title_fn(candidate),
-        axes=AXES_TITLE_ONLY,
-        service_item_id=id_fn(candidate) if id_fn is not None else None,
-    )
-
-
-async def update_service_match(
-    db: aiosqlite.Connection,
-    *,
-    album_id: int,
-    service: str,
-    match: ServiceMatch,
-    now: str | None = None,
-) -> None:
-    """Persist one service decision: URL, confidence and provenance in one UPDATE.
-
-    The provenance columns are written in the same statement as the URL so a row
-    can never record a URL from one pass beside a ``matched_title`` from another.
-    Caller commits.
-
-    A title-only decision additionally refuses to overwrite a row already at
-    ``found``: a guarded 80/80 match outranks a one-axis one, and the mirrored PG
-    table raises on exactly that demotion (``entity/streaming_catalog.py``'s
-    found-status trigger), so a drain that wrote it here would only fail later at
-    upload time.
-
-    Raises:
-        ValueError: for a service this table has no column family for.
-    """
-    if service not in _SERVICE_PREFIXES:
-        raise ValueError(f"unsupported service {service!r} for the albums table")
-    checked_at = now or datetime.now(UTC).isoformat()
-    id_assignment = f"{service}_id = ?, " if service in _SERVICES_WITH_ITEM_ID else ""
-    id_params: tuple[str | None, ...] = (
-        (match.service_item_id,) if service in _SERVICES_WITH_ITEM_ID else ()
-    )
-    no_demotion = (
-        "" if match.status == STATUS_FOUND else f" AND {service}_status != '{STATUS_FOUND}'"
-    )
-    await db.execute(
-        f"""UPDATE albums SET
-            {service}_status = ?, {service}_url = ?, {id_assignment}
-            {service}_confidence = ?, {service}_matched_artist = ?,
-            {service}_matched_title = ?, {service}_checked_at = ?
-            WHERE id = ?{no_demotion}""",
-        (
-            match.status,
-            match.url,
-            *id_params,
-            match.confidence,
-            match.matched_artist,
-            match.matched_title,
-            checked_at,
-            album_id,
-        ),
-    )
+    else:
+        relaxed = best_title_only_candidate(
+            results,
+            query_artist=query_artist,
+            query_title=query_title,
+            artist_fn=artist_fn,
+            title_fn=title_fn,
+            key_fn=url_fn,
+            floor=title_only_floor,
+        )
+        if relaxed is None:
+            return None
+        candidate, title_score = relaxed
+        match = ServiceMatch(
+            url=url_fn(candidate),
+            confidence=title_score,
+            matched_artist=artist_fn(candidate),
+            matched_title=title_fn(candidate),
+            axes=AXES_TITLE_ONLY,
+            service_item_id=id_fn(candidate) if id_fn is not None else None,
+        )
+    # Every URL extractor in play defaults to ``""`` on a missing key, and ``''``
+    # is not NULL: it clears ``export_streaming_links.py``'s ``spotify_url IS NOT
+    # NULL`` export gate and then violates the PG mirror's ``url <> ''`` CHECK
+    # when the artifact is seeded. A candidate with no link is not a decision.
+    return match if match.url else None
