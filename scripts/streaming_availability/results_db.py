@@ -11,6 +11,18 @@ import aiosqlite
 from clients.streaming.matching import normalize_album_title, normalize_artist_name
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
 
+#: SQL ``LIKE`` pattern for the statuses that mean "an answer was collected for
+#: this service" -- ``found`` and LML#1353's ``found_title_only``. A prefix rather
+#: than an enumeration, because the two failure directions are not symmetric:
+#: over-matching skips a write, which a later pass heals, while an enumeration
+#: someone forgets to extend overwrites a collected answer, which nothing heals.
+#: Exported so the one other place that has to leave a collected answer alone --
+#: ``phase_album_rollup`` in ``scripts/track_streaming/__main__.py`` -- shares the
+#: spelling instead of repeating it. ``tests/unit/test_results_db.py`` pins the
+#: whole status vocabulary against it, since the prefix would silently protect a
+#: status merely *named* ``found_something``.
+COLLECTED_STATUS_LIKE = "found%"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS albums (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -308,7 +320,11 @@ class ResultsDB:
             now = datetime.now(UTC).isoformat()
             rowcount = 0
             if service == "spotify":
-                guard = " AND spotify_status NOT LIKE 'found%'" if skip_if_resolved else ""
+                guard = (
+                    f" AND spotify_status NOT LIKE '{COLLECTED_STATUS_LIKE}'"
+                    if skip_if_resolved
+                    else ""
+                )
                 cursor = await self._db.execute(
                     f"""UPDATE albums SET
                        spotify_status = ?, spotify_url = ?, spotify_id = ?,
@@ -328,7 +344,11 @@ class ResultsDB:
                 )
                 rowcount = cursor.rowcount
             elif service == "apple":
-                guard = " AND apple_status NOT LIKE 'found%'" if skip_if_resolved else ""
+                guard = (
+                    f" AND apple_status NOT LIKE '{COLLECTED_STATUS_LIKE}'"
+                    if skip_if_resolved
+                    else ""
+                )
                 cursor = await self._db.execute(
                     f"""UPDATE albums SET
                        apple_status = ?, apple_url = ?,
@@ -339,7 +359,11 @@ class ResultsDB:
                 )
                 rowcount = cursor.rowcount
             elif service == "deezer":
-                guard = " AND deezer_status NOT LIKE 'found%'" if skip_if_resolved else ""
+                guard = (
+                    f" AND deezer_status NOT LIKE '{COLLECTED_STATUS_LIKE}'"
+                    if skip_if_resolved
+                    else ""
+                )
                 cursor = await self._db.execute(
                     f"""UPDATE albums SET
                        deezer_status = ?, deezer_url = ?,
