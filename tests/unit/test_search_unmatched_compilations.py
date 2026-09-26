@@ -9,12 +9,14 @@ artist, so the artist axis is informative and scored 30.77.
 
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 
+from clients.streaming.matching import _EXTRACTION_ERRORS
 from scripts._lib.match_decision import (
     AXES_ARTIST_AND_TITLE,
     AXES_TITLE_ONLY,
@@ -30,7 +32,7 @@ from scripts.search_unmatched_compilations import (
     run,
     search_discogs_by_title,
 )
-from scripts.streaming_availability.results_db import ResultsDB
+from scripts.streaming_availability.results_db import _SCHEMA, ResultsDB
 
 
 class TestSearchDiscogsByTitle:
@@ -115,6 +117,105 @@ class TestSearchDiscogsByTitle:
         pool = AsyncMock()
         pool.fetch.return_value = []
         assert await search_discogs_by_title(pool, "Aluminum Tunes", query_artist="Various") is None
+
+
+def _seeded_artifact(path) -> None:
+    """An artifact at the pre-migration schema version, as an older file would be.
+
+    ``_SCHEMA``'s ``CREATE TABLE`` is the base shape; the columns ``_migrate``
+    adds by ``ALTER`` (``bandcamp_*``, ``youtube_music_*``) are absent, which is
+    what distinguishes "migrated" from not.
+    """
+    conn = sqlite3.connect(path)
+    conn.executescript(_SCHEMA)
+    conn.execute(
+        """INSERT INTO albums (id, normalized_artist, normalized_title, display_artist,
+               display_title, library_ids, formats, is_compilation, spotify_status)
+           VALUES (52656, 'soundtracks m', 'married to the mob', 'Soundtracks - M',
+               'Married to the Mob', '[60671]', '[]', 1, 'skipped')"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def _columns(path) -> set[str]:
+    conn = sqlite3.connect(path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(albums)")}
+    conn.close()
+    return cols
+
+
+class TestDryRunIsReadOnly:
+    @pytest.mark.asyncio
+    async def test_a_dry_run_does_not_alter_the_artifact(self, tmp_path, monkeypatch):
+        """``--dry-run`` must not write to a precious, single-copy, bucket-backed file.
+
+        Opening through ``ResultsDB`` got the drain its provenance migration, but
+        ``connect`` runs ``executescript`` + ``_migrate`` + ``commit``
+        unconditionally — so a preview over a copy pulled from the bucket silently
+        added columns and indexes and rewrote the file.
+        """
+        artifact = tmp_path / "streaming_availability.db"
+        _seeded_artifact(artifact)
+        monkeypatch.delenv("DATABASE_URL_DISCOGS", raising=False)
+        before = _columns(artifact)
+        assert "bandcamp_slug" not in before, "fixture must start un-migrated"
+
+        args = SimpleNamespace(
+            db_path=str(artifact), limit=10, dry_run=True, discogs_only=True, max_streaming=1
+        )
+        await run(args)
+
+        assert _columns(artifact) == before
+
+    @pytest.mark.asyncio
+    async def test_a_real_run_still_migrates(self, tmp_path, monkeypatch):
+        """The other half: a real run still gets the columns it is about to write."""
+        artifact = tmp_path / "streaming_availability.db"
+        _seeded_artifact(artifact)
+        monkeypatch.delenv("DATABASE_URL_DISCOGS", raising=False)
+
+        args = SimpleNamespace(
+            db_path=str(artifact), limit=10, dry_run=False, discogs_only=True, max_streaming=1
+        )
+        await run(args)
+
+        assert "bandcamp_slug" in _columns(artifact)
+
+
+class TestPhaseTwoFailuresAreLoud:
+    @pytest.mark.asyncio
+    async def test_a_systemic_extractor_break_aborts_rather_than_logging(
+        self, tmp_path, monkeypatch
+    ):
+        """The per-album ``except Exception`` must not muffle the LML#376 signal.
+
+        ``decide_service_match`` computes the "every row failed extraction" verdict
+        over the unfiltered response precisely so a response-shape change cannot
+        read as a clean no-match. Caught per album, that raise became one warning
+        per row and a run reporting "0 streaming matches" — the outcome the verdict
+        exists to prevent.
+        """
+        artifact = tmp_path / "streaming_availability.db"
+        _seeded_artifact(artifact)
+        monkeypatch.delenv("DATABASE_URL_DISCOGS", raising=False)
+        monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
+        monkeypatch.delenv("SPOTIFY_CLIENT_SECRET", raising=False)
+
+        class BrokenDeezer:
+            async def search_album(self, artist, title):
+                # Every row malformed: `artist` is None, so `artist_fn` raises.
+                return [{"title": "x", "artist": None, "link": "https://deezer/1"}]
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr("clients.streaming.deezer.DeezerClient", BrokenDeezer)
+        args = SimpleNamespace(
+            db_path=str(artifact), limit=10, dry_run=False, discogs_only=False, max_streaming=10
+        )
+        with pytest.raises(_EXTRACTION_ERRORS):
+            await run(args)
 
 
 class TestRunArtifactGuard:

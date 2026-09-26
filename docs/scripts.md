@@ -546,7 +546,23 @@ Searches `is_compilation = 1` rows that no other pass has resolved, first agains
 
 Floors differ by lane only: Phase 2 uses the shared 80, the Discogs lane keeps its historical 70. The decision logic and the full argument live in `scripts/_lib/match_decision.py`'s module docstring.
 
-The narrowing this costs is deliberate: a compilation whose correct Discogs release is credited to a named entity the shelf credit does *not* name (a single-composer soundtrack under "Soundtracks - M") no longer gets a `discogs_release_id`. It stays a Phase 1 miss and falls through to Phase 2, where the alternative — a release id whose tracklist belongs to a different record — would have been inherited by every downstream track resolution.
+**What this refuses, stated in full** — the narrowing is larger than "a few soundtracks", and it is the whole behavioural change, so it is worth knowing before a run:
+
+The relaxation needs a V/A credit on **both** sides. `build_compilation_query` returns a *real name* for two of its arms — `_ARTIST_PLUS_VA_RE` ("Tim Sweeney mixes various artists" → `Tim Sweeney`) and the "misclassified real artist" fall-through (`Rhino Records` → `Rhino Records`) — and for those rows the guarded pass rejects on the artist axis while the relaxation refuses because the *query* side is not V/A. So nothing is recorded:
+
+| shelf credit | query credit | outcome |
+|---|---|---|
+| `Various Artists - Rock - N` | `None` → `Various` | recorded, `found_title_only` |
+| `Soundtracks - M` | `Soundtrack` | recorded, `found_title_only` |
+| `Tim Sweeney mixes various artists` | `Tim Sweeney` | **nothing recorded** |
+| `Rhino Records` | `Rhino Records` | **nothing recorded** |
+| `Stereolab` | `Stereolab` | **nothing recorded** |
+
+Before this change all five wrote a link, from the blanket title-only override this fix removes. The last row is the case the refusal is *for*: a genuinely misclassified album must not be bound to a same-titled V/A compilation. The middle two are the uncomfortable ones — a curated or label compilation whose catalogue counterpart is legitimately credited "Various Artists", where the artist axis is not saying "wrong record", it is saying "shelf credit and catalogue credit describe different things", which is the same argument used to justify relaxing in the first place.
+
+Admitting them would need a third case (named query credit vs V/A candidate → title axis), and that is **not** safe as stated, because it cannot be distinguished from the misclassified-album row above without `build_compilation_query` reporting *which* arm fired. That plus the size of the affected population — unmeasured; measuring it means querying the artifact — is tracked separately and is not decided here. Rows stay misses, so the loss is recoverable either way.
+
+On the Discogs lane the equivalent refusal is a compilation whose correct release is credited to a named entity the shelf credit does not name: it gets no `discogs_release_id`, stays a Phase 1 miss, and falls through to Phase 2. The alternative is a release id whose tracklist belongs to a different record, inherited by every downstream track resolution.
 
 **`found_title_only`.** A title-only acceptance is written to `{service}_status` as `found_title_only`, never `found`, so `{service}_confidence` has exactly one meaning per row: the score of the axes the row names. A title-only decision will not overwrite a row already holding a collected answer (`ResultsDB.update_result(..., skip_if_resolved=True)`, spelled `NOT LIKE 'found%'`): a guarded match outranks a one-axis one, and the mirrored PG table raises on that demotion.
 

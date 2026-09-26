@@ -202,11 +202,17 @@ async def resolve_lane(
 ) -> ServiceMatch | None:
     """Search one lane for an album and record the decision with its provenance.
 
-    Returns the decision only when it was *recorded* (or would have been, under
-    ``--dry-run``), so the caller's hit count and log line describe what actually
-    landed. None means nothing was written and the row stays available to a later
-    pass: either no axis admitted a candidate, or the decision was weaker than a
-    guarded match the row already holds.
+    Returns the decision only when it was *recorded*, so the caller's hit count
+    and log line describe what actually landed. None means nothing was written and
+    the row stays available to a later pass: either no axis admitted a candidate,
+    or the decision was weaker than the answer the row already holds.
+
+    Under ``--dry-run`` nothing is written and the decision is returned unchecked,
+    so a dry run's hit count is an **upper bound**: it cannot know which rows the
+    ``skip_if_resolved`` guard would have declined, and that is reachable on the
+    Deezer lane because Phase 2 selects on ``spotify_status`` alone. Reading the
+    current status to simulate it would cost a query per row, for a number that is
+    only ever a preview.
     """
     results = await lane.search(
         search_artist or lane.search_credit, strip_format_suffix(search_title)
@@ -262,7 +268,7 @@ async def run(args) -> None:
     # rows with stale spotify provenance), so this is a gap in ``_migrate``'s list
     # rather than a live failure. Tracked in LML#1358.
     results_db = ResultsDB(args.db_path)
-    await results_db.connect()
+    await results_db.connect(bootstrap=not args.dry_run)
     db = results_db._db
     assert db is not None
 
@@ -399,6 +405,7 @@ async def run(args) -> None:
 
     streaming_found = 0
     streaming_miss = 0
+    lane_error: Exception | None = None
 
     try:
         for i, row in enumerate(discogs_misses, 1):
@@ -420,13 +427,19 @@ async def run(args) -> None:
                         search_title=search_title,
                         dry_run=args.dry_run,
                     )
-                except Exception:
+                except ValueError:
+                    # An unsupported service token is a programming error in the
+                    # lane table, not a per-album condition. ``update_result``
+                    # raises it precisely so it cannot become a silent no-op.
+                    raise
+                except Exception as exc:
                     # exc_info because the write surface is wide now: a schema
                     # problem and a service outage both land here, and a bare
                     # message reads as the latter.
                     logger.warning(
                         "%s error for %s", lane.service, row["display_title"], exc_info=True
                     )
+                    lane_error = exc
                     continue
                 if decision is not None:
                     found = True
@@ -463,6 +476,15 @@ async def run(args) -> None:
             await spotify.close()
         if not args.dry_run:
             await db.commit()
+
+    # Per-album tolerance above, but a phase that recorded *nothing* while every
+    # album errored is an errored source, not a clean zero-match run (LML#376).
+    # ``decide_service_match`` raises only when every row of a response failed
+    # extraction, so reporting that as "0 streaming matches" is the one outcome the
+    # verdict was added to prevent. Raised after the clients are closed, and before
+    # the summary, so the run cannot look complete.
+    if lane_error is not None and not streaming_found:
+        raise lane_error
 
     logger.info(
         "Phase 2 complete: %d streaming matches, %d misses",
