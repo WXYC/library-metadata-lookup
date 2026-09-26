@@ -2426,12 +2426,28 @@ class DiscogsCacheService:
 
         The ``DELETE`` before each insert is load-bearing and must stay:
         ``DO NOTHING`` keeps the *existing* row, so relying on it in place of
-        the delete would silently stop applying upstream corrections. The one
-        thing the clause does discard is a second row whose key matches but
-        whose other columns differ — two aliases sharing a name under
-        different ids, say. Measured on production 2026-09-25: zero such
-        groups exist, which is also what makes ``(artist_id, alias_name)`` a
-        sound key for #433.
+        the delete would silently stop applying upstream corrections.
+        ``test_rehydration_applies_upstream_corrections`` pins that by
+        re-writing with mutated children; an earlier version of it wrote
+        identical children twice and pinned nothing, since every row then
+        conflicts and the counts stay put either way.
+
+        Two things the clause discards, both accepted:
+
+        1. A second row whose key matches but whose other columns differ —
+           two aliases sharing a name under different ids, say. Measured on
+           production 2026-09-25: zero such groups exist, which is also what
+           makes ``(artist_id, alias_name)`` a sound key for #433.
+        2. Under concurrent re-hydration of the *same* artist across workers,
+           the later transaction's children. If B's ``DELETE`` commits before
+           A's ``INSERT``, A lands first and every one of B's child rows then
+           conflicts and is skipped, so B's children are dropped wholesale
+           rather than replacing A's. Both transactions fetched the same
+           Discogs payload moments apart, so the rows are near-certainly
+           identical; and the pre-clause alternative was the rolled-back
+           write this whole clause exists to prevent. A Python-side dedupe
+           before ``executemany`` would fix case 1 without swallowing case 2,
+           if that ever matters.
 
         Args:
             details: Artist details to cache
