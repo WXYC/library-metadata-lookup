@@ -17,9 +17,9 @@ release-resolve endpoint's identifier merge and is out of scope here.
 deliberately a different one: "is this an album *page*", asked at the serve
 seam (``lookup/enrichment/streaming_link_validation.py``), where nothing is
 keyed on an extracted ID and the only failure mode worth guarding is a
-non-album path kind. It shares the host + locale + ``album/`` grammar with the
-extractor and stops there — no 22-char base62 floor. See
-``TestUrlIsSpotifyAlbum`` for why the two must not be collapsed.
+non-album path kind. It takes its host leg from ``url_has_spotify_host`` and
+matches only the path, with no 22-char base62 floor and no host literal of its
+own. See ``TestUrlIsSpotifyAlbum`` for why the two must not be collapsed.
 """
 
 from __future__ import annotations
@@ -50,12 +50,6 @@ class TestSpotifyAlbumIdFromUrl:
             (f"https://open.spotify.com/album/{_VALID_ID}#anchor", _VALID_ID),
             # http (not https) still resolves — the host anchor is what matters.
             (f"http://open.spotify.com/album/{_VALID_ID}", _VALID_ID),
-            # LML#1352 widened the grammar with the web player's locale prefix.
-            # It is a presentation segment: the album ID after it is the same
-            # ID the bare URL carries, so extracting it can only turn a skipped
-            # mint into a correct one, never into a wrong one.
-            (f"https://open.spotify.com/intl-de/album/{_VALID_ID}", _VALID_ID),
-            (f"https://open.spotify.com/intl-pt-br/album/{_VALID_ID}", _VALID_ID),
         ],
     )
     def test_extracts_id_from_album_url(self, url, expected):
@@ -72,6 +66,13 @@ class TestSpotifyAlbumIdFromUrl:
             f"https://example.com/album/{_VALID_ID}",
             # Spoofed host that merely contains the literal substring.
             f"https://open.spotify.com.evil.test/album/{_VALID_ID}",
+            # The web player's locale prefix is NOT in this extractor's
+            # grammar: its only caller mints from a live-resolved
+            # ``external_urls.spotify``, which never carries one, so widening
+            # here would buy an unreachable shape. The locale prefix IS in
+            # ``url_is_spotify_album``'s grammar, which reads the curated
+            # artifact where hand-pasted web-player URLs do carry it.
+            f"https://open.spotify.com/intl-de/album/{_VALID_ID}",
             "",
             "not a url",
         ],
@@ -133,8 +134,8 @@ class TestUrlIsSpotifyAlbum:
     browser — so importing that floor here would null a ``/album/<odd-id>``
     value for a reason that has no consequence at this seam, against the
     ticket's explicit constraint that the guard must not silently drop links
-    it has no evidence against. Path kind is the axis with evidence behind it
-    (6,143 artist pages, 989 tracks); ID charset is not.
+    it has no evidence against. Path kind is the axis the artifact census has
+    evidence on; ID charset is not, and neither is the host subdomain.
     """
 
     @pytest.mark.parametrize(
@@ -148,6 +149,15 @@ class TestUrlIsSpotifyAlbum:
             f"http://open.spotify.com/album/{_VALID_ID}",
             # No 22-char floor here — see the class docstring.
             "https://open.spotify.com/album/oyola-id",
+            # The host leg is :func:`url_has_spotify_host`'s, not a second
+            # literal: every album URL that check admits has to survive, or
+            # this guard drops a working link on an axis the artifact census
+            # never bucketed. The legacy web-player host still redirects, the
+            # bare registrable domain resolves, and a hand-pasted URL can
+            # carry an uppercased host.
+            f"https://play.spotify.com/album/{_VALID_ID}",
+            f"https://spotify.com/album/{_VALID_ID}",
+            f"https://OPEN.SPOTIFY.COM/album/{_VALID_ID}",
         ],
     )
     def test_true_for_album_pages(self, url):
@@ -170,6 +180,14 @@ class TestUrlIsSpotifyAlbum:
             f"https://open.spotify.com.evil.test/album/{_VALID_ID}",
             # An album segment that is not the first path segment.
             f"https://open.spotify.com/user/x/album/{_VALID_ID}",
+            # An album path that only appears in the query string. The first
+            # of these passes the host check too, so without an anchor on the
+            # parsed PATH it would survive both legs of the seam and be
+            # labelled ``verified`` — the exact failure this guard exists to
+            # close. The second is why the predicate must not be read as
+            # "stricter than the host check" unless it does its own host leg.
+            f"https://open.spotify.com/artist/{_VALID_ID}?u=//open.spotify.com/album/{_VALID_ID}",
+            f"https://evil.test/r?u=//open.spotify.com/album/{_VALID_ID}",
             None,
             "",
             "not a url",

@@ -27,30 +27,30 @@ slot + wall-clock on a live probe.
 
 **LML#1352 deliberately reverses that declination for ``spotify_url``, on one
 axis: the path kind.** The field must now be a Spotify *album* URL
-(``url_is_spotify_album``), not merely a URL on a Spotify host. For this field
-the consequence the LML#1295 review weighed as a cost is the *point* — a
-suppressed ``spotify_url`` falls through to the post-process's cache-UPSERT /
-mint leg, which resolves an album page for the REQUEST's (artist, album), so
-nulling an artist page trades a wrong link for a chance at the right one. The
-other stated consequence does not apply: ``skip_happy_probe`` is keyed on
-``apple_music_override``, and ``apple_music_url`` is untouched — a 2026-09-25
-artifact pull found all 288 populated ``apple_url`` values already album URLs,
-so this guard would have nothing to do there.
+(``url_is_spotify_album``), not merely a URL on a Spotify host. A 2026-09-25
+pull of the artifact found 7,152 of its 46,907 populated ``spotify_url`` values
+pointing at an artist, track, playlist, user or podcast page, and 100% of the
+artist-shaped ones carry no match provenance at all (``spotify_matched_artist``
+holds a strategy name like ``backfill-wiki (spotify)``) — so the guard removes
+one April-2026 campaign that resolved *artists* into an album column and
+touches nothing properly matched. Per-shape counts are pinned as the
+accept/reject table in ``tests/unit/test_streaming_link_validation.py``.
 
-Measured on that pull (46,907 ``albums`` rows with a non-empty ``spotify_url``),
-the guard suppresses 6,143 artist pages, 989 tracks, 13 playlists, 7 user pages,
-1 podcast and 11 id-less ``/album`` values, and keeps 31,835 ``/album/<id>``
-plus 24 locale-prefixed ``/intl-xx/album/<id>``. 100% of the artist-shaped
-values sit in the artifact's tag-provenance bucket (``spotify_matched_artist``
-holding a strategy name like ``backfill-wiki (spotify)``, ``spotify_matched_title``
-empty), so the guard removes one April-2026 campaign that resolved *artists*
-into an album column and touches nothing properly matched. Serving them was not
-a soft failure: ``item.py``'s ``_slot_urls`` /
+Serving those was not a soft failure: ``item.py``'s ``_slot_urls`` /
 ``_RESOLUTION_PROVING_URL_SERVICES`` force ``streaming_status.spotify =
 "verified"`` on any non-null Spotify slot, so an artist page was labelled a
-confirmed album match (the Mob/Money production case). Suppression moves the
-Spotify verdict to the post-process, which a later leg can supersede;
-``verified`` is terminal and cannot be.
+confirmed album match (the Mob/Money production case) and ``verified`` is
+terminal. Which makes the consequence the LML#1295 review weighed as a cost
+the *point* for this field: a suppressed ``spotify_url`` falls through to the
+post-process's cache-UPSERT / mint leg, which resolves an album page for the
+REQUEST's (artist, album) and whose verdict a later leg can still supersede.
+
+``apple_music_url`` stays host-check-only, by measurement rather than
+oversight: all 288 of its populated artifact values are already album URLs, so
+this guard would have nothing to do there, and nulling one would flip
+``skip_happy_probe`` off. Neither field gets the well-formedness floor — path
+kind is a different check with a different justification, not that floor
+arriving by the back door.
 
 **All five fields get a per-service host check** — the coordinated cross-PR
 split with Backend-Service's own boundary guard (BS#2351) is per-seam, not a
@@ -92,23 +92,7 @@ _FIELD_HOST_CHECKS: dict[str, Callable[[str], bool]] = {
 #: ``spotify_url`` / ``apple_music_url`` pre-date this ticket (LML#873) and
 #: are deliberately excluded — see the module docstring for why a new floor
 #: on those two is an out-of-scope behavior change, not a stricter check.
-#: LML#1352 does not change that: the album-path-kind check it adds below is
-#: a different check with a different justification, not this floor arriving
-#: by the back door.
 _WELL_FORMEDNESS_FIELDS = frozenset({"youtube_music_url", "bandcamp_url", "soundcloud_url"})
-
-#: Per-field path-KIND check, applied on top of the host check (LML#1352).
-#: Only ``spotify_url`` has one: its host check admits every path kind Spotify
-#: serves, and the artifact's album column measurably holds artist pages,
-#: tracks and playlists. ``apple_music_url`` is absent by measurement, not by
-#: oversight — all 288 populated ``apple_url`` artifact values are already
-#: album URLs, and nulling an Apple override costs a live-probe quota slot
-#: (``skip_happy_probe``). The three well-formedness fields are absent because
-#: their album-vs-not question is a different shape: YouTube Music and
-#: SoundCloud slots legitimately hold templated search URLs.
-_FIELD_PATH_KIND_CHECKS: dict[str, Callable[[str | None], bool]] = {
-    "spotify_url": url_is_spotify_album,
-}
 
 
 def _validate(field: str, url: str | None, host_check: Callable[[str], bool]) -> str | None:
@@ -124,8 +108,11 @@ def _validate(field: str, url: str | None, host_check: Callable[[str], bool]) ->
         return url
     if not host_check(url):
         return None
-    path_kind_check = _FIELD_PATH_KIND_CHECKS.get(field)
-    if path_kind_check is not None and not path_kind_check(url):
+    # LML#1352: spotify_url alone also has to be an ALBUM path. Spelled as a
+    # conditional rather than a per-field table — a second field wanting a
+    # path-kind check would want a different question asked of it, and the
+    # three well-formedness fields structurally cannot reach this line.
+    if field == "spotify_url" and not url_is_spotify_album(url):
         return None
     return url
 

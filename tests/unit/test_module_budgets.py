@@ -155,18 +155,20 @@ MODULE_BUDGETS: dict[str, int] = {
     # a pure function of the links dict with no dependency on enrich_one's
     # control flow. 1.3x its ~63-line measured size -> 100.
     #
-    # LML#1352: 98 -> 143 measured, raised 100 -> 150 for the spotify_url
-    # album-path-kind check. Read the search_urls.py entry above before
-    # raising this again: the growth here is the same kind, documentation the
-    # budget mechanism cannot tell from behavior. The executable delta is one
-    # import, a one-entry dispatch dict and three lines in `_validate`; the
-    # other ~35 are the module docstring recording WHY this reverses the
-    # LML#1295 review's explicit declination to add a check to this field,
-    # and the artifact census that justifies it. Granted the smallest
-    # multiple of 50 at or above the measurement rather than a re-derived
-    # 1.3x (which would license 200) -- so the rule for the next person is
-    # about the BODY: a fourth per-field check belongs in its own module
-    # (the seam is the dispatch dicts plus `_validate`), not appended here.
+    # LML#1352: 98 -> 133 measured, raised 100 -> 150 for the spotify_url
+    # album-path-kind check. The 100 was derived from a ~63-line file and
+    # LML#1295 had already grown it to 98, so this entry arrived at the
+    # ticket with 2 lines of headroom -- ANY change to the module moves it,
+    # so the raise is not by itself evidence that the growth was prose. The
+    # executable delta is one import plus four lines in `_validate`; most of
+    # the rest is the module docstring recording WHY this reverses the
+    # LML#1295 review's explicit declination to add a check to this field
+    # (the per-shape artifact census lives in the test's accept/reject table,
+    # not here). Granted the smallest multiple of 50 at or above the
+    # measurement rather than a re-derived 1.3x (which would license 200) --
+    # so the rule for the next person is about the BODY: a fourth per-field
+    # check belongs in its own module (the seam is `_FIELD_HOST_CHECKS` plus
+    # `_validate`), not appended here.
     "lookup/enrichment/streaming_link_validation.py": 150,
     # LML#1053: the per-service streaming-status merge, extracted out of
     # item.py to stay under its own ceiling above — a pure function with no

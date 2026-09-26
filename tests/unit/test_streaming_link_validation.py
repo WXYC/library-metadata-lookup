@@ -18,11 +18,11 @@ below pins that these two fields still behave as they did before LML#1295
 on every axis but the one LML#1352 added.
 
 LML#1352 adds exactly one check to ``spotify_url``: the path must be an
-*album* path. The production artifact holds 6,143 artist pages, 989 tracks,
-13 playlists, 7 user pages, a podcast and 11 id-less ``/album`` values in
-that column, all of which the host check alone admitted and ``item.py`` then
-labelled ``streaming_status.spotify = "verified"``.
-``TestSpotifyAlbumShapeGuard`` pins the accept/reject table.
+*album* path, because the production artifact's album column holds artist,
+track, playlist, user and podcast pages that the host check alone admitted
+and ``item.py`` then labelled ``streaming_status.spotify = "verified"``.
+``TestSpotifyAlbumShapeGuard``'s table below is the accept/reject pin, one
+row per measured production shape.
 
 ``bandcamp_url`` gets a host check like the other four (a 2026-08-11 audit
 found zero of 2,800 curated ``bandcamp_url`` rows off ``bandcamp.com``) — the
@@ -53,7 +53,9 @@ _HOST_CHECKED_FIELDS = tuple(_GENUINE)
 # apple_music_url are excluded on purpose — see the module docstring.
 _WELL_FORMEDNESS_FIELDS = ("youtube_music_url", "bandcamp_url", "soundcloud_url")
 
-# spotify_url / apple_music_url: host-check only, byte-identical to LML#873.
+# The two fields with no well-formedness floor. "Host-only" describes
+# apple_music_url exactly; spotify_url also carries LML#1352's album-path-kind
+# check, which is a path question and leaves every shape below untouched.
 _HOST_ONLY_FIELDS = ("spotify_url", "apple_music_url")
 
 _MALFORMED_SHAPES = {
@@ -147,10 +149,13 @@ class TestValidateStreamingLinkUrls:
 
 
 class TestHostCheckOnlyFieldsMatchPreLml1295:
-    """spotify_url / apple_music_url keep EXACTLY their pre-LML#1295 (LML#873)
-    validation: a per-service host check, nothing else. These pin the review
-    finding that adding the well-formedness floor here (as the bounced PR
-    did) is a behavior change beyond this module — see the module docstring.
+    """spotify_url / apple_music_url still get no well-formedness floor, so every
+    malformed-but-correct-host shape below survives here exactly as it did
+    before LML#1295. These pin the review finding that adding the floor here
+    (as the bounced PR did) is a behavior change beyond this module — see the
+    module docstring. LML#1352's album-path-kind check on ``spotify_url`` is
+    not that floor and does not touch these shapes; what it may and may not
+    suppress is pinned in ``TestSpotifyAlbumShapeGuard``.
     """
 
     @pytest.mark.parametrize("field", _HOST_ONLY_FIELDS)
@@ -258,8 +263,8 @@ class TestSpotifyAlbumShapeGuard:
     def test_off_host_album_path_is_still_suppressed(self):
         # Regression on the pre-existing host check: the album-shape guard must
         # not become the ONLY test, or a ``/album/<id>`` path on another host
-        # would pass. 7,892 artifact values are off ``open.spotify.com``
-        # entirely (YouTube, Bandcamp, ...).
+        # would pass. Thousands of artifact values are off Spotify entirely
+        # (YouTube, Bandcamp, ...).
         links = dict(_GENUINE)
         links["spotify_url"] = f"https://www.deezer.com/album/{_SPOTIFY_ID}"
 
@@ -270,6 +275,24 @@ class TestSpotifyAlbumShapeGuard:
         links["spotify_url"] = f"https://open.spotify.com.evil.test/album/{_SPOTIFY_ID}"
 
         assert validate_streaming_link_urls(links)["spotify_url"] is None
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"https://play.spotify.com/album/{_SPOTIFY_ID}",
+            f"https://spotify.com/album/{_SPOTIFY_ID}",
+        ],
+    )
+    def test_album_path_on_another_spotify_host_survives(self, url):
+        # The census bucketed the column by the literal ``open.spotify.com``,
+        # so a ``*.spotify.com``-but-not-``open`` album URL sits in a bucket it
+        # never counted — and the host check admits those today. The path-kind
+        # guard must not narrow the host, or it silently drops working links on
+        # an axis with no evidence behind it (LML#1352's explicit constraint).
+        links = dict(_GENUINE)
+        links["spotify_url"] = url
+
+        assert validate_streaming_link_urls(links)["spotify_url"] == url
 
     @pytest.mark.parametrize("falsy", [None, ""])
     def test_falsy_still_passes_through_unchanged(self, falsy):
