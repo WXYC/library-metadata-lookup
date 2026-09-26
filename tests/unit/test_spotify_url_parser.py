@@ -169,6 +169,11 @@ class TestUrlIsSpotifyAlbumOrTrack:
             # link at all, LML#573 having removed the templated search
             # fallback.
             f"https://open.spotify.com/track/{_VALID_ID}",
+            # The "Copy embed code" flow's shape. It is a real page that names
+            # the release, so dropping it would cost a working link for a
+            # shape the census never bucketed — the one axis on which this
+            # guard can violate #1352's constraint.
+            f"https://open.spotify.com/embed/album/{_VALID_ID}",
         ],
     )
     def test_true_for_album_pages(self, url):
@@ -204,6 +209,13 @@ class TestUrlIsSpotifyAlbumOrTrack:
             # string above, so the pattern is not asked about a path that
             # carries one.
             f"https://open.spotify.com/album/../artist/{_VALID_ID}",
+            # Percent-encoded, which ``urlparse`` leaves verbatim while WHATWG
+            # treats ``%2e%2e``, ``%2E%2E``, ``.%2e`` and ``%2e.`` as
+            # double-dot segments just like ``..`` — so the segment has to be
+            # decoded before it is compared, or the guard's whole invariant
+            # ("the path the pattern reads is the path that gets fetched") is
+            # only true of the unencoded spelling.
+            f"https://open.spotify.com/album/%2e%2e/artist/{_VALID_ID}",
             # Spotify's routes are case-sensitive, so an uppercased path kind
             # 404s. The measured locale rows are all lowercase, so neither leg
             # is matched case-insensitively — admitting a shape that cannot

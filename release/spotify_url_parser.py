@@ -24,7 +24,7 @@ posture the Apple parser's ``\\d{6,}`` floor provides against
 from __future__ import annotations
 
 import re
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from release.host_matching import host_matcher
 
@@ -41,23 +41,26 @@ SPOTIFY_ALBUM_ID_RE = re.compile(
 
 # Matched against ``urlparse(url).path`` and anchored at the path root, so a
 # release kind reached later (``/user/x/album/y``) or carried inside a query
-# string cannot pass for a release page. The optional leading segment is the
-# web player's locale prefix — ``intl-de``, or the hyphenated regional variant
-# ``intl-pt-br``, mirroring the Apple parser's locale group — which the curated
-# ``streaming_links`` artifact carries on hand-pasted URLs (24 rows: fr 7, it 6,
-# es 6, de 3, pt 2) and which names the same page. One character of
+# string cannot pass for a release page. Two optional segments may precede the
+# kind: the web player's locale prefix — ``intl-de``, or the hyphenated
+# regional variant ``intl-pt-br``, mirroring the Apple parser's locale group —
+# which the curated ``streaming_links`` artifact carries on hand-pasted URLs
+# (24 rows: fr 7, it 6, es 6, de 3, pt 2), and ``embed`` (the "Copy embed code"
+# shape). Both name the same release, so both are admitted: the census
+# bucketed only the ``open.spotify.com`` rows by kind, so an unmeasured but
+# working shape is exactly what this guard must not drop. One character of
 # non-separator has to follow the kind, rejecting an id-less ``/album``,
 # ``/album/`` and ``/album/?si=…`` while admitting any id shape.
 #
-# Case-sensitive on both legs, unlike the Apple parser's ``re.IGNORECASE``:
-# Spotify's routes are case-sensitive and every measured locale row is
-# lowercase, so admitting ``/ALBUM/<id>`` would gate in a shape that 404s —
-# the mirror image of dropping one that resolves. Host is not in this pattern
-# at all: :func:`url_is_spotify_album_or_track` asks
-# :func:`url_has_spotify_host` for that leg instead of carrying a second, and
-# narrower, host literal.
+# Case-sensitive, unlike the Apple parser's ``re.IGNORECASE``: Spotify's routes
+# are case-sensitive, so admitting ``/ALBUM/<id>`` would gate in a shape that
+# 404s — the mirror image of dropping one that resolves. The locale leg is
+# lowercase for the weaker reason that every measured row is, an uppercased
+# locale being unverified in both directions. Host is not in this pattern at
+# all: :func:`url_is_spotify_album_or_track` asks :func:`url_has_spotify_host`
+# for that leg instead of carrying a second, and narrower, host literal.
 _SPOTIFY_RELEASE_PATH_RE = re.compile(
-    r"^/(?:intl-[a-z]{2}(?:-[a-z]{2,4})?/)?(?:album|track)/[^/]",
+    r"^/(?:intl-[a-z]{2}(?:-[a-z]{2,4})?/)?(?:embed/)?(?:album|track)/[^/]",
 )
 
 
@@ -107,7 +110,12 @@ def url_is_spotify_album_or_track(url: str | None) -> bool:
     ``local_match``/``api_match``) for singles and compilations — and only when
     the album-level URL is absent, so it is that release's ONLY Spotify link.
     Rejecting the kind would leave those releases with no link at all, LML#573
-    having removed the templated Spotify search fallback.
+    having removed the templated Spotify search fallback. Accepting it does
+    inherit the seam's pre-existing terminal ``verified`` label, which forecloses
+    an album page that appears later — that is not new here and is routed on
+    LML#1352, because unwinding it means changing which slots
+    ``item.py``'s ``_RESOLUTION_PROVING_URL_SERVICES`` proves, not which URLs
+    this predicate admits.
 
     Stricter than :func:`url_has_spotify_host` on the path and no stricter on
     the host: it reuses that predicate for the host leg, so every Spotify host
@@ -115,18 +123,18 @@ def url_is_spotify_album_or_track(url: str | None) -> bool:
     host check alone admits every path kind Spotify serves, and the artifact's
     album column measurably holds artist, playlist, user and podcast pages.
 
-    Looser than :func:`spotify_album_id_from_url` on three axes, all on
+    Looser than :func:`spotify_album_id_from_url` on several axes, all on
     purpose. That extractor's 22-char base62 floor exists because the mint path
     keys ``entity.release_identity`` on what it returns, so a malformed ID must
     read as "no ID" rather than poison the entity graph; nothing is keyed on
     this predicate's answer — it decides whether a URL is handed to a browser —
     so importing the floor would null a ``/album/<odd-id>`` value for a reason
     with no consequence at this seam. Path kind is the axis the artifact census
-    has evidence on; ID charset is not. The locale prefix the artifact's
-    hand-pasted URLs carry is in this grammar but not the extractor's, which
-    only ever sees a live-resolved ``external_urls.spotify``. And the track
-    kind is here for the reason above and is not mintable, so the extractor
-    must keep rejecting it.
+    has evidence on; ID charset is not. The locale and ``embed`` prefixes the
+    artifact's hand-pasted URLs carry are in this grammar but not the
+    extractor's, which only ever sees a live-resolved ``external_urls.spotify``.
+    And the track kind is here for the reason above and is not mintable, so the
+    extractor must keep rejecting it.
 
     Guards ``None``/empty input by returning ``False``, like
     :func:`release.host_matching.is_well_formed_web_url`.
@@ -134,10 +142,15 @@ def url_is_spotify_album_or_track(url: str | None) -> bool:
     if not url or not url_has_spotify_host(url):
         return False
     path = urlparse(url).path
-    if ".." in path.split("/"):
-        # RFC 3986 dot-segment removal pops the kind segment before a browser
-        # requests the URL, so the path this pattern would read is not the path
-        # that gets fetched: ``/album/../artist/<id>`` resolves to the working
-        # artist page. Same bypass class as an album path in the query string.
+    if any(unquote(segment) == ".." for segment in path.split("/")):
+        # Dot-segment removal pops the kind segment before a browser requests
+        # the URL, so the path this pattern would read is not the path that
+        # gets fetched: ``/album/../artist/<id>`` resolves to the working
+        # artist page. Same bypass class as a release path in the query string.
+        # Each segment is percent-decoded first because WHATWG counts
+        # ``%2e%2e``, ``%2E%2E``, ``.%2e`` and ``%2e.`` as double-dot segments
+        # too, while ``urlparse`` leaves all four verbatim. One level of
+        # decoding is the right depth: ``%252e%252e`` decodes to the literal
+        # ``%2e%2e``, which no client treats as a dot segment.
         return False
     return _SPOTIFY_RELEASE_PATH_RE.match(path) is not None
