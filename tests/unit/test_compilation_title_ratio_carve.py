@@ -10,16 +10,18 @@ similarly-worded title": the extra "& 60s" is real content the Discogs release
 doesn't share.
 
 Fix: require the two titles to also be length-comparable
-(``min(len)/max(len) >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR``) before the
-carve-out admits a row. A title that's meaningfully longer or shorter than the
+(``min(len)/max(len) >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR`` in
+``lookup/compilation_title_floor.py``) before the carve-out admits a row. A title that's meaningfully longer or shorter than the
 Discogs release it's being compared to carries content the other one lacks
 entirely, which the ratio floor alone doesn't catch. Genuine reformattings
 (punctuation, capitalization, an added "!", "Vol." vs "Vol") stay
 length-comparable and keep clearing the floor.
 
-Both carve-out sites in ``track_on_compilation.py`` apply the same two-part
-test: the strict branch inside ``process_release`` (:~555) and the album-title
-fallback's ``_fallback_row_acceptable`` (:~591).
+Both carve-out sites -- the strict branch of ``_filter_release_matches`` in
+``lookup/strategies/track_on_compilation.py`` and the album-title fallback's
+``_fallback_row_acceptable`` in the same function -- call
+``compilation_title_carveout_verdict`` / ``compilation_title_carveout_admits``
+in ``lookup/compilation_title_floor.py``, which owns both floors.
 
 The length-comparability guard is gated behind
 ``LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT`` (default True): a Railway flip to
