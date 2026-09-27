@@ -50,7 +50,7 @@ from lookup.artist_resolution import (
 from lookup.candidate_memo import TrackCandidateMemo, TrackCandidateSet
 from lookup.compilation_title_floor import (
     _compilation_title_carveout_admits,
-    _compilation_title_length_ratio,
+    _compilation_title_carveout_verdict,
 )
 from lookup.concurrency import _chunked_gather
 from lookup.location_union import (
@@ -635,12 +635,9 @@ async def _filter_release_matches(
 
         def _fallback_row_acceptable(match: LibraryItem) -> bool:
             if discogs_is_compilation and is_compilation_artist(match.artist or ""):
-                match_title_lower = (match.title or "").lower()
-                title_score = _fuzz.ratio(release_album_lower, match_title_lower)
-                length_ratio = _compilation_title_length_ratio(
-                    release_album_lower, match_title_lower
+                return _compilation_title_carveout_admits(
+                    release_album_lower, (match.title or "").lower()
                 )
-                return _compilation_title_carveout_admits(title_score, length_ratio)
             return (
                 max(
                     _fuzz.token_set_ratio(
@@ -662,15 +659,16 @@ async def _filter_release_matches(
         if artist_matches_item(match, lib_artist):
             filtered_matches.append(match)
         elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
-            match_title_lower = (match.title or "").lower()
-            title_score = _fuzz.ratio(release_album_lower, match_title_lower)
-            length_ratio = _compilation_title_length_ratio(release_album_lower, match_title_lower)
-            if _compilation_title_carveout_admits(title_score, length_ratio):
+            verdict = _compilation_title_carveout_verdict(
+                release_album_lower, (match.title or "").lower()
+            )
+            if verdict.admitted:
                 filtered_matches.append(match)
             else:
                 logger.debug(
                     f"Rejected '{match.title}' for '{release_info.album}' "
-                    f"(title_score={title_score:.0f}, length_ratio={length_ratio:.2f})"
+                    f"(title_score={verdict.title_score:.0f}, "
+                    f"length_ratio={verdict.length_ratio:.2f})"
                 )
         elif bridge_enabled:
             if release_variations is None:

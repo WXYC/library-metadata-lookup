@@ -22,6 +22,8 @@ move; consolidating that derivation is left to the behavior change that
 follows.
 """
 
+from dataclasses import dataclass
+
 from config.settings import get_settings
 
 _COMPILATION_TITLE_RATIO_FLOOR = 80
@@ -45,15 +47,47 @@ def _compilation_title_length_ratio(a: str, b: str) -> float:
     return min(len(a), len(b)) / max(len(a), len(b))
 
 
-def _compilation_title_carveout_admits(title_score: float, length_ratio: float) -> bool:
+@dataclass(frozen=True)
+class CarveoutVerdict:
+    """One carve-out decision with the inputs that produced it, so a caller
+    that logs a rejection prints the numbers the policy actually saw rather
+    than re-deriving them."""
+
+    admitted: bool
+    title_score: float
+    length_ratio: float
+
+
+def _compilation_title_carveout_verdict(
+    release_title_lower: str, row_title_lower: str
+) -> CarveoutVerdict:
     """Whether a compilation-artist row's title clears the carve-out's
-    admission test. Always requires the ``fuzz.ratio`` floor. When
+    admission test, with the ``fuzz.ratio`` and length ratio it was judged on.
+    Always requires the ``fuzz.ratio`` floor. When
     ``LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT`` is True (default), also
     requires the LML#973 length-comparability guard; False is the kill
     switch that restores the pre-#973 ratio-floor-only admission without a
-    redeploy."""
+    redeploy.
+
+    Takes the two lowered titles rather than pre-computed scores: both call
+    sites in ``_filter_release_matches`` used to derive ``title_score`` and
+    ``length_ratio`` themselves, a parity they were trusted to keep by hand
+    and which the strict branch then re-derived once more for its debug line.
+    One function now owns the derivation and hands the numbers back."""
+    from rapidfuzz import fuzz
+
+    title_score = fuzz.ratio(release_title_lower, row_title_lower)
+    length_ratio = _compilation_title_length_ratio(release_title_lower, row_title_lower)
     if title_score < _COMPILATION_TITLE_RATIO_FLOOR:
-        return False
-    if get_settings().lml_tighten_compilation_title_carveout:
-        return length_ratio >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
-    return True
+        admitted = False
+    elif get_settings().lml_tighten_compilation_title_carveout:
+        admitted = length_ratio >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
+    else:
+        admitted = True
+    return CarveoutVerdict(admitted, title_score, length_ratio)
+
+
+def _compilation_title_carveout_admits(release_title_lower: str, row_title_lower: str) -> bool:
+    """:func:`_compilation_title_carveout_verdict` for a caller that needs only
+    the yes/no."""
+    return _compilation_title_carveout_verdict(release_title_lower, row_title_lower).admitted
