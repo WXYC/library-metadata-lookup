@@ -75,14 +75,13 @@ def compilation_title_carveout_verdict(
     log the same numbers.
 
     The LML#1369 gate (``LML_TITLE_TOKEN_IDENTITY_GATE``, default off) sits in
-    front of both floors, the kill switch included: #973's floors reject on
-    title *shape*, and a sibling volume has the right shape (87.1 / 0.938). The
-    switch restores pre-#973 *ratio* behavior, not one volume wearing another's.
+    front of both floors, kill switch included: #973's floors reject on title
+    *shape*, and a sibling volume has the right shape (87.1 / 0.938).
 
     Tests flip either flag via ``monkeypatch.setenv`` + ``get_settings.cache_clear()``
-    or by patching THIS module's ``get_settings``; the strategy module's does
-    not reach here. Both functions are value-imported by ``track_on_compilation``:
-    to intercept the strategy's call, patch ``lookup.strategies.track_on_compilation.<name>``."""
+    or by patching THIS module's ``get_settings`` (the strategy module's does not
+    reach here); both functions are value-imported, so to intercept the strategy's
+    call patch ``lookup.strategies.track_on_compilation.<name>``."""
     from rapidfuzz import fuzz
 
     title_score = fuzz.ratio(release_title_lower, row_title_lower)
