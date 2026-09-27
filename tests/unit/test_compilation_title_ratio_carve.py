@@ -303,6 +303,15 @@ class TestCarveoutVerdictCarriesItsInputs:
         assert verdict.admitted is False
         assert compilation_title_carveout_admits(release, row) is verdict.admitted
 
+    @pytest.mark.parametrize(("a", "b"), [("", "greatest hits"), ("greatest hits", ""), ("", "")])
+    def test_length_ratio_is_zero_when_either_title_is_empty(self, a, b):
+        """The guard arm of ``compilation_title_length_ratio``: an empty title
+        has no length to compare and must not divide by zero. Pinned on the
+        LML#1369-prep move so the arm is covered where it now lives."""
+        from lookup.compilation_title_floor import compilation_title_length_ratio
+
+        assert compilation_title_length_ratio(a, b) == 0.0
+
 
 class TestStrictBranchLogsTheVerdictItRejectedOn:
     """The strict branch's rejection line must print the numbers the carve-out
