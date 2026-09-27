@@ -49,13 +49,16 @@ def _compilation_title_length_ratio(a: str, b: str) -> float:
 
 @dataclass(frozen=True)
 class CarveoutVerdict:
-    """One carve-out decision with the inputs that produced it, so a caller
-    that logs a rejection prints the numbers the policy actually saw rather
-    than re-deriving them."""
+    """One carve-out decision with the inputs that produced it and, on a
+    rejection, which gate fired -- so a caller that logs it names the LML#1369
+    token gate, the ``fuzz.ratio`` floor or the LML#973 length guard, with the
+    numbers only where they decided it (review F6: a volume rejection logged
+    as "title_score=89, length_ratio=0.97" pointed at #973 instead)."""
 
     admitted: bool
     title_score: float
     length_ratio: float
+    reason: str | None = None
 
 
 def _compilation_title_carveout_verdict(
@@ -86,15 +89,17 @@ def _compilation_title_carveout_verdict(
 
     title_score = fuzz.ratio(release_title_lower, row_title_lower)
     length_ratio = _compilation_title_length_ratio(release_title_lower, row_title_lower)
+    reason = None
     if title_token_gate_rejects(release_title_lower, row_title_lower):
-        admitted = False
+        reason = "title identity (LML#1369)"
     elif title_score < _COMPILATION_TITLE_RATIO_FLOOR:
-        admitted = False
-    elif get_settings().lml_tighten_compilation_title_carveout:
-        admitted = length_ratio >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
-    else:
-        admitted = True
-    return CarveoutVerdict(admitted, title_score, length_ratio)
+        reason = f"ratio floor (title_score={title_score:.0f})"
+    elif (
+        get_settings().lml_tighten_compilation_title_carveout
+        and length_ratio < _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
+    ):
+        reason = f"length guard (title_score={title_score:.0f}, length_ratio={length_ratio:.2f})"
+    return CarveoutVerdict(reason is None, title_score, length_ratio, reason)
 
 
 def _compilation_title_carveout_admits(release_title_lower: str, row_title_lower: str) -> bool:

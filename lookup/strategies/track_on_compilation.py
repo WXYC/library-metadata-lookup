@@ -666,9 +666,7 @@ async def _filter_release_matches(
                 filtered_matches.append(match)
             else:
                 logger.debug(
-                    f"Rejected '{match.title}' for '{release_info.album}' "
-                    f"(title_score={verdict.title_score:.0f}, "
-                    f"length_ratio={verdict.length_ratio:.2f})"
+                    f"Rejected '{match.title}' for '{release_info.album}': {verdict.reason}"
                 )
         elif bridge_enabled:
             if release_variations is None:
