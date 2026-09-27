@@ -263,6 +263,14 @@ MODULE_BUDGETS: dict[str, int] = {
     # the three location_union_index_* stat keys. Smallest multiple of 50 at
     # or above the new measured size.
     "lookup/location_union.py": 300,
+    # Kept at 550 through the LML#1369-prep extraction (2026-09-27) rather than
+    # handed back like item.py / streaming_url_postprocess.py: the #531 series
+    # helpers left for title_identity.py (548 -> 481) and #1369 then added the
+    # shared gate call to `album_title_acceptable` (~490 measured). The
+    # recalibration convention would say 500, but this is the file every
+    # matching ticket touches, and ten lines of headroom there is the LML#1126
+    # zero-headroom hazard (see track_on_compilation.py below), not caution.
+    # The extraction was made to stop appending here; the next growth extracts.
     "lookup/matching.py": 550,
     # LML#1233 miss taxonomy. Carved out of `lookup/router.py` rather than
     # written at its `send_to_posthog` site, which had 27 lines of headroom
@@ -451,6 +459,12 @@ MODULE_BUDGETS: dict[str, int] = {
     # decomposition itself grew the file to 854 lines even though no
     # function now exceeds ~100 lines. Same formula as every other entry:
     # smallest multiple of 50 at or above 1.3x the post-change size.
+    #
+    # 2026-09-27 (LML#1369 prep): the file had grown to exactly its ceiling
+    # by the time the compilation-artist carve-out was extracted into
+    # compilation_title_floor.py, and measures ~1115 after it -- 3% headroom,
+    # not the 30% the 2026-07-29 note implies. Deliberately not raised: the
+    # next edit that trips this ceiling extracts, it does not append.
     "lookup/strategies/track_on_compilation.py": 1150,
     "lookup/strategies/track_release_matching.py": 550,
     "lookup/strategies/va_rescue.py": 300,
@@ -497,7 +511,7 @@ MODULE_BUDGETS: dict[str, int] = {
     # that rejected a row. Extracted from `lookup/strategies/track_on_compilation.py`
     # at that file's 1150 ceiling (LML#1369 prep), on the verbatim-move
     # precedent of `fallback_artwork.py` / `override_floor.py`; both branches
-    # of `_filter_release_matches` ask it and must admit the same class.
+    # of `_filter_release_matches` -- one function -- call it.
     # Re-sized 100 -> 150 for the verdict object and the #1369 gate (~108
     # measured); most of that is the constant docstring, which is the one
     # canonical copy of the #973 rationale.

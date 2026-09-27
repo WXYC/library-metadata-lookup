@@ -9,16 +9,15 @@ a :class:`CarveoutVerdict` that carries those numbers with the decision, so a
 caller that logs a rejection prints what the policy actually saw.
 
 Both branches of ``_filter_release_matches`` in
-``lookup/strategies/track_on_compilation.py`` ask it -- the strict branch and
-the album-title fallback's ``_fallback_row_acceptable`` -- and the two must
-admit exactly the same class, because a row the fallback admits is bound to
-the same release with the same confidence as one the strict branch admits.
+``lookup/strategies/track_on_compilation.py`` call it -- the strict branch and
+the album-title fallback's ``_fallback_row_acceptable``. They sit in one
+function, so this is not a ``typed_pair_floor.py``-style two-caller parity
+seam: the module exists because the strategy file was at its budget ceiling
+(LML#1369 prep, on the precedent of ``fallback_artwork.py`` and
+``override_floor.py``), and one function owning the derivation is what lets
+the strict branch's debug line print the numbers the verdict was judged on.
 The floors and the LML#973 rationale behind them are documented once, on the
 constants below; the docs and the flag entry point here.
-
-Extracted from ``lookup/strategies/track_on_compilation.py`` at its module
-budget (LML#1369 prep), on the precedent of ``fallback_artwork.py`` and
-``override_floor.py``.
 """
 
 from dataclasses import dataclass
