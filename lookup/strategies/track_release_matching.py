@@ -30,7 +30,6 @@ from lookup.matching import (
     _TRAILING_PARENTHETICAL_RE,
     MAX_SEARCH_RESULTS,
     _release_matches_library_row,
-    _va_series_title_match,
     album_title_acceptable,
     artist_matches_item,
 )
@@ -42,6 +41,7 @@ from lookup.rowless import (
     _recover_track_credit,
     _resolve_nonlibrary_release,
 )
+from lookup.title_identity import _va_series_title_match
 
 logger = logging.getLogger(__name__)
 

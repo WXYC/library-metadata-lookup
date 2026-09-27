@@ -485,6 +485,22 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/streaming_warm_admission.py": 100,
     "lookup/tail_deadline.py": 150,
     "lookup/timeouts.py": 100,
+    # LML#1369 prep: the compilation-artist title carve-out (the two #973
+    # floors, `_compilation_title_length_ratio`, `_compilation_title_carveout_admits`)
+    # moved verbatim out of `lookup/strategies/track_on_compilation.py`, which
+    # sat at exactly its 1150 ceiling -- the guardrail already firing -- rather
+    # than raising it. The `lookup/typed_pair_floor.py` precedent, for the same
+    # reason: two branches of `_filter_release_matches` ask this question and
+    # must admit the same class. 59 lines measured; 1.3x -> 76.7 -> 100.
+    "lookup/compilation_title_floor.py": 100,
+    # LML#1369 prep: the #531 V/A series helpers (`_va_series_base`,
+    # `_va_series_title_match`) moved verbatim out of `lookup/matching.py`,
+    # which sat 2 lines under its 550 ceiling -- the same extract-don't-append
+    # answer that produced `name_folding.py` and `miss_kind.py`. This is the
+    # seam the #1369 token-identity gate lands in; that change will grow this
+    # module and re-size the entry with its own justification. 89 lines
+    # measured; 1.3x -> 115.7 -> 150.
+    "lookup/title_identity.py": 150,
     # LML#1321: the ARTIST_PLUS_ALBUM match class — the joint 80/80 floor, the
     # LML#1206 artist-variant widening + exact-credit tie-break, and the LML#784
     # self-titled swap — hoisted out of `lookup/strategies/library_miss.py`,

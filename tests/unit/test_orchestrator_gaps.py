@@ -7,7 +7,7 @@ import pytest
 from core.search import SearchState, SearchStrategyType, _apply, get_search_type_from_state
 from generated.api_models import TrackMatchHint, TrackMatchSource
 from lookup.artwork import fetch_artwork_for_items
-from lookup.matching import _va_series_title_match, album_title_acceptable
+from lookup.matching import album_title_acceptable
 from lookup.orchestrator import resolve_albums_for_track
 from lookup.release_resolution import ResolvedRelease
 from lookup.strategies.artist_plus_album import search_library_with_fallback
@@ -20,6 +20,7 @@ from lookup.strategies.track_on_compilation import (
     search_compilations_for_track,
 )
 from lookup.strategies.track_release_matching import search_album_fuzzy
+from lookup.title_identity import _va_series_title_match
 from lookup.validation import filter_results_by_track_validation
 from services.parser import ParsedRequest
 from tests.factories import make_discogs_result
