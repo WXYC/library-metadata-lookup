@@ -3,23 +3,22 @@
 ``TRACK_ON_COMPILATION``'s artist-verification phase cannot ask "is this row
 credited to the release's artist?" of a Various-Artists row: the release credit
 and the library's filing name agree on nothing. So a V/A row is admitted on its
-*title* instead, and this module is that admission -- the ``fuzz.ratio`` floor
-and, behind its ``LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT`` kill switch, the
-LML#973 length-comparability guard.
+*title* instead, and this module is that admission. It takes the two lowered
+titles, derives the ``fuzz.ratio`` and the length ratio itself, and answers as
+a :class:`CarveoutVerdict` that carries those numbers with the decision, so a
+caller that logs a rejection prints what the policy actually saw.
 
 Both branches of ``_filter_release_matches`` in
 ``lookup/strategies/track_on_compilation.py`` ask it -- the strict branch and
 the album-title fallback's ``_fallback_row_acceptable`` -- and the two must
 admit exactly the same class, because a row the fallback admits is bound to
 the same release with the same confidence as one the strict branch admits.
+The floors and the LML#973 rationale behind them are documented once, on the
+constants below; the docs and the flag entry point here.
 
-Moved verbatim out of that strategy module (LML#1369 prep), which sat at its
-``tests/unit/test_module_budgets.py`` ceiling with no headroom, following the
-``lookup/typed_pair_floor.py`` precedent: a shared match floor is a concern,
-not a utility drawer. The signature is unchanged -- callers still derive
-``title_score`` and ``length_ratio`` themselves -- so this diff is a pure
-move; consolidating that derivation is left to the behavior change that
-follows.
+Extracted from ``lookup/strategies/track_on_compilation.py`` at its module
+budget (LML#1369 prep), on the precedent of ``fallback_artwork.py`` and
+``override_floor.py``.
 """
 
 from dataclasses import dataclass
