@@ -1,0 +1,210 @@
+"""LML#1369 (volume axis): the album-title gates must reject a sibling volume.
+
+``fuzz.ratio`` between "Art Of Field Recording Volume I" and "Art of Field
+Recording, vol. 2" is 87.1 -- the token that says *which release this is* is
+one character inside a thirty-character title, far under any ratio floor. The
+tests here pin the question the gates should ask instead: do the two titles
+carry *different* volume identifiers?
+
+Two things are pinned with equal weight to the rejection itself:
+
+* the gate is behind ``LML_TITLE_TOKEN_IDENTITY_GATE`` and default OFF -- with
+  the flag off every existing verdict is byte-for-byte today's, siblings
+  included -- because the flip waits on a prod recall measurement;
+* a volume on ONE side only is LML#531's recall case, not a disagreement, and
+  keeps matching with the flag on.
+"""
+
+import pytest
+
+from lookup.matching import album_title_acceptable
+from lookup.title_identity import (
+    _va_series_title_match,
+    title_token_gate_rejects,
+    titles_differ_by_discriminating_token,
+    volume_identifier,
+)
+from tests.factories import make_library_item
+
+_SIBLINGS = ("art of field recording volume i", "art of field recording, vol. 2")
+
+
+class TestVolumeIdentifier:
+    """The library writes ``vol. 2`` where Discogs writes ``Volume II``, and
+    this catalog also holds rows spelled ``Volume One`` / ``Volume three`` /
+    ``Volume Six`` / ``Volume Seven``. All spellings must fold to one value."""
+
+    @pytest.mark.parametrize(
+        ("title", "expected"),
+        [
+            ("art of field recording, vol. 2", "2"),
+            ("art of field recording vol 2", "2"),
+            ("art of field recording vol.2", "2"),
+            ("art of field recording volume 2", "2"),
+            ("art of field recording volume ii", "2"),
+            ("art of field recording volume two", "2"),
+            ("jean redpath, volume one", "1"),
+            ("jean redpath, volume three", "3"),
+            ("jean redpath, volume six", "6"),
+            ("jean redpath, volume seven", "7"),
+            ("pebbles, volume 10", "10"),
+            ("pebbles, volume x", "10"),
+            ("secret museum of mankind, vol. 2a", "2a"),
+            # Mid-title, the Discogs habit: "<base> Volume I: <subtitle>".
+            ("art of field recording volume i: fifty years of traditional music", "1"),
+        ],
+    )
+    def test_recognised_volume_forms(self, title, expected):
+        assert volume_identifier(title) == expected
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "aluminum tunes",
+            # "vol"-initial words that are not volume markers.
+            "jefferson airplane volunteers",
+            "volume dealers",
+            # A bare roman numeral with no volume keyword is not a volume.
+            "led zeppelin iv",
+            # A permissive roman accumulator reads "livid" as 443; the strict
+            # canonical-form check must not.
+            "vol. livid",
+        ],
+    )
+    def test_titles_without_a_volume_identifier(self, title):
+        assert volume_identifier(title) is None
+
+
+class TestVolumeDisagreement:
+    """The pure predicate, flag-independent."""
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            _SIBLINGS,
+            tuple(reversed(_SIBLINGS)),
+            ("art of field recording volume one", "art of field recording, vol. 2"),
+            ("art of field recording, vol. 2", "art of field recording volume three"),
+            ("jean redpath volume six", "jean redpath volume seven"),
+            ("pebbles, volume 1", "pebbles, volume 10"),
+            ("the r&b box, vol. 3", "the r&b box volume v"),
+        ],
+    )
+    def test_volume_siblings_disagree(self, left, right):
+        assert titles_differ_by_discriminating_token(left, right) is True
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            # LML#531's recall case: the volume is information the library has
+            # and Discogs does not, not a contradiction.
+            (
+                "disco not disco (post punk, electro & leftfield disco classics 1974-1986)",
+                "disco not disco, vol. 1",
+            ),
+            ("disco not disco", "disco not disco, vol. 2"),
+            # Same volume, divergent spellings.
+            ("art of field recording volume i", "art of field recording, vol. 1"),
+            ("art of field recording volume two", "art of field recording, vol. 2"),
+            ("jean redpath volume seven", "jean redpath, vol. 7"),
+            # No volume anywhere.
+            ("aluminum tunes", "aluminum tunes (remastered)"),
+            ("moon pix", "moon pix"),
+        ],
+    )
+    def test_agreeing_titles_are_not_rejected(self, left, right):
+        assert titles_differ_by_discriminating_token(left, right) is False
+
+
+class TestTheFlagGatesTheVeto:
+    def test_default_off_never_rejects(self):
+        assert title_token_gate_rejects(*_SIBLINGS) is False
+
+    def test_on_rejects_siblings(self, enable_title_token_identity_gate):
+        assert title_token_gate_rejects(*_SIBLINGS) is True
+
+
+class TestAlbumTitleAcceptable:
+    """The shared matcher is where the fix lands, so every caller of
+    ``album_title_acceptable`` -- ``SONG_AS_TRACK`` and
+    ``track_release_matching`` included -- inherits it."""
+
+    def test_flag_off_is_todays_behavior_siblings_included(self):
+        """Byte-for-byte pin of the pre-#1369 verdict: 87.1 clears the floor."""
+        assert album_title_acceptable(*_SIBLINGS) is True
+
+    def test_volume_siblings_rejected(self, enable_title_token_identity_gate):
+        assert album_title_acceptable(*_SIBLINGS) is False
+
+    def test_volume_one_is_not_a_prefix_of_volume_ten(self, enable_title_token_identity_gate):
+        """The prefix branch returns True for any title that literally starts
+        with the query, which ``pebbles, volume 1`` does against ``pebbles,
+        volume 10``. The gate has to run before it."""
+        assert album_title_acceptable("pebbles, volume 1", "pebbles, volume 10") is False
+
+    @pytest.mark.parametrize(
+        ("query", "result"),
+        [
+            ("chicago 16", "chicago v"),
+            ("chicago 16", "chicago ix"),
+            ("led zeppelin iv", "led zeppelin ii"),
+        ],
+    )
+    def test_lml24_corpus_still_rejected(self, enable_title_token_identity_gate, query, result):
+        assert album_title_acceptable(query, result) is False
+
+    @pytest.mark.parametrize(
+        ("query", "result"),
+        [
+            ("chicago 16", "chicago 16"),
+            ("aluminum tunes", "aluminum tunes (remastered)"),
+            ("rumours", "rumors"),
+            ("dark side of the moon", "the dark side of the moon"),
+            # LML#531's recall case must still clear the gate.
+            ("disco not disco", "disco not disco, vol. 1"),
+            ("art of field recording volume i", "art of field recording, vol. 1"),
+        ],
+    )
+    def test_accepted_titles_stay_accepted(self, enable_title_token_identity_gate, query, result):
+        assert album_title_acceptable(query, result) is True
+
+
+class TestVaSeriesTitleMatch:
+    """``_va_series_title_match`` is reached as an ``or`` arm in
+    ``search_album_fuzzy``, so it bypasses ``album_title_acceptable``
+    entirely. Within a series it admitted unconditionally -- the gate has to
+    be in this arm too or the fix routes around itself."""
+
+    def _row(self, title):
+        return make_library_item(
+            id=1, artist="Various Artists - Folk - A", title=title, genre="Folk"
+        )
+
+    def test_flag_off_is_todays_behavior_siblings_included(self):
+        assert _va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 2"))
+
+    def test_sibling_volume_no_longer_admitted(self, enable_title_token_identity_gate):
+        assert (
+            _va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 2"))
+            is False
+        )
+
+    def test_matching_volume_still_admitted(self, enable_title_token_identity_gate):
+        assert _va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 1"))
+
+    def test_lml531_recall_case_still_admitted(self, enable_title_token_identity_gate):
+        assert _va_series_title_match(
+            "disco not disco (post punk, electro & leftfield disco classics 1974-1986)",
+            self._row("Disco Not Disco, vol. 1"),
+        )
+
+    def test_non_compilation_artist_still_excluded(self, enable_title_token_identity_gate):
+        """The LML#717 guard: this arm is only for V/A rows. A same-shaped
+        non-V/A row must still be refused here, whatever the titles say."""
+        assert (
+            _va_series_title_match(
+                "live sessions (acoustic recordings from the greek theatre 1998-2002)",
+                make_library_item(id=2, artist="Some Band", title="Live Sessions, vol. 2"),
+            )
+            is False
+        )

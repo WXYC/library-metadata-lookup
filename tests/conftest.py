@@ -178,6 +178,26 @@ def _reset_streaming_check_inflight_cap():
     _streaming_router._streaming_check_semaphore = None
 
 
+@pytest.fixture
+def enable_title_token_identity_gate(monkeypatch):
+    """Flip ``LML_TITLE_TOKEN_IDENTITY_GATE`` on for one test (LML#1369).
+
+    The gate is default-OFF pending a HITL prod recall measurement, so every
+    test that exercises it opts in here. Pinned through the environment plus a
+    ``get_settings`` cache clear, never ``app.dependency_overrides``: most of
+    the pipeline calls ``config.settings.get_settings()`` directly, so an
+    override reaches the router and nothing under it. Same shape as
+    ``disable_tighten_compilation_title_carveout`` in
+    ``tests/unit/test_compilation_title_ratio_carve.py``.
+    """
+    monkeypatch.setenv("LML_TITLE_TOKEN_IDENTITY_GATE", "true")
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 @pytest.fixture(autouse=True)
 def _reset_discogs_pool_singleton():
     """Suite-wide reset of the discogs-cache ``async_singleton`` lock (LML#706).

@@ -341,3 +341,59 @@ class TestStrictBranchLogsTheVerdictItRejectedOn:
         assert f"'{_WRONG_PRESSING_LIBRARY_TITLE}'" in rejections[0]
         assert f"title_score={expected.title_score:.0f}" in rejections[0]
         assert f"length_ratio={expected.length_ratio:.2f}" in rejections[0]
+@pytest.mark.asyncio
+class TestVolumeSiblingsAtTheCarveOut:
+    """LML#1369: the carve-out is the only gate with real rejection power on
+    the V/A path, and it rejects on title *shape* (ratio + length ratio), not
+    on volume identity -- 87.1 clears the 80 floor and 0.938 clears the 0.90
+    floor, so a sibling volume walks straight through. Behind
+    ``LML_TITLE_TOKEN_IDENTITY_GATE``, default off."""
+
+    _RELEASES = [_release(3532729, "Art Of Field Recording Volume I")]
+    _MATCHES = {
+        "Art Of Field Recording Volume I": [
+            _va_row(58620, "Art of Field Recording, vol. 1"),
+            _va_row(58621, "Art of Field Recording, vol. 2"),
+        ]
+    }
+
+    async def test_flag_off_is_todays_behavior_both_volumes_admitted(self):
+        results, _titles = await _run(self._RELEASES, self._MATCHES)
+
+        assert {r.id for r in results} == {58620, 58621}
+
+    async def test_sibling_volume_row_is_dropped(self, enable_title_token_identity_gate):
+        results, _titles = await _run(self._RELEASES, self._MATCHES)
+
+        assert {r.id for r in results} == {58620}
+
+    async def test_same_volume_in_a_divergent_spelling_is_kept(
+        self, enable_title_token_identity_gate
+    ):
+        """The rejection is on volume *identity*, not on the volume phrase:
+        ``Volume II`` and ``vol. 2`` are the same release."""
+        releases = [_release(3532730, "Art Of Field Recording Volume II")]
+        matches = {
+            "Art Of Field Recording Volume II": [_va_row(58621, "Art of Field Recording, vol. 2")]
+        }
+
+        results, _titles = await _run(releases, matches)
+
+        assert {r.id for r in results} == {58621}
+
+    async def test_lml973_kill_switch_unchanged_with_the_gate_on(
+        self, enable_title_token_identity_gate, disable_tighten_compilation_title_carveout
+    ):
+        """The volume axis says nothing about row 58775 (no volume on either
+        side), so with the #973 length guard switched off it is readmitted
+        exactly as today. Pins that this PR does not narrow that kill switch."""
+        releases = [_release(_WRONG_PRESSING_RELEASE_ID, _WRONG_PRESSING_RELEASE_ALBUM)]
+        matches = {
+            _WRONG_PRESSING_RELEASE_ALBUM: [
+                _va_row(_WRONG_PRESSING_LIBRARY_ID, _WRONG_PRESSING_LIBRARY_TITLE)
+            ]
+        }
+
+        results, _titles = await _run(releases, matches)
+
+        assert {r.id for r in results} == {_WRONG_PRESSING_LIBRARY_ID}
