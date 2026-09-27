@@ -41,7 +41,11 @@ This module also holds the LML#531 ``<base>, vol. N`` helpers
 (``_va_series_base``, ``_va_series_title_match``), moved here from
 ``lookup/matching.py`` because they parse the same shape this module
 normalises: two files disagreeing about what a volume is would be exactly the
-drift the module-budget guardrail exists to prevent.
+drift the module-budget guardrail exists to prevent. They stay pure parsers:
+the gate is applied by their one caller, ``search_album_fuzzy``, once and
+ahead of the ``or`` that joins the #531 arm to ``album_title_acceptable``
+(review F8), so neither arm can route around it and neither helper carries a
+Settings coupling.
 """
 
 import re
@@ -278,12 +282,6 @@ def _va_series_title_match(query_lower: str, item: LibraryItem) -> bool:
     if not is_compilation_artist(item.artist or ""):
         return False
     library_title_lower = (item.title or "").lower()
-    # LML#1369: this arm is reached as an ``or`` in ``search_album_fuzzy`` and
-    # so bypasses ``album_title_acceptable`` entirely; within a series it
-    # admitted unconditionally. The gate has to be here too or it routes
-    # around itself.
-    if title_token_gate_rejects(query_lower, library_title_lower):
-        return False
     base = _va_series_base(library_title_lower)
     if not base:
         return False

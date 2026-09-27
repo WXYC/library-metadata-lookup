@@ -41,7 +41,7 @@ from lookup.rowless import (
     _recover_track_credit,
     _resolve_nonlibrary_release,
 )
-from lookup.title_identity import _va_series_title_match
+from lookup.title_identity import _va_series_title_match, title_token_gate_rejects
 
 logger = logging.getLogger(__name__)
 
@@ -347,11 +347,18 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
         if not raw:
             return []
         q_lower = query.lower()
+        # LML#1369: gated once here, ahead of the ``or``, so that neither the
+        # #531 V/A arm (which would otherwise admit a sibling volume
+        # unconditionally) nor the ratio path can route around it, and the
+        # #531 helper stays a pure parser (review F8).
         return [
             r
             for r in raw
-            if _va_series_title_match(q_lower, r)
-            or album_title_acceptable(q_lower, (r.title or "").lower())
+            if not title_token_gate_rejects(q_lower, (r.title or "").lower())
+            and (
+                _va_series_title_match(q_lower, r)
+                or album_title_acceptable(q_lower, (r.title or "").lower())
+            )
         ]
 
     # First try the un-stripped query. If it produces no surviving candidates,
