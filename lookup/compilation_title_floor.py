@@ -70,11 +70,9 @@ def compilation_title_carveout_verdict(
     switch that restores the pre-#973 ratio-floor-only admission without a
     redeploy.
 
-    Takes the two lowered titles rather than pre-computed scores: both call
-    sites in ``_filter_release_matches`` used to derive ``title_score`` and
-    ``length_ratio`` themselves, a parity they were trusted to keep by hand
-    and which the strict branch then re-derived once more for its debug line.
-    One function now owns the derivation and hands the numbers back.
+    Takes the two lowered titles, not pre-computed scores: this function owns
+    the derivation, so both branches of ``_filter_release_matches`` judge and
+    log the same numbers.
 
     The LML#1369 gate (``LML_TITLE_TOKEN_IDENTITY_GATE``, default off) sits in
     front of both floors, the kill switch included: #973's floors reject on
