@@ -23,6 +23,7 @@ from lookup.name_folding import (
     fold_punctuation_for_comparison,
     folded_hit,
 )
+from lookup.title_identity import title_token_gate_rejects
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -345,8 +346,22 @@ def album_title_acceptable(query_lower: str, result_lower: str) -> bool:
     Also rejects numbered series albums (e.g., "Chicago V" vs "Chicago 16",
     "Led Zeppelin II" vs "Led Zeppelin IV") by checking that when titles share
     a long common prefix, the short distinguishing suffixes are also similar.
+
+    LML#1369 puts ``title_token_gate_rejects`` in front of all of that. The
+    #24 remainder guard below is structurally unable to reach a volume-series
+    title -- it arms only when *both* remainders are <=5 chars, and ", vol. 2"
+    is 8 -- so "Art Of Field Recording Volume I" reached the ``fuzz.ratio >=
+    50`` floor at 87.1 and matched its own sibling volume. The guard is kept:
+    it is a cheap, well-calibrated rejection for its corpus, and the two rules
+    agree on it.
     """
     from rapidfuzz import fuzz
+
+    # LML#1369, and deliberately ahead of the prefix branch below: "pebbles,
+    # volume 1" is a literal prefix of "pebbles, volume 10", so a gate that
+    # ran after ``startswith`` would never see the disagreement.
+    if title_token_gate_rejects(query_lower, result_lower):
+        return False
 
     if query_lower.startswith(result_lower) or result_lower.startswith(query_lower):
         return True

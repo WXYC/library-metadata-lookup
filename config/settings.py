@@ -565,6 +565,26 @@ class Settings(BaseSettings):
             "See WXYC/library-metadata-lookup#973."
         ),
     )
+    lml_title_token_identity_gate: bool = Field(
+        default=False,
+        description=(
+            "When True, the three album-title gates (album_title_acceptable, "
+            "the #531 V/A series arm _va_series_title_match, and the "
+            "TRACK_ON_COMPILATION carve-out) reject a library row whose title "
+            "carries a DIFFERENT volume identifier from the Discogs release "
+            "title -- 'Art of Field Recording, vol. 2' against 'Art Of Field "
+            "Recording Volume I' -- with arabic, roman and spelled-out forms "
+            "folded onto one value. LML#1369: fuzz.ratio scores that pair "
+            "87.1 because the volume is one character in thirty, so every "
+            "ratio floor admits the sibling and the strategy binds Volume I's "
+            "release (and cover) to the vol. 2 row. Only a two-sided "
+            "disagreement rejects -- a volume on the library side alone is "
+            "#531's recall case and keeps matching. Default False: verdicts "
+            "are byte-for-byte pre-#1369 until a HITL prod recall measurement "
+            "clears the flip, per the #973 precedent. "
+            "See WXYC/library-metadata-lookup#1369."
+        ),
+    )
     lml_resolve_nonlibrary_release: bool = Field(
         default=False,
         description=(

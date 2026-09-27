@@ -497,10 +497,16 @@ MODULE_BUDGETS: dict[str, int] = {
     # `_va_series_title_match`) moved verbatim out of `lookup/matching.py`,
     # which sat 2 lines under its 550 ceiling -- the same extract-don't-append
     # answer that produced `name_folding.py` and `miss_kind.py`. This is the
-    # seam the #1369 token-identity gate lands in; that change will grow this
-    # module and re-size the entry with its own justification. 89 lines
-    # measured; 1.3x -> 115.7 -> 150.
-    "lookup/title_identity.py": 150,
+    # seam the #1369 token-identity gate lands in.
+    #
+    # Re-sized by LML#1369's volume axis (150 -> 300): the module gained the
+    # volume-form normaliser (arabic/roman/word onto one value), the two-sided
+    # disagreement predicate, and the flag-aware wrapper the three title gates
+    # consult. Roughly a third of the growth is the module docstring, which
+    # carries the two recall asymmetries a future reader must not "simplify"
+    # away. 228 lines measured; 1.3x -> 296.4 -> 300. The generic
+    # discriminating-token axis that follows will re-size it again.
+    "lookup/title_identity.py": 300,
     # LML#1321: the ARTIST_PLUS_ALBUM match class — the joint 80/80 floor, the
     # LML#1206 artist-variant widening + exact-credit tie-break, and the LML#784
     # self-titled swap — hoisted out of `lookup/strategies/library_miss.py`,
