@@ -48,6 +48,10 @@ from lookup.artist_resolution import (
     resolve_canonical_artist,
 )
 from lookup.candidate_memo import TrackCandidateMemo, TrackCandidateSet
+from lookup.compilation_title_floor import (
+    _compilation_title_carveout_admits,
+    _compilation_title_length_ratio,
+)
 from lookup.concurrency import _chunked_gather
 from lookup.location_union import (
     LOCATION_UNION_INDEX_DEGRADED_STAT_KEY,
@@ -83,41 +87,6 @@ from lookup.strategies.track_release_matching import search_album_fuzzy
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
-
-_COMPILATION_TITLE_RATIO_FLOOR = 80
-_COMPILATION_TITLE_LENGTH_RATIO_FLOOR = 0.9
-"""LML#973: the compilation carve-out's ``fuzz.ratio`` floor alone can't tell
-"same comp, reformatted title" from "different comp, similarly-worded title" —
-e.g. "Greatest Hits Of The 50's" vs "Greatest hits of the 50s & 60s" clears
-``ratio >= 80`` (87.3) even though the second title names a different,
-track-less pressing. Requiring the shorter title to be at least 90% the
-length of the longer catches that case (length ratio 0.83) while a genuine
-reformatting — punctuation, an added "!", "Vol." vs "Vol" — stays
-length-comparable and still clears both floors. Gated behind
-``LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT`` (default True); False restores
-the pre-#973 ratio-floor-only admission without a redeploy."""
-
-
-def _compilation_title_length_ratio(a: str, b: str) -> float:
-    """``min(len)/max(len)`` of two titles, in [0, 1]; 0.0 if either is empty."""
-    if not a or not b:
-        return 0.0
-    return min(len(a), len(b)) / max(len(a), len(b))
-
-
-def _compilation_title_carveout_admits(title_score: float, length_ratio: float) -> bool:
-    """Whether a compilation-artist row's title clears the carve-out's
-    admission test. Always requires the ``fuzz.ratio`` floor. When
-    ``LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT`` is True (default), also
-    requires the LML#973 length-comparability guard; False is the kill
-    switch that restores the pre-#973 ratio-floor-only admission without a
-    redeploy."""
-    if title_score < _COMPILATION_TITLE_RATIO_FLOOR:
-        return False
-    if get_settings().lml_tighten_compilation_title_carveout:
-        return length_ratio >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
-    return True
-
 
 TrackOnCompilationExecute = Callable[
     [LibraryDB, ParsedRequest],
