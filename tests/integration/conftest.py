@@ -481,6 +481,40 @@ SEED_ITEMS = [
     # parenthetical subtitle. The repro shape for WXYC#531.
     (58610, "Disco Not Disco, vol. 1", "Various Artists - Rock - D", "V", 3, 1, "Rock", "CD"),
     (58611, "Disco Not Disco, vol. 2", "Various Artists - Rock - D", "V", 3, 2, "Rock", "CD"),
+    # LML#1369 shape A: sibling volumes of one V/A series. A lookup for a
+    # track on vol. 1 must not surface vol. 2 wearing vol. 1's cover.
+    (
+        58620,
+        "Art of Field Recording, vol. 1",
+        "Various Artists - Folk - A",
+        "V",
+        4,
+        1,
+        "Folk",
+        "CD",
+    ),
+    (
+        58621,
+        "Art of Field Recording, vol. 2",
+        "Various Artists - Folk - A",
+        "V",
+        4,
+        2,
+        "Folk",
+        "CD",
+    ),
+    # LML#1369 shape C: a row differing from the Discogs title by one
+    # discriminating word ("Guitar" against "Monterey"/"Pop").
+    (
+        58630,
+        "The International Guitar Festival",
+        "Various Artists - Rock - I",
+        "V",
+        5,
+        1,
+        "Rock",
+        "CD",
+    ),
     # Non-V/A with the same shape — regression guard so the gate stays narrow.
     (60001, "Live Sessions, vol. 2", "Some Band", "S", 4, 2, "Rock", "CD"),
     # Trio / collaboration filed under one member (LML#684). The Discogs release

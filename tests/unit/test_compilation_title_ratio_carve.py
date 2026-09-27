@@ -277,3 +277,43 @@ class TestFallbackBranchTitleRatioCarveParity:
         results, _titles = await self._run_fallback(releases, matches)
 
         assert {r.id for r in results} == {50963}
+
+
+@pytest.mark.asyncio
+class TestVolumeSiblingsAtTheCarveOut:
+    """LML#1369: the carve-out is the only gate with real rejection power on
+    the V/A path, and it rejects on title *shape* (ratio + length ratio), not
+    on volume identity — 87.1 clears the 80 floor and 0.938 clears the 0.90
+    floor, so a sibling volume walks straight through."""
+
+    async def test_sibling_volume_row_is_dropped(self):
+        releases = [_release(3532729, "Art Of Field Recording Volume I")]
+        matches_by_album = {
+            "Art Of Field Recording Volume I": [
+                _va_row(58620, "Art of Field Recording, vol. 1"),
+                _va_row(58621, "Art of Field Recording, vol. 2"),
+            ]
+        }
+
+        results, _titles = await _run(releases, matches_by_album)
+
+        assert {r.id for r in results} == {58620}
+
+    async def test_same_volume_in_a_divergent_spelling_is_kept(self):
+        """The rejection is on volume *identity*, not on the volume phrase:
+        ``Volume II`` and ``vol. 2`` are the same release and must still be
+        admitted. (The LML#531 asymmetry — a Discogs title with no volume at
+        all — cannot reach this gate: an added ``, vol. N`` costs 8 characters,
+        which the #973 length-ratio floor already rejects. It is pinned at
+        ``_va_series_title_match`` and ``album_title_acceptable`` instead, in
+        ``tests/unit/test_title_identity.py``.)"""
+        releases = [_release(3532730, "Art Of Field Recording Volume II")]
+        matches_by_album = {
+            "Art Of Field Recording Volume II": [
+                _va_row(58621, "Art of Field Recording, vol. 2"),
+            ]
+        }
+
+        results, _titles = await _run(releases, matches_by_album)
+
+        assert {r.id for r in results} == {58621}
