@@ -33,6 +33,7 @@ Extracted from ``lookup/matching.py`` at its module budget (LML#1369 prep).
 """
 
 import re
+from collections.abc import Iterator
 
 from wxyc_etl.text import is_compilation_artist
 
@@ -81,7 +82,11 @@ _WORD_NUMBERS = {
 _ROMAN_VALUES = {"i": 1, "v": 5, "x": 10}
 _ROMAN_RE = re.compile(r"^x{0,3}(?:ix|iv|v?i{0,3})$")
 
-_ARABIC_RE = re.compile(r"^([0-9]+)([a-z]?)$")
+#: Arabic is at most three digits. A fourth makes a year, not a volume --
+#: "Posh Hits, vol. 1, 1983", "Country Funk, vol. 2, 1967-1974" (nine catalog
+#: titles) -- which would otherwise join the set as a further volume and, with
+#: a dash, expand as a range. Roman caps at 39 and words at 20 for the same reason.
+_ARABIC_RE = re.compile(r"^([0-9]{1,3})([a-z]?)$")
 
 
 def _roman_to_int(token: str) -> int | None:
@@ -126,10 +131,12 @@ def _range_interior(low: str, high: str) -> list[str]:
     return [str(n) for n in range(int(low) + 1, int(high))]
 
 
-def _parse_volume_phrase(title_lower: str) -> tuple[frozenset[str], int, int] | None:
-    """``(identifiers, start, end)`` of the first resolvable volume phrase --
-    every volume it names, canonicalised, plus its span so a caller can remove
-    it from the title -- or None when there is no resolvable marker."""
+def _volume_phrases(title_lower: str) -> Iterator[tuple[frozenset[str], int, int]]:
+    """Every resolvable volume phrase in ``title_lower``, in order, as
+    ``(identifiers, start, end)``: the volumes it names, canonicalised, and its
+    span so a caller can remove it. A title can carry more than one ("Volume 1
+    Volume 2", "vol. 1 & vol. 2"): :func:`volume_identifiers` unions them and
+    :func:`va_series_base` judges the last."""
     for match in _VOLUME_MARKER_RE.finditer(title_lower):
         first = _canonical_number(match.group(1))
         if first is None:
@@ -144,16 +151,15 @@ def _parse_volume_phrase(title_lower: str) -> tuple[frozenset[str], int, int] | 
                 identifiers.extend(_range_interior(identifiers[-1], following))
             identifiers.append(following)
             end = item.end()
-        return frozenset(identifiers), match.start(), end
-    return None
+        yield frozenset(identifiers), match.start(), end
 
 
 def volume_identifiers(title: str) -> frozenset[str]:
     """Every volume ``title`` names, canonicalised; empty when it names none.
     ``vol. 2`` / ``Volume II`` / ``Volume Two`` all yield ``{"2"}``; ``vols.
-    1-3`` yields ``{"1", "2", "3"}``; "Volunteers" yields nothing."""
-    parsed = _parse_volume_phrase(title.lower())
-    return parsed[0] if parsed is not None else frozenset()
+    1-3`` yields ``{"1", "2", "3"}``; a second phrase adds to the set; "Volunteers"
+    yields nothing."""
+    return frozenset().union(*(ids for ids, _start, _end in _volume_phrases(title.lower())))
 
 
 def volume_identifier(title: str) -> str | None:
@@ -191,22 +197,21 @@ def title_token_gate_rejects(left: str, right: str) -> bool:
 def va_series_base(library_title: str) -> str | None:
     """The series base of a ``<base>, vol. N`` library filing, or None.
 
-    A filing is a title whose volume phrase runs to the end -- ``, vol. N``,
+    A filing is a title whose last volume phrase runs to the end -- ``, vol. N``,
     `` volume N``, ``vol N``, ``vol.N`` (no space: 41 catalog titles), roman or
     spelled numbers, ``2a``, ``vols. 1-2`` -- over the same closed vocabulary
     :func:`volume_identifiers` uses, so "low volume music" and "hits, vol.
-    livid" are titles, not filings. A dash or colon separator is stripped with
-    the comma so it cannot survive into the base. Empty base is None.
+    livid" are titles, not filings. The base is everything before that phrase
+    (LML#531's ``$``-anchored regex judged the same phrase), with a dash or colon
+    separator stripped along with the comma. Empty base is None.
     """
     title_lower = library_title.lower()
-    parsed = _parse_volume_phrase(title_lower)
-    if parsed is None:
-        return None
-    _identifiers, start, end = parsed
-    if title_lower[end:].strip():
-        return None
-    base = title_lower[:start].rstrip(" ,:-\u2013")
-    return base or None
+    for _identifiers, start, end in _volume_phrases(title_lower):
+        if title_lower[end:].strip():
+            continue
+        base = title_lower[:start].rstrip(" ,:-\u2013")
+        return base or None
+    return None
 
 
 def va_series_title_match(query_lower: str, item: LibraryItem) -> bool:
