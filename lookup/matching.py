@@ -354,9 +354,8 @@ def album_title_acceptable(query_lower: str, result_lower: str) -> bool:
     """
     from rapidfuzz import fuzz
 
-    # LML#1369, and deliberately ahead of the prefix branch below: "pebbles,
-    # volume 1" is a literal prefix of "pebbles, volume 10", so a gate that
-    # ran after ``startswith`` would never see the disagreement.
+    # LML#1369, deliberately ahead of the prefix branch: "pebbles, volume 1"
+    # is a literal prefix of "pebbles, volume 10".
     if title_token_gate_rejects(query_lower, result_lower):
         return False
 
