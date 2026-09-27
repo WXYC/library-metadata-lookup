@@ -24,6 +24,7 @@ budget (LML#1369 prep), on the precedent of ``fallback_artwork.py`` and
 from dataclasses import dataclass
 
 from config.settings import get_settings
+from lookup.title_identity import title_token_gate_rejects
 
 _COMPILATION_TITLE_RATIO_FLOOR = 80
 _COMPILATION_TITLE_LENGTH_RATIO_FLOOR = 0.9
@@ -72,12 +73,22 @@ def _compilation_title_carveout_verdict(
     sites in ``_filter_release_matches`` used to derive ``title_score`` and
     ``length_ratio`` themselves, a parity they were trusted to keep by hand
     and which the strict branch then re-derived once more for its debug line.
-    One function now owns the derivation and hands the numbers back."""
+    One function now owns the derivation and hands the numbers back.
+
+    The LML#1369 gate (``LML_TITLE_TOKEN_IDENTITY_GATE``, default off) sits in
+    front of both floors, the kill switch included: #973's floors reject on
+    title *shape*, and a sibling volume has the right shape -- "Art Of Field
+    Recording Volume I" against "Art of Field Recording, vol. 2" scores 87.1
+    with a 0.938 length ratio and clears both. That switch restores pre-#973
+    *ratio* behavior; it is not a switch for binding one volume's release to
+    another volume's row."""
     from rapidfuzz import fuzz
 
     title_score = fuzz.ratio(release_title_lower, row_title_lower)
     length_ratio = _compilation_title_length_ratio(release_title_lower, row_title_lower)
-    if title_score < _COMPILATION_TITLE_RATIO_FLOOR:
+    if title_token_gate_rejects(release_title_lower, row_title_lower):
+        admitted = False
+    elif title_score < _COMPILATION_TITLE_RATIO_FLOOR:
         admitted = False
     elif get_settings().lml_tighten_compilation_title_carveout:
         admitted = length_ratio >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
