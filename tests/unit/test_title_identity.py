@@ -19,9 +19,10 @@ import pytest
 
 from lookup.matching import album_title_acceptable
 from lookup.title_identity import (
-    _va_series_title_match,
     title_token_gate_rejects,
     titles_differ_by_discriminating_token,
+    va_series_base,
+    va_series_title_match,
     volume_identifier,
     volume_identifiers,
 )
@@ -216,7 +217,7 @@ class TestSearchAlbumFuzzyGatesBothArms:
 
 
 class TestVaSeriesTitleMatch:
-    """``_va_series_title_match`` is reached as an ``or`` arm in
+    """``va_series_title_match`` is reached as an ``or`` arm in
     ``search_album_fuzzy``, so it bypasses ``album_title_acceptable``
     entirely. Within a series it admitted unconditionally -- the gate has to
     be in this arm too or the fix routes around itself."""
@@ -227,7 +228,7 @@ class TestVaSeriesTitleMatch:
         )
 
     def test_flag_off_is_todays_behavior_siblings_included(self):
-        assert _va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 2"))
+        assert va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 2"))
 
     def test_stays_a_pure_parser_with_the_gate_on(self, enable_title_token_identity_gate):
         """Review F8: the #531 arm has exactly one caller, ``search_album_fuzzy``,
@@ -236,13 +237,13 @@ class TestVaSeriesTitleMatch:
         then carries a Settings coupling for no second caller. So with the
         gate ON this arm still admits the sibling; ``search_album_fuzzy``
         (below) is where it is refused."""
-        assert _va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 2"))
+        assert va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 2"))
 
     def test_matching_volume_still_admitted(self, enable_title_token_identity_gate):
-        assert _va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 1"))
+        assert va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 1"))
 
     def test_lml531_recall_case_still_admitted(self, enable_title_token_identity_gate):
-        assert _va_series_title_match(
+        assert va_series_title_match(
             "disco not disco (post punk, electro & leftfield disco classics 1974-1986)",
             self._row("Disco Not Disco, vol. 1"),
         )
@@ -251,7 +252,7 @@ class TestVaSeriesTitleMatch:
         """The LML#717 guard: this arm is only for V/A rows. A same-shaped
         non-V/A row must still be refused here, whatever the titles say."""
         assert (
-            _va_series_title_match(
+            va_series_title_match(
                 "live sessions (acoustic recordings from the greek theatre 1998-2002)",
                 make_library_item(id=2, artist="Some Band", title="Live Sessions, vol. 2"),
             )
@@ -352,3 +353,84 @@ class TestMultiVolumeDisagreement:
     )
     def test_disjoint_sets_disagree(self, left, right):
         assert titles_differ_by_discriminating_token(left, right) is True
+
+
+class TestVaSeriesBaseIsOneDefinitionOfAVolume:
+    """Review F5/F9 acceptance: the #531 series parser and the #1369 volume
+    parser must agree on what a volume is. ``va_series_base`` now recovers the
+    base through the same phrase parser ``volume_identifiers`` uses -- the
+    phrase must run to the end of the title -- so the two cannot drift.
+
+    The table covers the forms the #531 docstring itself listed and had
+    pinned only one of (``, vol. N``), plus the shapes the finders showed the
+    old suffix regex mis-parsing: no space after the dot (41 catalog titles,
+    26 of them V/A rows), a dash or colon separator surviving into the base,
+    and any ``\\w+`` tail being read as a volume ("low volume music" -> "low").
+    """
+
+    @pytest.mark.parametrize(
+        ("title", "base"),
+        [
+            # The #531 docstring's own forms.
+            ("disco not disco, vol. 1", "disco not disco"),
+            ("disco not disco, volume 1", "disco not disco"),
+            ("disco not disco vol. 1", "disco not disco"),
+            ("disco not disco volume 1", "disco not disco"),
+            ("disco not disco vol 1", "disco not disco"),
+            ("disco not disco, vol. iii", "disco not disco"),
+            ("disco not disco, vol. 2a", "disco not disco"),
+            ("jean redpath, volume seven", "jean redpath"),
+            # F5 addendum: no space after the dot ("Aerial, vol.2" .. "vol.6").
+            ("disco not disco, vol.2", "disco not disco"),
+            ("disco not disco, vol.ii", "disco not disco"),
+            ("aerial, vol.2", "aerial"),
+            # A dash or colon separator must not survive into the base.
+            ("disco not disco - vol. 2", "disco not disco"),
+            ("disco not disco: vol. 2", "disco not disco"),
+            # A multi-volume filing is still a series filing.
+            ("nuggets, vols. 1-2", "nuggets"),
+            # Case-insensitive, like the rest of the module.
+            ("Disco Not Disco, Vol. 2", "disco not disco"),
+        ],
+    )
+    def test_series_filings_parse(self, title, base):
+        assert va_series_base(title) == base
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            # Any word after "volume" used to be a volume.
+            "low volume music",
+            "turn up the volume now",
+            "hits, vol. livid",
+            "the volume dealers",
+            # An empty base is not a series.
+            "  vol. 2",
+            "volume 2",
+            "",
+            # A volume that is not at the end is a title, not a filing.
+            "art of field recording volume i: fifty years of traditional music",
+            "aluminum tunes",
+        ],
+    )
+    def test_non_series_titles_do_not_parse(self, title):
+        assert va_series_base(title) is None
+
+
+class TestVaSeriesTitleMatchBoundary:
+    """Review F18: the base-prefix collision guard is the shared
+    ``next_char_is_boundary`` from ``lookup/name_folding.py`` -- the same
+    primitive ``article_stem_hit`` uses, so LML#1250's "any non-alphanumeric
+    continuation" rule cannot drift between the two again."""
+
+    def _row(self):
+        return make_library_item(id=1, artist="Various Artists", title="Disco Not Disco, vol. 1")
+
+    def test_exact_base_is_a_boundary(self):
+        assert va_series_title_match("disco not disco", self._row()) is True
+
+    def test_punctuation_continuation_is_a_boundary(self):
+        assert va_series_title_match("disco not disco: the collection", self._row()) is True
+
+    def test_letter_continuation_is_not(self):
+        assert va_series_title_match("disco not discotheque", self._row()) is False

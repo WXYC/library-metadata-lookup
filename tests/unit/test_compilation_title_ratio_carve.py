@@ -289,19 +289,19 @@ class TestCarveoutVerdictCarriesItsInputs:
         from rapidfuzz import fuzz
 
         from lookup.compilation_title_floor import (
-            _compilation_title_carveout_admits,
-            _compilation_title_carveout_verdict,
-            _compilation_title_length_ratio,
+            compilation_title_carveout_admits,
+            compilation_title_carveout_verdict,
+            compilation_title_length_ratio,
         )
 
         release = _WRONG_PRESSING_RELEASE_ALBUM.lower()
         row = _WRONG_PRESSING_LIBRARY_TITLE.lower()
-        verdict = _compilation_title_carveout_verdict(release, row)
+        verdict = compilation_title_carveout_verdict(release, row)
 
         assert verdict.title_score == fuzz.ratio(release, row)
-        assert verdict.length_ratio == _compilation_title_length_ratio(release, row)
+        assert verdict.length_ratio == compilation_title_length_ratio(release, row)
         assert verdict.admitted is False
-        assert _compilation_title_carveout_admits(release, row) is verdict.admitted
+        assert compilation_title_carveout_admits(release, row) is verdict.admitted
 
 
 class TestStrictBranchLogsTheVerdictItRejectedOn:
@@ -317,13 +317,13 @@ class TestStrictBranchLogsTheVerdictItRejectedOn:
     async def test_rejection_log_carries_the_verdicts_numbers_from_one_derivation(self, caplog):
         from rapidfuzz import fuzz
 
-        from lookup.compilation_title_floor import _compilation_title_carveout_verdict
+        from lookup.compilation_title_floor import compilation_title_carveout_verdict
         from lookup.strategies.track_on_compilation import _filter_release_matches
 
         release = _release(_WRONG_PRESSING_RELEASE_ID, _WRONG_PRESSING_RELEASE_ALBUM)
         row = _va_row(_WRONG_PRESSING_LIBRARY_ID, _WRONG_PRESSING_LIBRARY_TITLE)
         pair = (_WRONG_PRESSING_RELEASE_ALBUM.lower(), _WRONG_PRESSING_LIBRARY_TITLE.lower())
-        expected = _compilation_title_carveout_verdict(*pair)
+        expected = compilation_title_carveout_verdict(*pair)
         assert expected.admitted is False
 
         with (
