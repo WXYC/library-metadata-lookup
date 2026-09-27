@@ -341,6 +341,8 @@ class TestStrictBranchLogsTheVerdictItRejectedOn:
         assert f"'{_WRONG_PRESSING_LIBRARY_TITLE}'" in rejections[0]
         assert f"title_score={expected.title_score:.0f}" in rejections[0]
         assert f"length_ratio={expected.length_ratio:.2f}" in rejections[0]
+
+
 @pytest.mark.asyncio
 class TestVolumeSiblingsAtTheCarveOut:
     """LML#1369: the carve-out is the only gate with real rejection power on

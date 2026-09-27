@@ -347,10 +347,8 @@ def album_title_acceptable(query_lower: str, result_lower: str) -> bool:
     "Led Zeppelin II" vs "Led Zeppelin IV") by checking that when titles share
     a long common prefix, the short distinguishing suffixes are also similar.
 
-    LML#1369 puts ``title_token_gate_rejects`` in front of all of that: the
-    #24 remainder guard arms only when *both* remainders are <=5 chars, and
-    ", vol. 2" is 8, so a sibling volume reached the ratio floor at 87.1. The
-    guard is kept -- cheap, well-calibrated for its corpus, and the two agree.
+    LML#1369 puts ``title_token_gate_rejects`` ahead of all of that: the #24
+    guard arms only when *both* remainders are <=5 chars, and ", vol. 2" is 8.
     """
     from rapidfuzz import fuzz
 
