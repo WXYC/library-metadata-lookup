@@ -40,7 +40,7 @@ length-comparable and still clears both floors. Gated behind
 the pre-#973 ratio-floor-only admission without a redeploy."""
 
 
-def _compilation_title_length_ratio(a: str, b: str) -> float:
+def compilation_title_length_ratio(a: str, b: str) -> float:
     """``min(len)/max(len)`` of two titles, in [0, 1]; 0.0 if either is empty."""
     if not a or not b:
         return 0.0
@@ -61,7 +61,7 @@ class CarveoutVerdict:
     reason: str | None = None
 
 
-def _compilation_title_carveout_verdict(
+def compilation_title_carveout_verdict(
     release_title_lower: str, row_title_lower: str
 ) -> CarveoutVerdict:
     """Whether a compilation-artist row's title clears the carve-out's
@@ -86,7 +86,7 @@ def _compilation_title_carveout_verdict(
     from rapidfuzz import fuzz
 
     title_score = fuzz.ratio(release_title_lower, row_title_lower)
-    length_ratio = _compilation_title_length_ratio(release_title_lower, row_title_lower)
+    length_ratio = compilation_title_length_ratio(release_title_lower, row_title_lower)
     reason = None
     if title_token_gate_rejects(release_title_lower, row_title_lower):
         reason = "title identity (LML#1369)"
@@ -100,7 +100,7 @@ def _compilation_title_carveout_verdict(
     return CarveoutVerdict(reason is None, title_score, length_ratio, reason)
 
 
-def _compilation_title_carveout_admits(release_title_lower: str, row_title_lower: str) -> bool:
-    """:func:`_compilation_title_carveout_verdict` for a caller that needs only
+def compilation_title_carveout_admits(release_title_lower: str, row_title_lower: str) -> bool:
+    """:func:`compilation_title_carveout_verdict` for a caller that needs only
     the yes/no."""
-    return _compilation_title_carveout_verdict(release_title_lower, row_title_lower).admitted
+    return compilation_title_carveout_verdict(release_title_lower, row_title_lower).admitted

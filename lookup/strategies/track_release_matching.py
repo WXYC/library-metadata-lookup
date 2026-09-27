@@ -41,7 +41,7 @@ from lookup.rowless import (
     _recover_track_credit,
     _resolve_nonlibrary_release,
 )
-from lookup.title_identity import _va_series_title_match, title_token_gate_rejects
+from lookup.title_identity import title_token_gate_rejects, va_series_title_match
 
 logger = logging.getLogger(__name__)
 
@@ -356,7 +356,7 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
             for r in raw
             if not title_token_gate_rejects(q_lower, (r.title or "").lower())
             and (
-                _va_series_title_match(q_lower, r)
+                va_series_title_match(q_lower, r)
                 or album_title_acceptable(q_lower, (r.title or "").lower())
             )
         ]

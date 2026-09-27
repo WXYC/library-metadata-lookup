@@ -316,7 +316,13 @@ MODULE_BUDGETS: dict[str, int] = {
     # PR's review round overran its own first grant on comment prose and had
     # to trim back to fit rather than raise again, which is exactly the
     # pressure the guardrail is for.
-    "lookup/name_folding.py": 250,
+    #
+    # Raised by LML#1369 (250 -> 300, measured ~262): `next_char_is_boundary`,
+    # the word-boundary primitive `article_stem_hit` and
+    # `title_identity.va_series_title_match` both re-implemented until the #1377
+    # review (F18) noticed LML#1250 had changed one and not the other. Nine
+    # executable lines; the rest is the docstring saying why it is shared.
+    "lookup/name_folding.py": 300,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
     # transparent-fold calibration): the location-union task is now threaded
     # through `_step_search_pipeline` into the TRACK_ON_COMPILATION execute
@@ -485,14 +491,17 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/streaming_warm_admission.py": 100,
     "lookup/tail_deadline.py": 150,
     "lookup/timeouts.py": 100,
-    # LML#1369 prep: the compilation-artist title carve-out (the two #973
-    # floors, `_compilation_title_length_ratio`, `_compilation_title_carveout_admits`)
-    # moved verbatim out of `lookup/strategies/track_on_compilation.py`, which
-    # sat at exactly its 1150 ceiling -- the guardrail already firing -- rather
-    # than raising it. The `lookup/typed_pair_floor.py` precedent, for the same
-    # reason: two branches of `_filter_release_matches` ask this question and
-    # must admit the same class. 59 lines measured; 1.3x -> 76.7 -> 100.
-    "lookup/compilation_title_floor.py": 100,
+    # The compilation-artist title carve-out: the two #973 floors,
+    # `compilation_title_length_ratio`, and `compilation_title_carveout_verdict`
+    # (+ its bool wrapper), which derives both scores itself and names the gate
+    # that rejected a row. Extracted from `lookup/strategies/track_on_compilation.py`
+    # at that file's 1150 ceiling (LML#1369 prep), on the verbatim-move
+    # precedent of `fallback_artwork.py` / `override_floor.py`; both branches
+    # of `_filter_release_matches` ask it and must admit the same class.
+    # Re-sized 100 -> 150 for the verdict object and the #1369 gate (~108
+    # measured); most of that is the constant docstring, which is the one
+    # canonical copy of the #973 rationale.
+    "lookup/compilation_title_floor.py": 150,
     # LML#1369 prep: the #531 V/A series helpers (`_va_series_base`,
     # `_va_series_title_match`) moved verbatim out of `lookup/matching.py`,
     # which sat 2 lines under its 550 ceiling -- the same extract-don't-append
