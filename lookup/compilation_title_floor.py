@@ -80,11 +80,9 @@ def _compilation_title_carveout_verdict(
 
     The LML#1369 gate (``LML_TITLE_TOKEN_IDENTITY_GATE``, default off) sits in
     front of both floors, the kill switch included: #973's floors reject on
-    title *shape*, and a sibling volume has the right shape -- "Art Of Field
-    Recording Volume I" against "Art of Field Recording, vol. 2" scores 87.1
-    with a 0.938 length ratio and clears both. That switch restores pre-#973
-    *ratio* behavior; it is not a switch for binding one volume's release to
-    another volume's row."""
+    title *shape*, and a sibling volume has the right shape (87.1 ratio, 0.938
+    length ratio). That switch restores pre-#973 *ratio* behavior; it is not a
+    switch for binding one volume's release to another volume's row."""
     from rapidfuzz import fuzz
 
     title_score = fuzz.ratio(release_title_lower, row_title_lower)
