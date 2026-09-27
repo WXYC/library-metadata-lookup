@@ -42,10 +42,8 @@ This module also holds the LML#531 ``<base>, vol. N`` helpers
 ``lookup/matching.py`` because they parse the same shape this module
 normalises: two files disagreeing about what a volume is would be exactly the
 drift the module-budget guardrail exists to prevent. They stay pure parsers:
-the gate is applied by their one caller, ``search_album_fuzzy``, once and
-ahead of the ``or`` that joins the #531 arm to ``album_title_acceptable``
-(review F8), so neither arm can route around it and neither helper carries a
-Settings coupling.
+their one caller, ``search_album_fuzzy``, applies the gate once ahead of the
+``or`` joining the #531 arm to ``album_title_acceptable`` (review F8).
 """
 
 import re
@@ -64,31 +62,27 @@ from library.models import LibraryItem
 _VA_VOLUME_SUFFIX_RE = re.compile(r"[,\s]+vol(?:\.|ume)?\s+\w+\s*$", re.IGNORECASE)
 
 
-# A volume marker anywhere in a title, with its first identifier. Deliberately
-# looser than ``_VA_VOLUME_SUFFIX_RE`` above on *where* it may sit (that one
-# anchors at the end, because its job is to recover a series *base*, and it
-# stays verbatim because the #531 arm it serves runs with the flag off):
-# Discogs routinely puts the volume mid-title, as in "Art Of Field Recording
-# Volume I: Fifty Years Of Traditional American Music". The identifier is
-# captured as a bare word and then *validated* by :func:`_canonical_number` --
-# "Volunteers" and "Volume Dealers" both match this pattern and both resolve to
-# None, which is the point. IGNORECASE, and the public functions lower their
-# input besides: a mixed-case title that parsed as "no volume" would read as a
+# A volume marker anywhere in a title, with its first identifier -- Discogs
+# puts the volume mid-title ("Art Of Field Recording Volume I: Fifty Years...").
+# ``_VA_VOLUME_SUFFIX_RE`` above anchors at the end because its job is a series
+# *base*, and it stays verbatim because the #531 arm runs with the flag off.
+# The identifier is captured as a bare word and *validated* by
+# :func:`_canonical_number` -- "Volunteers" and "Volume Dealers" both match and
+# both resolve to None, which is the point. IGNORECASE, and the public functions
+# lower their input besides: a mixed-case title read as "no volume" is a
 # one-sided None, which the two-sided rule treats as agreement (review F5).
 _VOLUME_MARKER_RE = re.compile(r"\bvol(?:ume)?s?\.?\s*([0-9]+[a-z]?|[a-z]+)\b", re.IGNORECASE)
 
-# A further identifier in the same phrase -- "vol. 1 & 2", "vols. 1-3",
-# "vols. 1, 2 and 3". Group 1 is the separator (a range when it is a dash or
-# "to"), group 2 the candidate identifier, which is validated exactly as the
-# first one is; the list stops at the first word that is not a volume number,
-# so "vol. 2, the best of" is volume 2 alone (review F4).
+# A further identifier in the same phrase ("vol. 1 & 2", "vols. 1-3", "vols.
+# 1, 2 and 3"): group 1 the separator (a range when a dash or "to"), group 2 a
+# candidate validated exactly as the first was. The list stops at the first
+# word that is not a volume number, so "vol. 2, the best of" is 2 alone (F4).
 _VOLUME_LIST_ITEM_RE = re.compile(
     r"\s*(&|and|,|/|-|\u2013|to)\s*([0-9]+[a-z]?|[a-z]+)\b", re.IGNORECASE
 )
 
-#: Widest numeric range a "vols. N-M" phrase is expanded across. A double or
-#: triple set is the real shape; a span past this is a year or a catalog
-#: number that happened to follow a dash, and is kept as two endpoints.
+#: Widest "vols. N-M" range that is expanded; past it the dash is a year or a
+#: catalog number, and the two endpoints stand alone.
 _MAX_VOLUME_RANGE_SPAN = 20
 
 #: Spelled-out volume numbers. Capped at twenty: the longest series in the
@@ -105,13 +99,12 @@ _WORD_NUMBERS = {
     )
 }
 
-#: The roman alphabet this parser admits is i/v/x only, canonical form,
-#: which tops out at xxxix (39). The restriction is load-bearing (review F9):
-#: with l/c/d/m admitted, "vol. c" read as volume 100, "vol. cd" as 400 and
-#: "vol. mix" as 1009 -- a lone letter or a real word is not a volume, and a
-#: series lettered A-G must be adjudicated for none of its letters rather than
-#: for the ones that happen to be numerals. No series in this catalog is
-#: numbered past 39 in roman; the long ones are written in digits.
+#: Roman is i/v/x only, canonical form, topping out at xxxix (39). Load-bearing
+#: (review F9): with l/c/d/m admitted, "vol. c" read as 100, "vol. cd" as 400
+#: and "vol. mix" as 1009 -- a lone letter or a real word is not a volume, and
+#: a series lettered A-G must be adjudicated for none of its letters rather
+#: than the ones that happen to be numerals. No roman-numbered series here
+#: passes 39; the long ones are written in digits.
 _ROMAN_VALUES = {"i": 1, "v": 5, "x": 10}
 _ROMAN_RE = re.compile(r"^x{0,3}(?:ix|iv|v?i{0,3})$")
 
@@ -155,9 +148,8 @@ def _canonical_number(raw: str) -> str | None:
 
 
 def _range_interior(low: str, high: str) -> list[str]:
-    """The volumes strictly between two range endpoints, when both are plain
-    numbers no more than ``_MAX_VOLUME_RANGE_SPAN`` apart; otherwise nothing,
-    and the endpoints stand alone."""
+    """Volumes strictly between two plain-number endpoints no more than
+    ``_MAX_VOLUME_RANGE_SPAN`` apart; otherwise nothing."""
     if not (low.isdigit() and high.isdigit()):
         return []
     if not 0 < int(high) - int(low) <= _MAX_VOLUME_RANGE_SPAN:
@@ -166,12 +158,9 @@ def _range_interior(low: str, high: str) -> list[str]:
 
 
 def _parse_volume_phrase(title_lower: str) -> tuple[frozenset[str], int, int] | None:
-    """The first resolvable volume phrase in ``title_lower``.
-
-    Returns ``(identifiers, start, end)`` -- every volume the phrase names,
-    canonicalised, plus the span of the whole phrase so a caller can remove it
-    from the title -- or None when the title carries no resolvable marker.
-    """
+    """``(identifiers, start, end)`` of the first resolvable volume phrase --
+    every volume it names, canonicalised, plus its span so a caller can remove
+    it from the title -- or None when there is no resolvable marker."""
     for match in _VOLUME_MARKER_RE.finditer(title_lower):
         first = _canonical_number(match.group(1))
         if first is None:
@@ -192,37 +181,26 @@ def _parse_volume_phrase(title_lower: str) -> tuple[frozenset[str], int, int] | 
 
 def volume_identifiers(title: str) -> frozenset[str]:
     """Every volume ``title`` names, canonicalised; empty when it names none.
-
-    ``vol. 2``, ``Vol.2``, ``volume 2``, ``Volume II`` and ``Volume Two`` all
-    yield ``{"2"}``; ``vols. 1-3`` yields ``{"1", "2", "3"}``. Only a
-    *resolvable* marker counts, so "Jefferson Airplane Volunteers" yields
-    nothing. Case-insensitive.
-    """
+    ``vol. 2`` / ``Volume II`` / ``Volume Two`` all yield ``{"2"}``; ``vols.
+    1-3`` yields ``{"1", "2", "3"}``; "Volunteers" yields nothing."""
     parsed = _parse_volume_phrase(title.lower())
     return parsed[0] if parsed is not None else frozenset()
 
 
 def volume_identifier(title: str) -> str | None:
-    """The one volume ``title`` names, or None.
-
-    None both when the title names no volume and when it names several -- a
-    two-volume set has no single answer, and a caller that wants the set asks
-    :func:`volume_identifiers` for it.
-    """
+    """The one volume ``title`` names, or None -- both for no volume and for
+    several: a two-volume set has no single answer, and a caller that wants
+    the set asks :func:`volume_identifiers`."""
     identifiers = volume_identifiers(title)
     return next(iter(identifiers)) if len(identifiers) == 1 else None
 
 
 def titles_differ_by_discriminating_token(left: str, right: str) -> bool:
-    """Whether two album titles name different releases.
-
-    True when both carry volume identifiers and the sets are disjoint --
-    membership is agreement, so a library "vol. 2" row is not rejected
-    against the Discogs "vol. 1 & 2" set that contains it. False otherwise,
-    including the asymmetric case this gate must never reject, a volume on
-    one side only (see the module docstring). Case-insensitive and
-    flag-independent; the gates call :func:`title_token_gate_rejects`.
-    """
+    """Whether two album titles name different releases: both carry volume
+    identifiers and the sets are disjoint. Membership is agreement (a "vol. 2"
+    row against the "vol. 1 & 2" set that contains it), and a volume on one
+    side only never rejects (see the module docstring). Case-insensitive and
+    flag-independent; the gates call :func:`title_token_gate_rejects`."""
     left_volumes = volume_identifiers(left)
     right_volumes = volume_identifiers(right)
     return bool(left_volumes) and bool(right_volumes) and left_volumes.isdisjoint(right_volumes)
