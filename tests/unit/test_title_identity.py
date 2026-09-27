@@ -15,13 +15,13 @@ naive symmetric rule would break recall rather than improve precision:
 """
 
 import pytest
+
+from lookup.matching import album_title_acceptable
 from lookup.title_identity import (
     _va_series_title_match,
     titles_differ_by_discriminating_token,
     volume_identifier,
 )
-
-from lookup.matching import album_title_acceptable
 from tests.factories import make_library_item
 
 

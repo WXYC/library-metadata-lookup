@@ -485,6 +485,28 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/streaming_warm_admission.py": 100,
     "lookup/tail_deadline.py": 150,
     "lookup/timeouts.py": 100,
+    # LML#1369: the compilation-artist title carve-out, hoisted out of
+    # `lookup/strategies/track_on_compilation.py` at that file's 1150 ceiling
+    # rather than raising it — the `lookup/typed_pair_floor.py` precedent, and
+    # for the same reason: two branches of `_filter_release_matches` ask this
+    # question and must admit the same class. 74 lines measured; sized per the
+    # tight convention, smallest multiple of 50 at or above it.
+    "lookup/compilation_title_floor.py": 100,
+    # LML#1369: album-title token identity -- the volume-form normaliser
+    # (arabic/roman/word) and the two-sided discriminating-token rule that the
+    # three title gates now consult, plus the cognate LML#531 series helpers
+    # (`_va_series_base`, `_va_series_title_match`) moved along with them.
+    # Carved out of `lookup/matching.py` rather than appended to it: that file
+    # sat 2 lines under its own 550 ceiling, the same extract-don't-append
+    # answer that produced `name_folding.py` and `miss_kind.py`. Moving the
+    # #531 helpers is not incidental -- they parse the same `<base>, vol. N`
+    # shape this module normalises, and two files disagreeing about what a
+    # volume is would be exactly the drift the guardrail exists to catch.
+    # Most of the measured size is prose: the module's three recall
+    # asymmetries are the part a future reader must not "simplify" away.
+    # Sized per this table's tight convention for one bounded, self-contained
+    # concern: smallest multiple of 50 at or above the measured size.
+    "lookup/title_identity.py": 400,
     # LML#1321: the ARTIST_PLUS_ALBUM match class — the joint 80/80 floor, the
     # LML#1206 artist-variant widening + exact-credit tie-break, and the LML#784
     # self-titled swap — hoisted out of `lookup/strategies/library_miss.py`,

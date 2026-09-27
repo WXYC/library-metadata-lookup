@@ -65,6 +65,19 @@ _WRONG_PRESSING_LIBRARY_TITLE = "Greatest hits of the 50s & 60s"
 _WRONG_PRESSING_RELEASE_ID = 605487
 _WRONG_PRESSING_RELEASE_ALBUM = "Greatest Hits Of The 50's"
 
+# LML#1369 left the kill switch governing only what it was built to govern.
+# The #973 repro above is no longer a usable kill-switch probe: its extra
+# "& 60s" is a discriminating token, so the #1369 gate rejects row 58775
+# ahead of the flag and flipping the flag no longer readmits it (see
+# ``test_kill_switch_does_not_readmit_a_token_disagreement``). This pair is
+# rejected by the length guard ALONE -- ratio 88.2, length ratio 0.789, no
+# token disagreement (the library's ", vol. 1" is the LML#531 asymmetry, not
+# a contradiction) -- so it still isolates the flag.
+_LENGTH_ONLY_LIBRARY_ID = 58790
+_LENGTH_ONLY_LIBRARY_TITLE = "Bloodstains Across the Midwest, vol. 1"
+_LENGTH_ONLY_RELEASE_ID = 605490
+_LENGTH_ONLY_RELEASE_ALBUM = "Bloodstains Across The Midwest"
+
 
 def _release(release_id: int, album: str) -> ReleaseInfo:
     return ReleaseInfo(
@@ -139,9 +152,28 @@ class TestStrictBranchTitleRatioCarve:
         self, disable_tighten_compilation_title_carveout
     ):
         """LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT=false is the kill switch: with
-        the length-comparability guard bypassed, row 58775 clears the bare
-        ratio-floor-only rule (87.3 >= 80) and is admitted again -- byte-for-byte
-        the pre-#973 behavior."""
+        the length-comparability guard bypassed, a row rejected by that guard
+        alone clears the bare ratio-floor-only rule (88.2 >= 80) and is admitted
+        again -- byte-for-byte the pre-#973 behavior."""
+        releases = [_release(_LENGTH_ONLY_RELEASE_ID, _LENGTH_ONLY_RELEASE_ALBUM)]
+        matches_by_album = {
+            _LENGTH_ONLY_RELEASE_ALBUM: [
+                _va_row(_LENGTH_ONLY_LIBRARY_ID, _LENGTH_ONLY_LIBRARY_TITLE)
+            ]
+        }
+
+        results, _titles = await _run(releases, matches_by_album)
+
+        assert {r.id for r in results} == {_LENGTH_ONLY_LIBRARY_ID}
+
+    async def test_kill_switch_does_not_readmit_a_token_disagreement(
+        self, disable_tighten_compilation_title_carveout
+    ):
+        """LML#1369: the flag governs the #973 *length* guard, not the token
+        gate. Row 58775's extra "& 60s" is real content the Discogs release
+        lacks -- which is what #973's own docstring says about it -- so the
+        token rule rejects it independently, and flipping the flag must not
+        bind a different comp's release to it."""
         releases = [_release(_WRONG_PRESSING_RELEASE_ID, _WRONG_PRESSING_RELEASE_ALBUM)]
         matches_by_album = {
             _WRONG_PRESSING_RELEASE_ALBUM: [
@@ -151,7 +183,7 @@ class TestStrictBranchTitleRatioCarve:
 
         results, _titles = await _run(releases, matches_by_album)
 
-        assert {r.id for r in results} == {_WRONG_PRESSING_LIBRARY_ID}
+        assert results == []
 
     async def test_genuine_same_titled_comps_are_kept(self):
         """Rows 50963 and 8865: genuine hits whose library title matches the
@@ -262,13 +294,13 @@ class TestFallbackBranchTitleRatioCarveParity:
     ):
         """Parity with the strict-branch kill switch: the fallback's
         ``_fallback_row_acceptable`` also drops the length guard when
-        LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT=false, admitting row 58775."""
-        releases = [_release(_WRONG_PRESSING_RELEASE_ID, _WRONG_PRESSING_RELEASE_ALBUM)]
-        matches = [_va_row(_WRONG_PRESSING_LIBRARY_ID, _WRONG_PRESSING_LIBRARY_TITLE)]
+        LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT=false."""
+        releases = [_release(_LENGTH_ONLY_RELEASE_ID, _LENGTH_ONLY_RELEASE_ALBUM)]
+        matches = [_va_row(_LENGTH_ONLY_LIBRARY_ID, _LENGTH_ONLY_LIBRARY_TITLE)]
 
         results, _titles = await self._run_fallback(releases, matches)
 
-        assert {r.id for r in results} == {_WRONG_PRESSING_LIBRARY_ID}
+        assert {r.id for r in results} == {_LENGTH_ONLY_LIBRARY_ID}
 
     async def test_genuine_same_titled_comp_kept_via_fallback(self):
         releases = [_release(50001, "Doo Wop Classics")]
