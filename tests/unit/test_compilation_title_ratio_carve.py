@@ -397,3 +397,56 @@ class TestVolumeSiblingsAtTheCarveOut:
         results, _titles = await _run(releases, matches)
 
         assert {r.id for r in results} == {_WRONG_PRESSING_LIBRARY_ID}
+
+
+@pytest.mark.asyncio
+class TestRejectionLogNamesTheGateThatFired:
+    """Review F6: on a token-identity rejection the strict branch used to
+    recompute ``title_score`` / ``length_ratio`` purely for the debug log,
+    and then report numbers that PASS both #973 floors -- pointing anyone
+    debugging a recall drop from the flag flip at #973 instead of #1369."""
+
+    async def test_volume_rejection_is_attributed_to_lml1369_not_to_the_floors(
+        self, enable_title_token_identity_gate, caplog
+    ):
+        import logging
+
+        releases = [_release(3532729, "Art Of Field Recording Volume I")]
+        matches = {
+            "Art Of Field Recording Volume I": [_va_row(58621, "Art of Field Recording, vol. 2")]
+        }
+
+        with caplog.at_level(logging.DEBUG, logger="lookup.strategies.track_on_compilation"):
+            results, _titles = await _run(releases, matches)
+
+        assert results == []
+        rejection = next(
+            r.getMessage()
+            for r in caplog.records
+            if "Rejected 'Art of Field Recording" in r.getMessage()
+        )
+        assert "LML#1369" in rejection, rejection
+        assert "title_score=" not in rejection, rejection
+
+    async def test_length_rejection_still_reports_the_numbers(
+        self, enable_title_token_identity_gate, caplog
+    ):
+        """The #973 numbers stay in the log where #973 is what fired."""
+        import logging
+
+        releases = [_release(_WRONG_PRESSING_RELEASE_ID, _WRONG_PRESSING_RELEASE_ALBUM)]
+        matches = {
+            _WRONG_PRESSING_RELEASE_ALBUM: [
+                _va_row(_WRONG_PRESSING_LIBRARY_ID, _WRONG_PRESSING_LIBRARY_TITLE)
+            ]
+        }
+
+        with caplog.at_level(logging.DEBUG, logger="lookup.strategies.track_on_compilation"):
+            results, _titles = await _run(releases, matches)
+
+        assert results == []
+        rejection = next(
+            r.getMessage() for r in caplog.records if "Rejected 'Greatest hits" in r.getMessage()
+        )
+        assert "length_ratio=0.83" in rejection, rejection
+        assert "LML#1369" not in rejection, rejection
