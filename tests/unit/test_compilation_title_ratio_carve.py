@@ -29,6 +29,7 @@ in case the guard turns out to cost real recall in prod.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -301,3 +302,41 @@ class TestCarveoutVerdictCarriesItsInputs:
         assert verdict.length_ratio == _compilation_title_length_ratio(release, row)
         assert verdict.admitted is False
         assert _compilation_title_carveout_admits(release, row) is verdict.admitted
+
+
+class TestStrictBranchLogsTheVerdictItRejectedOn:
+    """The strict branch's rejection line must print the numbers the carve-out
+    judged the pair on -- derived once, handed back on the verdict -- not a
+    second ``fuzz.ratio`` computed for the log alone. A re-derivation is the
+    #1377 F6 class: a rejection logged with numbers that had nothing to do
+    with why it was rejected."""
+
+    @pytest.mark.asyncio
+    async def test_rejection_log_carries_the_verdicts_numbers_from_one_derivation(self, caplog):
+        from rapidfuzz import fuzz
+
+        from lookup.compilation_title_floor import _compilation_title_carveout_verdict
+        from lookup.strategies.track_on_compilation import _filter_release_matches
+
+        release = _release(_WRONG_PRESSING_RELEASE_ID, _WRONG_PRESSING_RELEASE_ALBUM)
+        row = _va_row(_WRONG_PRESSING_LIBRARY_ID, _WRONG_PRESSING_LIBRARY_TITLE)
+        expected = _compilation_title_carveout_verdict(
+            _WRONG_PRESSING_RELEASE_ALBUM.lower(), _WRONG_PRESSING_LIBRARY_TITLE.lower()
+        )
+        assert expected.admitted is False
+
+        with (
+            patch("rapidfuzz.fuzz.ratio", wraps=fuzz.ratio) as ratio_spy,
+            caplog.at_level(logging.DEBUG, logger="lookup.strategies.track_on_compilation"),
+        ):
+            kept = await _filter_release_matches([row], "The Flamingos", release, None, strict=True)
+
+        assert kept == []
+        assert ratio_spy.call_count == 1
+        rejections = [
+            r.getMessage() for r in caplog.records if r.getMessage().startswith("Rejected ")
+        ]
+        assert len(rejections) == 1
+        assert f"'{_WRONG_PRESSING_LIBRARY_TITLE}'" in rejections[0]
+        assert f"title_score={expected.title_score:.0f}" in rejections[0]
+        assert f"length_ratio={expected.length_ratio:.2f}" in rejections[0]
