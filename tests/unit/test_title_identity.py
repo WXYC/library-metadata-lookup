@@ -170,6 +170,51 @@ class TestAlbumTitleAcceptable:
         assert album_title_acceptable(query, result) is True
 
 
+class TestSearchAlbumFuzzyGatesBothArms:
+    """Review F8: one ``title_token_gate_rejects`` filter in
+    ``_search_and_filter`` ahead of the ``or`` covers both the #531 V/A arm
+    and ``album_title_acceptable`` -- and is the only place the V/A arm is
+    gated (see ``TestVaSeriesTitleMatch``)."""
+
+    def _db(self):
+        from unittest.mock import AsyncMock
+
+        rows = [
+            make_library_item(
+                id=58620,
+                artist="Various Artists - Folk - A",
+                title="Art of Field Recording, vol. 1",
+            ),
+            make_library_item(
+                id=58621,
+                artist="Various Artists - Folk - A",
+                title="Art of Field Recording, vol. 2",
+            ),
+        ]
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=rows)
+        return db
+
+    @pytest.mark.asyncio
+    async def test_flag_off_admits_both_va_rows(self):
+        from lookup.strategies.track_release_matching import search_album_fuzzy
+
+        results = await search_album_fuzzy(self._db(), "Art Of Field Recording Volume I")
+
+        assert {r.id for r in results} == {58620, 58621}
+
+    @pytest.mark.asyncio
+    async def test_flag_on_refuses_the_sibling_through_the_va_arm(
+        self, enable_title_token_identity_gate
+    ):
+        from lookup.strategies.track_release_matching import search_album_fuzzy
+
+        results = await search_album_fuzzy(self._db(), "Art Of Field Recording Volume I")
+
+        assert {r.id for r in results} == {58620}
+
+
 class TestVaSeriesTitleMatch:
     """``_va_series_title_match`` is reached as an ``or`` arm in
     ``search_album_fuzzy``, so it bypasses ``album_title_acceptable``
@@ -184,11 +229,14 @@ class TestVaSeriesTitleMatch:
     def test_flag_off_is_todays_behavior_siblings_included(self):
         assert _va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 2"))
 
-    def test_sibling_volume_no_longer_admitted(self, enable_title_token_identity_gate):
-        assert (
-            _va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 2"))
-            is False
-        )
+    def test_stays_a_pure_parser_with_the_gate_on(self, enable_title_token_identity_gate):
+        """Review F8: the #531 arm has exactly one caller, ``search_album_fuzzy``,
+        which ``or``s it with ``album_title_acceptable``. The gate belongs at
+        that call site, once, ahead of the ``or`` -- not inside a parser that
+        then carries a Settings coupling for no second caller. So with the
+        gate ON this arm still admits the sibling; ``search_album_fuzzy``
+        (below) is where it is refused."""
+        assert _va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 2"))
 
     def test_matching_volume_still_admitted(self, enable_title_token_identity_gate):
         assert _va_series_title_match(_SIBLINGS[0], self._row("Art of Field Recording, vol. 1"))
