@@ -313,6 +313,17 @@ class TestVolumeIdentifierReviewFindings:
             # The list stops at the first word that is not a volume number.
             ("nuggets vol. 2, the best of", {"2"}),
             ("aluminum tunes", set()),
+            # Every phrase counts, not only the first: a two-in-one filed as two
+            # phrases (catalog row 16344) names both volumes, and "& vol. 2"
+            # restarts the marker rather than continuing the list.
+            ("urmur bile trax volume 1 volume 2", {"1", "2"}),
+            ("nuggets vol. 1 & vol. 2", {"1", "2"}),
+            # A year after the separator is not a further volume, and a year
+            # range is not a run of volumes: "vol. 2, 1967-1974" is one volume,
+            # not nine. Nine catalog titles carry this shape.
+            ("posh hits, vol. 1, 1983", {"1"}),
+            ("country funk, vol. 2, 1967-1974", {"2"}),
+            ("valaida volume 1, 1935-37", {"1"}),
         ],
     )
     def test_volume_identifiers_is_the_full_set(self, title, expected):
@@ -338,6 +349,10 @@ class TestMultiVolumeDisagreement:
             ("nuggets vols. 1-3", "nuggets, vol. 2"),
             # F5 at the predicate: mixed case must not read as one-sided.
             ("Art Of Field Recording Volume I", "Art of Field Recording, Vol. 1"),
+            # A second volume phrase is part of the set: the two-in-one row
+            # agrees with either of its volumes.
+            ("urmur bile trax volume 1 volume 2", "urmur bile trax volume 2"),
+            ("nuggets vol. 1 & vol. 2", "nuggets, vol. 2"),
         ],
     )
     def test_membership_is_agreement(self, left, right):
@@ -349,6 +364,8 @@ class TestMultiVolumeDisagreement:
             ("nuggets vol. 1 & 2", "nuggets vol. 3"),
             ("nuggets vols. 1-2", "nuggets, vol. 4"),
             ("Art Of Field Recording Volume I", "Art of Field Recording, Vol. 2"),
+            # Overlapping year spans must not read as shared volumes.
+            ("country funk, vol. 1, 1969-1975", "country funk, vol. 2, 1967-1974"),
         ],
     )
     def test_disjoint_sets_disagree(self, left, right):
@@ -411,10 +428,37 @@ class TestVaSeriesBaseIsOneDefinitionOfAVolume:
             # A volume that is not at the end is a title, not a filing.
             "art of field recording volume i: fifty years of traditional music",
             "aluminum tunes",
+            # A year after the volume is a tail, not a further volume, so the
+            # phrase does not run to the end (LML#531's regex agreed: None).
+            "posh hits, vol. 1, 1983",
+            "country funk, vol. 2, 1967-1974",
         ],
     )
     def test_non_series_titles_do_not_parse(self, title):
         assert va_series_base(title) is None
+
+    @pytest.mark.parametrize(
+        ("title", "base"),
+        [
+            (
+                "island records 1964-1969: rhythm & blues beat, volume 2 r&b beat vol. 2",
+                "island records 1964-1969: rhythm & blues beat, volume 2 r&b beat",
+            ),
+            ("urmur bile trax volume 1 volume 2", "urmur bile trax volume 1"),
+            (
+                "sun papa and the fan club orchestra vol. 1 & vol. 2",
+                "sun papa and the fan club orchestra vol. 1 &",
+            ),
+        ],
+    )
+    def test_a_filing_is_judged_on_its_trailing_phrase(self, title, base):
+        """LML#531's suffix regex was ``$``-anchored, so a title carrying two
+        volume phrases was a filing on its *last* one. Judging the first phrase
+        instead turned catalog row 36837 -- a V/A row the #531 arm admitted --
+        into a non-filing: the one flag-independent rejection the F5 addendum
+        would otherwise introduce. The base is whatever precedes the trailing
+        phrase, exactly as before."""
+        assert va_series_base(title) == base
 
 
 class TestVaSeriesTitleMatchBoundary:
