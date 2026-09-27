@@ -37,13 +37,14 @@ International Pop Festival" by one *word* on each side and fails the ratio
 floors the same way. That generic discriminating-token check is the next
 change to land in this module; the function names are chosen for it.
 
-This module also holds the LML#531 ``<base>, vol. N`` helpers
-(``_va_series_base``, ``_va_series_title_match``), moved here from
-``lookup/matching.py`` because they parse the same shape this module
-normalises: two files disagreeing about what a volume is would be exactly the
-drift the module-budget guardrail exists to prevent. They stay pure parsers:
-their one caller, ``search_album_fuzzy``, applies the gate once ahead of the
-``or`` joining the #531 arm to ``album_title_acceptable`` (review F8).
+The LML#531 series helpers live here too -- :func:`va_series_base` recovers
+the ``<base>`` of a ``<base>, vol. N`` filing through the same phrase parser,
+so the two cannot disagree about what a volume is, and
+:func:`va_series_title_match` is the admission arm ``search_album_fuzzy``
+reaches for a V/A row. Both stay pure parsers: their one caller applies the
+gate once, ahead of the ``or`` joining that arm to ``album_title_acceptable``.
+
+Extracted from ``lookup/matching.py`` at its module budget (LML#1369 prep).
 """
 
 import re
@@ -52,15 +53,7 @@ from wxyc_etl.text import is_compilation_artist
 
 from config.settings import get_settings
 from library.models import LibraryItem
-
-# V/A series suffixes catalogued in WXYC library as "<base>, vol. N" or close
-# variants. See WXYC/library-metadata-lookup#531 — Discogs returns the canonical
-# release with a long parenthetical subtitle ("Disco Not Disco (Post Punk,
-# Electro & Leftfield Disco Classics 1974-1986)") while the library keeps the
-# terse series identifier ("Disco Not Disco, vol. 1"), so the standard
-# length-sensitive fuzz.ratio path in ``album_title_acceptable`` rejects them.
-_VA_VOLUME_SUFFIX_RE = re.compile(r"[,\s]+vol(?:\.|ume)?\s+\w+\s*$", re.IGNORECASE)
-
+from lookup.name_folding import next_char_is_boundary
 
 # A volume marker anywhere in a title, with its first identifier -- Discogs
 # puts the volume mid-title ("Art Of Field Recording Volume I: Fifty Years...").
@@ -215,59 +208,51 @@ def title_token_gate_rejects(left: str, right: str) -> bool:
     return titles_differ_by_discriminating_token(left, right)
 
 
-def _va_series_base(library_title_lower: str) -> str | None:
-    """If ``library_title_lower`` is a ``<base>, vol. N`` series identifier,
-    return the lowercased ``<base>``. Otherwise return ``None``.
+def va_series_base(library_title: str) -> str | None:
+    """The series base of a ``<base>, vol. N`` library filing, or None.
 
-    Strips trailing ``, vol. N`` / ``, volume N`` / `` vol. N`` / `` volume N``
-    (and ``vol N`` without the dot). The numeric tail is ``\\w+`` so roman
-    numerals ("vol. III") and mixed identifiers ("vol. 2a") also match.
+    A filing is a title whose volume phrase runs to the end: ``, vol. N`` /
+    ``, volume N`` / `` vol. N`` / ``vol N`` / ``vol.N`` (no space -- 41
+    catalog titles), roman or spelled numbers, a ``2a`` suffix, a
+    multi-volume phrase (``vols. 1-2``). The identifier vocabulary is the same
+    closed one :func:`volume_identifiers` uses, so "low volume music" and
+    "hits, vol. livid" are titles, not filings. A dash or colon separator is
+    stripped with the comma so it cannot survive into the base and defeat the
+    prefix test downstream. Case-insensitive; an empty base is None.
     """
-    match = _VA_VOLUME_SUFFIX_RE.search(library_title_lower)
-    if not match:
+    title_lower = library_title.lower()
+    parsed = _parse_volume_phrase(title_lower)
+    if parsed is None:
         return None
-    base = library_title_lower[: match.start()].rstrip(" ,")
+    _identifiers, start, end = parsed
+    if title_lower[end:].strip():
+        return None
+    base = title_lower[:start].rstrip(" ,:-\u2013")
     return base or None
 
 
-def _va_series_title_match(query_lower: str, item: LibraryItem) -> bool:
-    """Special-case for V/A series releases catalogued as ``<base>, vol. N``.
+def va_series_title_match(query_lower: str, item: LibraryItem) -> bool:
+    """The LML#531 admission arm for Various-Artists series rows.
 
-    The library files V/A compilations under a terse ``<base>, vol. N`` series
-    identifier (filing convention preserved in ``library.artist_name``), while
-    Discogs returns the canonical release with a long descriptive subtitle.
-    Neither the prefix branch nor the length-sensitive ``fuzz.ratio`` branch
-    of ``album_title_acceptable`` can bridge that asymmetry, so V/A series
-    rows stay hidden.
+    The library files V/A compilations as a terse ``<base>, vol. N`` while
+    Discogs returns the canonical release under a long descriptive subtitle,
+    an asymmetry neither the prefix branch nor the length-sensitive ratio in
+    ``album_title_acceptable`` can bridge. This admits a row when it is a V/A
+    row (``is_compilation_artist`` -- the guard that keeps an artist's own
+    ``Live Sessions, vol. 2`` out, LML#717), its title parses as a series
+    filing, and the Discogs query starts with the base at a word boundary
+    (:func:`~lookup.name_folding.next_char_is_boundary`, so ``Disco`` does not
+    grandfather every release beginning with that word).
 
-    This accepts when:
-
-    1. The library item is a V/A row (``is_compilation_artist`` on the artist
-       string — gate keeps the looser path from grandfathering non-V/A albums
-       with the same shape, e.g. an artist's own ``Live Sessions, vol. 2``).
-    2. The library title parses as ``<base>, vol. N`` (or close-cousin
-       ``vol. N`` / ``volume N`` variants).
-    3. The Discogs query title starts with ``<base>`` followed by a
-       non-alphanumeric boundary — protects against base-prefix collisions like
-       ``Disco`` matching every Discogs release that happens to start with
-       that word.
-
-    Returns True when all three hold; the caller then bypasses
-    ``album_title_acceptable`` for this row.
-
-    See WXYC/library-metadata-lookup#531.
+    A pure parser: its one caller, ``search_album_fuzzy``, applies the
+    LML#1369 gate once ahead of the ``or`` that joins this arm to
+    ``album_title_acceptable``.
     """
     if not is_compilation_artist(item.artist or ""):
         return False
-    library_title_lower = (item.title or "").lower()
-    base = _va_series_base(library_title_lower)
+    base = va_series_base(item.title or "")
     if not base:
         return False
     if not query_lower.startswith(base):
         return False
-    # Require a word boundary after the base so "Disco" doesn't grandfather
-    # every Discogs release whose title starts with that token.
-    tail = query_lower[len(base) :]
-    if tail and tail[0].isalnum():
-        return False
-    return True
+    return next_char_is_boundary(query_lower, len(base))

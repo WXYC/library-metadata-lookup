@@ -49,8 +49,8 @@ from lookup.artist_resolution import (
 )
 from lookup.candidate_memo import TrackCandidateMemo, TrackCandidateSet
 from lookup.compilation_title_floor import (
-    _compilation_title_carveout_admits,
-    _compilation_title_carveout_verdict,
+    compilation_title_carveout_admits,
+    compilation_title_carveout_verdict,
 )
 from lookup.concurrency import _chunked_gather
 from lookup.location_union import (
@@ -635,7 +635,7 @@ async def _filter_release_matches(
 
         def _fallback_row_acceptable(match: LibraryItem) -> bool:
             if discogs_is_compilation and is_compilation_artist(match.artist or ""):
-                return _compilation_title_carveout_admits(
+                return compilation_title_carveout_admits(
                     release_album_lower, (match.title or "").lower()
                 )
             return (
@@ -659,7 +659,7 @@ async def _filter_release_matches(
         if artist_matches_item(match, lib_artist):
             filtered_matches.append(match)
         elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
-            verdict = _compilation_title_carveout_verdict(
+            verdict = compilation_title_carveout_verdict(
                 release_album_lower, (match.title or "").lower()
             )
             if verdict.admitted:

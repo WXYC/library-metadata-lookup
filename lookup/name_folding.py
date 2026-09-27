@@ -227,7 +227,8 @@ def article_stem_hit(candidate: str, query: str, *, exact: bool) -> bool:
     non-alphanumeric continuation counts, not only a space -- rung 4's
     candidate is folded, so punctuation already *is* a space by the time it
     looks, and demanding a literal one made the two rungs disagree about
-    "The F.U.'s". Same shape as ``_va_series_title_match``. A **content-length
+    "The F.U.'s". Shared with ``va_series_title_match`` via
+    :func:`next_char_is_boundary`. A **content-length
     floor** closes what the boundary cannot -- folding manufactures a genuine
     boundary around a one-character stem, since "A E" strips to "e" and
     "E-40" folds to "e 40". :data:`_ARTICLE_STEM_MIN_LENGTH` carries the
@@ -246,5 +247,16 @@ def article_stem_hit(candidate: str, query: str, *, exact: bool) -> bool:
         return False
     if not candidate.startswith(query):
         return False
-    tail = candidate[len(query) :]
-    return bool(tail) and not tail[0].isalnum()
+    return len(candidate) > len(query) and next_char_is_boundary(candidate, len(query))
+
+
+def next_char_is_boundary(text: str, index: int) -> bool:
+    """Whether ``text`` ends at ``index`` or continues with a non-alphanumeric.
+
+    The one word-boundary rule behind both :func:`article_stem_hit` and
+    ``lookup.title_identity.va_series_title_match``: a matched prefix counts
+    only if the string does not run on into the same word. Any non-alphanumeric
+    continuation counts, not only a space -- the LML#1250 rule -- and it lives
+    here once so the two callers cannot drift on it again (LML#1369 review).
+    """
+    return index >= len(text) or not text[index].isalnum()
