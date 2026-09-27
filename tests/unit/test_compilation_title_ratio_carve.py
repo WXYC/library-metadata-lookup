@@ -277,3 +277,27 @@ class TestFallbackBranchTitleRatioCarveParity:
         results, _titles = await self._run_fallback(releases, matches)
 
         assert {r.id for r in results} == {50963}
+
+
+class TestCarveoutVerdictCarriesItsInputs:
+    """The strict branch logs a rejection's ``title_score`` / ``length_ratio``;
+    with the derivation moved inside the predicate, the numbers it hands back
+    must be the ones the call sites used to compute themselves."""
+
+    def test_verdict_numbers_match_the_direct_derivation(self):
+        from rapidfuzz import fuzz
+
+        from lookup.compilation_title_floor import (
+            _compilation_title_carveout_admits,
+            _compilation_title_carveout_verdict,
+            _compilation_title_length_ratio,
+        )
+
+        release = _WRONG_PRESSING_RELEASE_ALBUM.lower()
+        row = _WRONG_PRESSING_LIBRARY_TITLE.lower()
+        verdict = _compilation_title_carveout_verdict(release, row)
+
+        assert verdict.title_score == fuzz.ratio(release, row)
+        assert verdict.length_ratio == _compilation_title_length_ratio(release, row)
+        assert verdict.admitted is False
+        assert _compilation_title_carveout_admits(release, row) is verdict.admitted
