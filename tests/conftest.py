@@ -204,6 +204,18 @@ def _reset_discogs_pool_singleton():
     ``None`` (the mid-acquire ``create_pool`` never returned), so nulling it
     here is unnecessary; doing it *without* ``aclose`` would instead orphan a
     live asyncpg pool in the pg suite (a connection leak), so we don't.
+
+    ``_last_built_discogs_pool`` (LML#1354's peek cache) IS reset, and the
+    distinction is the reason the paragraph above does not apply to it: that
+    module global is explicitly "not a lifecycle handle — read it, never close
+    it", so dropping the reference orphans nothing. Leaving it set is what made
+    ``TestTheProfilerNeverBuildsThePool`` order-dependent:
+    ``tests/unit/test_dependencies.py::TestGetDiscogsService::test_creates_pool_with_database_url``
+    builds a pool from a mocked ``asyncpg.create_pool`` and its ``monkeypatch``
+    undoes the patch but not the global, so ``peek_discogs_pool()`` kept
+    handing an ``AsyncMock`` to every later test in the same worker. Whether
+    those two tests saw it came down to how ``pytest -n auto`` sharded the
+    file — same commit green on one run and red on the next.
     """
     from core import dependencies as _core_deps
 
@@ -224,6 +236,7 @@ def _reset_discogs_pool_singleton():
         for name, cell in zip(freevars, closure, strict=True):
             if name == "lock":
                 cell.cell_contents = asyncio.Lock()
+        _core_deps._last_built_discogs_pool = None
 
     _reset()
     yield
