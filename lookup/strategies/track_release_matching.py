@@ -347,10 +347,8 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
         if not raw:
             return []
         q_lower = query.lower()
-        # LML#1369: gated once here, ahead of the ``or``, so that neither the
-        # #531 V/A arm (which would otherwise admit a sibling volume
-        # unconditionally) nor the ratio path can route around it, and the
-        # #531 helper stays a pure parser (review F8).
+        # LML#1369: gated once, ahead of the ``or``, so neither the #531 V/A arm
+        # nor the ratio path can route around it (and the arm stays a parser).
         return [
             r
             for r in raw

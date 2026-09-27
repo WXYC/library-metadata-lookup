@@ -502,22 +502,17 @@ MODULE_BUDGETS: dict[str, int] = {
     # measured); most of that is the constant docstring, which is the one
     # canonical copy of the #973 rationale.
     "lookup/compilation_title_floor.py": 150,
-    # LML#1369 prep: the #531 V/A series helpers (`_va_series_base`,
-    # `_va_series_title_match`) moved verbatim out of `lookup/matching.py`,
-    # which sat 2 lines under its 550 ceiling -- the same extract-don't-append
-    # answer that produced `name_folding.py` and `miss_kind.py`. This is the
-    # seam the #1369 token-identity gate lands in.
-    #
-    # Re-sized by LML#1369's volume axis (150 -> 300): the module gained the
-    # volume-form normaliser (arabic/roman/word onto one value), the two-sided
-    # disagreement predicate, and the flag-aware wrapper the three title gates
-    # consult. Roughly a third of the growth is the module docstring, which
-    # carries the two recall asymmetries a future reader must not "simplify"
-    # away. 273 lines measured after the #1377 review fixes (the multi-volume
-    # phrase parser and the i/v/x roman restriction); 1.3x would say 400, but
-    # 300 is kept as a deliberate under-grant -- the generic
-    # discriminating-token axis that follows will re-size it with its own
-    # justification, and a third axis would be a new module.
+    # Album-title identity beyond fuzz.ratio (LML#1369): the volume-phrase
+    # parser (arabic/roman/word spellings, lists and bounded ranges onto one
+    # canonical set), the two-sided disagreement predicate, the flag-aware
+    # wrapper the title gates consult, and the #531 series helpers, which
+    # recover a filing's base through the same parser so the two cannot
+    # disagree about what a volume is. Extracted from `lookup/matching.py` at
+    # that file's 550 ceiling (LML#1369 prep), on the verbatim-move precedent
+    # of `fallback_artwork.py` / `override_floor.py`. Roughly a third of the
+    # measured size is the module docstring carrying the recall asymmetries a
+    # future reader must not "simplify" away. ~260 measured; 300 is a
+    # deliberate under-grant against the 1.3x formula's 350.
     "lookup/title_identity.py": 300,
     # LML#1321: the ARTIST_PLUS_ALBUM match class — the joint 80/80 floor, the
     # LML#1206 artist-variant widening + exact-credit tie-break, and the LML#784

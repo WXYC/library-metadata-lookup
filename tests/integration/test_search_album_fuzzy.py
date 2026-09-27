@@ -64,6 +64,25 @@ async def test_va_series_surfaces_against_various_prefix_retry(library_db):
 
 
 @pytest.mark.asyncio
+async def test_va_series_with_volume_surfaces_with_the_gate_on_too(
+    library_db, enable_title_token_identity_gate
+):
+    """LML#1369 deliberately keeps the two assertions above: the Discogs
+    query carries NO volume, so a `, vol. N` row on the library side is the
+    one-sided case the gate must never reject (#531's recall property). Both
+    volumes still surface with the gate on. Do not "fix" either test back --
+    the gate-on rejection lives in
+    ``test_sibling_volume_row_does_not_surface_for_volume_i`` below, whose
+    query names a volume."""
+    results = await search_album_fuzzy(
+        library_db,
+        "Disco Not Disco (Post Punk, Electro & Leftfield Disco Classics 1974-1986)",
+    )
+    titles = {r.title for r in results}
+    assert {"Disco Not Disco, vol. 1", "Disco Not Disco, vol. 2"} <= titles, titles
+
+
+@pytest.mark.asyncio
 async def test_plain_base_query_unchanged(library_db):
     """Regression guard: a query that already matches by FTS5 (no paren,
     exact prefix of the library row) must continue to surface. This locks in
@@ -71,6 +90,7 @@ async def test_plain_base_query_unchanged(library_db):
     """
     results = await search_album_fuzzy(library_db, "Disco Not Disco")
     titles = {r.title for r in results}
+    # Both volumes, flag on or off: the query names no volume (LML#1369).
     assert "Disco Not Disco, vol. 1" in titles
     assert "Disco Not Disco, vol. 2" in titles
 

@@ -253,10 +253,7 @@ def article_stem_hit(candidate: str, query: str, *, exact: bool) -> bool:
 def next_char_is_boundary(text: str, index: int) -> bool:
     """Whether ``text`` ends at ``index`` or continues with a non-alphanumeric.
 
-    The one word-boundary rule behind both :func:`article_stem_hit` and
-    ``lookup.title_identity.va_series_title_match``: a matched prefix counts
-    only if the string does not run on into the same word. Any non-alphanumeric
-    continuation counts, not only a space -- the LML#1250 rule -- and it lives
-    here once so the two callers cannot drift on it again (LML#1369 review).
-    """
+    The one word-boundary rule behind :func:`article_stem_hit` and
+    ``title_identity.va_series_title_match`` (any non-alphanumeric, not only a
+    space -- LML#1250), kept here once so the two cannot drift on it again."""
     return index >= len(text) or not text[index].isalnum()

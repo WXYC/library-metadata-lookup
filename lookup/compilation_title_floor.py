@@ -50,10 +50,8 @@ def compilation_title_length_ratio(a: str, b: str) -> float:
 @dataclass(frozen=True)
 class CarveoutVerdict:
     """One carve-out decision with the inputs that produced it and, on a
-    rejection, which gate fired -- so a caller that logs it names the LML#1369
-    token gate, the ``fuzz.ratio`` floor or the LML#973 length guard, with the
-    numbers only where they decided it (review F6: a volume rejection logged
-    as "title_score=89, length_ratio=0.97" pointed at #973 instead)."""
+    rejection, which gate fired -- the LML#1369 token gate, the ratio floor or
+    the #973 length guard -- with numbers only where they decided it (F6)."""
 
     admitted: bool
     title_score: float
@@ -80,9 +78,13 @@ def compilation_title_carveout_verdict(
 
     The LML#1369 gate (``LML_TITLE_TOKEN_IDENTITY_GATE``, default off) sits in
     front of both floors, the kill switch included: #973's floors reject on
-    title *shape*, and a sibling volume has the right shape (87.1 ratio, 0.938
-    length ratio). That switch restores pre-#973 *ratio* behavior; it is not a
-    switch for binding one volume's release to another volume's row."""
+    title *shape*, and a sibling volume has the right shape (87.1 / 0.938). The
+    switch restores pre-#973 *ratio* behavior, not one volume wearing another's.
+
+    Tests flip either flag via ``monkeypatch.setenv`` + ``get_settings.cache_clear()``
+    or by patching THIS module's ``get_settings``; the strategy module's does
+    not reach here. Both functions are value-imported by ``track_on_compilation``:
+    to intercept the strategy's call, patch ``lookup.strategies.track_on_compilation.<name>``."""
     from rapidfuzz import fuzz
 
     title_score = fuzz.ratio(release_title_lower, row_title_lower)
