@@ -23,6 +23,7 @@ from lookup.title_identity import (
     title_token_gate_rejects,
     titles_differ_by_discriminating_token,
     volume_identifier,
+    volume_identifiers,
 )
 from tests.factories import make_library_item
 
@@ -208,3 +209,98 @@ class TestVaSeriesTitleMatch:
             )
             is False
         )
+
+
+class TestVolumeIdentifierReviewFindings:
+    """Pins from the #1377 review: the volume parser must be case-insensitive
+    (F5), must not read a lone letter or a real word as a roman numeral (F9),
+    and must read a multi-volume phrase as the set it names (F4)."""
+
+    @pytest.mark.parametrize(
+        ("title", "expected"),
+        [
+            # F5: every caller happens to lower() first; nothing enforced it,
+            # and a one-sided None reads as "no disagreement".
+            ("Art Of Field Recording Volume II", "2"),
+            ("Art of Field Recording, Vol. 2", "2"),
+            ("PEBBLES VOL.10", "10"),
+        ],
+    )
+    def test_case_insensitive(self, title, expected):
+        assert volume_identifier(title) == expected
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            # F9: canonical roman accepted single letters and real words --
+            # "vol. c" read as 100, "vol. mix" as 1009, "vol. cd" as 400.
+            "sun ra vol. c",
+            "vol. mix",
+            "vol. cd",
+            "vol. l",
+            "vol. d",
+            "vol. m",
+            # A lettered series (A-G, the LIBRARY_RELEASE.CALL_LETTERS shape) is
+            # not a numbered one; adjudicate none of it rather than some of it.
+            "atlantic rhythm and blues vol. a",
+            "atlantic rhythm and blues vol. b",
+        ],
+    )
+    def test_letters_and_words_are_not_roman_volumes(self, title):
+        assert volume_identifier(title) is None
+
+    @pytest.mark.parametrize(
+        ("title", "expected"),
+        [
+            ("pebbles volume x", {"10"}),
+            ("pebbles volume xiv", {"14"}),
+            ("pebbles volume xxxix", {"39"}),
+            # F4: a multi-volume release names every volume it contains.
+            ("nuggets vol. 1 & 2", {"1", "2"}),
+            ("nuggets vols. 1-2", {"1", "2"}),
+            ("nuggets vols. 1, 2 and 3", {"1", "2", "3"}),
+            ("nuggets vols. 3-5", {"3", "4", "5"}),
+            ("nuggets vol. i & ii", {"1", "2"}),
+            # The list stops at the first word that is not a volume number.
+            ("nuggets vol. 2, the best of", {"2"}),
+            ("aluminum tunes", set()),
+        ],
+    )
+    def test_volume_identifiers_is_the_full_set(self, title, expected):
+        assert volume_identifiers(title) == frozenset(expected)
+
+    def test_single_identifier_is_none_for_a_multi_volume_phrase(self):
+        """``volume_identifier`` answers "which one volume?"; a two-volume set
+        has no one answer, and a caller that wants the set asks for it."""
+        assert volume_identifier("nuggets vol. 1 & 2") is None
+
+
+class TestMultiVolumeDisagreement:
+    """F4, at the predicate: membership is agreement. A library vol. 2 row is
+    *contained* in Discogs's two-volume set and must not be rejected against
+    it, while a volume the set does not contain still is."""
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            ("nuggets vol. 1 & 2", "nuggets vol. 2"),
+            ("nuggets vol. 2", "nuggets vol. 1 & 2"),
+            ("nuggets vols. 1-2", "nuggets, vol. 1"),
+            ("nuggets vols. 1-3", "nuggets, vol. 2"),
+            # F5 at the predicate: mixed case must not read as one-sided.
+            ("Art Of Field Recording Volume I", "Art of Field Recording, Vol. 1"),
+        ],
+    )
+    def test_membership_is_agreement(self, left, right):
+        assert titles_differ_by_discriminating_token(left, right) is False
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            ("nuggets vol. 1 & 2", "nuggets vol. 3"),
+            ("nuggets vols. 1-2", "nuggets, vol. 4"),
+            ("Art Of Field Recording Volume I", "Art of Field Recording, Vol. 2"),
+        ],
+    )
+    def test_disjoint_sets_disagree(self, left, right):
+        assert titles_differ_by_discriminating_token(left, right) is True
