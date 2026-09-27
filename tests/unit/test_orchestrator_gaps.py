@@ -20,7 +20,7 @@ from lookup.strategies.track_on_compilation import (
     search_compilations_for_track,
 )
 from lookup.strategies.track_release_matching import search_album_fuzzy
-from lookup.title_identity import _va_series_title_match
+from lookup.title_identity import va_series_title_match
 from lookup.validation import filter_results_by_track_validation
 from services.parser import ParsedRequest
 from tests.factories import make_discogs_result
@@ -1220,7 +1220,7 @@ class TestSearchAlbumFuzzy:
         """The ``, vol. N`` special-case is gated on ``is_compilation_artist``.
 
         A non-V/A library row with the same shape (``<base>, vol. N``) must NOT
-        be accepted through the ``_va_series_title_match`` looser path. Asserts
+        be accepted through the ``va_series_title_match`` looser path. Asserts
         the gate directly rather than through ``search_album_fuzzy`` end-to-end
         — the latter can reach the row via the existing prefix branch in
         ``album_title_acceptable`` once the search query is paren-stripped
@@ -1239,13 +1239,13 @@ class TestSearchAlbumFuzzy:
         # paren subtitle or has been stripped to the base — the artist gate
         # is what keeps non-V/A rows out of the looser path.
         assert (
-            _va_series_title_match(
+            va_series_title_match(
                 "live sessions (acoustic recordings from the greek theatre 1998-2002)",
                 item,
             )
             is False
         )
-        assert _va_series_title_match("live sessions", item) is False
+        assert va_series_title_match("live sessions", item) is False
 
     def test_va_series_gate_accepts_va_artist_with_matching_base(self):
         """Companion to the gate-narrowness test: confirm the helper *does*
@@ -1258,13 +1258,13 @@ class TestSearchAlbumFuzzy:
             title="Disco Not Disco, vol. 1",
         )
         assert (
-            _va_series_title_match(
+            va_series_title_match(
                 "disco not disco (post punk, electro & leftfield disco classics 1974-1986)",
                 item,
             )
             is True
         )
-        assert _va_series_title_match("disco not disco", item) is True
+        assert va_series_title_match("disco not disco", item) is True
 
     @pytest.mark.asyncio
     async def test_paren_strip_handles_multiple_trailing_groups(self):

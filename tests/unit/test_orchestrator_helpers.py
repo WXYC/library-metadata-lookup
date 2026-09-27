@@ -732,8 +732,9 @@ class TestArtistMatchesItem:
         the fold is built on and what rung 4 already assumes, since folding
         turns that apostrophe into the very space rung 2 was looking for.
         Requiring a *literal* space made rung 2 the only rung that disagreed.
-        The repo already spells this boundary at ``_va_series_title_match``
-        (``matching.py``), for the same reason and in the same shape.
+        The repo spells this boundary once, as ``next_char_is_boundary`` in
+        ``lookup/name_folding.py``; ``va_series_title_match``
+        (``lookup/title_identity.py``) shares it for the same reason.
         """
         item = make_library_item(id=1, artist=catalog_artist, title="Album")
         assert artist_matches_item(item, query) is True
@@ -5172,3 +5173,25 @@ class TestApiCallCap:
             "Item B never fired the cap but inherited A's signal — concurrent "
             "bulk regression (iter-3 review)."
         )
+
+
+class TestNextCharIsBoundary:
+    """Review F18: the one word-boundary primitive behind both
+    ``article_stem_hit`` and ``va_series_title_match``. LML#1250 moved the
+    article rung from "literal space" to "any non-alphanumeric continuation";
+    the V/A arm was not in that diff and only happened to agree."""
+
+    def test_end_of_string_is_a_boundary(self):
+        from lookup.name_folding import next_char_is_boundary
+
+        assert next_char_is_boundary("black dog", len("black dog")) is True
+
+    def test_punctuation_is_a_boundary(self):
+        from lookup.name_folding import next_char_is_boundary
+
+        assert next_char_is_boundary("the f.u.'s", len("the f")) is True
+
+    def test_a_letter_is_not(self):
+        from lookup.name_folding import next_char_is_boundary
+
+        assert next_char_is_boundary("habib koite", len("ha")) is False
