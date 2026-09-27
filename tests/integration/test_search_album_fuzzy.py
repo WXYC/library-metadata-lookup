@@ -187,3 +187,116 @@ async def test_non_va_paren_match_filtered_by_downstream_artist_gate(library_db)
         f"Non-V/A row paired with a non-matching Discogs artist must be filtered "
         f"by process_release's artist gate, got: {titles}"
     )
+
+
+# ---------------------------------------------------------------------------
+# LML#1369 -- sibling volumes (behind LML_TITLE_TOKEN_IDENTITY_GATE)
+# ---------------------------------------------------------------------------
+
+_AOFR_VOLUME_I = "Art Of Field Recording Volume I"
+_AOFR_VOLUME_I_RELEASE_ID = 3532729
+
+
+@pytest.mark.asyncio
+async def test_flag_off_sibling_volume_still_surfaces(library_db):
+    """Byte-for-byte pin of today's behavior with the gate off: both volumes
+    clear every ratio floor for a Volume I query."""
+    results = await search_album_fuzzy(library_db, _AOFR_VOLUME_I)
+    titles = {r.title for r in results}
+
+    assert {"Art of Field Recording, vol. 1", "Art of Field Recording, vol. 2"} <= titles
+
+
+@pytest.mark.asyncio
+async def test_sibling_volume_row_does_not_surface_for_volume_i(
+    library_db, enable_title_token_identity_gate
+):
+    """LML#1369 shape A, at the shared matcher. The vol. 1 row is asserted
+    present so the vol. 2 assertion cannot pass vacuously on an empty FTS5
+    result."""
+    results = await search_album_fuzzy(library_db, _AOFR_VOLUME_I)
+    titles = {r.title for r in results}
+
+    assert "Art of Field Recording, vol. 1" in titles, (
+        f"the matching volume must still surface, got: {titles}"
+    )
+    assert "Art of Field Recording, vol. 2" not in titles, (
+        f"the sibling volume must not surface for a Volume I query, got: {titles}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_va_sibling_volume_is_covered_too(library_db, enable_title_token_identity_gate):
+    """The non-V/A path never reaches the compilation carve-out, so before
+    LML#1369 nothing but FTS5 retrieval stood between same-artist volume
+    siblings. Row 60001 is ``Live Sessions, vol. 2`` under ``Some Band``; a
+    Volume 1 query must not reach it. This is also the non-TRACK_ON_COMPILATION
+    caller the ticket asks to see covered."""
+    results = await search_album_fuzzy(library_db, "Live Sessions Volume 1")
+    titles = {r.title for r in results}
+
+    assert "Live Sessions, vol. 2" not in titles, (
+        f"a non-V/A sibling volume must not surface either, got: {titles}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lookup_for_a_track_on_volume_i_binds_only_volume_i(
+    library_db, enable_title_token_identity_gate
+):
+    """End-to-end over ``search_compilations_for_track``: with the fan-out at
+    the strategy's bind site deliberately left alone (LML#1369 splits it out),
+    the only thing keeping release 3532729 off the vol. 2 row is the title
+    gate. So this pins the gate through the strategy, not just the predicate."""
+    parsed = ParsedRequest(
+        artist="Gordon Tanner",
+        song="Medley",
+        raw_message="medley by gordon tanner",
+    )
+
+    service = AsyncMock()
+    service.cache_service = None
+
+    async def _track_releases(track, artist=None, artist_as_keyword=False, **_):
+        return TrackReleasesResponse(
+            track=track,
+            artist=artist,
+            releases=[
+                ReleaseInfo(
+                    album=_AOFR_VOLUME_I,
+                    artist="Various",
+                    release_id=_AOFR_VOLUME_I_RELEASE_ID,
+                    release_url=f"https://www.discogs.com/release/{_AOFR_VOLUME_I_RELEASE_ID}",
+                    is_compilation=True,
+                )
+            ],
+            total=1,
+        )
+
+    service.search_releases_by_track = AsyncMock(side_effect=_track_releases)
+    service.validate_track_on_release = AsyncMock(return_value=True)
+
+    with patch(
+        "lookup.strategies.track_on_compilation.lookup_releases_by_track",
+        new_callable=AsyncMock,
+        return_value=[],
+    ):
+        items, resolved = await search_compilations_for_track(
+            library_db, parsed, discogs_service=service
+        )
+
+    titles = {item.title for item in items}
+    assert "Art of Field Recording, vol. 1" in titles, (
+        f"the volume carrying the track must still be returned, got: {titles}"
+    )
+    assert "Art of Field Recording, vol. 2" not in titles, (
+        f"the sibling volume must not be returned, got: {titles}"
+    )
+    bound_to_volume_i = {
+        item_id
+        for item_id, release in resolved.items()
+        if release.release_id == _AOFR_VOLUME_I_RELEASE_ID
+    }
+    assert 58621 not in bound_to_volume_i, (
+        "the vol. 2 row must not be bound to Volume I's release (it would wear Volume I's cover)"
+    )
