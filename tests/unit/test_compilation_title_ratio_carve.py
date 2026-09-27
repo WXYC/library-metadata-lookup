@@ -309,7 +309,9 @@ class TestStrictBranchLogsTheVerdictItRejectedOn:
     judged the pair on -- derived once, handed back on the verdict -- not a
     second ``fuzz.ratio`` computed for the log alone. A re-derivation is the
     #1377 F6 class: a rejection logged with numbers that had nothing to do
-    with why it was rejected."""
+    with why it was rejected. The spy is process-wide, so only calls on the
+    carve-out's own title pair are counted: a future ``fuzz.ratio`` rung in
+    ``artist_matches_item`` would score the artist strings, not this pair."""
 
     @pytest.mark.asyncio
     async def test_rejection_log_carries_the_verdicts_numbers_from_one_derivation(self, caplog):
@@ -320,9 +322,8 @@ class TestStrictBranchLogsTheVerdictItRejectedOn:
 
         release = _release(_WRONG_PRESSING_RELEASE_ID, _WRONG_PRESSING_RELEASE_ALBUM)
         row = _va_row(_WRONG_PRESSING_LIBRARY_ID, _WRONG_PRESSING_LIBRARY_TITLE)
-        expected = _compilation_title_carveout_verdict(
-            _WRONG_PRESSING_RELEASE_ALBUM.lower(), _WRONG_PRESSING_LIBRARY_TITLE.lower()
-        )
+        pair = (_WRONG_PRESSING_RELEASE_ALBUM.lower(), _WRONG_PRESSING_LIBRARY_TITLE.lower())
+        expected = _compilation_title_carveout_verdict(*pair)
         assert expected.admitted is False
 
         with (
@@ -332,7 +333,7 @@ class TestStrictBranchLogsTheVerdictItRejectedOn:
             kept = await _filter_release_matches([row], "The Flamingos", release, None, strict=True)
 
         assert kept == []
-        assert ratio_spy.call_count == 1
+        assert [call.args for call in ratio_spy.call_args_list].count(pair) == 1
         rejections = [
             r.getMessage() for r in caplog.records if r.getMessage().startswith("Rejected ")
         ]
