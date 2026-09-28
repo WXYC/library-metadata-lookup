@@ -503,6 +503,18 @@ SEED_ITEMS = [
         "Folk",
         "CD",
     ),
+    # LML#1369 shape C: a row differing from the Discogs title by one
+    # discriminating word ("Guitar" against "Monterey"/"Pop").
+    (
+        58630,
+        "The International Guitar Festival",
+        "Various Artists - Rock - I",
+        "V",
+        5,
+        1,
+        "Rock",
+        "CD",
+    ),
     # Non-V/A with the same shape — regression guard so the gate stays narrow.
     (60001, "Live Sessions, vol. 2", "Some Band", "S", 4, 2, "Rock", "CD"),
     # Trio / collaboration filed under one member (LML#684). The Discogs release
