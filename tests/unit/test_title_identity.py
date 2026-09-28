@@ -324,6 +324,21 @@ class TestVolumeIdentifierReviewFindings:
             ("posh hits, vol. 1, 1983", {"1"}),
             ("country funk, vol. 2, 1967-1974", {"2"}),
             ("valaida volume 1, 1935-37", {"1"}),
+            # A list continues only in the phrase's own notation: a spelled
+            # number opening the subtitle is not a further volume, and a
+            # spelled list is still a list. "and"/"to" are whole words.
+            ("rare soul vol. 2, one night only", {"2"}),
+            ("vol. 1 and one more", {"1"}),
+            ("volume one and two", {"1", "2"}),
+            ("nuggets vols. i to iii", {"1", "2", "3"}),
+            ("vol. i tox", {"1"}),
+            # A spelled number past the vocabulary is not its first word.
+            ("jean redpath, volume twenty one", set()),
+            ("jean redpath, volume twenty-one", set()),
+            # A dash that is not a bounded ascending run ends the phrase at
+            # its first identifier: "2-63" is a catalog number, not volume 63.
+            ("series vol. 2-63", {"2"}),
+            ("series vols. 1-100", {"1"}),
         ],
     )
     def test_volume_identifiers_is_the_full_set(self, title, expected):
@@ -353,6 +368,9 @@ class TestMultiVolumeDisagreement:
             # agrees with either of its volumes.
             ("urmur bile trax volume 1 volume 2", "urmur bile trax volume 2"),
             ("nuggets vol. 1 & vol. 2", "nuggets, vol. 2"),
+            # Past-vocabulary spellings read as no volume, never as their
+            # first word: a one-sided None is agreement, not a false reject.
+            ("jean redpath, volume twenty one", "jean redpath volume 21"),
         ],
     )
     def test_membership_is_agreement(self, left, right):
@@ -366,6 +384,10 @@ class TestMultiVolumeDisagreement:
             ("Art Of Field Recording Volume I", "Art of Field Recording, Vol. 2"),
             # Overlapping year spans must not read as shared volumes.
             ("country funk, vol. 1, 1969-1975", "country funk, vol. 2, 1967-1974"),
+            # A subtitle's number word must not smuggle the sibling into the set.
+            ("rare soul, vol. 1", "rare soul vol. 2, one night only"),
+            # A catalog-number dash must not assert its second half as a volume.
+            ("series, vol. 63", "series vol. 2-63"),
         ],
     )
     def test_disjoint_sets_disagree(self, left, right):
