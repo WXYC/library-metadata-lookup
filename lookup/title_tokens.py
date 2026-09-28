@@ -27,8 +27,9 @@ ordinals and the catalog's abbreviations ("part" is "pt", "two" and "2nd" are
 or three consecutive tokens ("doggy style" is "doggystyle", with the same
 tolerance: "rock and roll" is "rock'n'roll" once "and" is dropped). Packaging
 vocabulary that describes an edition rather than its contents never
-discriminates, and neither does a lone letter, so a series lettered A-G is
-adjudicated for none of its letters rather than some.
+discriminates, and neither does a lone letter (a roman digit -- i, v, x -- is
+a number first, so "Chicago V" against "Chicago 16" is adjudicated), so a
+series lettered A-G is adjudicated for none of its letters rather than some.
 
 Two properties of :func:`tokens_disagree` are asymmetries on purpose: a
 one-sided extra token never rejects ("Aluminum Tunes (Remastered)" is not a
@@ -50,15 +51,18 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 #: prepositions and conjunctions, the credit/series vocabulary, and the
 #: packaging words that describe an edition rather than its contents -- the
 #: library catalogues "Trax Records 20th Anniversary Collection" where Discogs
-#: writes "Trax Records: The 20th Anniversary Edition". Listing a token here
-#: can only make the veto *less* likely to fire, so an over-long list costs
+#: writes "Trax Records: The 20th Anniversary Edition", and 2,144 of its
+#: titles carry a bracket annotation ("[EP]", "[single]", "[delete]") that a
+#: Discogs subtitle would otherwise make two-sided. Listing a token here can
+#: only make the veto *less* likely to fire, so an over-long list costs
 #: precision, never recall. Keep content words out: "Guitar" against
 #: "Monterey" is the shape this module exists to reject.
 _NON_DISCRIMINATING_TOKENS = frozenset(
     "a an and at by de del der die el feat featuring for from ft in la le los of on presents "
     "the to vs with vol vols volume volumes "
     "anthology collection collections compilation compilations deluxe edition editions "
-    "expanded records recordings reissue remaster remastered series".split()
+    "expanded records recordings reissue remaster remastered series "
+    "bonus box cd delete disc ep import lp mono promo set single stereo version".split()
 )
 
 #: Abbreviations the two catalogs expand differently, folded onto the SHORT
@@ -101,8 +105,10 @@ _ORDINAL_WORDS = {
 }
 _ORDINAL_SUFFIX_RE = re.compile(r"^([0-9]+)(?:st|nd|rd|th)$")
 
-#: Punctuation between two digits is a separator ("1947-1974" is two years);
-#: any other punctuation inside a token is removed, not split on.
+#: Punctuation between two digits is a separator ("1947-1974" is two years)
+#: except a thousands comma ("1,000" is one number); any other punctuation
+#: inside a token is removed, not split on.
+_THOUSANDS_SEPARATOR_RE = re.compile(r"(?<=[0-9]),(?=[0-9]{3}\b)")
 _DIGIT_SEPARATOR_RE = re.compile(r"(?<=[0-9])[^\w\s]+(?=[0-9])")
 _INTRA_TOKEN_PUNCTUATION_RE = re.compile(r"[^\w\s]|_")
 
@@ -120,7 +126,8 @@ and "2" compare equal on the word axis exactly as they do on the volume axis."""
 
 def _canonical_token(raw: str, fold_number: NumberFolder) -> str:
     """One token in its comparison form: a spelled-out reading folded onto its
-    abbreviation, ordinals and numbers folded to digits."""
+    abbreviation, ordinals and numbers folded to digits -- a pluralised number
+    word ("ones") with its suffix dropped."""
     token = _ABBREVIATIONS.get(raw, raw)
     ordinal = _ORDINAL_SUFFIX_RE.fullmatch(token)
     if ordinal:
@@ -128,6 +135,8 @@ def _canonical_token(raw: str, fold_number: NumberFolder) -> str:
     if token in _ORDINAL_WORDS:
         return str(_ORDINAL_WORDS[token])
     number = fold_number(token)
+    if number is None and len(token) > 2 and token.endswith("s"):
+        number = fold_number(token[:-1])
     return number if number is not None else token
 
 
@@ -135,7 +144,8 @@ def content_tokens(text: str, fold_number: NumberFolder) -> tuple[str, ...]:
     """The comparison tokens of a title (with its volume phrases already
     removed): diacritics and intra-token punctuation folded, stopwords and
     packaging vocabulary dropped, each token canonical."""
-    folded = _DIGIT_SEPARATOR_RE.sub(" ", normalize_for_comparison(text.lower()))
+    folded = _THOUSANDS_SEPARATOR_RE.sub("", normalize_for_comparison(text.lower()))
+    folded = _DIGIT_SEPARATOR_RE.sub(" ", folded)
     folded = _INTRA_TOKEN_PUNCTUATION_RE.sub("", folded)
     return tuple(
         _canonical_token(raw, fold_number)
@@ -157,16 +167,18 @@ def _stem(token: str) -> str:
 
 def _is_abbreviated_year(short: str, long: str) -> bool:
     """ "74" is "1974" -- exactly a two-digit suffix of a four-digit number, so
-    it cannot generalise into "any number that ends with another number"."""
+    it cannot generalise into "any number that ends with another number".
+    Judged on stems, so a decade pairs too ("50s" is "1950s")."""
     return len(short) == 2 and len(long) == 4 and long.isdigit() and long.endswith(short)
 
 
 def _same_token(left: str, right: str) -> bool:
+    left_stem, right_stem = _stem(left), _stem(right)
     return (
-        _stem(left) == _stem(right)
+        left_stem == right_stem
         or fuzz.ratio(left, right) >= _TOKEN_EQUIVALENCE_FLOOR
-        or _is_abbreviated_year(left, right)
-        or _is_abbreviated_year(right, left)
+        or _is_abbreviated_year(left_stem, right_stem)
+        or _is_abbreviated_year(right_stem, left_stem)
     )
 
 
@@ -197,36 +209,42 @@ def _mark_counterparts(
                 break
 
 
-def discriminating_remainders(
-    left: tuple[str, ...], right: tuple[str, ...]
-) -> tuple[list[str], list[str]]:
-    """The tokens on each side with no counterpart on the other. A lone letter
-    is never counted: it can join into a neighbour ("rock" + "n" + "roll") but
-    on its own discriminates nothing."""
+def _alignment(left: tuple[str, ...], right: tuple[str, ...]) -> tuple[list[bool], list[bool]]:
+    """Which tokens on each side have a counterpart on the other."""
     left_done, right_done = [False] * len(left), [False] * len(right)
     _mark_counterparts(left, left_done, right, right_done)
     _mark_counterparts(right, right_done, left, left_done)
+    return left_done, right_done
 
-    def remainder(tokens: tuple[str, ...], done: list[bool]) -> list[str]:
-        return [
-            t
-            for t, d in zip(tokens, done, strict=True)
-            if not d and not (len(t) == 1 and t.isalpha())
-        ]
 
-    return remainder(left, left_done), remainder(right, right_done)
+def _remainder(tokens: tuple[str, ...], done: list[bool]) -> list[str]:
+    """The tokens with no counterpart. A lone letter is never counted: it can
+    join into a neighbour ("rock" + "n" + "roll") but on its own discriminates
+    nothing."""
+    return [
+        t for t, d in zip(tokens, done, strict=True) if not d and not (len(t) == 1 and t.isalpha())
+    ]
+
+
+def discriminating_remainders(
+    left: tuple[str, ...], right: tuple[str, ...]
+) -> tuple[list[str], list[str]]:
+    """The tokens on each side with no counterpart on the other."""
+    left_done, right_done = _alignment(left, right)
+    return _remainder(left, left_done), _remainder(right, right_done)
 
 
 def tokens_disagree(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
     """Whether two token tuples name different releases: each side carries a
     content token the other lacks, while sharing at least one. Never on a
     one-sided difference, and never when nothing is shared (see the module
-    docstring)."""
+    docstring) -- with nothing aligned there is no "one token out of place" to
+    detect, only two unrelated titles the floors judge better. Shared-ness is
+    read off the alignment, not inferred from the remainder's length, which a
+    lone letter dropped from the remainder would inflate."""
     if not left or not right or left == right:
         return False
-    left_only, right_only = discriminating_remainders(left, right)
-    if not left_only or not right_only:
+    left_done, right_done = _alignment(left, right)
+    if not any(left_done):
         return False
-    # An aligned remainder: with nothing shared there is no "one token out of
-    # place" to detect, only two unrelated titles the floors judge better.
-    return len(left_only) < len(left)
+    return bool(_remainder(left, left_done)) and bool(_remainder(right, right_done))
