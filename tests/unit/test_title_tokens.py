@@ -374,7 +374,7 @@ _ORDER_PAIRS = [
 
 
 class TestArgumentOrderSymmetry:
-    """The verdict is a property of the pair, not of which title is passed
+    """On these pairs the verdict does not depend on which title is passed
     first: every production caller passes the library title second, so an
     order-dependent rule silently applies to one side only (#1386/#1387 review)."""
 

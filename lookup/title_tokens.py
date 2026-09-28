@@ -233,8 +233,8 @@ def _alignment(
     left: tuple[str, ...], right: tuple[str, ...]
 ) -> tuple[list[bool], list[bool], bool]:
     """Which tokens on each side have a counterpart on the other, and whether
-    any matched pair is shared -- a property of the pair, so it reads the same
-    whichever title is passed first (#1386 review)."""
+    any matched pair is shared (per pair, not per side). Greedy matching can still
+    pair by order on contrived input: "hip-hop" against "hiphop hip" (#1386 review)."""
     left_done, right_done = [False] * len(left), [False] * len(right)
     shared = _mark_counterparts(left, left_done, right, right_done)
     shared = _mark_counterparts(right, right_done, left, left_done) or shared
