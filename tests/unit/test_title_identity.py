@@ -215,6 +215,43 @@ class TestSearchAlbumFuzzyGatesBothArms:
 
         assert {r.id for r in results} == {58620}
 
+    def _paren_db(self):
+        """FTS5 answers nothing for a title carrying ``(``; the paren-strip
+        retry's plain query answers with both volumes."""
+        from unittest.mock import AsyncMock
+
+        rows = [
+            make_library_item(id=1, artist="Various Artists", title="Pebbles, volume 1"),
+            make_library_item(id=10, artist="Various Artists", title="Pebbles, volume 10"),
+        ]
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(side_effect=lambda query, limit: [] if "(" in query else rows)
+        return db
+
+    @pytest.mark.asyncio
+    async def test_flag_off_paren_strip_retry_is_todays_behavior(self):
+        from lookup.strategies.track_release_matching import search_album_fuzzy
+
+        results = await search_album_fuzzy(self._paren_db(), "Pebbles (Volume 10)")
+
+        assert {r.id for r in results} == {1, 10}
+
+    @pytest.mark.asyncio
+    async def test_flag_on_gates_the_paren_strip_retry_on_the_full_title(
+        self, enable_title_token_identity_gate
+    ):
+        """The retry strips the parenthetical before searching, and the gate
+        used to judge that stripped query -- ``pebbles`` against ``pebbles,
+        volume 1`` is one-sided, so the #531 arm admitted the sibling and the
+        strategy bound Volume 10's release to it. The gate judges the full
+        Discogs title, whichever query retrieved the row."""
+        from lookup.strategies.track_release_matching import search_album_fuzzy
+
+        results = await search_album_fuzzy(self._paren_db(), "Pebbles (Volume 10)")
+
+        assert {r.id for r in results} == {10}
+
 
 class TestVaSeriesTitleMatch:
     """``va_series_title_match`` is reached as an ``or`` arm in
