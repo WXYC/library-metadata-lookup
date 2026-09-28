@@ -25,8 +25,8 @@ distinguishing *word*, "Guitar" against "Monterey" -- is
 ``lookup/title_tokens.py``, a leaf that compares content tokens;
 :func:`titles_name_different_releases` composes the two (volume phrases
 removed first, so a volume is adjudicated on its own axis or not at all) over
-a per-title profile cache, and :func:`title_token_gate_rejects` is that
-composed verdict behind the flag.
+a per-title profile cache; the gate uses it only when the nested
+``LML_TITLE_WORD_IDENTITY_GATE`` is on too (LML#1382).
 
 The LML#531 series helpers live here too: :func:`va_series_base` recovers a
 ``<base>, vol. N`` filing's base through the same phrase parser, so the two
@@ -238,18 +238,21 @@ def titles_name_different_releases(left: str, right: str) -> bool:
 
 
 def title_token_gate_rejects(left: str, right: str) -> bool:
-    """:func:`titles_name_different_releases`, behind
-    ``LML_TITLE_TOKEN_IDENTITY_GATE``. Always False while the flag is off, so
-    a caller that consults it first changes nothing until the flip.
+    """Always False while ``LML_TITLE_TOKEN_IDENTITY_GATE`` is off, so a caller
+    that consults it first changes nothing until the flip. On, the volume axis
+    alone; with ``LML_TITLE_WORD_IDENTITY_GATE`` on too, the composed verdict.
 
-    Tests flip the flag via ``monkeypatch.setenv`` + ``get_settings.cache_clear()``
-    (the ``enable_title_token_identity_gate`` fixture) or by patching THIS
+    Tests flip the flags via ``monkeypatch.setenv`` + ``get_settings.cache_clear()``
+    (the ``enable_title_*_identity_gate`` fixtures) or by patching THIS
     module's ``get_settings``; patching the strategy module's does not reach
     here. ``va_series_title_match`` is value-imported by ``track_release_matching``:
     to intercept the strategy's call, patch it there, not here."""
-    if not get_settings().lml_title_token_identity_gate:
+    settings = get_settings()
+    if not settings.lml_title_token_identity_gate:
         return False
-    return titles_name_different_releases(left, right)
+    if settings.lml_title_word_identity_gate:
+        return titles_name_different_releases(left, right)
+    return titles_differ_by_discriminating_token(left, right)
 
 
 def va_series_base(library_title: str) -> str | None:

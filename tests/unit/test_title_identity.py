@@ -13,6 +13,12 @@ Two things are pinned with equal weight to the rejection itself:
   included -- because the flip waits on a prod recall measurement;
 * a volume on ONE side only is LML#531's recall case, not a disagreement, and
   keeps matching with the flag on.
+
+The word axis sits on the nested ``LML_TITLE_WORD_IDENTITY_GATE`` (LML#1382),
+and both flags on rejects a superset of the master alone. So a volume
+must-reject test requests the master only (the first rollout stage), while a
+word-axis test or a must-not-reject test requests both -- each the strongest
+form of its claim.
 """
 
 import pytest
@@ -21,6 +27,7 @@ from lookup.matching import album_title_acceptable
 from lookup.title_identity import (
     title_token_gate_rejects,
     titles_differ_by_discriminating_token,
+    titles_name_different_releases,
     va_series_base,
     va_series_title_match,
     volume_identifiers,
@@ -28,6 +35,8 @@ from lookup.title_identity import (
 from tests.factories import make_library_item
 
 _SIBLINGS = ("art of field recording volume i", "art of field recording, vol. 2")
+# LML#1369 shape C: one discriminating word on each side, no volume on either.
+_SHAPE_C = ("the monterey international pop festival", "the international guitar festival")
 
 
 class TestVolumeIdentifier:
@@ -124,6 +133,35 @@ class TestTheFlagGatesTheVeto:
     def test_on_rejects_siblings(self, enable_title_token_identity_gate):
         assert title_token_gate_rejects(*_SIBLINGS) is True
 
+    @pytest.mark.parametrize(
+        ("master", "word", "pair", "rejects"),
+        [
+            (False, False, _SIBLINGS, False),
+            (False, False, _SHAPE_C, False),
+            # The word flag is nested: on its own it changes nothing.
+            (False, True, _SIBLINGS, False),
+            (False, True, _SHAPE_C, False),
+            # Master alone is the volume axis only -- the first rollout stage.
+            (True, False, _SIBLINGS, True),
+            (True, False, _SHAPE_C, False),
+            # Both is the composed verdict, volume and word axes together.
+            (True, True, _SIBLINGS, True),
+            (True, True, _SHAPE_C, True),
+        ],
+    )
+    def test_word_axis_is_nested_under_the_master(self, request, master, word, pair, rejects):
+        """LML#1382: the word axis is hand-curated where the volume axis was
+        measured, so it rides its own flag -- a prod recall drop can then be
+        attributed to one axis, and rolling the word axis back keeps the
+        volume axis. The composed verdict itself stays flag-independent."""
+        if master:
+            request.getfixturevalue("enable_title_token_identity_gate")
+        if word:
+            request.getfixturevalue("enable_title_word_identity_gate")
+
+        assert title_token_gate_rejects(*pair) is rejects
+        assert titles_name_different_releases(*pair) is True
+
 
 class TestAlbumTitleAcceptable:
     """The shared matcher is where the fix lands, so every caller of
@@ -166,7 +204,9 @@ class TestAlbumTitleAcceptable:
             ("art of field recording volume i", "art of field recording, vol. 1"),
         ],
     )
-    def test_accepted_titles_stay_accepted(self, enable_title_token_identity_gate, query, result):
+    def test_accepted_titles_stay_accepted(
+        self, enable_title_token_identity_gate, enable_title_word_identity_gate, query, result
+    ):
         assert album_title_acceptable(query, result) is True
 
 
@@ -546,13 +586,13 @@ class TestAlbumTitleAcceptableWordAxis:
     same flag-gated verdict the volume axis uses, so every caller of
     ``album_title_acceptable`` inherits it."""
 
-    _SHAPE_C = ("the monterey international pop festival", "the international guitar festival")
-
     def test_flag_off_is_todays_behavior_shape_c_included(self):
-        assert album_title_acceptable(*self._SHAPE_C)
+        assert album_title_acceptable(*_SHAPE_C)
 
-    def test_shape_c_single_word_rejected(self, enable_title_token_identity_gate):
-        assert album_title_acceptable(*self._SHAPE_C) is False
+    def test_shape_c_single_word_rejected(
+        self, enable_title_token_identity_gate, enable_title_word_identity_gate
+    ):
+        assert album_title_acceptable(*_SHAPE_C) is False
 
     @pytest.mark.parametrize(
         ("query", "result"),
@@ -562,7 +602,9 @@ class TestAlbumTitleAcceptableWordAxis:
             ("hip-hop classics", "hiphop classics"),
         ],
     )
-    def test_variant_spellings_stay_accepted(self, enable_title_token_identity_gate, query, result):
+    def test_variant_spellings_stay_accepted(
+        self, enable_title_token_identity_gate, enable_title_word_identity_gate, query, result
+    ):
         assert album_title_acceptable(query, result) is True
 
 

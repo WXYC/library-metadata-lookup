@@ -587,13 +587,27 @@ class Settings(BaseSettings):
             "the #531 series parser, shares the gate's volume vocabulary, so "
             "which library titles count as a '<base>, vol. N' filing shifts "
             "slightly whatever the flag says; docs/env-vars.md lists the "
-            "directions. The same flag also rejects a row whose title differs "
-            "from the Discogs title by a discriminating WORD on each side -- "
-            "'The International Guitar Festival' against 'The Monterey "
-            "International Pop Festival' -- compared after folding "
-            "punctuation, diacritics, numbers, abbreviations and plurals "
-            "(lookup/title_tokens.py); a one-sided extra token never rejects. "
+            "directions. On its own this flag gates the volume axis alone; "
+            "the word axis also needs lml_title_word_identity_gate (LML#1382), "
+            "so the rollout stages volume, then both. "
             "See WXYC/library-metadata-lookup#1369."
+        ),
+    )
+    lml_title_word_identity_gate: bool = Field(
+        default=False,
+        description=(
+            "Nested under lml_title_token_identity_gate, and a no-op while "
+            "that master is off. When both are True the gates also reject a "
+            "row whose title differs from the Discogs title by a "
+            "discriminating WORD on each side -- 'The International Guitar "
+            "Festival' against 'The Monterey International Pop Festival' -- "
+            "compared after folding punctuation, diacritics, numbers, "
+            "abbreviations and plurals (lookup/title_tokens.py); a one-sided "
+            "extra token never rejects. Its own flag because the word axis is "
+            "hand-curated where the volume axis was measured: a prod recall "
+            "drop can be attributed to one axis, and rolling the word axis "
+            "back keeps the volume axis. Default False. "
+            "See WXYC/library-metadata-lookup#1382."
         ),
     )
     lml_resolve_nonlibrary_release: bool = Field(

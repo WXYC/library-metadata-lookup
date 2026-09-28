@@ -65,7 +65,7 @@ async def test_va_series_surfaces_against_various_prefix_retry(library_db):
 
 @pytest.mark.asyncio
 async def test_va_series_with_volume_surfaces_with_the_gate_on_too(
-    library_db, enable_title_token_identity_gate
+    library_db, enable_title_token_identity_gate, enable_title_word_identity_gate
 ):
     """LML#1369 deliberately keeps the two assertions above: the Discogs
     query carries NO volume, so a `, vol. N` row on the library side is the
@@ -333,7 +333,7 @@ async def test_flag_off_one_discriminating_word_row_still_surfaces(library_db):
 
 @pytest.mark.asyncio
 async def test_one_discriminating_word_row_does_not_surface(
-    library_db, enable_title_token_identity_gate
+    library_db, enable_title_token_identity_gate, enable_title_word_identity_gate
 ):
     """LML#1369 shape C: "The International Guitar Festival" against "The
     Monterey International Pop Festival" differs by one word on each side."""
@@ -343,3 +343,37 @@ async def test_one_discriminating_word_row_does_not_surface(
     assert "The International Guitar Festival" not in titles, (
         f"a row differing by one discriminating word must not surface, got: {titles}"
     )
+
+
+@pytest.mark.asyncio
+async def test_word_flag_alone_is_todays_behavior_end_to_end(
+    library_db, enable_title_word_identity_gate
+):
+    """LML#1382: the word flag is nested under the master, so with the master
+    off it changes nothing -- both the sibling volume and the one-word row
+    surface exactly as with every flag off."""
+    volume_titles = {r.title for r in await search_album_fuzzy(library_db, _AOFR_VOLUME_I)}
+    word_titles = {
+        r.title
+        for r in await search_album_fuzzy(library_db, "The Monterey International Pop Festival")
+    }
+
+    assert {"Art of Field Recording, vol. 1", "Art of Field Recording, vol. 2"} <= volume_titles
+    assert "The International Guitar Festival" in word_titles
+
+
+@pytest.mark.asyncio
+async def test_master_alone_rejects_on_the_volume_axis_only_end_to_end(
+    library_db, enable_title_token_identity_gate
+):
+    """LML#1382's first rollout stage: the master without the word flag
+    refuses the sibling volume but not the one-word row."""
+    volume_titles = {r.title for r in await search_album_fuzzy(library_db, _AOFR_VOLUME_I)}
+    word_titles = {
+        r.title
+        for r in await search_album_fuzzy(library_db, "The Monterey International Pop Festival")
+    }
+
+    assert "Art of Field Recording, vol. 1" in volume_titles, volume_titles
+    assert "Art of Field Recording, vol. 2" not in volume_titles, volume_titles
+    assert "The International Guitar Festival" in word_titles, word_titles
