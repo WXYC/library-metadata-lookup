@@ -464,7 +464,12 @@ class TestVolumeIdentifierReviewFindings:
             ("series vol. 2-63", set()),
             ("series vols. 1-100", set()),
             ("series vols. 1, 2-40", set()),
+            ("series vols. 1-22", set()),
             ("series vols. 1-21", {str(n) for n in range(1, 22)}),
+            # An unknown phrase makes the whole title unknown: a second phrase
+            # must not narrow a box set back to the volumes it happens to spell.
+            ("series vol. 1-24, vol. 30", set()),
+            ("super hits vol 1-24 & vol. 25", set()),
             # "+" is a list joiner too ("Vol. 1 + 2", a double-set spelling).
             ("nuggets vol. 1 + 2", {"1", "2"}),
             # A spelled range is a range; only "twenty" compounds with a units word.
@@ -503,6 +508,11 @@ class TestMultiVolumeDisagreement:
             # number's second half.
             ("super hits of the 70s, vol 1-24 (a-x)", "super hits of the 70s, vol. 12"),
             ("series, vol. 63", "series vol. 2-63"),
+            # Review of #1389: emptying only the unexpandable phrase left the
+            # other phrase's volume, which newly disagreed with the low end.
+            ("series vol. 1-24, vol. 30", "series vol. 1"),
+            ("series vol. 30, vol. 1-24", "series, vol. 1"),
+            ("super hits vol 1-24 & vol. 25", "super hits vol. 12"),
         ],
     )
     def test_membership_is_agreement(self, left, right):

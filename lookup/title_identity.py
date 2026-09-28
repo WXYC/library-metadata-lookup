@@ -142,8 +142,8 @@ def _classify(raw: str) -> tuple[str, str] | None:
 
 def _range_interior(low: str, high: str) -> range | None:
     """Volumes strictly between two ascending plain-number endpoints (empty for
-    adjacent ones), or None when the pair cannot be a run -- a letter suffix or
-    a descending pair, whose dash joins a catalog or disc number, not volumes."""
+    adjacent ones), or None when the pair cannot be a run -- a letter suffix, an
+    equal or a descending pair, whose dash joins a catalog or disc number."""
     if not (low.isdigit() and high.isdigit() and int(low) < int(high)):
         return None
     return range(int(low) + 1, int(high))
@@ -173,7 +173,7 @@ def _volume_phrases(title_lower: str) -> Iterator[tuple[frozenset[str], int, int
                 interior = _range_interior(identifiers[-1], following[0])
                 if interior is None:
                     break
-                if len(interior) >= _MAX_VOLUME_RANGE_SPAN:  # N-M spans more than the cap
+                if interior.stop - (interior.start - 1) > _MAX_VOLUME_RANGE_SPAN:
                     identifiers = []
                     break
                 identifiers.extend(map(str, interior))
@@ -187,8 +187,10 @@ def volume_identifiers(title: str) -> frozenset[str]:
     """Every volume ``title`` names, canonicalised; empty when it names none.
     ``vol. 2`` / ``Volume II`` / ``Volume Two`` all yield ``{"2"}``; ``vols.
     1-3`` yields ``{"1", "2", "3"}``; a second phrase adds to the set; "Volunteers"
-    yields nothing. Cached per title for the reason :func:`_profile` is."""
-    return frozenset().union(*(ids for ids, _start, _end in _volume_phrases(title.lower())))
+    yields nothing, and so does a title with any phrase too wide to expand.
+    Cached per title for the reason :func:`_profile` is."""
+    sets = [ids for ids, _start, _end in _volume_phrases(title.lower())]
+    return frozenset().union(*sets) if all(sets) else frozenset()
 
 
 def _volumes_disjoint(a: frozenset[str], b: frozenset[str]) -> bool:
