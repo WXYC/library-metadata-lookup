@@ -75,11 +75,12 @@ def compilation_title_carveout_verdict(
     the derivation, so both branches of ``_filter_release_matches`` judge and
     log the same numbers.
 
-    The LML#1369 gate (``LML_TITLE_TOKEN_IDENTITY_GATE``, default off) sits in
+    The LML#1369 gate (``LML_TITLE_TOKEN_IDENTITY_GATE``, default off; its word
+    axis also needs ``LML_TITLE_WORD_IDENTITY_GATE``, LML#1382) sits in
     front of both floors, kill switch included: #973's floors reject on title
     *shape*, and a sibling volume has the right shape (87.1 / 0.938).
 
-    Tests flip either flag via ``monkeypatch.setenv`` + ``get_settings.cache_clear()``
+    Tests flip any of these flags via ``monkeypatch.setenv`` + ``get_settings.cache_clear()``
     or by patching THIS module's ``get_settings`` (the strategy module's does not
     reach here); both functions are value-imported, so to intercept the strategy's
     call patch ``lookup.strategies.track_on_compilation.<name>``."""

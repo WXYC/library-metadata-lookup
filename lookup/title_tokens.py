@@ -11,8 +11,9 @@ of one character (LML#1369).
 The module is a leaf: it knows nothing about volume phrases or the flag. A
 caller removes the volume phrases first (so a volume is adjudicated on its own
 axis or not at all) and passes the number folder it wants applied to bare
-tokens; ``title_identity.title_token_gate_rejects`` is that caller and composes
-the two axes. Splitting the axes into two modules is where the "one module or
+tokens; ``title_identity.titles_name_different_releases`` is that caller and
+composes the two axes, which ``title_token_gate_rejects`` consults only when
+``LML_TITLE_WORD_IDENTITY_GATE`` is on as well (LML#1382). Splitting the axes into two modules is where the "one module or
 two?" question from the #1377 review landed: each module's docstring can now
 say exactly what it adjudicates.
 

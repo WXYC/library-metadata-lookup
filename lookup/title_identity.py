@@ -192,10 +192,9 @@ def volume_identifiers(title: str) -> frozenset[str]:
 def titles_differ_by_discriminating_token(left: str, right: str) -> bool:
     """Both titles carry volumes and the sets are disjoint. Membership is
     agreement ("vol. 2" against "vol. 1 & 2"); a volume on one side only never
-    rejects. Flag-independent; the gates call :func:`title_token_gate_rejects`."""
-    left_volumes = volume_identifiers(left)
-    right_volumes = volume_identifiers(right)
-    return bool(left_volumes) and bool(right_volumes) and left_volumes.isdisjoint(right_volumes)
+    rejects. Flag-independent; the gates call :func:`title_token_gate_rejects`.
+    Reads the per-title :func:`_profile`, so both gate branches share one rule."""
+    return _volumes_disjoint(_profile(left), _profile(right))
 
 
 def _fold_number(raw: str) -> str | None:
@@ -226,15 +225,17 @@ def _profile(title: str) -> _TitleProfile:
     return _TitleProfile(volumes, content_tokens(rest, _fold_number))
 
 
+def _volumes_disjoint(a: _TitleProfile, b: _TitleProfile) -> bool:
+    return bool(a.volumes) and bool(b.volumes) and a.volumes.isdisjoint(b.volumes)
+
+
 def titles_name_different_releases(left: str, right: str) -> bool:
     """The composed, flag-independent verdict: the titles carry disjoint
     volume sets (:func:`titles_differ_by_discriminating_token`), or each side
     carries a content token the other lacks while sharing at least one
     (:func:`lookup.title_tokens.tokens_disagree`)."""
     a, b = _profile(left), _profile(right)
-    if a.volumes and b.volumes and a.volumes.isdisjoint(b.volumes):
-        return True
-    return tokens_disagree(a.tokens, b.tokens)
+    return _volumes_disjoint(a, b) or tokens_disagree(a.tokens, b.tokens)
 
 
 def title_token_gate_rejects(left: str, right: str) -> bool:
