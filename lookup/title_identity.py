@@ -51,10 +51,13 @@ _VOLUME_MARKER_RE = re.compile(r"\bvol(?:ume)?s?\.?\s*([0-9]+[a-z]?|[a-z]+)\b", 
 # A further identifier in the same phrase ("vol. 1 & 2", "vols. 1-3", "vols.
 # 1, 2 and 3"): group 1 the separator (a range when a dash or "to"), group 2 a
 # candidate validated exactly as the first was. The list stops at the first
-# word that is not a volume number, so "vol. 2, the best of" is 2 alone (F4).
+# word that is not a volume number *in the phrase's own notation*, so "vol. 2,
+# the best of" is 2 alone (F4) and so is "vol. 2, one night only" -- a subtitle
+# opening with a number word is not a further volume.
 _VOLUME_LIST_ITEM_RE = re.compile(
-    r"\s*(&|and|,|/|-|\u2013|to)\s*([0-9]+[a-z]?|[a-z]+)\b", re.IGNORECASE
+    r"\s*(&|\band\b|,|/|-|\u2013|\bto\b)\s*([0-9]+[a-z]?|[a-z]+)\b", re.IGNORECASE
 )
+_RANGE_SEPARATORS = frozenset({"-", "\u2013", "to"})
 
 #: Widest "vols. N-M" range that is expanded; past it the dash is a year or a
 #: catalog number, and the two endpoints stand alone.
@@ -88,6 +91,11 @@ _ROMAN_RE = re.compile(r"^x{0,3}(?:ix|iv|v?i{0,3})$")
 #: a dash, expand as a range. Roman caps at 39 and words at 20 for the same reason.
 _ARABIC_RE = re.compile(r"^([0-9]{1,3})([a-z]?)$")
 
+#: A second number word right after a spelled identifier ("twenty one",
+#: "twenty-one") is a spelling past the vocabulary: no volume at all, rather
+#: than its first word -- a one-sided None is agreement, not a false reject.
+_COMPOUND_WORD_RE = re.compile(r"[\s-]+(?:" + "|".join(_WORD_NUMBERS) + r")\b")
+
 
 def _roman_to_int(token: str) -> int | None:
     """Parse a canonical lowercase roman numeral over i/v/x, or return None."""
@@ -105,29 +113,39 @@ def _roman_to_int(token: str) -> int | None:
     return total or None
 
 
-def _canonical_number(raw: str) -> str | None:
-    """``"2"``, ``"02"``, ``"II"`` and ``"two"`` all fold to ``"2"``; ``"2a"``
-    keeps its letter; anything else is not a volume identifier (None)."""
+def _classify(raw: str) -> tuple[str, str] | None:
+    """``(canonical, notation)`` of a volume identifier: ``"2"``, ``"02"`` and
+    ``"2a"`` are ``arabic`` (the letter kept), ``"two"`` is ``word``, ``"II"``
+    is ``roman``, all canonical ``"2"``; anything else is None."""
     raw = raw.lower()
     arabic = _ARABIC_RE.fullmatch(raw)
     if arabic:
-        return f"{int(arabic.group(1))}{arabic.group(2)}"
+        return f"{int(arabic.group(1))}{arabic.group(2)}", "arabic"
     word_value = _WORD_NUMBERS.get(raw)
     if word_value is not None:
-        return str(word_value)
+        return str(word_value), "word"
     roman_value = _roman_to_int(raw)
     if roman_value is not None:
-        return str(roman_value)
+        return str(roman_value), "roman"
     return None
 
 
-def _range_interior(low: str, high: str) -> list[str]:
+def _canonical_number(raw: str) -> str | None:
+    """``"2"``, ``"02"``, ``"II"`` and ``"two"`` all fold to ``"2"``; ``"2a"``
+    keeps its letter; anything else is not a volume identifier (None)."""
+    classified = _classify(raw)
+    return classified[0] if classified is not None else None
+
+
+def _range_interior(low: str, high: str) -> list[str] | None:
     """Volumes strictly between two plain-number endpoints no more than
-    ``_MAX_VOLUME_RANGE_SPAN`` apart; otherwise nothing."""
+    ``_MAX_VOLUME_RANGE_SPAN`` apart (empty for adjacent ones), or None when
+    the pair is not such a run -- a letter suffix, a descending or too-wide
+    span -- because that dash joins a year or a catalog number, not volumes."""
     if not (low.isdigit() and high.isdigit()):
-        return []
+        return None
     if not 0 < int(high) - int(low) <= _MAX_VOLUME_RANGE_SPAN:
-        return []
+        return None
     return [str(n) for n in range(int(low) + 1, int(high))]
 
 
@@ -138,18 +156,24 @@ def _volume_phrases(title_lower: str) -> Iterator[tuple[frozenset[str], int, int
     Volume 2", "vol. 1 & vol. 2"): :func:`volume_identifiers` unions them and
     :func:`va_series_base` judges the last."""
     for match in _VOLUME_MARKER_RE.finditer(title_lower):
-        first = _canonical_number(match.group(1))
-        if first is None:
+        classified = _classify(match.group(1))
+        if classified is None:
+            continue
+        first, notation = classified
+        if notation == "word" and _COMPOUND_WORD_RE.match(title_lower, match.end()):
             continue
         identifiers = [first]
         end = match.end()
         while (item := _VOLUME_LIST_ITEM_RE.match(title_lower, end)) is not None:
-            following = _canonical_number(item.group(2))
-            if following is None:
+            following = _classify(item.group(2))
+            if following is None or following[1] != notation:
                 break
-            if item.group(1).lower() in ("-", "\u2013", "to"):
-                identifiers.extend(_range_interior(identifiers[-1], following))
-            identifiers.append(following)
+            if item.group(1).lower() in _RANGE_SEPARATORS:
+                interior = _range_interior(identifiers[-1], following[0])
+                if interior is None:
+                    break
+                identifiers.extend(interior)
+            identifiers.append(following[0])
             end = item.end()
         yield frozenset(identifiers), match.start(), end
 
