@@ -75,14 +75,26 @@ class TestDiscriminatingWordDisagreement:
             ("aluminum tunes", "aluminium tunes"),
             ("rumours", "rumors"),
             # No shared token at all: nothing to align, leave it to the ratio.
+            # A lone letter is not a shared token either (#1378 review).
             ("doggystyle", "doggy style"),
-            # A two-digit year abbreviation is the same year.
+            ("plan b live", "scheme"),
+            # A two-digit year abbreviation is the same year, and a decade
+            # spelled two ways is one decade (#1378 review).
             ("atlantic rhythm and blues 1947-1974", "atlantic rhythm and blues 1947-74"),
+            ("hits of the 50s", "hits of the 1950s"),
+            ("hits of the 50's", "hits of the 1950's"),
+            # A thousands separator is not a token boundary (#1378 review).
+            ("1,000 hours", "1000 hours"),
+            ("10,000 maniacs live", "10000 maniacs live"),
+            # A pluralised number word folds like its singular (#1378 review).
+            ("loved ones", "loved one"),
             # Packaging vocabulary describes an edition, not its contents.
             (
                 "trax records: the 20th anniversary edition",
                 "trax records 20th anniversary collection",
             ),
+            ("moon pix (mono)", "moon pix (stereo)"),
+            ("moon pix (bonus disc)", "moon pix (promo cd)"),
             # Articles and prepositions never discriminate.
             ("dark side of the moon", "the dark side of the moon"),
             # Diacritics fold before tokens compare -- in either composition
