@@ -198,45 +198,53 @@ def _same_token(left: str, right: str) -> bool:
     return fuzz.ratio(left, right) >= _TOKEN_EQUIVALENCE_FLOOR
 
 
+def _shareable(token: str) -> bool:
+    """Not a hyphen-attached stopword (the only kind that survives tokenising)."""
+    return token not in _NON_DISCRIMINATING_TOKENS
+
+
 def _mark_counterparts(
     a: tuple[str, ...], a_done: list[bool], b: tuple[str, ...], b_done: list[bool]
-) -> None:
+) -> bool:
     """Mark every token of ``a`` that has a counterpart in ``b`` -- one token,
     or two or three consecutive tokens that join to it ("doggy" + "style") --
     and the ``b`` tokens it consumed. A join is judged by :func:`_same_token`
     like a single token is: "rock" + "roll" is one character short of
-    "rocknroll" once the conjunction has been dropped as a stopword."""
+    "rocknroll" once the conjunction has been dropped as a stopword. Returns
+    whether any pair it made is shared: :func:`_shareable` at both ends."""
+    shared = False
     for i, token in enumerate(a):
         if a_done[i]:
             continue
-        for j, other in enumerate(b):
-            if not b_done[j] and _same_token(token, other):
-                a_done[i] = b_done[j] = True
-                break
-        if a_done[i]:
-            continue
-        for width in (2, 3):
+        for width in (1, 2, 3):
             for j in range(len(b) - width + 1):
-                if not any(b_done[j : j + width]) and _same_token(token, "".join(b[j : j + width])):
+                joined = b[j : j + width]
+                if not any(b_done[j : j + width]) and _same_token(token, "".join(joined)):
                     a_done[i] = True
                     b_done[j : j + width] = [True] * width
+                    shared = shared or (_shareable(token) and any(map(_shareable, joined)))
                     break
             if a_done[i]:
                 break
+    return shared
 
 
-def _alignment(left: tuple[str, ...], right: tuple[str, ...]) -> tuple[list[bool], list[bool]]:
-    """Which tokens on each side have a counterpart on the other."""
+def _alignment(
+    left: tuple[str, ...], right: tuple[str, ...]
+) -> tuple[list[bool], list[bool], bool]:
+    """Which tokens on each side have a counterpart on the other, and whether
+    any matched pair is shared -- a property of the pair, so it reads the same
+    whichever title is passed first (#1386 review)."""
     left_done, right_done = [False] * len(left), [False] * len(right)
-    _mark_counterparts(left, left_done, right, right_done)
-    _mark_counterparts(right, right_done, left, left_done)
-    return left_done, right_done
+    shared = _mark_counterparts(left, left_done, right, right_done)
+    shared = _mark_counterparts(right, right_done, left, left_done) or shared
+    return left_done, right_done, shared
 
 
 def _counts(token: str) -> bool:
     """A lone letter or a hyphen-attached stopword can join into a neighbour
     ("rock" + "n" + "roll", "in" + "utero") but on its own discriminates nothing."""
-    return not (len(token) == 1 and token.isalpha()) and token not in _NON_DISCRIMINATING_TOKENS
+    return not (len(token) == 1 and token.isalpha()) and _shareable(token)
 
 
 def _remainder(tokens: tuple[str, ...], done: list[bool]) -> list[str]:
@@ -251,13 +259,11 @@ def tokens_disagree(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
     docstring) -- with nothing aligned there is no "one token out of place" to
     detect, only two unrelated titles the floors judge better. Shared-ness is
     read off the alignment, not inferred from the remainder's length, which a
-    lone letter dropped from the remainder would inflate; an attached stopword
-    ("in" of "in-utero") aligns but is not a shared token."""
+    lone letter dropped from the remainder would inflate; a pair with an
+    attached stopword ("in" of "in-utero") at either end is not shared."""
     if not left or not right or left == right:
         return False
-    left_done, right_done = _alignment(left, right)
-    if not any(
-        d and t not in _NON_DISCRIMINATING_TOKENS for t, d in zip(left, left_done, strict=True)
-    ):
+    left_done, right_done, shared = _alignment(left, right)
+    if not shared:
         return False
     return bool(_remainder(left, left_done)) and bool(_remainder(right, right_done))
