@@ -583,8 +583,8 @@ class TestVaSeriesTitleMatchBoundary:
 
 class TestAlbumTitleAcceptableWordAxis:
     """Shape C through the shared matcher: the word axis composes into the
-    same flag-gated verdict the volume axis uses, so every caller of
-    ``album_title_acceptable`` inherits it."""
+    same gate the volume axis uses, behind the nested word flag (LML#1382), so
+    every caller of ``album_title_acceptable`` inherits it."""
 
     def test_flag_off_is_todays_behavior_shape_c_included(self):
         assert album_title_acceptable(*_SHAPE_C)
@@ -642,6 +642,22 @@ class TestTitleProfileCache:
         for row in rows:
             titles_name_different_releases(release, row)
 
+        info = _profile.cache_info()
+        assert info.misses == 1 + len(rows), info
+        assert info.hits == len(rows) - 1, info
+
+    def test_master_only_gate_reads_the_same_profile_cache(self, enable_title_token_identity_gate):
+        """Stage 1 of the LML#1382 rollout (master on, word axis off) is the
+        configuration prod runs longest, so its volume-only branch must reuse
+        the per-title cache rather than re-parse the release for every row."""
+        from lookup.title_identity import _profile, title_token_gate_rejects
+
+        _profile.cache_clear()
+        release = "art of field recording volume i"
+        rows = [f"art of field recording, vol. {n}" for n in range(1, 6)]
+        verdicts = [title_token_gate_rejects(release, row) for row in rows]
+
+        assert verdicts == [False, True, True, True, True]
         info = _profile.cache_info()
         assert info.misses == 1 + len(rows), info
         assert info.hits == len(rows) - 1, info

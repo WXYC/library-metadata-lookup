@@ -400,8 +400,8 @@ class TestVolumeSiblingsAtTheCarveOut:
         enable_title_word_identity_gate,
         disable_tighten_compilation_title_carveout,
     ):
-        """The volume axis says nothing about row 58775 (no volume on either
-        side), so with the #973 length guard switched off it is readmitted
+        """Neither axis says anything about row 58775 (no volume on either
+        side, no one-word disagreement), so with the #973 length guard switched off it is readmitted
         exactly as today. Pins that this PR does not narrow that kill switch."""
         releases = [_release(_WRONG_PRESSING_RELEASE_ID, _WRONG_PRESSING_RELEASE_ALBUM)]
         matches = {
