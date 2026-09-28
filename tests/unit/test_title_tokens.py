@@ -102,6 +102,12 @@ class TestDiscriminatingWordDisagreement:
             ("pequena vertigem de amor", "pequeña vertigem de amor"),
             ("café del mar", "café del mar"),
             ("café del mar", "cafe del mar"),
+            # Review R4: a Discogs title transliterated to ASCII against a library
+            # row keeping the letter is one word twice, not two words -- "bølgen"
+            # against "bolgen" is 83.3 under the 85 floor once the fold keeps ø.
+            ("bølgen live", "bolgen live"),
+            ("łódź sessions", "lodz sessions"),
+            ("ßtraße tapes", "strasse tapes"),
             # A lone letter never discriminates, so a lettered series is
             # adjudicated for none of its letters (review F9 consistency).
             ("series vol. a", "series vol. b"),
