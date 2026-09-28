@@ -42,7 +42,7 @@ from library.models import LibraryItem
 from lookup.name_folding import next_char_is_boundary
 
 # A volume marker anywhere in a title (Discogs puts it mid-title), its
-# identifier captured as a bare word and *validated* by :func:`_canonical_number`
+# identifier captured as a bare word and *validated* by :func:`_classify`
 # -- "Volunteers" and "Volume Dealers" both match and resolve to None, which is
 # the point. IGNORECASE, and the public functions lower their input besides: a
 # mixed-case title read as "no volume" is a one-sided None, i.e. agreement (F5).
@@ -55,12 +55,12 @@ _VOLUME_MARKER_RE = re.compile(r"\bvol(?:ume)?s?\.?\s*([0-9]+[a-z]?|[a-z]+)\b", 
 # the best of" is 2 alone (F4) and so is "vol. 2, one night only" -- a subtitle
 # opening with a number word is not a further volume.
 _VOLUME_LIST_ITEM_RE = re.compile(
-    r"\s*(&|\band\b|,|/|-|\u2013|\bto\b)\s*([0-9]+[a-z]?|[a-z]+)\b", re.IGNORECASE
+    r"\s*(&|\+|\band\b|,|/|-|\u2013|\bto\b)\s*([0-9]+[a-z]?|[a-z]+)\b", re.IGNORECASE
 )
 _RANGE_SEPARATORS = frozenset({"-", "\u2013", "to"})
 
-#: Widest "vols. N-M" range that is expanded; past it the dash is a year or a
-#: catalog number, and the two endpoints stand alone.
+#: Widest "vols. N-M" range that is expanded; past it the dash joins a year or
+#: a catalog number, and the phrase ends at its first identifier.
 _MAX_VOLUME_RANGE_SPAN = 20
 
 #: Spelled-out volume numbers. Capped at twenty: the longest series in the
@@ -91,10 +91,11 @@ _ROMAN_RE = re.compile(r"^x{0,3}(?:ix|iv|v?i{0,3})$")
 #: a dash, expand as a range. Roman caps at 39 and words at 20 for the same reason.
 _ARABIC_RE = re.compile(r"^([0-9]{1,3})([a-z]?)$")
 
-#: A second number word right after a spelled identifier ("twenty one",
-#: "twenty-one") is a spelling past the vocabulary: no volume at all, rather
-#: than its first word -- a one-sided None is agreement, not a false reject.
-_COMPOUND_WORD_RE = re.compile(r"[\s-]+(?:" + "|".join(_WORD_NUMBERS) + r")\b")
+#: "twenty" followed by a units word ("twenty one", "twenty-one") is a spelling
+#: past the vocabulary: no volume at all, rather than its first word -- a
+#: one-sided None is agreement, not a false reject. Only "twenty" compounds, so
+#: "one-two" stays the spelled range it is.
+_COMPOUND_WORD_RE = re.compile(r"twenty[\s-]+(?:one|two|three|four|five|six|seven|eight|nine)\b")
 
 
 def _roman_to_int(token: str) -> int | None:
@@ -130,13 +131,6 @@ def _classify(raw: str) -> tuple[str, str] | None:
     return None
 
 
-def _canonical_number(raw: str) -> str | None:
-    """``"2"``, ``"02"``, ``"II"`` and ``"two"`` all fold to ``"2"``; ``"2a"``
-    keeps its letter; anything else is not a volume identifier (None)."""
-    classified = _classify(raw)
-    return classified[0] if classified is not None else None
-
-
 def _range_interior(low: str, high: str) -> list[str] | None:
     """Volumes strictly between two plain-number endpoints no more than
     ``_MAX_VOLUME_RANGE_SPAN`` apart (empty for adjacent ones), or None when
@@ -160,7 +154,7 @@ def _volume_phrases(title_lower: str) -> Iterator[tuple[frozenset[str], int, int
         if classified is None:
             continue
         first, notation = classified
-        if notation == "word" and _COMPOUND_WORD_RE.match(title_lower, match.end()):
+        if notation == "word" and _COMPOUND_WORD_RE.match(title_lower, match.start(1)):
             continue
         identifiers = [first]
         end = match.end()
