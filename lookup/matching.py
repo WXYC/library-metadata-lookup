@@ -10,6 +10,7 @@ layer of `lookup/` — and unit-tested without mocks. Extracted verbatim from
 import logging
 import re
 
+from rapidfuzz import fuzz
 from wxyc_etl.text import is_compilation_artist, strip_leading_article
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
@@ -320,8 +321,6 @@ def _filter_results_by_album_match(
     """
     if not album or not album.strip():
         return results
-    from rapidfuzz import fuzz
-
     norm_album = normalize_for_comparison(album)
     kept: list[LibraryItem] = []
     for item in results:
@@ -350,8 +349,6 @@ def album_title_acceptable(query_lower: str, result_lower: str) -> bool:
     LML#1369 puts ``title_token_gate_rejects`` ahead of all of that: the #24
     guard arms only when *both* remainders are <=5 chars, and ", vol. 2" is 8.
     """
-    from rapidfuzz import fuzz
-
     # LML#1369, deliberately ahead of the prefix branch: "pebbles, volume 1"
     # is a literal prefix of "pebbles, volume 10".
     if title_token_gate_rejects(query_lower, result_lower):

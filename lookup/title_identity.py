@@ -19,8 +19,14 @@ load-bearing: **only a two-sided disagreement rejects** (a ``, vol. 1`` row
 against a Discogs title with no volume is LML#531's recall case -- information
 the library has and Discogs lacks, not a contradiction), and **the flag is
 default OFF**, because the #973 precedent is that a recall-governing flip
-follows a prod measurement. Only the volume axis is adjudicated; a single
-distinguishing *word* ("Guitar" against "Monterey") is left to the floors.
+follows a prod measurement. This module's own verdict adjudicates only the
+volume axis. The general rule that volume is one instance of -- a single
+distinguishing *word*, "Guitar" against "Monterey" -- is
+``lookup/title_tokens.py``, a leaf that compares content tokens;
+:func:`titles_name_different_releases` composes the two (volume phrases
+removed first, so a volume is adjudicated on its own axis or not at all) over
+a per-title profile cache, and :func:`title_token_gate_rejects` is that
+composed verdict behind the flag.
 
 The LML#531 series helpers live here too: :func:`va_series_base` recovers a
 ``<base>, vol. N`` filing's base through the same phrase parser, so the two
@@ -32,14 +38,17 @@ that arm to ``album_title_acceptable``.
 Extracted from ``lookup/matching.py`` at its module budget (LML#1369 prep).
 """
 
+import functools
 import re
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 from wxyc_etl.text import is_compilation_artist
 
 from config.settings import get_settings
 from library.models import LibraryItem
 from lookup.name_folding import next_char_is_boundary
+from lookup.title_tokens import content_tokens, tokens_disagree
 
 # A volume marker anywhere in a title (Discogs puts it mid-title), its
 # identifier captured as a bare word and *validated* by :func:`_classify`
@@ -180,14 +189,6 @@ def volume_identifiers(title: str) -> frozenset[str]:
     return frozenset().union(*(ids for ids, _start, _end in _volume_phrases(title.lower())))
 
 
-def volume_identifier(title: str) -> str | None:
-    """The one volume ``title`` names, or None -- both for no volume and for
-    several: a two-volume set has no single answer, and a caller that wants
-    the set asks :func:`volume_identifiers`."""
-    identifiers = volume_identifiers(title)
-    return next(iter(identifiers)) if len(identifiers) == 1 else None
-
-
 def titles_differ_by_discriminating_token(left: str, right: str) -> bool:
     """Both titles carry volumes and the sets are disjoint. Membership is
     agreement ("vol. 2" against "vol. 1 & 2"); a volume on one side only never
@@ -197,8 +198,47 @@ def titles_differ_by_discriminating_token(left: str, right: str) -> bool:
     return bool(left_volumes) and bool(right_volumes) and left_volumes.isdisjoint(right_volumes)
 
 
+def _fold_number(raw: str) -> str | None:
+    """The word axis's number folder: a bare token that spells a volume-style
+    number ("two", "II", "02") in its canonical digits, else None."""
+    classified = _classify(raw)
+    return classified[0] if classified is not None else None
+
+
+@dataclass(frozen=True)
+class _TitleProfile:
+    volumes: frozenset[str]
+    tokens: tuple[str, ...]
+
+
+@functools.lru_cache(maxsize=1024)
+def _profile(title: str) -> _TitleProfile:
+    """A title's volume set and content tokens, computed once per distinct
+    title: ``_filter_release_matches`` compares one release against every row,
+    so the release side is profiled once, not per row (review F10). The volume
+    phrases are removed before tokenising."""
+    lower = title.lower()
+    phrases = list(_volume_phrases(lower))
+    volumes = frozenset().union(*(ids for ids, _start, _end in phrases))
+    rest = lower
+    for _ids, start, end in reversed(phrases):
+        rest = f"{rest[:start]} {rest[end:]}"
+    return _TitleProfile(volumes, content_tokens(rest, _fold_number))
+
+
+def titles_name_different_releases(left: str, right: str) -> bool:
+    """The composed, flag-independent verdict: the titles carry disjoint
+    volume sets (:func:`titles_differ_by_discriminating_token`), or each side
+    carries a content token the other lacks while sharing at least one
+    (:func:`lookup.title_tokens.tokens_disagree`)."""
+    a, b = _profile(left), _profile(right)
+    if a.volumes and b.volumes and a.volumes.isdisjoint(b.volumes):
+        return True
+    return tokens_disagree(a.tokens, b.tokens)
+
+
 def title_token_gate_rejects(left: str, right: str) -> bool:
-    """:func:`titles_differ_by_discriminating_token`, behind
+    """:func:`titles_name_different_releases`, behind
     ``LML_TITLE_TOKEN_IDENTITY_GATE``. Always False while the flag is off, so
     a caller that consults it first changes nothing until the flip.
 
@@ -209,7 +249,7 @@ def title_token_gate_rejects(left: str, right: str) -> bool:
     to intercept the strategy's call, patch it there, not here."""
     if not get_settings().lml_title_token_identity_gate:
         return False
-    return titles_differ_by_discriminating_token(left, right)
+    return titles_name_different_releases(left, right)
 
 
 def va_series_base(library_title: str) -> str | None:
