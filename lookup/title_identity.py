@@ -68,8 +68,8 @@ _VOLUME_LIST_ITEM_RE = re.compile(
 )
 _RANGE_SEPARATORS = frozenset({"-", "\u2013", "to"})
 
-#: Widest "vols. N-M" range that is expanded; past it the dash joins a year or
-#: a catalog number, and the phrase ends at its first identifier.
+#: Widest "vols. N-M" range that is expanded. A wider one is a box set's "vol
+#: 1-24" or a catalog number, which read alike, so it names no volume (LML#1382).
 _MAX_VOLUME_RANGE_SPAN = 20
 
 #: Spelled-out volume numbers. Capped at twenty: the longest series in the
@@ -140,22 +140,20 @@ def _classify(raw: str) -> tuple[str, str] | None:
     return None
 
 
-def _range_interior(low: str, high: str) -> list[str] | None:
-    """Volumes strictly between two plain-number endpoints no more than
-    ``_MAX_VOLUME_RANGE_SPAN`` apart (empty for adjacent ones), or None when
-    the pair is not such a run -- a letter suffix, a descending or too-wide
-    span -- because that dash joins a year or a catalog number, not volumes."""
-    if not (low.isdigit() and high.isdigit()):
+def _range_interior(low: str, high: str) -> range | None:
+    """Volumes strictly between two ascending plain-number endpoints (empty for
+    adjacent ones), or None when the pair cannot be a run -- a letter suffix or
+    a descending pair, whose dash joins a catalog or disc number, not volumes."""
+    if not (low.isdigit() and high.isdigit() and int(low) < int(high)):
         return None
-    if not 0 < int(high) - int(low) <= _MAX_VOLUME_RANGE_SPAN:
-        return None
-    return [str(n) for n in range(int(low) + 1, int(high))]
+    return range(int(low) + 1, int(high))
 
 
 def _volume_phrases(title_lower: str) -> Iterator[tuple[frozenset[str], int, int]]:
     """Every resolvable volume phrase in ``title_lower``, in order, as
     ``(identifiers, start, end)``: the volumes it names, canonicalised, and its
-    span so a caller can remove it. A title can carry more than one ("Volume 1
+    span so a caller can remove it; a run too wide to expand empties the set but
+    keeps the span at its low end. A title can carry more than one ("Volume 1
     Volume 2", "vol. 1 & vol. 2"): :func:`volume_identifiers` unions them and
     :func:`va_series_base` judges the last."""
     for match in _VOLUME_MARKER_RE.finditer(title_lower):
@@ -175,7 +173,10 @@ def _volume_phrases(title_lower: str) -> Iterator[tuple[frozenset[str], int, int
                 interior = _range_interior(identifiers[-1], following[0])
                 if interior is None:
                     break
-                identifiers.extend(interior)
+                if len(interior) >= _MAX_VOLUME_RANGE_SPAN:  # N-M spans more than the cap
+                    identifiers = []
+                    break
+                identifiers.extend(map(str, interior))
             identifiers.append(following[0])
             end = item.end()
         yield frozenset(identifiers), match.start(), end
