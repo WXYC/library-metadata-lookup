@@ -385,3 +385,55 @@ class TestArgumentOrderSymmetry:
         assert titles_name_different_releases(left, right) == titles_name_different_releases(
             right, left
         )
+
+
+class TestBracketAnnotations:
+    """LML#1382 item 4: a library title's square-bracket annotation ("[4-CD
+    box]", "[missing 8/04]", "[RCA 1956]") describes the copy, not the
+    release, so against a Discogs subtitle it must not make the pair
+    two-sided. Bracket content is stripped from what can discriminate (or be
+    the shared token) on either side -- the leaf does not know which side is
+    the library -- but still absorbs a counterpart the other side spells out."""
+
+    @pytest.mark.parametrize(
+        ("left", "right", "expected"),
+        [
+            # Must not reject: an annotation against a Discogs subtitle.
+            ("fire music [4-cd box]", "fire music: the complete sessions", False),
+            ("elvis [rca 1956]", "elvis presley", False),
+            ("wonderfulness [missing 8/04]", "wonderfulness (live at the hungry i)", False),
+            ("red house painters [45 minutes long]", "red house painters (rollercoaster)", False),
+            # Either side: the leaf strips both.
+            ("fire music: the complete sessions", "fire music [4-cd box]", False),
+            # The annotation still absorbs the same words written as a subtitle.
+            (
+                "goodbye, babylon [vintage gospel] (discs 1,2)",
+                "goodbye, babylon (vintage gospel)",
+                False,
+            ),
+            # A bracket word is not the shared token either.
+            ("aluminum tunes [live]", "live at the fillmore", False),
+            # Must reject: a different word outside the brackets.
+            (
+                "the international pop festival [2-cd set]",
+                "the international guitar festival",
+                True,
+            ),
+            ("live at the fillmore 1969 [2-cd]", "live at the fillmore 1968", True),
+        ],
+    )
+    def test_bracket_rows(self, left, right, expected):
+        assert titles_name_different_releases(left, right) is expected
+
+    def test_bracket_content_stays_in_the_tokens_for_matching(self):
+        """Kept, in order, so it can absorb a counterpart; only the verdict ignores it."""
+        assert content_tokens("Elvis [RCA 1956] Live", _no_numbers) == (
+            "elvis",
+            "rca",
+            "1956",
+            "live",
+        )
+        assert (
+            tokens_disagree(content_tokens("Elvis [RCA 1956]", _no_numbers), ("elvis", "presley"))
+            is False
+        )
