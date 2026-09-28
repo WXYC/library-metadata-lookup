@@ -165,6 +165,28 @@ class TestTheFlagGatesTheVeto:
         assert title_token_gate_rejects(*pair) is rejects
         assert titles_name_different_releases(*pair) is True
 
+    @pytest.mark.parametrize(
+        "pair",
+        [
+            (
+                "super hits of the 70s: have a nice day, vol. 12",
+                "super hits of the 70s, vol 1-24 (a-x)",
+            ),
+            (
+                "super hits of the 70s, vol 1-24 (a-x)",
+                "super hits of the 70s: have a nice day, vol. 12",
+            ),
+        ],
+    )
+    def test_an_unexpandable_range_never_rejects_at_stage_1(self, set_title_gate_flags, pair):
+        """LML#1382 stage-1 replay: the 24-volume box's one library row read as
+        vol. 1, so the master gate disjoint-rejected it for every query naming
+        volumes 7-24 (18 of 3,248 sampled flowsheet lookups). The master alone
+        is the rollout stage that must not; the word axis is judged on its own."""
+        set_title_gate_flags(master=True, word=False)
+
+        assert title_token_gate_rejects(*pair) is False
+
     @pytest.mark.parametrize("word", [False, True])
     def test_every_gate_is_volume_only_with_the_master_alone(self, set_title_gate_flags, word):
         """Stage 1 must hold at all three gates, not just the shared helper: a
@@ -428,10 +450,21 @@ class TestVolumeIdentifierReviewFindings:
             # A spelled number past the vocabulary is not its first word.
             ("jean redpath, volume twenty one", set()),
             ("jean redpath, volume twenty-one", set()),
-            # A dash that is not a bounded ascending run ends the phrase at
-            # its first identifier: "2-63" is a catalog number, not volume 63.
-            ("series vol. 2-63", {"2"}),
-            ("series vols. 1-100", {"1"}),
+            # A dash that cannot be a run of volumes -- descending, or a letter
+            # suffix -- ends the phrase at its first identifier: "12-3" joins a
+            # catalog or disc number to volume 12, not volumes.
+            ("series vol. 12-3", {"12"}),
+            ("series vol. 2a-3", {"2a"}),
+            # An ascending run too wide to expand names NO volume (LML#1382): a
+            # box set ("vol 1-24", catalog row 47607) and a catalog number
+            # ("vol. 2-63") are the same shape, and reading the low end rejected
+            # the box set against its own volumes 2-24. The widest run expands.
+            ("super hits of the 70s, vol 1-24 (a-x)", set()),
+            ("Super Hits of the 70s, vol 1-24 (a-x)", set()),
+            ("series vol. 2-63", set()),
+            ("series vols. 1-100", set()),
+            ("series vols. 1, 2-40", set()),
+            ("series vols. 1-21", {str(n) for n in range(1, 22)}),
             # "+" is a list joiner too ("Vol. 1 + 2", a double-set spelling).
             ("nuggets vol. 1 + 2", {"1", "2"}),
             # A spelled range is a range; only "twenty" compounds with a units word.
@@ -465,6 +498,11 @@ class TestMultiVolumeDisagreement:
             # Past-vocabulary spellings read as no volume, never as their
             # first word: a one-sided None is agreement, not a false reject.
             ("jean redpath, volume twenty one", "jean redpath volume 21"),
+            # An unexpandable range reads as no volume, so it agrees with every
+            # volume -- its own (LML#1382) and, the accepted cost, a catalog
+            # number's second half.
+            ("super hits of the 70s, vol 1-24 (a-x)", "super hits of the 70s, vol. 12"),
+            ("series, vol. 63", "series vol. 2-63"),
         ],
     )
     def test_membership_is_agreement(self, left, right):
@@ -481,7 +519,7 @@ class TestMultiVolumeDisagreement:
             # A subtitle's number word must not smuggle the sibling into the set.
             ("rare soul, vol. 1", "rare soul vol. 2, one night only"),
             # A catalog-number dash must not assert its second half as a volume.
-            ("series, vol. 63", "series vol. 2-63"),
+            ("series, vol. 3", "series vol. 12-3"),
         ],
     )
     def test_disjoint_sets_disagree(self, left, right):
@@ -550,6 +588,10 @@ class TestVaSeriesBaseIsOneDefinitionOfAVolume:
             # phrase does not run to the end (LML#531's regex agreed: None).
             "posh hits, vol. 1, 1983",
             "country funk, vol. 2, 1967-1974",
+            # An unexpandable range is no filing either: its phrase still ends
+            # at the low end, so the dash is a tail (unchanged by LML#1382).
+            "super hits of the 70s, vol 1-24 (a-x)",
+            "series vols. 1-24",
         ],
     )
     def test_non_series_titles_do_not_parse(self, title):
