@@ -8,11 +8,21 @@ pins the production path and not the leaf in isolation. The must-NOT-reject
 half is the load-bearing one, because the first attempt at this axis rejected
 on orthography: a possessive apostrophe, a punctuation-fused compound, an
 abbreviation, a spelled number, a plural (#1378 review F1/F2/F3).
+
+The leaf's own contract is pinned separately below (LML#1382 item 5):
+literal-tuple tables for ``content_tokens`` and ``tokens_disagree``, and a
+``NumberFolder`` that is not the volume classifier, so a change to the fold or
+the alignment shows up as a changed tuple rather than only as a flipped verdict.
 """
 
 import pytest
 
-from lookup.title_identity import titles_name_different_releases
+from lookup.title_identity import _fold_number, titles_name_different_releases
+from lookup.title_tokens import content_tokens, tokens_disagree
+
+
+def _no_numbers(_token: str) -> str | None:
+    return None
 
 
 class TestDiscriminatingWordDisagreement:
@@ -119,3 +129,111 @@ class TestDiscriminatingWordDisagreement:
     )
     def test_agreeing_titles_are_not_rejected(self, left, right):
         assert titles_name_different_releases(left, right) is False
+
+
+class TestContentTokens:
+    @pytest.mark.parametrize(
+        ("title", "expected"),
+        [
+            # Articles and prepositions drop; content words keep their order.
+            ("The Dark Side of the Moon", ("dark", "side", "moon")),
+            # Apostrophes and periods are removed inside a token, not split on.
+            ("Greatest Hits of the 50's", ("greatest", "hits", "50s")),
+            ("Title E.P.", ("title",)),
+            # Diacritics fold before anything else compares.
+            ("Café del Mar", ("cafe", "mar")),
+            # A thousands comma joins; punctuation between two years separates.
+            ("1,000 Hours", ("1000", "hours")),
+            (
+                "Atlantic Rhythm and Blues 1947-1974",
+                ("atlantic", "rhythm", "blues", "1947", "1974"),
+            ),
+            # Abbreviations fold onto the short form, every reading of it.
+            ("Exile on Main Street", ("exile", "main", "st")),
+            ("Kill Bill Part 2", ("kill", "bill", "pt", "2")),
+            # Ordinals fold to digits without consulting the number folder.
+            ("The 3rd Album", ("3", "album")),
+            ("Third Album", ("3", "album")),
+            # Packaging vocabulary never survives.
+            ("Moon Pix (Bonus Disc)", ("moon", "pix")),
+        ],
+    )
+    def test_folds_a_title_to_its_comparison_tokens(self, title, expected):
+        assert content_tokens(title, _no_numbers) == expected
+
+    @pytest.mark.parametrize(
+        ("title", "expected"),
+        [
+            ("Kill Bill Pt. Two", ("kill", "bill", "pt", "2")),
+            ("Led Zeppelin IV", ("led", "zeppelin", "4")),
+            ("Chicago V", ("chicago", "5")),
+            # A pluralised number word folds like its singular.
+            ("Loved Ones", ("loved", "1")),
+        ],
+    )
+    def test_the_volume_classifier_folds_bare_number_tokens(self, title, expected):
+        assert content_tokens(title, _fold_number) == expected
+
+
+class TestTokensDisagree:
+    @pytest.mark.parametrize(
+        ("left", "right", "expected"),
+        [
+            # Two-sided: each side carries a token the other lacks, one shared.
+            (("international", "pop", "festival"), ("international", "guitar", "festival"), True),
+            (("live", "1969"), ("live", "1970"), True),
+            (("chicago", "16"), ("chicago", "5"), True),
+            # Identical or empty: nothing to adjudicate.
+            (("moon", "pix"), ("moon", "pix"), False),
+            ((), ("moon", "pix"), False),
+            (("moon", "pix"), (), False),
+            # One-sided: an extra token never rejects.
+            (("aluminum", "tunes"), ("aluminum", "tunes", "remastered"), False),
+            # Nothing shared: no aligned remainder to reason about.
+            (("doggystyle",), ("scheme",), False),
+            # A lone letter is never counted in the remainder.
+            (("series", "a"), ("series", "b"), False),
+            # Plural, near-spelling and two-digit-year tolerance.
+            (("dance", "mix"), ("dance", "mixes"), False),
+            (("rumours", "live"), ("rumors", "live"), False),
+            (("hits", "50s"), ("hits", "1950s"), False),
+            (("blues", "1947", "74"), ("blues", "1947", "1974"), False),
+            # Two- and three-token joins, judged with the same tolerance.
+            (("doggy", "style", "classics"), ("doggystyle", "classics"), False),
+            (("rock", "n", "roll", "party"), ("rocknroll", "party"), False),
+            (("rock", "roll", "party"), ("rocknroll", "party"), False),
+        ],
+    )
+    def test_literal_token_tuples(self, left, right, expected):
+        assert tokens_disagree(left, right) is expected
+        assert tokens_disagree(right, left) is expected
+
+
+class TestNumberFolderContract:
+    def test_a_caller_supplied_folder_is_applied_to_bare_tokens(self):
+        """Any ``NumberFolder`` works, not only ``title_identity``'s classifier:
+        it sees each bare token after the punctuation and abbreviation folds,
+        its answer replaces the token, a plural retries without the "s", and
+        an ordinal is folded before the folder is consulted."""
+        seen: list[str] = []
+
+        def dozens(token: str) -> str | None:
+            seen.append(token)
+            return "12" if token == "dozen" else None
+
+        assert content_tokens("A Dozen Roses, Dozens More: 2nd St.", dozens) == (
+            "12",
+            "roses",
+            "12",
+            "more",
+            "2",
+            "st",
+        )
+        assert "dozen" in seen and "st" in seen
+        assert "2nd" not in seen and "a" not in seen
+        assert (
+            tokens_disagree(
+                content_tokens("A Dozen Roses", dozens), content_tokens("12 Roses", _no_numbers)
+            )
+            is False
+        )
