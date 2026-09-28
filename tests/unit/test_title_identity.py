@@ -26,8 +26,8 @@ import pytest
 from lookup.matching import album_title_acceptable
 from lookup.title_identity import (
     title_token_gate_rejects,
-    titles_differ_by_discriminating_token,
     titles_name_different_releases,
+    titles_name_different_volumes,
     va_series_base,
     va_series_title_match,
     volume_identifiers,
@@ -37,6 +37,10 @@ from tests.factories import make_library_item
 _SIBLINGS = ("art of field recording volume i", "art of field recording, vol. 2")
 # LML#1369 shape C: one discriminating word on each side, no volume on either.
 _SHAPE_C = ("the monterey international pop festival", "the international guitar festival")
+_STUDIO_ONE = (
+    "soul jazz records presents studio one rockers",
+    "soul jazz records presents studio one roots",
+)
 
 
 class TestVolumeIdentifier:
@@ -101,7 +105,7 @@ class TestVolumeDisagreement:
         ],
     )
     def test_volume_siblings_disagree(self, left, right):
-        assert titles_differ_by_discriminating_token(left, right) is True
+        assert titles_name_different_volumes(left, right) is True
 
     @pytest.mark.parametrize(
         ("left", "right"),
@@ -123,7 +127,7 @@ class TestVolumeDisagreement:
         ],
     )
     def test_agreeing_titles_are_not_rejected(self, left, right):
-        assert titles_differ_by_discriminating_token(left, right) is False
+        assert titles_name_different_volumes(left, right) is False
 
 
 class TestTheFlagGatesTheVeto:
@@ -149,18 +153,31 @@ class TestTheFlagGatesTheVeto:
             (True, True, _SHAPE_C, True),
         ],
     )
-    def test_word_axis_is_nested_under_the_master(self, request, master, word, pair, rejects):
+    def test_word_axis_is_nested_under_the_master(
+        self, set_title_gate_flags, master, word, pair, rejects
+    ):
         """LML#1382: the word axis is hand-curated where the volume axis was
         measured, so it rides its own flag -- a prod recall drop can then be
         attributed to one axis, and rolling the word axis back keeps the
         volume axis. The composed verdict itself stays flag-independent."""
-        if master:
-            request.getfixturevalue("enable_title_token_identity_gate")
-        if word:
-            request.getfixturevalue("enable_title_word_identity_gate")
+        set_title_gate_flags(master=master, word=word)
 
         assert title_token_gate_rejects(*pair) is rejects
         assert titles_name_different_releases(*pair) is True
+
+    @pytest.mark.parametrize("word", [False, True])
+    def test_every_gate_is_volume_only_with_the_master_alone(self, set_title_gate_flags, word):
+        """Stage 1 must hold at all three gates, not just the shared helper: a
+        gate that called the composed verdict directly would apply the word
+        axis with the master alone. Each pair clears its gate's own floors with
+        every flag off (the Studio One pair scores 93 / 0.956 on the carve-out),
+        so only the word axis can refuse it."""
+        from lookup.compilation_title_floor import compilation_title_carveout_verdict
+
+        set_title_gate_flags(master=True, word=word)
+
+        assert album_title_acceptable(*_SHAPE_C) is not word
+        assert compilation_title_carveout_verdict(*_STUDIO_ONE).admitted is not word
 
 
 class TestAlbumTitleAcceptable:
@@ -451,7 +468,7 @@ class TestMultiVolumeDisagreement:
         ],
     )
     def test_membership_is_agreement(self, left, right):
-        assert titles_differ_by_discriminating_token(left, right) is False
+        assert titles_name_different_volumes(left, right) is False
 
     @pytest.mark.parametrize(
         ("left", "right"),
@@ -468,7 +485,7 @@ class TestMultiVolumeDisagreement:
         ],
     )
     def test_disjoint_sets_disagree(self, left, right):
-        assert titles_differ_by_discriminating_token(left, right) is True
+        assert titles_name_different_volumes(left, right) is True
 
 
 class TestVaSeriesBaseIsOneDefinitionOfAVolume:
@@ -646,18 +663,22 @@ class TestTitleProfileCache:
         assert info.misses == 1 + len(rows), info
         assert info.hits == len(rows) - 1, info
 
-    def test_master_only_gate_reads_the_same_profile_cache(self, enable_title_token_identity_gate):
+    def test_master_only_gate_runs_no_word_axis_code(self, set_title_gate_flags):
         """Stage 1 of the LML#1382 rollout (master on, word axis off) is the
-        configuration prod runs longest, so its volume-only branch must reuse
-        the per-title cache rather than re-parse the release for every row."""
-        from lookup.title_identity import _profile, title_token_gate_rejects
+        configuration prod runs longest. Its branch parses each distinct title
+        once, on a volume-only cache, and never reaches ``_profile`` -- whose
+        word tokenizer the word flag exists to take off the path."""
+        from lookup.title_identity import _profile, title_token_gate_rejects, volume_identifiers
 
+        set_title_gate_flags(master=True, word=False)
         _profile.cache_clear()
+        volume_identifiers.cache_clear()
         release = "art of field recording volume i"
         rows = [f"art of field recording, vol. {n}" for n in range(1, 6)]
         verdicts = [title_token_gate_rejects(release, row) for row in rows]
 
         assert verdicts == [False, True, True, True, True]
-        info = _profile.cache_info()
+        info = volume_identifiers.cache_info()
         assert info.misses == 1 + len(rows), info
         assert info.hits == len(rows) - 1, info
+        assert _profile.cache_info().currsize == 0
