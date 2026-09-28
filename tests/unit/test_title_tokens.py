@@ -276,3 +276,71 @@ class TestNumbersCompareByEquality:
         assert title_token_gate_rejects("100 broken windows live", "1000 broken windows live")
         set_title_gate_flags(master=True, word=False)
         assert not title_token_gate_rejects("100 broken windows live", "1000 broken windows live")
+
+
+class TestHyphenAndSlashSplit:
+    """LML#1382 item 3: a hyphen or slash separates two tokens instead of
+    fusing them ("in-utero" was "inutero" against "in utero"'s "utero"), and
+    the two-and-three-token join recovers a compound ("hip" + "hop" is
+    "hiphop"). A hyphen-attached stopword is kept as join material ("a" + "ha"
+    is "aha") but, like a lone letter, never counted in a remainder or as the
+    shared token."""
+
+    @pytest.mark.parametrize(
+        ("title", "expected"),
+        [
+            ("In-Utero Demos", ("in", "utero", "demos")),
+            ("In\u2013Utero Demos", ("in", "utero", "demos")),
+            ("Hip-Hop Classics", ("hip", "hop", "classics")),
+            ("AC/DC Live", ("ac", "dc", "live")),
+            ("On/Off Sessions", ("on", "off", "sessions")),
+            ("Bum cd-1", ("bum", "cd", "1")),
+            # A free stopword still drops.
+            ("The Hip-Hop of the 80s", ("hip", "hop", "80s")),
+            # Apostrophes and periods are still removed, not split on.
+            ("Rock'n'Roll E.P.", ("rocknroll",)),
+        ],
+    )
+    def test_content_tokens_split_on_hyphen_and_slash(self, title, expected):
+        assert content_tokens(title, _no_numbers) == expected
+
+    @pytest.mark.parametrize(
+        ("left", "right", "expected"),
+        [
+            # Must not reject: one title, hyphenated and not.
+            ("in-utero demos", "in utero demos", False),
+            ("in\u2013utero demos", "in utero demos", False),
+            ("on/off sessions", "on off sessions", False),
+            ("bum cd-1", "bum cd 1", False),
+            ("hip-hop classics", "hip hop classics", False),
+            ("hip-hop classics", "hiphop classics", False),
+            ("hip hop classics", "hiphop classics", False),
+            ("x-ray vision live", "xray vision live", False),
+            ("x-ray vision live", "x ray vision live", False),
+            ("ac/dc live", "acdc live", False),
+            ("ac/dc live", "ac dc live", False),
+            ("rock-and-roll party", "rock'n'roll party", False),
+            # A hyphen-attached stopword joins back into the fused spelling.
+            ("a-ha live", "aha live", False),
+            ("a-ok sessions", "aok sessions", False),
+            ("de-tuned live", "detuned live", False),
+            # Must still reject: a different word next to the compound.
+            ("x-ray vision live", "x-ray spex live", True),
+            ("post-punk classics", "post-rock classics", True),
+        ],
+    )
+    def test_hyphen_rows(self, left, right, expected):
+        assert titles_name_different_releases(left, right) is expected
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            # An unmatched hyphen-attached stopword is not a discriminating token...
+            (("in", "utero", "demos"), ("utero", "demos")),
+            # ...nor, matched, a shared one: nothing else is shared here.
+            (("in", "utero"), ("in", "bloom")),
+        ],
+    )
+    def test_an_attached_stopword_neither_counts_nor_is_shared(self, left, right):
+        assert tokens_disagree(left, right) is False
+        assert tokens_disagree(right, left) is False

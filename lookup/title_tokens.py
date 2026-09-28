@@ -19,9 +19,11 @@ review landed: each module's docstring can now say exactly what it adjudicates.
 
 What counts as the same token is the load-bearing part, because the naive rule
 rejects on orthography. Tokens are compared after folding diacritics and
-**removing** intra-token punctuation ("50's" is "50s", "e.p." is "ep",
-"hip-hop" is "hiphop" -- the fold-to-space in ``name_folding`` exists for
-prefix semantics and is the wrong fold here), after canonicalising numbers,
+**removing** apostrophes and periods ("50's" is "50s", "e.p." is "ep") but
+**splitting** on a hyphen or slash, so the join below rebuilds a compound
+("hip-hop" is "hip" + "hop", joining to "hiphop") and a hyphen-attached
+stopword is join material that is never counted ("in-utero" is "in utero",
+"a-ha" is "aha"), after canonicalising numbers,
 ordinals and the catalog's abbreviations ("part" is "pt", "two" and "2nd" are
 "2"), with a plural and near-spelling tolerance ("mixes"/"mix",
 "rumours"/"rumors") that never reaches two numbers -- they are one only when
@@ -108,10 +110,13 @@ _ORDINAL_WORDS = {
 _ORDINAL_SUFFIX_RE = re.compile(r"^([0-9]+)(?:st|nd|rd|th)$")
 
 #: Punctuation between two digits is a separator ("1947-1974" is two years)
-#: except a thousands comma ("1,000" is one number); any other punctuation
-#: inside a token is removed, not split on.
+#: except a thousands comma ("1,000" is one number), and so is a hyphen or a
+#: slash anywhere ("in-utero" is "in" + "utero", LML#1382 item 3; the fold has
+#: already turned an en dash into a hyphen); any other punctuation inside a
+#: token is removed, not split on ("50's" is "50s").
 _THOUSANDS_SEPARATOR_RE = re.compile(r"(?<=[0-9]),(?=[0-9]{3}\b)")
 _DIGIT_SEPARATOR_RE = re.compile(r"(?<=[0-9])[^\w\s]+(?=[0-9])")
+_WORD_SEPARATOR_RE = re.compile(r"[-/]")
 _INTRA_TOKEN_PUNCTUATION_RE = re.compile(r"[^\w\s]|_")
 
 #: ``fuzz.ratio`` at or above which two tokens are one word spelled twice
@@ -145,15 +150,18 @@ def _canonical_token(raw: str, fold_number: NumberFolder) -> str:
 def content_tokens(text: str, fold_number: NumberFolder) -> tuple[str, ...]:
     """The comparison tokens of a title (with its volume phrases already
     removed): diacritics and intra-token punctuation folded, stopwords and
-    packaging vocabulary dropped, each token canonical."""
+    packaging vocabulary dropped, each token canonical. A stopword attached
+    by a hyphen or slash is kept for the join to rebuild the compound with
+    ("a-ha" is "a" + "ha", joining to "aha"); :func:`_remainder` never counts it."""
     folded = _THOUSANDS_SEPARATOR_RE.sub("", normalize_for_comparison(text.lower()))
-    folded = _DIGIT_SEPARATOR_RE.sub(" ", folded)
-    folded = _INTRA_TOKEN_PUNCTUATION_RE.sub("", folded)
-    return tuple(
-        _canonical_token(raw, fold_number)
-        for raw in folded.split()
-        if raw not in _NON_DISCRIMINATING_TOKENS
-    )
+    tokens: list[str] = []
+    for word in _DIGIT_SEPARATOR_RE.sub(" ", folded).split():
+        pieces = [_INTRA_TOKEN_PUNCTUATION_RE.sub("", p) for p in _WORD_SEPARATOR_RE.split(word)]
+        pieces = [p for p in pieces if p]
+        if len(pieces) == 1 and pieces[0] in _NON_DISCRIMINATING_TOKENS:
+            continue
+        tokens.extend(_canonical_token(piece, fold_number) for piece in pieces)
+    return tuple(tokens)
 
 
 def _stem(token: str) -> str:
@@ -225,13 +233,15 @@ def _alignment(left: tuple[str, ...], right: tuple[str, ...]) -> tuple[list[bool
     return left_done, right_done
 
 
+def _counts(token: str) -> bool:
+    """A lone letter or a hyphen-attached stopword can join into a neighbour
+    ("rock" + "n" + "roll", "in" + "utero") but on its own discriminates nothing."""
+    return not (len(token) == 1 and token.isalpha()) and token not in _NON_DISCRIMINATING_TOKENS
+
+
 def _remainder(tokens: tuple[str, ...], done: list[bool]) -> list[str]:
-    """The tokens with no counterpart. A lone letter is never counted: it can
-    join into a neighbour ("rock" + "n" + "roll") but on its own discriminates
-    nothing."""
-    return [
-        t for t, d in zip(tokens, done, strict=True) if not d and not (len(t) == 1 and t.isalpha())
-    ]
+    """The tokens with no counterpart that :func:`_counts`."""
+    return [t for t, d in zip(tokens, done, strict=True) if not d and _counts(t)]
 
 
 def tokens_disagree(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
@@ -241,10 +251,13 @@ def tokens_disagree(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
     docstring) -- with nothing aligned there is no "one token out of place" to
     detect, only two unrelated titles the floors judge better. Shared-ness is
     read off the alignment, not inferred from the remainder's length, which a
-    lone letter dropped from the remainder would inflate."""
+    lone letter dropped from the remainder would inflate; an attached stopword
+    ("in" of "in-utero") aligns but is not a shared token."""
     if not left or not right or left == right:
         return False
     left_done, right_done = _alignment(left, right)
-    if not any(left_done):
+    if not any(
+        d and t not in _NON_DISCRIMINATING_TOKENS for t, d in zip(left, left_done, strict=True)
+    ):
         return False
     return bool(_remainder(left, left_done)) and bool(_remainder(right, right_done))
