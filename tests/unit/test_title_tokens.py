@@ -370,6 +370,13 @@ _ORDER_PAIRS = [
     ("doggy style live", "doggystyle"),
     ("x-ray spex live", "xray vision"),
     ("de-tuned live", "detuned sessions"),
+    # A bracket annotation matched to a plain token is not a shared pair either.
+    ("aluminum tunes [live]", "live at the fillmore"),
+    ("Tracks to Tsumbliwa [missing 8/04]", "The Eight Legged Groove Machine [with extra tracks]"),
+    ("fire music [4-cd box]", "fire music: the complete sessions"),
+    ("goodbye, babylon [vintage gospel] (discs 1,2)", "goodbye, babylon (vintage gospel)"),
+    ("elvis [rca 1956]", "elvis presley"),
+    ("the international pop festival [2-cd set]", "the international guitar festival"),
 ]
 
 
@@ -422,8 +429,21 @@ class TestBracketAnnotations:
             ("live at the fillmore 1969 [2-cd]", "live at the fillmore 1968", True),
         ],
     )
-    def test_bracket_rows(self, left, right, expected):
+    @pytest.mark.parametrize("swap", [False, True], ids=["as-written", "swapped"])
+    def test_bracket_rows(self, left, right, expected, swap):
+        if swap:
+            left, right = right, left
         assert titles_name_different_releases(left, right) is expected
+
+    def test_through_the_gate_with_the_library_title_second(self, set_title_gate_flags):
+        """Every production caller passes the library title second."""
+        from lookup.title_identity import title_token_gate_rejects
+
+        set_title_gate_flags(master=True, word=True)
+        assert not title_token_gate_rejects("live at the fillmore", "aluminum tunes [live]")
+        assert not title_token_gate_rejects(
+            "fire music: the complete sessions", "fire music [4-cd box]"
+        )
 
     def test_bracket_content_stays_in_the_tokens_for_matching(self):
         """Kept, in order, so it can absorb a counterpart; only the verdict ignores it."""
