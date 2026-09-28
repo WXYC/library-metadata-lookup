@@ -421,9 +421,11 @@ class TestVaSeriesBaseIsOneDefinitionOfAVolume:
             "turn up the volume now",
             "hits, vol. livid",
             "the volume dealers",
-            # An empty base is not a series.
+            # An empty base is not a series: nothing before the phrase, or only
+            # the separator the base would be stripped of.
             "  vol. 2",
             "volume 2",
+            ", vol. 1",
             "",
             # A volume that is not at the end is a title, not a filing.
             "art of field recording volume i: fifty years of traditional music",
