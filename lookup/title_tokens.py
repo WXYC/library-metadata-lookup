@@ -21,10 +21,11 @@ rejects on orthography. Tokens are compared after folding diacritics and
 **removing** intra-token punctuation ("50's" is "50s", "e.p." is "ep",
 "hip-hop" is "hiphop" -- the fold-to-space in ``name_folding`` exists for
 prefix semantics and is the wrong fold here), after canonicalising numbers,
-ordinals and the catalog's abbreviations ("pt." is "part", "two" and "2nd" are
+ordinals and the catalog's abbreviations ("part" is "pt", "two" and "2nd" are
 "2"), with a plural and near-spelling tolerance ("mixes"/"mix",
 "rumours"/"rumors"), a two-digit-year pairing ("74"/"1974"), and joins of two
-or three consecutive tokens ("doggy style" is "doggystyle"). Packaging
+or three consecutive tokens ("doggy style" is "doggystyle", with the same
+tolerance: "rock and roll" is "rock'n'roll" once "and" is dropped). Packaging
 vocabulary that describes an edition rather than its contents never
 discriminates, and neither does a lone letter, so a series lettered A-G is
 adjudicated for none of its letters rather than some.
@@ -54,27 +55,37 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 #: precision, never recall. Keep content words out: "Guitar" against
 #: "Monterey" is the shape this module exists to reject.
 _NON_DISCRIMINATING_TOKENS = frozenset(
-    "a an and at by de del der die el feat featuring for from in la le los of on presents "
+    "a an and at by de del der die el feat featuring for from ft in la le los of on presents "
     "the to vs with vol vols volume volumes "
     "anthology collection collections compilation compilations deluxe edition editions "
     "expanded records recordings reissue remaster remastered series".split()
 )
 
-#: Abbreviations the two catalogs expand differently. Expansion can only merge
-#: tokens, so a missing entry costs precision, never recall.
+#: Abbreviations the two catalogs expand differently, folded onto the SHORT
+#: form. An abbreviation can carry more than one reading ("st." is Saint and
+#: Street, "dr." Doctor and Drive, "pt." Part and Point): folding every
+#: reading onto the abbreviation merges all of them, where expanding the
+#: abbreviation would pick one reading and reject the other. Plurals fold onto
+#: the plural abbreviation so :func:`_stem` still pairs them ("parts"/"pts"
+#: both stem to "pt"). Folding can only merge tokens, so a missing entry costs
+#: precision, never recall.
 _ABBREVIATIONS = {
-    "pt": "part",
-    "pts": "parts",
-    "st": "saint",
-    "mt": "mount",
-    "bros": "brothers",
-    "no": "number",
-    "nos": "numbers",
-    "ft": "featuring",
-    "dr": "doctor",
-    "mr": "mister",
-    "jr": "junior",
-    "sr": "senior",
+    "part": "pt",
+    "parts": "pts",
+    "point": "pt",
+    "points": "pts",
+    "saint": "st",
+    "street": "st",
+    "mount": "mt",
+    "brother": "bro",
+    "brothers": "bros",
+    "number": "no",
+    "numbers": "nos",
+    "doctor": "dr",
+    "drive": "dr",
+    "mister": "mr",
+    "junior": "jr",
+    "senior": "sr",
 }
 
 _ORDINAL_WORDS = {
@@ -108,8 +119,8 @@ and "2" compare equal on the word axis exactly as they do on the volume axis."""
 
 
 def _canonical_token(raw: str, fold_number: NumberFolder) -> str:
-    """One token in its comparison form: abbreviations expanded, ordinals and
-    numbers folded to digits."""
+    """One token in its comparison form: a spelled-out reading folded onto its
+    abbreviation, ordinals and numbers folded to digits."""
     token = _ABBREVIATIONS.get(raw, raw)
     ordinal = _ORDINAL_SUFFIX_RE.fullmatch(token)
     if ordinal:
@@ -164,7 +175,9 @@ def _mark_counterparts(
 ) -> None:
     """Mark every token of ``a`` that has a counterpart in ``b`` -- one token,
     or two or three consecutive tokens that join to it ("doggy" + "style") --
-    and the ``b`` tokens it consumed."""
+    and the ``b`` tokens it consumed. A join is judged by :func:`_same_token`
+    like a single token is: "rock" + "roll" is one character short of
+    "rocknroll" once the conjunction has been dropped as a stopword."""
     for i, token in enumerate(a):
         if a_done[i]:
             continue
@@ -174,10 +187,9 @@ def _mark_counterparts(
                 break
         if a_done[i]:
             continue
-        stem = _stem(token)
         for width in (2, 3):
             for j in range(len(b) - width + 1):
-                if not any(b_done[j : j + width]) and _stem("".join(b[j : j + width])) == stem:
+                if not any(b_done[j : j + width]) and _same_token(token, "".join(b[j : j + width])):
                     a_done[i] = True
                     b_done[j : j + width] = [True] * width
                     break
