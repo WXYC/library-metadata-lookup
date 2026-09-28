@@ -372,7 +372,7 @@ _ORDER_PAIRS = [
     ("de-tuned live", "detuned sessions"),
     # A bracket annotation matched to a plain token is not a shared pair either.
     ("aluminum tunes [live]", "live at the fillmore"),
-    ("Tracks to Tsumbliwa [missing 8/04]", "The Eight Legged Groove Machine [with extra tracks]"),
+    ("elvis presley live", "the king [elvis presley]"),
     ("fire music [4-cd box]", "fire music: the complete sessions"),
     ("goodbye, babylon [vintage gospel] (discs 1,2)", "goodbye, babylon (vintage gospel)"),
     ("elvis [rca 1956]", "elvis presley"),
@@ -420,6 +420,14 @@ class TestBracketAnnotations:
             ),
             # A bracket word is not the shared token either.
             ("aluminum tunes [live]", "live at the fillmore", False),
+            # Nor is a pair with an annotation at one end, even when each side
+            # has such a pair ("tracks"/[tracks], [8]/"eight"): a per-side check
+            # reads both sides as shared and rejects.
+            (
+                "Tracks to Tsumbliwa [missing 8/04]",
+                "The Eight Legged Groove Machine [with extra tracks]",
+                False,
+            ),
             # Must reject: a different word outside the brackets.
             (
                 "the international pop festival [2-cd set]",
