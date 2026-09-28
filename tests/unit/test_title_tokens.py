@@ -465,3 +465,40 @@ class TestBracketAnnotations:
             tokens_disagree(content_tokens("Elvis [RCA 1956]", _no_numbers), ("elvis", "presley"))
             is False
         )
+
+
+class TestRemainingCatalogShapes:
+    """LML#1382 item 4, the remaining shapes: one fixed, two pinned as
+    accepted misses so a later change to them is a decision, not an accident."""
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            ("songs from the mountain live", "songs from the mt. live"),
+            ("smoky mountains sessions", "smoky mts. sessions"),
+        ],
+    )
+    def test_mountain_folds_onto_mt(self, left, right):
+        assert titles_name_different_releases(left, right) is False
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            ("50 words for snow", "fifty words for snow"),
+            ("100 broken windows", "one hundred broken windows"),
+        ],
+    )
+    def test_number_words_past_twenty_are_an_accepted_miss(self, left, right):
+        """Accepted miss per LML#1382: number words past twenty are not folded."""
+        assert titles_name_different_releases(left, right) is True
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            ("dr. octagon", "dr. octagonecologyst"),
+            ("the monterey international pop fest", "the monterey international pop festival"),
+        ],
+    )
+    def test_mid_token_prefix_or_truncation_is_an_accepted_miss(self, left, right):
+        """Accepted miss per LML#1382: a token is not matched on a prefix of another."""
+        assert titles_name_different_releases(left, right) is True

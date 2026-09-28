@@ -41,6 +41,12 @@ one-sided extra token never rejects ("Aluminum Tunes (Remastered)" is not a
 different album from "Aluminum Tunes"), and at least one shared token is
 required -- two titles with nothing in common have no aligned remainder to
 reason about, and the ratio floors judge them better than this rule can.
+
+Two recall misses are accepted, and pinned in tests (LML#1382): a number
+spelled past twenty ("fifty words for snow" against "50 words for snow") is
+outside the number vocabulary and rejects, and a token that is a prefix or a
+truncation of the other side's ("dr. octagon" against "dr. octagonecologyst")
+is not matched on the prefix.
 """
 
 import re
@@ -86,6 +92,8 @@ _ABBREVIATIONS = {
     "saint": "st",
     "street": "st",
     "mount": "mt",
+    "mountain": "mt",
+    "mountains": "mts",
     "brother": "bro",
     "brothers": "bros",
     "number": "no",
