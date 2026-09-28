@@ -226,14 +226,6 @@ def _remainder(tokens: tuple[str, ...], done: list[bool]) -> list[str]:
     ]
 
 
-def discriminating_remainders(
-    left: tuple[str, ...], right: tuple[str, ...]
-) -> tuple[list[str], list[str]]:
-    """The tokens on each side with no counterpart on the other."""
-    left_done, right_done = _alignment(left, right)
-    return _remainder(left, left_done), _remainder(right, right_done)
-
-
 def tokens_disagree(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
     """Whether two token tuples name different releases: each side carries a
     content token the other lacks, while sharing at least one. Never on a
