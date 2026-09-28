@@ -569,8 +569,9 @@ class Settings(BaseSettings):
         default=False,
         description=(
             "When True, the three album-title gates (album_title_acceptable, "
-            "the #531 V/A series arm _va_series_title_match, and the "
-            "TRACK_ON_COMPILATION carve-out) reject a library row whose title "
+            "the or in search_album_fuzzy that joins the #531 V/A series arm "
+            "va_series_title_match to it, and the TRACK_ON_COMPILATION "
+            "carve-out) reject a library row whose title "
             "carries a DIFFERENT volume identifier from the Discogs release "
             "title -- 'Art of Field Recording, vol. 2' against 'Art Of Field "
             "Recording Volume I' -- with arabic, roman and spelled-out forms "
