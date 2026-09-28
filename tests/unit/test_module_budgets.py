@@ -525,8 +525,9 @@ MODULE_BUDGETS: dict[str, int] = {
     # that file's 550 ceiling (LML#1369 prep), on the verbatim-move precedent
     # of `fallback_artwork.py` / `override_floor.py`. Roughly a third of the
     # measured size is the module docstring carrying the recall asymmetries a
-    # future reader must not "simplify" away. ~260 measured; 300 is a
-    # deliberate under-grant against the 1.3x formula's 350.
+    # future reader must not "simplify" away. ~235 measured (2026-09-28, after
+    # the review's prose tightening); 300 is a deliberate under-grant against
+    # the 1.3x formula's 350.
     "lookup/title_identity.py": 300,
     # LML#1321: the ARTIST_PLUS_ALBUM match class — the joint 80/80 floor, the
     # LML#1206 artist-variant widening + exact-credit tie-break, and the LML#784
