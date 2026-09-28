@@ -212,7 +212,7 @@ class TestTokensDisagree:
 class TestNumberFolderContract:
     def test_a_caller_supplied_folder_is_applied_to_bare_tokens(self):
         """Any ``NumberFolder`` works, not only ``title_identity``'s classifier:
-        it sees each bare token after the punctuation and abbreviation folds,
+        it sees each bare token after the abbreviation fold ("street" as "st"),
         its answer replaces the token, a plural retries without the "s", and
         an ordinal is folded before the folder is consulted."""
         seen: list[str] = []
@@ -221,7 +221,7 @@ class TestNumberFolderContract:
             seen.append(token)
             return "12" if token == "dozen" else None
 
-        assert content_tokens("A Dozen Roses, Dozens More: 2nd St.", dozens) == (
+        assert content_tokens("A Dozen Roses, Dozens More: 2nd Street", dozens) == (
             "12",
             "roses",
             "12",
@@ -230,7 +230,7 @@ class TestNumberFolderContract:
             "st",
         )
         assert "dozen" in seen and "st" in seen
-        assert "2nd" not in seen and "a" not in seen
+        assert "street" not in seen and "2nd" not in seen and "a" not in seen
         assert (
             tokens_disagree(
                 content_tokens("A Dozen Roses", dozens), content_tokens("12 Roses", _no_numbers)
