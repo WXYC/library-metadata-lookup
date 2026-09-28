@@ -580,10 +580,14 @@ class Settings(BaseSettings):
             "ratio floor admits the sibling and the strategy binds Volume I's "
             "release (and cover) to the vol. 2 row. Only a two-sided "
             "disagreement rejects -- a volume on the library side alone is "
-            "#531's recall case and keeps matching. Default False: verdicts "
-            "are byte-for-byte pre-#1369 until a HITL prod recall measurement "
-            "clears the flip, per the #973 precedent. "
-            "See WXYC/library-metadata-lookup#1369."
+            "#531's recall case and keeps matching. Default False: every gate "
+            "verdict is byte-for-byte pre-#1369 until a HITL prod recall "
+            "measurement clears the flip, per the #973 precedent. One "
+            "flag-independent change rides with this field: va_series_base, "
+            "the #531 series parser, shares the gate's volume vocabulary, so "
+            "which library titles count as a '<base>, vol. N' filing shifts "
+            "slightly whatever the flag says; docs/env-vars.md lists the "
+            "directions. See WXYC/library-metadata-lookup#1369."
         ),
     )
     lml_resolve_nonlibrary_release: bool = Field(
