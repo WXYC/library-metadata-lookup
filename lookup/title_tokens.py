@@ -82,8 +82,9 @@ _NON_DISCRIMINATING_TOKENS = frozenset(
 #: reading onto the abbreviation merges all of them, where expanding the
 #: abbreviation would pick one reading and reject the other. Plurals fold onto
 #: the plural abbreviation so :func:`_stem` still pairs them ("parts"/"pts"
-#: both stem to "pt"). Folding can only merge tokens, so a missing entry costs
-#: precision, never recall.
+#: both stem to "pt"). An entry merges its two spellings but takes the long one
+#: off the spelling floor and the join: once "mountain" is "mt", a misspelt
+#: "mountian" or a fused "bluemountain" no longer reaches it (#1388 review).
 _ABBREVIATIONS = {
     "part": "pt",
     "parts": "pts",

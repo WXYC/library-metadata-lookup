@@ -484,6 +484,18 @@ class TestRemainingCatalogShapes:
     @pytest.mark.parametrize(
         ("left", "right"),
         [
+            ("mountain songs live", "mountian songs live"),
+            ("blue mountain live", "bluemountain live"),
+            ("mountain-top live", "mountaintop live"),
+        ],
+    )
+    def test_the_mt_fold_costs_misspelt_and_fused_mountain(self, left, right):
+        """Accepted cost of folding mountain onto mt (no catalog title has these shapes)."""
+        assert titles_name_different_releases(left, right) is True
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
             ("50 words for snow", "fifty words for snow"),
             ("100 broken windows", "one hundred broken windows"),
         ],
