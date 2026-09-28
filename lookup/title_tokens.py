@@ -31,7 +31,8 @@ equal -- a two-digit-year pairing ("74"/"1974"), and joins of two
 or three consecutive tokens ("doggy style" is "doggystyle", with the same
 tolerance: "rock and roll" is "rock'n'roll" once "and" is dropped). Packaging
 vocabulary that describes an edition rather than its contents never
-discriminates, and neither does a lone letter (a roman digit -- i, v, x -- is
+discriminates, nor does a square-bracket annotation on the library's copy
+("[4-CD box]", "[missing 8/04]") or a lone letter (a roman digit -- i, v, x -- is
 a number first, so "Chicago V" against "Chicago 16" is adjudicated), so a
 series lettered A-G is adjudicated for none of its letters rather than some.
 
@@ -43,7 +44,7 @@ reason about, and the ratio floors judge them better than this rule can.
 """
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 # At module top on purpose: ``title_identity`` imports this module at module
 # top and the streaming matcher already pulls rapidfuzz in at import time, so
@@ -147,21 +148,39 @@ def _canonical_token(raw: str, fold_number: NumberFolder) -> str:
     return number if number is not None else token
 
 
+class _Annotation(str):
+    """A token from a square-bracket span ("[4-CD box]", "[missing 8/04]"): a
+    library note on the copy, not the release. It absorbs a counterpart the
+    other side spells out, but never discriminates nor is the shared token --
+    stripped from the verdict on both sides, since the leaf cannot tell which
+    side is the library (LML#1382 item 4)."""
+
+
+_BRACKET_RE = re.compile(r"\[([^\]]*)\]")
+
+
+def _part_tokens(part: str, fold_number: NumberFolder) -> Iterator[str]:
+    for word in _DIGIT_SEPARATOR_RE.sub(" ", part).split():
+        pieces = [_INTRA_TOKEN_PUNCTUATION_RE.sub("", p) for p in _WORD_SEPARATOR_RE.split(word)]
+        pieces = [p for p in pieces if p]
+        if len(pieces) == 1 and pieces[0] in _NON_DISCRIMINATING_TOKENS:
+            continue
+        yield from (_canonical_token(piece, fold_number) for piece in pieces)
+
+
 def content_tokens(text: str, fold_number: NumberFolder) -> tuple[str, ...]:
     """The comparison tokens of a title (with its volume phrases already
     removed): diacritics and intra-token punctuation folded, stopwords and
     packaging vocabulary dropped, each token canonical. A stopword attached
     by a hyphen or slash is kept for the join to rebuild the compound with
-    ("a-ha" is "a" + "ha", joining to "aha"); :func:`_remainder` never counts it."""
+    ("a-ha" is "a" + "ha", joining to "aha"), and square-bracket content is
+    kept as :class:`_Annotation` tokens; :func:`_remainder` counts neither."""
     folded = _THOUSANDS_SEPARATOR_RE.sub("", normalize_for_comparison(text.lower()))
-    tokens: list[str] = []
-    for word in _DIGIT_SEPARATOR_RE.sub(" ", folded).split():
-        pieces = [_INTRA_TOKEN_PUNCTUATION_RE.sub("", p) for p in _WORD_SEPARATOR_RE.split(word)]
-        pieces = [p for p in pieces if p]
-        if len(pieces) == 1 and pieces[0] in _NON_DISCRIMINATING_TOKENS:
-            continue
-        tokens.extend(_canonical_token(piece, fold_number) for piece in pieces)
-    return tuple(tokens)
+    return tuple(
+        _Annotation(token) if index % 2 else token
+        for index, part in enumerate(_BRACKET_RE.split(folded))
+        for token in _part_tokens(part, fold_number)
+    )
 
 
 def _stem(token: str) -> str:
@@ -199,8 +218,9 @@ def _same_token(left: str, right: str) -> bool:
 
 
 def _shareable(token: str) -> bool:
-    """Not a hyphen-attached stopword (the only kind that survives tokenising)."""
-    return token not in _NON_DISCRIMINATING_TOKENS
+    """Neither a hyphen-attached stopword (the only kind that survives
+    tokenising) nor an :class:`_Annotation`."""
+    return token not in _NON_DISCRIMINATING_TOKENS and not isinstance(token, _Annotation)
 
 
 def _mark_counterparts(
@@ -242,8 +262,8 @@ def _alignment(
 
 
 def _counts(token: str) -> bool:
-    """A lone letter or a hyphen-attached stopword can join into a neighbour
-    ("rock" + "n" + "roll", "in" + "utero") but on its own discriminates nothing."""
+    """A lone letter, a hyphen-attached stopword or an annotation can match or
+    join ("rock" + "n" + "roll", "in" + "utero") but on its own discriminates nothing."""
     return not (len(token) == 1 and token.isalpha()) and _shareable(token)
 
 
@@ -260,7 +280,8 @@ def tokens_disagree(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
     detect, only two unrelated titles the floors judge better. Shared-ness is
     read off the alignment, not inferred from the remainder's length, which a
     lone letter dropped from the remainder would inflate; a pair with an
-    attached stopword ("in" of "in-utero") at either end is not shared."""
+    attached stopword ("in" of "in-utero") or an annotation at either end is
+    not shared."""
     if not left or not right or left == right:
         return False
     left_done, right_done, shared = _alignment(left, right)
