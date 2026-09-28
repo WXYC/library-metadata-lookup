@@ -45,7 +45,7 @@ from collections.abc import Callable
 # top and the streaming matcher already pulls rapidfuzz in at import time, so
 # a function-local import here would defer nothing.
 from rapidfuzz import fuzz
-from wxyc_etl.text import to_match_form as normalize_for_comparison
+from wxyc_etl.text import to_ascii_form as normalize_for_comparison
 
 #: Tokens that never discriminate between two releases: articles, the short
 #: prepositions and conjunctions, the credit/series vocabulary, and the
