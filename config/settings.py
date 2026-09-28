@@ -587,7 +587,13 @@ class Settings(BaseSettings):
             "the #531 series parser, shares the gate's volume vocabulary, so "
             "which library titles count as a '<base>, vol. N' filing shifts "
             "slightly whatever the flag says; docs/env-vars.md lists the "
-            "directions. See WXYC/library-metadata-lookup#1369."
+            "directions. The same flag also rejects a row whose title differs "
+            "from the Discogs title by a discriminating WORD on each side -- "
+            "'The International Guitar Festival' against 'The Monterey "
+            "International Pop Festival' -- compared after folding "
+            "punctuation, diacritics, numbers, abbreviations and plurals "
+            "(lookup/title_tokens.py); a one-sided extra token never rejects. "
+            "See WXYC/library-metadata-lookup#1369."
         ),
     )
     lml_resolve_nonlibrary_release: bool = Field(

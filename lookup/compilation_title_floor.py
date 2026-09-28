@@ -22,6 +22,8 @@ constants below; the docs and the flag entry point here.
 
 from dataclasses import dataclass
 
+from rapidfuzz import fuzz
+
 from config.settings import get_settings
 from lookup.title_identity import title_token_gate_rejects
 
@@ -81,8 +83,6 @@ def compilation_title_carveout_verdict(
     or by patching THIS module's ``get_settings`` (the strategy module's does not
     reach here); both functions are value-imported, so to intercept the strategy's
     call patch ``lookup.strategies.track_on_compilation.<name>``."""
-    from rapidfuzz import fuzz
-
     title_score = fuzz.ratio(release_title_lower, row_title_lower)
     length_ratio = compilation_title_length_ratio(release_title_lower, row_title_lower)
     reason = None

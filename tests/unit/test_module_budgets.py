@@ -529,6 +529,16 @@ MODULE_BUDGETS: dict[str, int] = {
     # the review's prose tightening); 300 is a deliberate under-grant against
     # the 1.3x formula's 350.
     "lookup/title_identity.py": 300,
+    # The word axis of album-title identity (LML#1369): the token fold
+    # (diacritics, intra-token punctuation, number/ordinal/abbreviation
+    # canonicalisation, stopword and packaging vocabulary), the plural and
+    # near-spelling tolerance, fragment joins, and the two-sided disagreement
+    # rule. A leaf `lookup/title_identity.py` composes with its volume axis --
+    # its own module so each docstring says exactly what it adjudicates (the
+    # #1377 review's one-module-or-two question landed here). About a third is
+    # the module docstring carrying the recall asymmetries. 220 measured
+    # (2026-09-28); 1.3x -> 286 -> 300.
+    "lookup/title_tokens.py": 300,
     # LML#1321: the ARTIST_PLUS_ALBUM match class — the joint 80/80 floor, the
     # LML#1206 artist-variant widening + exact-credit tie-break, and the LML#784
     # self-titled swap — hoisted out of `lookup/strategies/library_miss.py`,
