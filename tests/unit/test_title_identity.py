@@ -376,6 +376,11 @@ class TestVolumeIdentifierReviewFindings:
             # its first identifier: "2-63" is a catalog number, not volume 63.
             ("series vol. 2-63", {"2"}),
             ("series vols. 1-100", {"1"}),
+            # "+" is a list joiner too ("Vol. 1 + 2", a double-set spelling).
+            ("nuggets vol. 1 + 2", {"1", "2"}),
+            # A spelled range is a range; only "twenty" compounds with a units word.
+            ("series volumes one-two", {"1", "2"}),
+            ("series volume one - two", {"1", "2"}),
         ],
     )
     def test_volume_identifiers_is_the_full_set(self, title, expected):
@@ -399,6 +404,7 @@ class TestMultiVolumeDisagreement:
             ("nuggets vol. 2", "nuggets vol. 1 & 2"),
             ("nuggets vols. 1-2", "nuggets, vol. 1"),
             ("nuggets vols. 1-3", "nuggets, vol. 2"),
+            ("nuggets vol. 1 + 2", "nuggets, vol. 2"),
             # F5 at the predicate: mixed case must not read as one-sided.
             ("Art Of Field Recording Volume I", "Art of Field Recording, Vol. 1"),
             # A second volume phrase is part of the set: the two-in-one row
