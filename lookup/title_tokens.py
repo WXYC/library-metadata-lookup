@@ -24,7 +24,8 @@ rejects on orthography. Tokens are compared after folding diacritics and
 prefix semantics and is the wrong fold here), after canonicalising numbers,
 ordinals and the catalog's abbreviations ("part" is "pt", "two" and "2nd" are
 "2"), with a plural and near-spelling tolerance ("mixes"/"mix",
-"rumours"/"rumors"), a two-digit-year pairing ("74"/"1974"), and joins of two
+"rumours"/"rumors") that never reaches two numbers -- they are one only when
+equal -- a two-digit-year pairing ("74"/"1974"), and joins of two
 or three consecutive tokens ("doggy style" is "doggystyle", with the same
 tolerance: "rock and roll" is "rock'n'roll" once "and" is dropped). Packaging
 vocabulary that describes an edition rather than its contents never
@@ -174,13 +175,19 @@ def _is_abbreviated_year(short: str, long: str) -> bool:
 
 
 def _same_token(left: str, right: str) -> bool:
+    """Equal stems, a two-digit year, or -- for words only -- the spelling
+    floor. Two numbers are one only by equality: "100"/"1000" is 85.7 and
+    "1969"/"1968" 75, the same score as "grey"/"gray" (LML#1382 item 1a)."""
     left_stem, right_stem = _stem(left), _stem(right)
-    return (
+    if (
         left_stem == right_stem
-        or fuzz.ratio(left, right) >= _TOKEN_EQUIVALENCE_FLOOR
         or _is_abbreviated_year(left_stem, right_stem)
         or _is_abbreviated_year(right_stem, left_stem)
-    )
+    ):
+        return True
+    if left_stem.isdigit() and right_stem.isdigit():
+        return False
+    return fuzz.ratio(left, right) >= _TOKEN_EQUIVALENCE_FLOOR
 
 
 def _mark_counterparts(
