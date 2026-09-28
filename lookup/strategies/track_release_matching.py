@@ -342,6 +342,8 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
     if exact:
         return exact
 
+    album_lower = album_title.lower()
+
     async def _search_and_filter(query: str) -> list[LibraryItem]:
         raw = await db.search(query=query, limit=MAX_SEARCH_RESULTS)
         if not raw:
@@ -349,10 +351,12 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
         q_lower = query.lower()
         # LML#1369: gated once, ahead of the ``or``, so neither the #531 V/A arm
         # nor the ratio path can route around it (and the arm stays a parser).
+        # Judged on the full Discogs title, not on ``query``: the paren-strip
+        # retry below hands this a query with "(Volume 10)" already removed.
         return [
             r
             for r in raw
-            if not title_token_gate_rejects(q_lower, (r.title or "").lower())
+            if not title_token_gate_rejects(album_lower, (r.title or "").lower())
             and (
                 va_series_title_match(q_lower, r)
                 or album_title_acceptable(q_lower, (r.title or "").lower())
@@ -394,7 +398,6 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
         significant_words = [w for w in words if len(w) > 3 and w not in STOPWORDS]
 
         if significant_words:
-            album_lower = album_title.lower()
             # Require roughly half the keywords to match — lenient enough for
             # abbreviated titles (e.g., "Punk 82-88" vs "Post Punk 1982 - 1988")
             # but strict enough to reject unrelated albums that share a few words
