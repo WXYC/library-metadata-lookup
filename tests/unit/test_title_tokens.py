@@ -237,3 +237,42 @@ class TestNumberFolderContract:
             )
             is False
         )
+
+
+class TestNumbersCompareByEquality:
+    """LML#1382 item 1a: two all-digit tokens are one number only when equal
+    (or a two-digit year of the four-digit one), never by the spelling floor
+    -- "100"/"1000" scores 85.7 and "1969"/"1968" 75, the same as "grey"/"gray"."""
+
+    @pytest.mark.parametrize(
+        ("left", "right", "expected"),
+        [
+            # Must reject: a different number is a different release.
+            ("100 broken windows live", "1000 broken windows live", True),
+            ("live at the fillmore 1969", "live at the fillmore 1968", True),
+            ("peel sessions 1979", "peel sessions 1997", True),
+            ("2000 light years live", "20000 light years live", True),
+            # Must not reject: one number written two ways.
+            ("hits of '74", "hits of 1974", False),
+            ("hits of the 50s", "hits of the 1950s", False),
+            ("hits of the 50's", "hits of the 50s", False),
+            ("1,000 hours", "1000 hours", False),
+        ],
+    )
+    def test_number_rows(self, left, right, expected):
+        assert titles_name_different_releases(left, right) is expected
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [(("broken", "100"), ("broken", "1000")), (("fillmore", "1969"), ("fillmore", "1968"))],
+    )
+    def test_the_leaf_rejects_unequal_numbers(self, left, right):
+        assert tokens_disagree(left, right) is True
+
+    def test_through_the_gate_with_both_flags_on(self, set_title_gate_flags):
+        from lookup.title_identity import title_token_gate_rejects
+
+        set_title_gate_flags(master=True, word=True)
+        assert title_token_gate_rejects("100 broken windows live", "1000 broken windows live")
+        set_title_gate_flags(master=True, word=False)
+        assert not title_token_gate_rejects("100 broken windows live", "1000 broken windows live")
