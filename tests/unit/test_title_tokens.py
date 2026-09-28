@@ -329,18 +329,59 @@ class TestHyphenAndSlashSplit:
             ("post-punk classics", "post-rock classics", True),
         ],
     )
-    def test_hyphen_rows(self, left, right, expected):
+    @pytest.mark.parametrize("swap", [False, True], ids=["as-written", "swapped"])
+    def test_hyphen_rows(self, left, right, expected, swap):
+        if swap:
+            left, right = right, left
         assert titles_name_different_releases(left, right) is expected
 
     @pytest.mark.parametrize(
         ("left", "right"),
         [
-            # An unmatched hyphen-attached stopword is not a discriminating token...
-            (("in", "utero", "demos"), ("utero", "demos")),
-            # ...nor, matched, a shared one: nothing else is shared here.
+            # An unmatched hyphen-attached stopword is not a discriminating token
+            # (the right side's "live" is, so a counted "in" would make it two-sided)...
+            (("in", "utero", "demos"), ("utero", "demos", "live")),
+            # ...nor, matched, a shared one: nothing else is shared here...
             (("in", "utero"), ("in", "bloom")),
+            # ...whichever side it is on: "cds"/"cd" pair a content token with an
+            # attached packaging word, so neither side may read the pair as shared.
+            (("nuggets", "8", "cds"), ("tribute", "wes", "2", "cd")),
         ],
     )
     def test_an_attached_stopword_neither_counts_nor_is_shared(self, left, right):
         assert tokens_disagree(left, right) is False
         assert tokens_disagree(right, left) is False
+
+
+#: Pairs whose verdict once depended on argument order, or could: an attached
+#: stopword or packaging piece matched to a content token on the other side.
+_ORDER_PAIRS = [
+    ("Nuggets box set 8 cds (A-H)", "Tribute to Wes Montgomery (2-cd set)"),
+    ("Nuggets box set 8 cds (A-H)", "Arkology (3-cd box set)"),
+    ("Complete Fantasy Records [3 volumes of 3 cd's each]", "Toxygene cd-4"),
+    ("Christiansands (cd-single)", "The Tomato Collection (2 cd's)"),
+    ("in-utero demos", "in utero demos live"),
+    ("in-utero", "in-bloom"),
+    ("a-ha live", "aha live"),
+    ("hip-hop classics vol. 2", "hiphop classics"),
+    ("rock-and-roll party", "rock and roll party tonight"),
+    ("on/off sessions", "off the record sessions"),
+    ("the international pop festival", "the international guitar festival"),
+    ("doggy style live", "doggystyle"),
+    ("x-ray spex live", "xray vision"),
+    ("de-tuned live", "detuned sessions"),
+]
+
+
+class TestArgumentOrderSymmetry:
+    """The verdict is a property of the pair, not of which title is passed
+    first: every production caller passes the library title second, so an
+    order-dependent rule silently applies to one side only (#1386/#1387 review)."""
+
+    @pytest.mark.parametrize(("left", "right"), _ORDER_PAIRS)
+    def test_verdict_does_not_depend_on_argument_order(self, left, right):
+        a, b = content_tokens(left, _fold_number), content_tokens(right, _fold_number)
+        assert tokens_disagree(a, b) == tokens_disagree(b, a)
+        assert titles_name_different_releases(left, right) == titles_name_different_releases(
+            right, left
+        )
