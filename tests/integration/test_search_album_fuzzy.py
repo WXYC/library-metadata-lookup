@@ -320,3 +320,26 @@ async def test_lookup_for_a_track_on_volume_i_binds_only_volume_i(
     assert 58621 not in bound_to_volume_i, (
         "the vol. 2 row must not be bound to Volume I's release (it would wear Volume I's cover)"
     )
+
+
+@pytest.mark.asyncio
+async def test_flag_off_one_discriminating_word_row_still_surfaces(library_db):
+    """Byte-for-byte pin of today's behavior with the gate off: the row clears
+    every aggregate ratio floor."""
+    results = await search_album_fuzzy(library_db, "The Monterey International Pop Festival")
+
+    assert "The International Guitar Festival" in {r.title for r in results}
+
+
+@pytest.mark.asyncio
+async def test_one_discriminating_word_row_does_not_surface(
+    library_db, enable_title_token_identity_gate
+):
+    """LML#1369 shape C: "The International Guitar Festival" against "The
+    Monterey International Pop Festival" differs by one word on each side."""
+    results = await search_album_fuzzy(library_db, "The Monterey International Pop Festival")
+    titles = {r.title for r in results}
+
+    assert "The International Guitar Festival" not in titles, (
+        f"a row differing by one discriminating word must not surface, got: {titles}"
+    )

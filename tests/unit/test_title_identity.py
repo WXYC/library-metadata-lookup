@@ -23,7 +23,6 @@ from lookup.title_identity import (
     titles_differ_by_discriminating_token,
     va_series_base,
     va_series_title_match,
-    volume_identifier,
     volume_identifiers,
 )
 from tests.factories import make_library_item
@@ -57,7 +56,7 @@ class TestVolumeIdentifier:
         ],
     )
     def test_recognised_volume_forms(self, title, expected):
-        assert volume_identifier(title) == expected
+        assert volume_identifiers(title) == {expected}
 
     @pytest.mark.parametrize(
         "title",
@@ -74,7 +73,7 @@ class TestVolumeIdentifier:
         ],
     )
     def test_titles_without_a_volume_identifier(self, title):
-        assert volume_identifier(title) is None
+        assert volume_identifiers(title) == frozenset()
 
 
 class TestVolumeDisagreement:
@@ -313,7 +312,7 @@ class TestVolumeIdentifierReviewFindings:
         ],
     )
     def test_case_insensitive(self, title, expected):
-        assert volume_identifier(title) == expected
+        assert volume_identifiers(title) == {expected}
 
     @pytest.mark.parametrize(
         "title",
@@ -333,7 +332,7 @@ class TestVolumeIdentifierReviewFindings:
         ],
     )
     def test_letters_and_words_are_not_roman_volumes(self, title):
-        assert volume_identifier(title) is None
+        assert volume_identifiers(title) == frozenset()
 
     @pytest.mark.parametrize(
         ("title", "expected"),
@@ -385,11 +384,6 @@ class TestVolumeIdentifierReviewFindings:
     )
     def test_volume_identifiers_is_the_full_set(self, title, expected):
         assert volume_identifiers(title) == frozenset(expected)
-
-    def test_single_identifier_is_none_for_a_multi_volume_phrase(self):
-        """``volume_identifier`` answers "which one volume?"; a two-volume set
-        has no one answer, and a caller that wants the set asks for it."""
-        assert volume_identifier("nuggets vol. 1 & 2") is None
 
 
 class TestMultiVolumeDisagreement:
@@ -545,3 +539,67 @@ class TestVaSeriesTitleMatchBoundary:
 
     def test_letter_continuation_is_not(self):
         assert va_series_title_match("disco not discotheque", self._row()) is False
+
+
+class TestAlbumTitleAcceptableWordAxis:
+    """Shape C through the shared matcher: the word axis composes into the
+    same flag-gated verdict the volume axis uses, so every caller of
+    ``album_title_acceptable`` inherits it."""
+
+    _SHAPE_C = ("the monterey international pop festival", "the international guitar festival")
+
+    def test_flag_off_is_todays_behavior_shape_c_included(self):
+        assert album_title_acceptable(*self._SHAPE_C)
+
+    def test_shape_c_single_word_rejected(self, enable_title_token_identity_gate):
+        assert album_title_acceptable(*self._SHAPE_C) is False
+
+    @pytest.mark.parametrize(
+        ("query", "result"),
+        [
+            ("kill bill pt. 2", "kill bill part two"),
+            ("greatest hits of the 50's", "greatest hits of the 50s"),
+            ("hip-hop classics", "hiphop classics"),
+        ],
+    )
+    def test_variant_spellings_stay_accepted(self, enable_title_token_identity_gate, query, result):
+        assert album_title_acceptable(query, result) is True
+
+
+class TestTitleProfileCache:
+    """Review F10: with the flag on, ``_filter_release_matches`` compares one
+    release title against every row; the release side is profiled once and
+    cached, and caching changes no verdict."""
+
+    _PAIRS = [
+        ("art of field recording volume i", "art of field recording, vol. 2"),
+        ("the monterey international pop festival", "the international guitar festival"),
+        ("disco not disco", "disco not disco, vol. 1"),
+        ("greatest hits of the 50's", "greatest hits of the 50s & 60s"),
+        ("kill bill pt. 2", "kill bill part two"),
+    ]
+
+    def test_verdicts_are_identical_cold_and_warm(self):
+        from lookup.title_identity import _profile, titles_name_different_releases
+
+        cold = []
+        for left, right in self._PAIRS:
+            _profile.cache_clear()
+            cold.append(titles_name_different_releases(left, right))
+        warm = [titles_name_different_releases(left, right) for left, right in self._PAIRS]
+        warm_again = [titles_name_different_releases(left, right) for left, right in self._PAIRS]
+
+        assert cold == warm == warm_again == [True, True, False, False, False]
+
+    def test_release_side_is_profiled_once_per_title(self):
+        from lookup.title_identity import _profile, titles_name_different_releases
+
+        _profile.cache_clear()
+        release = "art of field recording volume i"
+        rows = [f"art of field recording, vol. {n}" for n in range(1, 6)]
+        for row in rows:
+            titles_name_different_releases(release, row)
+
+        info = _profile.cache_info()
+        assert info.misses == 1 + len(rows), info
+        assert info.hits == len(rows) - 1, info
