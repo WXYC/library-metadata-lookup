@@ -381,7 +381,7 @@ class TestVolumeSiblingsAtTheCarveOut:
         assert {r.id for r in results} == {58620}
 
     async def test_same_volume_in_a_divergent_spelling_is_kept(
-        self, enable_title_token_identity_gate
+        self, enable_title_token_identity_gate, enable_title_word_identity_gate
     ):
         """The rejection is on volume *identity*, not on the volume phrase:
         ``Volume II`` and ``vol. 2`` are the same release."""
@@ -395,7 +395,10 @@ class TestVolumeSiblingsAtTheCarveOut:
         assert {r.id for r in results} == {58621}
 
     async def test_lml973_kill_switch_unchanged_with_the_gate_on(
-        self, enable_title_token_identity_gate, disable_tighten_compilation_title_carveout
+        self,
+        enable_title_token_identity_gate,
+        enable_title_word_identity_gate,
+        disable_tighten_compilation_title_carveout,
     ):
         """The volume axis says nothing about row 58775 (no volume on either
         side), so with the #973 length guard switched off it is readmitted
@@ -442,7 +445,7 @@ class TestRejectionLogNamesTheGateThatFired:
         assert "title_score=" not in rejection, rejection
 
     async def test_length_rejection_still_reports_the_numbers(
-        self, enable_title_token_identity_gate, caplog
+        self, enable_title_token_identity_gate, enable_title_word_identity_gate, caplog
     ):
         """The #973 numbers stay in the log where #973 is what fired."""
         import logging

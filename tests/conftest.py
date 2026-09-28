@@ -198,6 +198,23 @@ def enable_title_token_identity_gate(monkeypatch):
     get_settings.cache_clear()
 
 
+@pytest.fixture
+def enable_title_word_identity_gate(monkeypatch):
+    """Flip ``LML_TITLE_WORD_IDENTITY_GATE`` on for one test (LML#1382).
+
+    Nested under the master: on its own it changes nothing, so a test of the
+    word axis requests this AND ``enable_title_token_identity_gate``. With the
+    master alone the gate is the volume axis only. Same env + ``get_settings``
+    cache-clear pattern as the master's fixture, for the same reason.
+    """
+    monkeypatch.setenv("LML_TITLE_WORD_IDENTITY_GATE", "true")
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 @pytest.fixture(autouse=True)
 def _reset_discogs_pool_singleton():
     """Suite-wide reset of the discogs-cache ``async_singleton`` lock (LML#706).
