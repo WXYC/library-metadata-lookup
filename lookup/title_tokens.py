@@ -13,9 +13,9 @@ caller removes the volume phrases first (so a volume is adjudicated on its own
 axis or not at all) and passes the number folder it wants applied to bare
 tokens; ``title_identity.titles_name_different_releases`` is that caller and
 composes the two axes, which ``title_token_gate_rejects`` consults only when
-``LML_TITLE_WORD_IDENTITY_GATE`` is on as well (LML#1382). Splitting the axes into two modules is where the "one module or
-two?" question from the #1377 review landed: each module's docstring can now
-say exactly what it adjudicates.
+``LML_TITLE_WORD_IDENTITY_GATE`` is on as well (LML#1382). Splitting the axes
+into two modules is where the "one module or two?" question from the #1377
+review landed: each module's docstring can now say exactly what it adjudicates.
 
 What counts as the same token is the load-bearing part, because the naive rule
 rejects on orthography. Tokens are compared after folding diacritics and

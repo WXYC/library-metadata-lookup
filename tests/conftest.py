@@ -215,6 +215,26 @@ def enable_title_word_identity_gate(monkeypatch):
     get_settings.cache_clear()
 
 
+@pytest.fixture
+def set_title_gate_flags(monkeypatch):
+    """Pin BOTH title-gate flags (LML#1369 master, LML#1382 word axis) for one test.
+
+    For tests that assert a flag is OFF: the two fixtures above only turn a flag
+    on, and ``Settings`` also reads ``.env``, so a developer whose ``.env``
+    enables either flag would otherwise run an off-row with it on. The
+    environment outranks ``.env``, so setting both explicitly is hermetic.
+    """
+    from config.settings import get_settings
+
+    def _set(*, master: bool, word: bool) -> None:
+        monkeypatch.setenv("LML_TITLE_TOKEN_IDENTITY_GATE", str(master).lower())
+        monkeypatch.setenv("LML_TITLE_WORD_IDENTITY_GATE", str(word).lower())
+        get_settings.cache_clear()
+
+    yield _set
+    get_settings.cache_clear()
+
+
 @pytest.fixture(autouse=True)
 def _reset_discogs_pool_singleton():
     """Suite-wide reset of the discogs-cache ``async_singleton`` lock (LML#706).

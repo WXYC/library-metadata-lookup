@@ -12,7 +12,7 @@ This module asks **do the two titles name different volumes?**, folding the
 spellings that diverge across sources onto one value first (the library's
 ``vol. 2``, Discogs's ``Volume II``, the catalog's own ``Volume One`` /
 ``Volume Seven``). :func:`volume_identifiers` is the fold,
-:func:`titles_differ_by_discriminating_token` the verdict, and
+:func:`titles_name_different_volumes` the verdict, and
 :func:`title_token_gate_rejects` that verdict behind
 ``LML_TITLE_TOKEN_IDENTITY_GATE`` -- what the gates call. Two properties are
 load-bearing: **only a two-sided disagreement rejects** (a ``, vol. 1`` row
@@ -181,20 +181,25 @@ def _volume_phrases(title_lower: str) -> Iterator[tuple[frozenset[str], int, int
         yield frozenset(identifiers), match.start(), end
 
 
+@functools.lru_cache(maxsize=1024)
 def volume_identifiers(title: str) -> frozenset[str]:
     """Every volume ``title`` names, canonicalised; empty when it names none.
     ``vol. 2`` / ``Volume II`` / ``Volume Two`` all yield ``{"2"}``; ``vols.
     1-3`` yields ``{"1", "2", "3"}``; a second phrase adds to the set; "Volunteers"
-    yields nothing."""
+    yields nothing. Cached per title for the reason :func:`_profile` is."""
     return frozenset().union(*(ids for ids, _start, _end in _volume_phrases(title.lower())))
 
 
-def titles_differ_by_discriminating_token(left: str, right: str) -> bool:
+def _volumes_disjoint(a: frozenset[str], b: frozenset[str]) -> bool:
+    return bool(a) and bool(b) and a.isdisjoint(b)
+
+
+def titles_name_different_volumes(left: str, right: str) -> bool:
     """Both titles carry volumes and the sets are disjoint. Membership is
     agreement ("vol. 2" against "vol. 1 & 2"); a volume on one side only never
-    rejects. Flag-independent; the gates call :func:`title_token_gate_rejects`.
-    Reads the per-title :func:`_profile`, so both gate branches share one rule."""
-    return _volumes_disjoint(_profile(left), _profile(right))
+    rejects. Flag-independent; the gates call :func:`title_token_gate_rejects`,
+    whose master-only stage is this and never reaches the word tokenizer."""
+    return _volumes_disjoint(volume_identifiers(left), volume_identifiers(right))
 
 
 def _fold_number(raw: str) -> str | None:
@@ -216,26 +221,19 @@ def _profile(title: str) -> _TitleProfile:
     title: ``_filter_release_matches`` compares one release against every row,
     so the release side is profiled once, not per row (review F10). The volume
     phrases are removed before tokenising."""
-    lower = title.lower()
-    phrases = list(_volume_phrases(lower))
-    volumes = frozenset().union(*(ids for ids, _start, _end in phrases))
-    rest = lower
-    for _ids, start, end in reversed(phrases):
+    rest = title.lower()
+    for _ids, start, end in reversed(list(_volume_phrases(rest))):
         rest = f"{rest[:start]} {rest[end:]}"
-    return _TitleProfile(volumes, content_tokens(rest, _fold_number))
-
-
-def _volumes_disjoint(a: _TitleProfile, b: _TitleProfile) -> bool:
-    return bool(a.volumes) and bool(b.volumes) and a.volumes.isdisjoint(b.volumes)
+    return _TitleProfile(volume_identifiers(title), content_tokens(rest, _fold_number))
 
 
 def titles_name_different_releases(left: str, right: str) -> bool:
     """The composed, flag-independent verdict: the titles carry disjoint
-    volume sets (:func:`titles_differ_by_discriminating_token`), or each side
+    volume sets (:func:`titles_name_different_volumes`), or each side
     carries a content token the other lacks while sharing at least one
     (:func:`lookup.title_tokens.tokens_disagree`)."""
     a, b = _profile(left), _profile(right)
-    return _volumes_disjoint(a, b) or tokens_disagree(a.tokens, b.tokens)
+    return _volumes_disjoint(a.volumes, b.volumes) or tokens_disagree(a.tokens, b.tokens)
 
 
 def title_token_gate_rejects(left: str, right: str) -> bool:
@@ -253,7 +251,7 @@ def title_token_gate_rejects(left: str, right: str) -> bool:
         return False
     if settings.lml_title_word_identity_gate:
         return titles_name_different_releases(left, right)
-    return titles_differ_by_discriminating_token(left, right)
+    return titles_name_different_volumes(left, right)
 
 
 def va_series_base(library_title: str) -> str | None:
