@@ -51,11 +51,23 @@ class TestDiscriminatingWordDisagreement:
             ("hip-hop classics", "hiphop classics"),
             ("post-punk classics", "post punk classics"),
             ("rock'n'roll party", "rock n roll party"),
+            # A conjunction that survives as a letter on one side and vanishes
+            # on the other ("and" is a stopword, "&" is punctuation) leaves a
+            # 2-token join one character short of the fused token; the join
+            # tolerates that the way single tokens do (#1378 review).
+            ("rock and roll party", "rock'n'roll party"),
+            ("rock & roll party", "rock'n'roll party"),
+            ("drum & bass classics", "drum'n'bass classics"),
             # Review F2: abbreviation and number-form variants of one title.
             ("kill bill pt. 2", "kill bill part 2"),
             ("kill bill pt. 2", "kill bill part two"),
             ("st. elsewhere", "saint elsewhere"),
             ("blues brothers", "blues bros."),
+            # An abbreviation with two readings folds every reading onto the
+            # abbreviation, so neither reading is rejected against it
+            # ("st." is Saint and Street, "dr." Doctor and Drive; #1378 review).
+            ("exile on main st.", "exile on main street"),
+            ("mulholland dr.", "mulholland drive"),
             ("two sevens clash", "2 sevens clash"),
             ("the 3rd album", "the third album"),
             ("dance mix", "dance mixes"),
