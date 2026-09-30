@@ -479,6 +479,13 @@ class TestIsSelfTitled:
             pytest.param("Self-Titled", id="self-titled"),
             pytest.param("self titled", id="self-titled-no-hyphen"),
             pytest.param(" S/t ", id="with-whitespace"),
+            pytest.param("Eponymous", id="eponymous"),
+            pytest.param("eponymous", id="eponymous-lower"),
+            pytest.param("Epon", id="epon"),
+            pytest.param("epon.", id="epon-dot"),
+            pytest.param("Epon.", id="epon-dot-upper"),
+            pytest.param("St", id="bare-st"),
+            pytest.param("st", id="bare-st-lower"),
         ],
     )
     def test_self_titled_detected(self, title):
@@ -491,6 +498,8 @@ class TestIsSelfTitled:
             pytest.param("", id="empty"),
             pytest.param("St. Elsewhere", id="saint"),
             pytest.param("Satisfaction", id="starts-with-s"),
+            pytest.param("Eponymous 2", id="eponymous-with-suffix"),
+            pytest.param("Stapleton", id="starts-with-st"),
         ],
     )
     def test_non_self_titled(self, title):

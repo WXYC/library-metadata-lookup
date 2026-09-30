@@ -45,8 +45,12 @@ a library pressing ranked past the smaller page would be dropped. The consumer
 gates reuse on ``TrackCandidateSet.search_limit >= WAVE_A_SEARCH_LIMIT``, which
 fails safe (re-search, never silently narrow) if the two ever diverge."""
 
-SELF_TITLED_PATTERNS = frozenset({"s/t", "s.t.", "self-titled", "self titled"})
-"""Common abbreviations for self-titled albums (case-insensitive exact match)."""
+SELF_TITLED_PATTERNS = frozenset(
+    {"s/t", "s.t", "self-titled", "self titled", "eponymous", "epon", "st"}
+)
+"""Common abbreviations for self-titled albums (case-insensitive exact match
+against the title with trailing periods stripped, e.g. "S.T." and "Epon."
+both match without listing every punctuation variant)."""
 
 
 def is_self_titled(title: str) -> bool:
@@ -56,9 +60,10 @@ def is_self_titled(title: str) -> bool:
         title: Album title to check
 
     Returns:
-        True if title is a common self-titled abbreviation (e.g. "S/t", "S.T.")
+        True if title is a common self-titled abbreviation (e.g. "S/t", "S.T.",
+        "Epon.", "eponymous")
     """
-    return title.strip().lower() in SELF_TITLED_PATTERNS
+    return title.strip().lower().rstrip(".") in SELF_TITLED_PATTERNS
 
 
 def map_library_format_to_discogs(fmt: str | None) -> str | None:

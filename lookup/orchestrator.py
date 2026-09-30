@@ -72,6 +72,7 @@ from lookup.location_union import (
 )
 from lookup.matching import (
     WAVE_A_SEARCH_LIMIT,
+    is_self_titled,
     library_artist_for,
     limit_results,
 )
@@ -134,10 +135,14 @@ async def resolve_albums_for_track(
         and normalize_for_comparison(parsed.album).strip()
         == normalize_for_comparison(parsed.artist).strip()
     )
+    album_is_self_titled = parsed.album is not None and is_self_titled(parsed.album)
 
-    if parsed.song and parsed.artist and (album_is_missing or album_is_artist):
+    should_resolve = album_is_missing or album_is_artist or album_is_self_titled
+    if parsed.song and parsed.artist and should_resolve:
         if album_is_artist:
             logger.info(f"Album '{parsed.album}' appears to be artist name, looking up albums")
+        elif album_is_self_titled:
+            logger.info(f"Album '{parsed.album}' is a self-titled placeholder, looking up albums")
         try:
             releases = await lookup_releases_by_track(
                 parsed.song,
