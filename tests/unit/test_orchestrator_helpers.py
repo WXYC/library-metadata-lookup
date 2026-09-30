@@ -1815,6 +1815,31 @@ class TestFilterResultsByTrackValidation:
         assert validated[0].title == "Cup Of Loneliness / Choices"
 
     @pytest.mark.asyncio
+    async def test_eponymous_literal_title_swaps_search_album_same_as_s_t(
+        self, mock_discogs_service
+    ):
+        """A library row whose real title is "Eponymous" now swaps to the
+        artist name for the Discogs search, same as an "S/t" placeholder
+        already did. Confirmation still compares the *unswapped* library title
+        against the Discogs result (``album_title_acceptable``), so — like a
+        genuine "S/t" row before this change — the search album changes but
+        the row still fails to validate here; this pins that this widening
+        doesn't newly regress ``filter_results_by_track_validation``, it just
+        inherits the same pre-existing limitation self-titled rows already had."""
+        items = [make_library_item(id=1, artist="R.E.M.", title="Eponymous")]
+        search_result = make_discogs_result(release_id=777, album="R.E.M.", artist="R.E.M.")
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[search_result])
+        mock_discogs_service.validate_track_on_release.return_value = True
+
+        validated = await filter_results_by_track_validation(
+            items, "Feeling Gravitys Pull", "R.E.M.", mock_discogs_service
+        )
+
+        assert validated is None
+        called_request = mock_discogs_service.search.call_args.args[0]
+        assert called_request.album == "R.E.M."
+
+    @pytest.mark.asyncio
     async def test_returns_none_without_discogs(self):
         items = [make_library_item(id=1, artist="Queen", title="A Night at the Opera")]
         result = await filter_results_by_track_validation(items, "Song", "Artist", None)
@@ -2642,6 +2667,31 @@ class TestFetchArtworkForItems:
         assert len(results) == 1
         assert results[0][1] is not None
         assert results[0][1].release_id == 555
+
+    @pytest.mark.asyncio
+    async def test_eponymous_literal_title_also_gets_self_titled_swap(self, mock_discogs_service):
+        """Pins a known, accepted tradeoff (LML#1208): widening
+        SELF_TITLED_PATTERNS to the bare word "eponymous" (LML#1392) means a
+        library row whose REAL title happens to be "Eponymous" (e.g. R.E.M.'s
+        1988 compilation) also gets its album mutated to the artist name for
+        the Discogs search, same as a literal "S/t" placeholder would. This
+        trades away independent title confirmation for that specific row in
+        exchange for resolving the far more common self-titled placeholders."""
+        item = make_library_item(id=1, artist="R.E.M.", title="Eponymous", format="LP")
+
+        candidate = make_discogs_result(
+            release_id=777,
+            album="R.E.M.",
+            artist="R.E.M.",
+            artwork_url="https://example.com/rem.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[candidate])
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is not None
+        assert results[0][1].release_id == 777
 
     @pytest.mark.asyncio
     async def test_compilation_artist_scores_against_various(self, mock_discogs_service):
