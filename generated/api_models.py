@@ -359,6 +359,18 @@ class PlaylistSearchResult(BaseModel):
         description="The DJ's public on-air handle, never the DJ's legal name. Read from the denormalized `flowsheet.dj_name` column, itself populated at entry-insert time via the PII-safe chain (BS#1371); `\"Unknown DJ\"` substitutes when that resolves to nothing.",
     )
     show_id: int
+    rotation_bin: RotationBin | None = Field(
+        None,
+        description="Resolved by the shared flowsheet resolver: the writer's `rotation_id` where present (unwindowed, per BS#2183), otherwise a window bounded on both sides against this entry's own `add_time`. Null when neither source resolves. This reports that the release was in rotation at some point, not that it was in rotation when this entry aired. BS#2184 tracks a known inaccuracy in the retired-record cohort.\n",
+    )
+    request_flag: bool | None = Field(
+        None,
+        description="Straight from `flowsheet.request_flag` (`NOT NULL DEFAULT false`), so a present `false` is a real negative. The key itself is optional on the wire: absent means this server does not emit the field, so treat absence as unknown, not as `false`.\n",
+    )
+    on_streaming: bool | None = Field(
+        None,
+        description="True if this release is available on at least one streaming service. False means only available in the WXYC physical library. Null if unknown.",
+    )
 
 
 class PlaylistSearchResponse(BaseModel):
