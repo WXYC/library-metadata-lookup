@@ -169,9 +169,13 @@ async def resolve_albums_for_track(
                     logger.info(f"Found {len(albums)} albums for song '{parsed.song}': {albums}")
                     return albums, False
             logger.info(f"Could not find albums for song '{parsed.song}'")
+            if album_is_self_titled and parsed.album:
+                return [parsed.album], False
             return [], True
         except Exception as e:
             logger.warning(f"Track lookup failed: {e}")
+            if album_is_self_titled and parsed.album:
+                return [parsed.album], False
             return [], True
     return [parsed.album] if parsed.album else [], False
 
