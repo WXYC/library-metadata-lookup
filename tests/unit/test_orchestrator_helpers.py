@@ -999,6 +999,55 @@ class TestResolveAlbumsForTrack:
         assert not_found is False
 
     @pytest.mark.asyncio
+    async def test_self_titled_placeholder_falls_back_to_original_on_discogs_miss(
+        self, mock_discogs_service
+    ):
+        """When Discogs has no album for the song, the original placeholder string
+        is passed through rather than dropped: ARTIST_PLUS_ALBUM's own fold-based
+        match (name_folding.fold_punctuation_for_comparison) can still resolve
+        "S/T" against a catalog row literally titled "S/T", which is what the
+        request would have hit before this Discogs lookup was ever attempted."""
+        parsed = ParsedRequest(
+            song="Test Song",
+            artist="Stereolab",
+            album="S/T",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            albums, not_found = await resolve_albums_for_track(parsed, mock_discogs_service)
+
+        assert albums == ["S/T"]
+        assert not_found is False
+
+    @pytest.mark.asyncio
+    async def test_self_titled_placeholder_falls_back_to_original_on_discogs_exception(
+        self, mock_discogs_service
+    ):
+        parsed = ParsedRequest(
+            song="Test Song",
+            artist="Stereolab",
+            album="eponymous",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        ):
+            albums, not_found = await resolve_albums_for_track(parsed, mock_discogs_service)
+
+        assert albums == ["eponymous"]
+        assert not_found is False
+
+    @pytest.mark.asyncio
     async def test_non_library_artist_returns_song_not_found_with_zero_validations(self):
         """Acceptance (b) (LML#866): through the real seam, a non-library artist
         does one Discogs search and zero tracklist fetches.
