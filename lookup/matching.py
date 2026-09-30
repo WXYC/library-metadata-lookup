@@ -45,12 +45,8 @@ a library pressing ranked past the smaller page would be dropped. The consumer
 gates reuse on ``TrackCandidateSet.search_limit >= WAVE_A_SEARCH_LIMIT``, which
 fails safe (re-search, never silently narrow) if the two ever diverge."""
 
-SELF_TITLED_PATTERNS = frozenset(
-    {"s/t", "s.t", "self-titled", "self titled", "eponymous", "epon", "st"}
-)
-"""Common abbreviations for self-titled albums (case-insensitive exact match
-against the title with trailing periods stripped, e.g. "S.T." and "Epon."
-both match without listing every punctuation variant)."""
+SELF_TITLED_PATTERNS = frozenset({"s/t", "s.t.", "self-titled", "self titled"})
+"""Common abbreviations for self-titled albums (case-insensitive exact match)."""
 
 
 def is_self_titled(title: str) -> bool:
@@ -60,10 +56,58 @@ def is_self_titled(title: str) -> bool:
         title: Album title to check
 
     Returns:
-        True if title is a common self-titled abbreviation (e.g. "S/t", "S.T.",
-        "Epon.", "eponymous")
+        True if title is a common self-titled abbreviation (e.g. "S/t", "S.T.")
     """
-    return title.strip().lower().rstrip(".") in SELF_TITLED_PATTERNS
+    return title.strip().lower() in SELF_TITLED_PATTERNS
+
+
+REQUEST_SELF_TITLED_PLACEHOLDERS = SELF_TITLED_PATTERNS | frozenset({"eponymous", "epon", "epon."})
+"""Self-titled placeholders recognized on a *typed request album* (LML#1392).
+
+A superset of :data:`SELF_TITLED_PATTERNS` that adds the eponymous forms
+listeners type ("eponymous", "epon", "epon."). These are deliberately NOT in
+the shared catalog vocabulary: catalog-side consumers (``lookup/validation.py``,
+``lookup/artwork.py``, ``typed_pair_floor``) test *library titles*, and a
+catalog row titled "Eponymous" can be the real album (R.E.M.'s 1988
+compilation, library row 27175), which must keep validating and binding
+artwork against its own title. A listener typing "eponymous" almost always
+means "the self-titled one"."""
+
+
+def is_self_titled_request_placeholder(title: str) -> bool:
+    """Check if a typed request album is a self-titled placeholder.
+
+    Use this only on the album a caller *typed*, never on a catalog title; for
+    catalog titles use :func:`is_self_titled`. See
+    :data:`REQUEST_SELF_TITLED_PLACEHOLDERS` for why the two differ.
+
+    Args:
+        title: The typed album from the request.
+
+    Returns:
+        True if ``title`` is a self-titled placeholder (e.g. "S/T", "Epon.",
+        "eponymous"), case-insensitive after trimming surrounding whitespace.
+    """
+    return title.strip().lower() in REQUEST_SELF_TITLED_PLACEHOLDERS
+
+
+def needs_album_resolution(parsed: ParsedRequest) -> bool:
+    """Whether step 2 runs the song->album Discogs lookup for this request.
+
+    True when the request has a song and an artist and the typed album is
+    missing, normalizes equal to the artist name, or is a self-titled
+    placeholder (:func:`is_self_titled_request_placeholder`, LML#1392). The one
+    trigger for ``resolve_albums_for_track`` and the step-2 Discogs API-call
+    telemetry, so the two cannot disagree.
+    """
+    if not (parsed.song and parsed.artist):
+        return False
+    if not parsed.album or is_self_titled_request_placeholder(parsed.album):
+        return True
+    return (
+        normalize_for_comparison(parsed.album).strip()
+        == normalize_for_comparison(parsed.artist).strip()
+    )
 
 
 def map_library_format_to_discogs(fmt: str | None) -> str | None:

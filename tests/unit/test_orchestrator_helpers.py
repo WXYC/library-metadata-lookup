@@ -34,7 +34,12 @@ from generated.api_models import (
 )
 from lookup.artwork import fetch_artwork_for_items
 from lookup.fallback_artwork import _resolve_fallback_artwork
-from lookup.matching import MAX_SEARCH_RESULTS, artist_matches_item, filter_results_by_artist
+from lookup.matching import (
+    MAX_SEARCH_RESULTS,
+    artist_matches_item,
+    filter_results_by_artist,
+    needs_album_resolution,
+)
 from lookup.orchestrator import (
     build_context_message,
     resolve_albums_for_track,
@@ -973,12 +978,17 @@ class TestResolveAlbumsForTrack:
             pytest.param("s.t.", id="s-dot-t"),
             pytest.param("self-titled", id="self-titled"),
             pytest.param("eponymous", id="eponymous"),
+            pytest.param("epon", id="epon"),
             pytest.param("Epon.", id="epon-dot"),
         ],
     )
     async def test_looks_up_album_for_self_titled_placeholder(self, mock_discogs_service, album):
-        """A self-titled placeholder in the album field runs song->album resolution,
-        same as when the album is missing or equals the artist name."""
+        """A self-titled placeholder in the album field runs song->album
+        resolution, same as when the album is missing or equals the artist
+        name (LML#1392). The typed placeholder rides last, after the Discogs
+        albums, so ARTIST_PLUS_ALBUM still tries the literal match against a
+        catalog row titled e.g. "S/T" (the only path this request had on main)
+        even when the Discogs hit omits the self-titled release."""
         parsed = ParsedRequest(
             song="Test Song",
             artist="Stereolab",
@@ -995,18 +1005,25 @@ class TestResolveAlbumsForTrack:
             albums, not_found = await resolve_albums_for_track(parsed, mock_discogs_service)
 
         mock_lookup.assert_awaited_once()
-        assert albums == ["Emperor Tomato Ketchup"]
+        assert albums == ["Emperor Tomato Ketchup", album]
         assert not_found is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "releases",
+        [
+            pytest.param([], id="no-releases"),
+            pytest.param([("Some Other Band", "Greatest Hits")], id="all-filtered-by-artist"),
+        ],
+    )
     async def test_self_titled_placeholder_falls_back_to_original_on_discogs_miss(
-        self, mock_discogs_service
+        self, mock_discogs_service, releases
     ):
-        """When Discogs has no album for the song, the original placeholder string
-        is passed through rather than dropped: ARTIST_PLUS_ALBUM's own fold-based
-        match (name_folding.fold_punctuation_for_comparison) can still resolve
-        "S/T" against a catalog row literally titled "S/T", which is what the
-        request would have hit before this Discogs lookup was ever attempted."""
+        """When Discogs yields no album for the song (no release, or every
+        release filtered out by the artist-prefix check), the self-titled miss
+        contract is ``([placeholder], False)`` -- exactly what this request
+        returned on main -- not the missing/album-is-artist ``([], True)``, so
+        ``song_not_found`` and downstream strategy routing are unchanged."""
         parsed = ParsedRequest(
             song="Test Song",
             artist="Stereolab",
@@ -1018,7 +1035,7 @@ class TestResolveAlbumsForTrack:
         with patch(
             "lookup.orchestrator.lookup_releases_by_track",
             new_callable=AsyncMock,
-            return_value=[],
+            return_value=releases,
         ):
             albums, not_found = await resolve_albums_for_track(parsed, mock_discogs_service)
 
@@ -1046,6 +1063,47 @@ class TestResolveAlbumsForTrack:
 
         assert albums == ["eponymous"]
         assert not_found is False
+
+    @pytest.mark.parametrize(
+        "album, expected",
+        [
+            pytest.param(None, True, id="missing"),
+            pytest.param("Stereolab", True, id="album-is-artist"),
+            pytest.param("S/T", True, id="s-slash-t"),
+            pytest.param("Epon.", True, id="epon-dot"),
+            pytest.param("Emperor Tomato Ketchup", False, id="real-title"),
+        ],
+    )
+    def test_needs_album_resolution(self, album, expected):
+        """The step-2 trigger predicate, shared by ``resolve_albums_for_track``
+        and the step-2 Discogs telemetry so the two cannot disagree."""
+        parsed = ParsedRequest(
+            song="Test Song",
+            artist="Stereolab",
+            album=album,
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        assert needs_album_resolution(parsed) is expected
+
+    @pytest.mark.parametrize(
+        "song, artist",
+        [
+            pytest.param(None, "Stereolab", id="no-song"),
+            pytest.param("Test Song", None, id="no-artist"),
+        ],
+    )
+    def test_needs_album_resolution_requires_song_and_artist(self, song, artist):
+        parsed = ParsedRequest(
+            song=song,
+            artist=artist,
+            album="S/T",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        assert needs_album_resolution(parsed) is False
 
     @pytest.mark.asyncio
     async def test_non_library_artist_returns_song_not_found_with_zero_validations(self):
@@ -1815,29 +1873,33 @@ class TestFilterResultsByTrackValidation:
         assert validated[0].title == "Cup Of Loneliness / Choices"
 
     @pytest.mark.asyncio
-    async def test_eponymous_literal_title_swaps_search_album_same_as_s_t(
+    async def test_real_eponymous_catalog_title_validates_against_its_own_title(
         self, mock_discogs_service
     ):
-        """A library row whose real title is "Eponymous" now swaps to the
-        artist name for the Discogs search, same as an "S/t" placeholder
-        already did. Confirmation still compares the *unswapped* library title
-        against the Discogs result (``album_title_acceptable``), so — like a
-        genuine "S/t" row before this change — the search album changes but
-        the row still fails to validate here; this pins that this widening
-        doesn't newly regress ``filter_results_by_track_validation``, it just
-        inherits the same pre-existing limitation self-titled rows already had."""
-        items = [make_library_item(id=1, artist="R.E.M.", title="Eponymous")]
-        search_result = make_discogs_result(release_id=777, album="R.E.M.", artist="R.E.M.")
-        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[search_result])
+        """LML#1392 regression pin: a catalog row whose REAL title is
+        "Eponymous" (R.E.M.'s 1988 compilation, library row 27175) is not a
+        self-titled placeholder on the catalog side. The Discogs search must
+        use "Eponymous" (not the artist name) and the row must validate, as on
+        main. The eponymous forms are request-side only."""
+        items = [make_library_item(id=27175, artist="R.E.M.", title="Eponymous")]
+        eponymous = make_discogs_result(release_id=1001, album="Eponymous", artist="R.E.M.")
+        other = make_discogs_result(release_id=1002, album="Document", artist="R.E.M.")
+
+        async def search(request):
+            hit = eponymous if request.album == "Eponymous" else other
+            return DiscogsSearchResponse(results=[hit])
+
+        mock_discogs_service.search.side_effect = search
         mock_discogs_service.validate_track_on_release.return_value = True
 
         validated = await filter_results_by_track_validation(
-            items, "Feeling Gravitys Pull", "R.E.M.", mock_discogs_service
+            items, "Talk About the Passion", "R.E.M.", mock_discogs_service
         )
 
-        assert validated is None
+        assert validated is not None
+        assert [item.id for item in validated] == [27175]
         called_request = mock_discogs_service.search.call_args.args[0]
-        assert called_request.album == "R.E.M."
+        assert called_request.album == "Eponymous"
 
     @pytest.mark.asyncio
     async def test_returns_none_without_discogs(self):
@@ -2669,29 +2731,37 @@ class TestFetchArtworkForItems:
         assert results[0][1].release_id == 555
 
     @pytest.mark.asyncio
-    async def test_eponymous_literal_title_also_gets_self_titled_swap(self, mock_discogs_service):
-        """Pins a known, accepted tradeoff (LML#1208): widening
-        SELF_TITLED_PATTERNS to the bare word "eponymous" (LML#1392) means a
-        library row whose REAL title happens to be "Eponymous" (e.g. R.E.M.'s
-        1988 compilation) also gets its album mutated to the artist name for
-        the Discogs search, same as a literal "S/t" placeholder would. This
-        trades away independent title confirmation for that specific row in
-        exchange for resolving the far more common self-titled placeholders."""
-        item = make_library_item(id=1, artist="R.E.M.", title="Eponymous", format="LP")
-
-        candidate = make_discogs_result(
-            release_id=777,
-            album="R.E.M.",
+    async def test_real_eponymous_catalog_title_binds_its_own_artwork(self, mock_discogs_service):
+        """LML#1392 regression pin: a catalog row whose REAL title is
+        "Eponymous" (R.E.M., library row 27175) keeps its own title as the
+        Discogs search album and binds the Eponymous release's artwork, as on
+        main. No R.E.M. release is titled "R.E.M.", so a self-titled swap here
+        would search for the wrong album and bind nothing."""
+        item = make_library_item(id=27175, artist="R.E.M.", title="Eponymous", format="LP")
+        eponymous = make_discogs_result(
+            release_id=1001,
+            album="Eponymous",
             artist="R.E.M.",
-            artwork_url="https://example.com/rem.jpg",
+            artwork_url="https://example.com/eponymous.jpg",
         )
-        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[candidate])
+        other = make_discogs_result(
+            release_id=1002,
+            album="Document",
+            artist="R.E.M.",
+            artwork_url="https://example.com/document.jpg",
+        )
+
+        async def search(request):
+            hit = eponymous if request.album == "Eponymous" else other
+            return DiscogsSearchResponse(results=[hit])
+
+        mock_discogs_service.search.side_effect = search
 
         results = await fetch_artwork_for_items([item], mock_discogs_service)
 
         assert len(results) == 1
         assert results[0][1] is not None
-        assert results[0][1].release_id == 777
+        assert results[0][1].release_id == 1001
 
     @pytest.mark.asyncio
     async def test_compilation_artist_scores_against_various(self, mock_discogs_service):

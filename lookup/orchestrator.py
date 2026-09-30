@@ -72,9 +72,10 @@ from lookup.location_union import (
 )
 from lookup.matching import (
     WAVE_A_SEARCH_LIMIT,
-    is_self_titled,
+    is_self_titled_request_placeholder,
     library_artist_for,
     limit_results,
+    needs_album_resolution,
 )
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.release_resolution import (
@@ -109,9 +110,12 @@ async def resolve_albums_for_track(
     db: LibraryDB | None = None,
     memo: TrackCandidateMemo | None = None,
 ) -> tuple[list[str], bool]:
-    """Resolve album names for a track if not provided.
+    """Resolve album names for a track when the typed album doesn't name one.
 
-    Searches Discogs for ALL releases containing the track, not just the first one.
+    Runs when ``needs_album_resolution`` is true (song + artist, with the album
+    missing, equal to the artist, or a self-titled placeholder such as "S/T" or
+    "Epon."; LML#1392); otherwise returns the typed album unchanged. Searches
+    Discogs for ALL releases containing the track, not just the first one.
 
     When ``db`` is supplied, tracklist validation is gated library-first (LML#866):
     the (corrected-or-typed) query artist must have at least one library row or the
@@ -126,23 +130,28 @@ async def resolve_albums_for_track(
     instead of re-issuing the same search.
 
     Returns:
-        Tuple of (list of album names, song_not_found_flag)
-    """
-    album_is_missing = not parsed.album
-    album_is_artist = (
-        parsed.album
-        and parsed.artist
-        and normalize_for_comparison(parsed.album).strip()
-        == normalize_for_comparison(parsed.artist).strip()
-    )
-    album_is_self_titled = parsed.album is not None and is_self_titled(parsed.album)
+        Tuple of (album names, song_not_found flag). Two miss contracts, which
+        step 3's strategy routing reads, so do not unify them:
 
-    should_resolve = album_is_missing or album_is_artist or album_is_self_titled
-    if parsed.song and parsed.artist and should_resolve:
-        if album_is_artist:
-            logger.info(f"Album '{parsed.album}' appears to be artist name, looking up albums")
-        elif album_is_self_titled:
+        - Album missing or equal to the artist: hit ``(discogs_albums, False)``;
+          miss (no release by the artist) or exception ``([], True)``.
+        - Self-titled placeholder: hit ``(discogs_albums + [placeholder], False)``;
+          miss or exception ``([placeholder], False)``. Keeping the placeholder
+          preserves main's literal match against a catalog row titled e.g. "S/T".
+
+        A spine-deadline trip is not a miss: ``run_within_spine_deadline`` cancels
+        this coroutine (``CancelledError`` bypasses ``except Exception``) and the
+        caller returns the timed-out response.
+    """
+    if needs_album_resolution(parsed):
+        assert parsed.song and parsed.artist  # narrowed by needs_album_resolution
+        typed_album = parsed.album or ""
+        kept = [typed_album] if is_self_titled_request_placeholder(typed_album) else []
+        miss: tuple[list[str], bool] = (kept, False) if kept else ([], True)
+        if kept:
             logger.info(f"Album '{parsed.album}' is a self-titled placeholder, looking up albums")
+        elif parsed.album:
+            logger.info(f"Album '{parsed.album}' appears to be artist name, looking up albums")
         try:
             releases = await lookup_releases_by_track(
                 parsed.song,
@@ -167,16 +176,13 @@ async def resolve_albums_for_track(
                             albums.append(album)
                 if albums:
                     logger.info(f"Found {len(albums)} albums for song '{parsed.song}': {albums}")
+                    albums += [p for p in kept if p not in albums]
                     return albums, False
             logger.info(f"Could not find albums for song '{parsed.song}'")
-            if album_is_self_titled and parsed.album:
-                return [parsed.album], False
-            return [], True
+            return miss
         except Exception as e:
             logger.warning(f"Track lookup failed: {e}")
-            if album_is_self_titled and parsed.album:
-                return [parsed.album], False
-            return [], True
+            return miss
     return [parsed.album] if parsed.album else [], False
 
 
@@ -520,7 +526,7 @@ async def _step_prepare_request(
 
     if parsed.artist:
         with services.telemetry.track_step("album_lookup"):
-            if parsed.song and not parsed.album:
+            if needs_album_resolution(parsed):
                 services.telemetry.record_api_call("discogs")
             # Resolve the fuzzy library-artist correction FIRST (a cached local lookup)
             # so album resolution can gate its Discogs tracklist validation on library
