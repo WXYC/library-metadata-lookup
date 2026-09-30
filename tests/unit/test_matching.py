@@ -14,9 +14,11 @@ from discogs.matching import (
 )
 from discogs.service import calculate_confidence
 from lookup.matching import (
+    SELF_TITLED_PATTERNS,
     artist_variant_tie_break_key,
     artist_variants_with_stripped_suffix,
     is_self_titled,
+    is_self_titled_request_placeholder,
     map_library_format_to_discogs,
 )
 from tests.factories import make_discogs_result
@@ -479,13 +481,6 @@ class TestIsSelfTitled:
             pytest.param("Self-Titled", id="self-titled"),
             pytest.param("self titled", id="self-titled-no-hyphen"),
             pytest.param(" S/t ", id="with-whitespace"),
-            pytest.param("Eponymous", id="eponymous"),
-            pytest.param("eponymous", id="eponymous-lower"),
-            pytest.param("Epon", id="epon"),
-            pytest.param("epon.", id="epon-dot"),
-            pytest.param("Epon.", id="epon-dot-upper"),
-            pytest.param("St", id="bare-st"),
-            pytest.param("st", id="bare-st-lower"),
         ],
     )
     def test_self_titled_detected(self, title):
@@ -498,12 +493,64 @@ class TestIsSelfTitled:
             pytest.param("", id="empty"),
             pytest.param("St. Elsewhere", id="saint"),
             pytest.param("Satisfaction", id="starts-with-s"),
-            pytest.param("Eponymous 2", id="eponymous-with-suffix"),
-            pytest.param("Stapleton", id="starts-with-st"),
         ],
     )
     def test_non_self_titled(self, title):
         assert is_self_titled(title) is False
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            pytest.param("Eponymous", id="eponymous"),
+            pytest.param("Epon.", id="epon-dot"),
+            pytest.param("st", id="bare-st"),
+        ],
+    )
+    def test_catalog_vocabulary_excludes_request_only_forms(self, title):
+        """The eponymous forms are request-side only (LML#1392). A catalog row
+        whose real title is "Eponymous" (R.E.M., library row 27175) must not
+        be reclassified as a self-titled placeholder by the catalog-side
+        consumers (validation, artwork, typed_pair_floor)."""
+        assert is_self_titled(title) is False
+
+
+class TestIsSelfTitledRequestPlaceholder:
+    @pytest.mark.parametrize(
+        "title",
+        [
+            pytest.param("S/T", id="s-slash-t"),
+            pytest.param("s.t.", id="s-dot-t"),
+            pytest.param("self-titled", id="self-titled"),
+            pytest.param("Self Titled", id="self-titled-no-hyphen"),
+            pytest.param("eponymous", id="eponymous"),
+            pytest.param("Eponymous", id="eponymous-capitalized"),
+            pytest.param("epon", id="epon"),
+            pytest.param("epon.", id="epon-dot"),
+            pytest.param(" Epon. ", id="epon-dot-whitespace"),
+        ],
+    )
+    def test_placeholder_detected(self, title):
+        assert is_self_titled_request_placeholder(title) is True
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("DOGA", id="normal-title"),
+            pytest.param("Eponymous 2", id="eponymous-with-suffix"),
+            pytest.param("Epona", id="starts-with-epon"),
+            pytest.param("st", id="bare-st-not-added"),
+            pytest.param("St. Elsewhere", id="saint"),
+        ],
+    )
+    def test_non_placeholder(self, title):
+        assert is_self_titled_request_placeholder(title) is False
+
+    @pytest.mark.parametrize("title", sorted(SELF_TITLED_PATTERNS))
+    def test_superset_of_catalog_vocabulary(self, title):
+        """Every catalog-side self-titled form is also a request placeholder,
+        so the two vocabularies cannot drift apart."""
+        assert is_self_titled_request_placeholder(title) is True
 
 
 # ---------------------------------------------------------------------------

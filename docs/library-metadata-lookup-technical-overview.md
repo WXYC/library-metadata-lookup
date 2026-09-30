@@ -32,7 +32,7 @@ A single call to `perform_lookup()` passes through the step-labeled pipeline bel
 | Step | What it does | Key function |
 |------|-------------|--------------|
 | 1. Artist correction | Fuzzy-match artist against catalog to fix typos | `LibraryDB.find_similar_artist()` |
-| 2. Album resolution | If song provided without album, ask Discogs which albums contain it | `resolve_albums_for_track()` |
+| 2. Album resolution | If song provided without a usable album (missing, equal to the artist, or a self-titled placeholder like "S/T"/"Epon."), ask Discogs which albums contain it | `resolve_albums_for_track()` |
 | 3. Strategy execution | Run search strategies in order until results found | `execute_search_pipeline()` |
 | 3a. Library-miss Discogs probe | On a pipeline miss with artist+album, probe Discogs directly; a confident match is synthesized as a row-less result | `lookup/strategies/library_miss.py` |
 | 3b. Track validation | If fallback returned all artist albums, validate each against Discogs tracklists | `filter_results_by_track_validation()` |

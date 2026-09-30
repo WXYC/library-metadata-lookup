@@ -1044,6 +1044,44 @@ class TestPerformLookupAlbumResolution:
         assert response.song_not_found is False
         assert response.search_type == "direct"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "album, expected_discogs_calls",
+        [
+            pytest.param(None, 1, id="missing"),
+            pytest.param("Stereolab", 1, id="album-is-artist"),
+            pytest.param("Epon.", 1, id="self-titled-placeholder"),
+            pytest.param("Emperor Tomato Ketchup", 0, id="real-title-no-step-2-call"),
+        ],
+    )
+    async def test_step_2_discogs_call_is_counted_for_every_trigger(
+        self, mock_library_db, mock_discogs_service, telemetry, album, expected_discogs_calls
+    ):
+        """Step 2's song->album Discogs search is counted in
+        ``api_calls["discogs"]`` whenever it actually runs -- for a missing
+        album, an album equal to the artist, and a self-titled placeholder
+        (LML#1392) -- and not when a real album skips it. Library and Discogs
+        both come back empty so no later step records a Discogs call."""
+        mock_library_db.find_similar_artist.return_value = None
+        mock_library_db.search.return_value = []
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Stereolab",
+            song="Percolator",
+            album=album,
+            raw_message="Stereolab - Percolator",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert telemetry.api_calls["discogs"] == expected_discogs_calls
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - fallback and context messages
