@@ -966,6 +966,39 @@ class TestResolveAlbumsForTrack:
         assert "Emperor Tomato Ketchup" in albums
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "album",
+        [
+            pytest.param("S/T", id="s-slash-t"),
+            pytest.param("s.t.", id="s-dot-t"),
+            pytest.param("self-titled", id="self-titled"),
+            pytest.param("eponymous", id="eponymous"),
+            pytest.param("Epon.", id="epon-dot"),
+        ],
+    )
+    async def test_looks_up_album_for_self_titled_placeholder(self, mock_discogs_service, album):
+        """A self-titled placeholder in the album field runs song->album resolution,
+        same as when the album is missing or equals the artist name."""
+        parsed = ParsedRequest(
+            song="Test Song",
+            artist="Stereolab",
+            album=album,
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[("Stereolab", "Emperor Tomato Ketchup")],
+        ) as mock_lookup:
+            albums, not_found = await resolve_albums_for_track(parsed, mock_discogs_service)
+
+        mock_lookup.assert_awaited_once()
+        assert albums == ["Emperor Tomato Ketchup"]
+        assert not_found is False
+
+    @pytest.mark.asyncio
     async def test_non_library_artist_returns_song_not_found_with_zero_validations(self):
         """Acceptance (b) (LML#866): through the real seam, a non-library artist
         does one Discogs search and zero tracklist fetches.
