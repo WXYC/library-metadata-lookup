@@ -64,14 +64,13 @@ def is_self_titled(title: str) -> bool:
 REQUEST_SELF_TITLED_PLACEHOLDERS = SELF_TITLED_PATTERNS | frozenset({"eponymous", "epon", "epon."})
 """Self-titled placeholders recognized on a *typed request album* (LML#1392).
 
-A superset of :data:`SELF_TITLED_PATTERNS` that adds the eponymous forms
-listeners type ("eponymous", "epon", "epon."). These are deliberately NOT in
-the shared catalog vocabulary: catalog-side consumers (``lookup/validation.py``,
-``lookup/artwork.py``, ``typed_pair_floor``) test *library titles*, and a
-catalog row titled "Eponymous" can be the real album (R.E.M.'s 1988
-compilation, library row 27175), which must keep validating and binding
-artwork against its own title. A listener typing "eponymous" almost always
-means "the self-titled one"."""
+Adds the eponymous forms listeners type to :data:`SELF_TITLED_PATTERNS`, for step
+2 only. ``lookup/validation.py`` and ``lookup/artwork.py`` test library titles,
+where "Eponymous" can be the real album (R.E.M., library row 27175).
+``typed_album_axis`` and ``track_on_compilation`` test the typed album but keep
+the narrow set too: Backend-Service enrichment types catalog titles verbatim, so
+widening them would search Discogs for album "R.E.M.". Step 2 is safe because the
+typed album stays first (:func:`order_self_titled_albums`)."""
 
 
 def is_self_titled_request_placeholder(title: str) -> bool:
@@ -108,6 +107,18 @@ def needs_album_resolution(parsed: ParsedRequest) -> bool:
         normalize_for_comparison(parsed.album).strip()
         == normalize_for_comparison(parsed.artist).strip()
     )
+
+
+def order_self_titled_albums(placeholder: str, discogs_albums: list[str], artist: str) -> list[str]:
+    """Step 2's albums for a self-titled placeholder (LML#1392): the typed album
+    first (ARTIST_PLUS_ALBUM anchors on ``albums[0]``), then Discogs albums titled
+    with the artist's name, then the rest in Discogs order; deduped case-blind."""
+    artist_key = normalize_for_comparison(artist).strip()
+    named = [a for a in discogs_albums if normalize_for_comparison(a).strip() == artist_key]
+    ordered: dict[str, str] = {}
+    for album in [placeholder, *named, *discogs_albums]:
+        ordered.setdefault(album.strip().lower(), album)
+    return list(ordered.values())
 
 
 def map_library_format_to_discogs(fmt: str | None) -> str | None:
