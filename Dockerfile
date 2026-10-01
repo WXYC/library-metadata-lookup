@@ -30,6 +30,15 @@ RUN mkdir -p /app/logs /data && chown -R appuser:appuser /app/logs /data
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
+# Cap glibc's malloc arenas (LML#1354). The container reports the host's 48
+# CPUs, so asyncio's default executor grows to 32 threads; glibc gives each
+# allocating thread its own arena (up to 8 x CPUs) and every arena keeps freed
+# memory, which made RSS ramp until the next restart. glibc reads this once at
+# process start. 4, not 2: at 2 the arenas are contended and median /lookup
+# latency rose by about 100 ms on staging; at 4 production showed no change.
+# A Railway service variable of the same name overrides this value.
+ENV MALLOC_ARENA_MAX=4
+
 # Expose port
 EXPOSE 8000
 
