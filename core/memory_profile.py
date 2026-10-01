@@ -57,6 +57,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import sentry_sdk
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from config.settings import Settings
 
@@ -79,6 +81,10 @@ SNAPSHOT_FILTERS: tuple[tracemalloc.Filter, ...] = (
     tracemalloc.Filter(False, tracemalloc.__file__),
     tracemalloc.Filter(False, linecache.__file__),
 )
+
+#: Constant on purpose: Sentry groups messages by their text, so every crossing
+#: lands in one issue an alert rule can key on. The numbers travel as context.
+RSS_OVER_BOUND_MESSAGE = "LML process RSS crossed its configured bound"
 
 
 def read_rss_bytes(statm_path: Path = STATM_PATH, *, page_size: int | None = None) -> int | None:
@@ -207,6 +213,57 @@ def diff_snapshots(current: Any, previous: Any | None, *, top_n: int) -> dict[st
     return {"growing": growing, "largest": [_summarize(s) for s in by_size[:top_n]]}
 
 
+def report_rss_over_bound(rss_mb: float, bound_mb: int) -> None:
+    """Announce one crossing of the RSS bound (LML#1400).
+
+    A WARNING record alone is only a breadcrumb under this service's Sentry
+    logging integration (``event_level=ERROR``), so the report also sends an
+    explicit message. Not the running-max measurement helpers: those are broken
+    under sentry-sdk 2.x (LML#1390).
+    """
+    logger.warning("memory_rss_over_bound rss_mb=%s bound_mb=%s", rss_mb, bound_mb)
+    with sentry_sdk.new_scope() as scope:
+        scope.set_context("memory", {"rss_mb": rss_mb, "bound_mb": bound_mb})
+        sentry_sdk.capture_message(RSS_OVER_BOUND_MESSAGE, level="warning")
+
+
+class RssBound:
+    """Report once each time RSS rises above a bound (LML#1400).
+
+    LML#1354's ramp ran for months and was found on the bill, because the only
+    thing that carried RSS was an INFO line. This holds the one bit of state
+    that turns the same reading into a report per *crossing*: an hourly sampler
+    sitting above the bound for a week reports once, not 168 times, and it
+    re-arms only after RSS has fallen back to the bound or below.
+
+    A level, not a slope: it guards against a ramp nobody is watching and does
+    not replace the age-matched comparison in LML#1354. ``bound_mb`` of 0
+    disables it.
+    """
+
+    def __init__(
+        self, bound_mb: int, *, report: Callable[[float, int], None] | None = None
+    ) -> None:
+        self._bound_mb = bound_mb
+        self._report = report
+        self._over = False
+
+    def observe(self, rss_mb: float | None) -> None:
+        """Take one sample. ``None`` (RSS unreadable) leaves the state alone."""
+        if self._bound_mb <= 0 or rss_mb is None:
+            return
+        was_over, self._over = self._over, rss_mb > self._bound_mb
+        if not self._over or was_over:
+            return
+        try:
+            # Resolved at call time so the module-level default stays patchable.
+            (self._report or report_rss_over_bound)(rss_mb, self._bound_mb)
+        except Exception:
+            # The state already moved, so a broken reporter is not retried
+            # every interval; the gauges line this follows is already logged.
+            logger.exception("memory RSS bound report failed")
+
+
 async def _default_pool_getter() -> Any | None:
     """The discogs-cache pool, if the lifespan already built one.
 
@@ -239,8 +296,12 @@ async def report_once(
     top_n: int,
     previous: Any | None,
     pool_getter: Callable[[], Awaitable[Any | None]],
+    rss_bound: RssBound | None = None,
 ) -> Any | None:
     """Emit one report line; return the snapshot to keep as ``previous``.
+
+    ``rss_bound``, when given, is fed the RSS this line reports, after the line
+    is logged so the bound can never cost the report.
 
     Every expensive part is guarded independently so the cheap gauges always
     reach the log. A pool acquisition failing during a database outage, or a
@@ -262,6 +323,8 @@ async def report_once(
             snapshot = previous
             payload["tracemalloc_error"] = repr(exc)
     logger.info("memory_profile %s", payload)
+    if rss_bound is not None:
+        rss_bound.observe(payload["rss_mb"])
     return snapshot
 
 
@@ -270,6 +333,7 @@ async def run_sampler(
     mode: str,
     interval_s: float,
     top_n: int,
+    rss_warn_mb: int = 0,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     pool_getter: Callable[[], Awaitable[Any | None]] = _default_pool_getter,
 ) -> None:
@@ -278,14 +342,21 @@ async def run_sampler(
     ``sleep`` and ``pool_getter`` are injected so a test can drive N iterations
     without real time or a real pool. It sleeps *before* the first report so a
     boot-time report (measuring a heap that has not done any work yet) is not
-    what the operator sees first.
+    what the operator sees first. ``rss_warn_mb`` above 0 arms one
+    :class:`RssBound` for the life of the loop, so its crossing state spans
+    intervals.
     """
     previous: Any | None = None
+    rss_bound = RssBound(rss_warn_mb) if rss_warn_mb > 0 else None
     while True:
         try:
             await sleep(interval_s)
             previous = await report_once(
-                mode=mode, top_n=top_n, previous=previous, pool_getter=pool_getter
+                mode=mode,
+                top_n=top_n,
+                previous=previous,
+                pool_getter=pool_getter,
+                rss_bound=rss_bound,
             )
         except asyncio.CancelledError:
             raise
@@ -316,6 +387,7 @@ def start_sampler(settings: Settings | None = None) -> asyncio.Task[None] | None
             mode=mode,
             interval_s=settings.lml_memory_profile_interval_s,
             top_n=settings.lml_memory_profile_top_n,
+            rss_warn_mb=settings.lml_memory_rss_warn_mb,
         ),
         name="memory-profile-sampler",
     )

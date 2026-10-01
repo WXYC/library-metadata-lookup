@@ -867,6 +867,21 @@ class Settings(BaseSettings):
             "boot. See WXYC/library-metadata-lookup#1354."
         ),
     )
+    lml_memory_rss_warn_mb: int = Field(
+        default=600,
+        ge=0,
+        description=(
+            "RSS bound, in MB, above which the memory profiler reports once per "
+            "crossing: a WARNING log line plus one Sentry message, re-armed only "
+            "after RSS falls back to the bound or below; default 600, 0 "
+            "disables. Read from the sample the profiler already takes, so it "
+            "does nothing when lml_memory_profile_mode is 'off'. A level, not a "
+            "slope: a guardrail so a memory ramp announces itself instead of "
+            "being found on the bill. Before the arena limit, production passed "
+            "600 MB roughly 30-48 h after a restart. See "
+            "WXYC/library-metadata-lookup#1400."
+        ),
+    )
     # Persistent streaming-URL cache flags (LML#573). A service is persisted
     # only when BOTH the master kill switch AND its per-service flag are true
     # (AND-gate). The master defaults True and the per-service flags default
