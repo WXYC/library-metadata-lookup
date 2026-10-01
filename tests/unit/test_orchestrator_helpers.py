@@ -985,11 +985,11 @@ class TestResolveAlbumsForTrack:
     async def test_looks_up_album_for_self_titled_placeholder(self, mock_discogs_service, album):
         """A self-titled placeholder in the album field runs song->album
         resolution, same as when the album is missing or equals the artist
-        name (LML#1392). The typed placeholder leads the Discogs albums, so
-        ARTIST_PLUS_ALBUM still tries the literal match against a catalog row
-        titled e.g. "S/T" (the only path this request had on main) even when
-        the Discogs hit omits the self-titled release, and a real catalog title
-        typed as the album (R.E.M.'s "Eponymous") stays the ranking anchor."""
+        name (LML#1392). No ``db`` here, so the literal-title guard is off (a
+        placeholder naming a shelved record skips step 2; see
+        ``TestSelfTitledPlaceholderRanking``). The typed placeholder stays in the
+        album list ahead of the Discogs albums, so ARTIST_PLUS_ALBUM still tries
+        its literal match even when the Discogs hit omits the self-titled release."""
         parsed = ParsedRequest(
             song="Test Song",
             artist="Stereolab",
@@ -1579,13 +1579,43 @@ class TestSearchLibraryWithFallback:
         assert fallback is False
 
 
+_REM_SHELF = [
+    make_library_item(id=27162, artist="R.E.M.", title="Murmur"),
+    make_library_item(id=27164, artist="R.E.M.", title="(Don't Go Back to) Rockville"),
+    make_library_item(id=27165, artist="R.E.M.", title="Fables of the Reconstruction"),
+    make_library_item(id=27166, artist="R.E.M.", title="Driver 8"),
+    make_library_item(id=27171, artist="R.E.M.", title="The One I Love"),
+    make_library_item(id=27172, artist="R.E.M.", title="Document"),
+    make_library_item(
+        id=27173,
+        artist="R.E.M.",
+        title="It's the End of the World as We Know It (And I Feel Fine)",
+    ),
+    make_library_item(id=27175, artist="R.E.M.", title="Eponymous"),
+]
+"""R.E.M.'s shelf around library row 27175, the real album "Eponymous", with the
+shelved singles whose titles contain the song (27164, 27166, 27171, 27173)."""
+
+_ASTRAL_SOCIAL_CLUB_SHELF = [
+    make_library_item(id=39020, artist="Astral Social Club", title="s/t"),
+    make_library_item(id=51470, artist="Astral Social Club", title="Metal guru", format='7"'),
+]
+"""A literal self-titled catalog row ("s/t") next to a 7-inch titled after the song."""
+
+
 class TestSelfTitledPlaceholderRanking:
     """Step 2 -> ARTIST_PLUS_ALBUM for a self-titled placeholder (LML#1392):
     which library row leads, since artwork and Backend-Service linkage bind
-    position 0. Drives ``resolve_albums_for_track`` (Discogs mocked) into
+    position 0. Drives ``resolve_albums_for_track`` (Discogs mocked, the library
+    mock passed as ``db`` so the literal-title guard sees the shelf) into
     ``search_library_with_fallback`` against a library mock that returns every
     row by the artist for any query, leaving the strategy's own title filter
-    to decide which rows each album search keeps."""
+    to decide which rows each album search keeps.
+
+    ARTIST_PLUS_ALBUM ranks a row whose title contains the song above
+    ``albums[0]``, so once step 2 adds Discogs albums a shelved single titled
+    after the song outranks the typed record. The guard keeps a typed album that
+    names a shelved record out of step 2 entirely, so it ranks as on main."""
 
     @staticmethod
     async def _rank(mock_library_db, artist, album, song, discogs_albums, rows):
@@ -1602,47 +1632,115 @@ class TestSelfTitledPlaceholderRanking:
             "lookup.orchestrator.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[(artist, a) for a in discogs_albums],
-        ):
-            albums, _ = await resolve_albums_for_track(parsed, AsyncMock())
+        ) as step_2_search:
+            albums, _ = await resolve_albums_for_track(parsed, AsyncMock(), db=mock_library_db)
         results, fallback = await search_library_with_fallback(mock_library_db, parsed, albums)
-        return albums, results, fallback
+        return albums, results, fallback, step_2_search
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "discogs_albums",
+        "song, discogs_albums",
         [
-            pytest.param(["Murmur", "Eponymous"], id="discogs-lists-eponymous-second"),
-            pytest.param(["Murmur", "Document"], id="discogs-omits-eponymous"),
+            pytest.param(
+                "Radio Free Europe", ["Murmur", "Eponymous"], id="discogs-lists-eponymous-second"
+            ),
+            pytest.param("Radio Free Europe", ["Murmur", "Document"], id="discogs-omits-eponymous"),
+            pytest.param(
+                "Driver 8",
+                ["Fables of the Reconstruction", "Driver 8", "Eponymous"],
+                id="driver-8-single-shelved",
+            ),
+            pytest.param(
+                "It's the End of the World as We Know It (And I Feel Fine)",
+                [
+                    "Document",
+                    "It's the End of the World as We Know It (And I Feel Fine)",
+                    "Eponymous",
+                ],
+                id="end-of-the-world-single-shelved",
+            ),
+            pytest.param(
+                "The One I Love",
+                ["Document", "The One I Love", "Eponymous"],
+                id="the-one-i-love-single-shelved",
+            ),
+            pytest.param(
+                "(Don't Go Back to) Rockville",
+                ["Reckoning", "(Don't Go Back to) Rockville", "Eponymous"],
+                id="rockville-single-shelved",
+            ),
         ],
     )
-    async def test_real_eponymous_catalog_title_leads(self, mock_library_db, discogs_albums):
+    async def test_real_eponymous_catalog_title_matches_main(
+        self, mock_library_db, song, discogs_albums
+    ):
         """Backend-Service flowsheet enrichment types the catalog title
         verbatim, so R.E.M.'s real album "Eponymous" (library row 27175)
-        arrives as a request placeholder. Row 27175 must still lead, as on
-        main, rather than the first album Discogs lists."""
-        rows = [
-            make_library_item(id=27162, artist="R.E.M.", title="Murmur"),
-            make_library_item(id=27172, artist="R.E.M.", title="Document"),
-            make_library_item(id=27175, artist="R.E.M.", title="Eponymous"),
-        ]
-        albums, results, fallback = await self._rank(
-            mock_library_db, "R.E.M.", "Eponymous", "Radio Free Europe", discogs_albums, rows
+        arrives as a request placeholder. The typed title names that shelved
+        row, so step 2's Discogs search never runs and the result is main's:
+        row 27175 alone, not the shelved single titled after the song (nor a
+        sibling album Discogs lists)."""
+        albums, results, fallback, step_2_search = await self._rank(
+            mock_library_db, "R.E.M.", "Eponymous", song, discogs_albums, _REM_SHELF
         )
 
-        assert results[0].id == 27175
-        assert albums[0] == "Eponymous"
+        step_2_search.assert_not_awaited()
+        assert albums == ["Eponymous"]
+        assert [r.id for r in results] == [27175]
         assert fallback is False
 
     @pytest.mark.asyncio
-    async def test_artist_named_release_leads_for_placeholder(self, mock_library_db):
-        """ "Epon." means the release titled with the artist's name. When
+    @pytest.mark.parametrize(
+        "album",
+        [pytest.param("S/T", id="s-slash-t"), pytest.param("s.t.", id="s-dot-t")],
+    )
+    async def test_literal_self_titled_catalog_row_leads(self, mock_library_db, album):
+        """A typed "S/T" names the artist's literal "s/t" catalog row, so step 2
+        does not run and that row leads, as on main, instead of the 7-inch
+        titled after the song."""
+        albums, results, fallback, step_2_search = await self._rank(
+            mock_library_db,
+            "Astral Social Club",
+            album,
+            "Metal Guru",
+            ["Metal Guru", "Astral Social Club"],
+            _ASTRAL_SOCIAL_CLUB_SHELF,
+        )
+
+        step_2_search.assert_not_awaited()
+        assert albums == [album]
+        assert [r.id for r in results] == [39020]
+        assert fallback is False
+
+    @pytest.mark.asyncio
+    async def test_any_placeholder_defers_to_a_shelved_self_titled_row(self, mock_library_db):
+        """A typed placeholder in another form ("Eponymous") still names the
+        artist's self-titled record when the shelf files it under a self-titled
+        placeholder title ("s/t"), so step 2 is skipped and the typed album
+        passes through unchanged, exactly as on main."""
+        albums, _, _, step_2_search = await self._rank(
+            mock_library_db,
+            "Astral Social Club",
+            "Eponymous",
+            "Metal Guru",
+            ["Metal Guru", "Astral Social Club"],
+            _ASTRAL_SOCIAL_CLUB_SHELF,
+        )
+
+        step_2_search.assert_not_awaited()
+        assert albums == ["Eponymous"]
+
+    @pytest.mark.asyncio
+    async def test_artist_named_release_leads_for_unshelved_placeholder(self, mock_library_db):
+        """ "Epon." names nothing on this shelf: the self-titled record is
+        catalogued under the artist's own name. So step 2 runs, and when
         Discogs lists another album carrying the song first, the artist-named
-        album still precedes it, and the self-titled shelf row leads."""
+        album still precedes it and the self-titled shelf row leads."""
         rows = [
             make_library_item(id=1, artist="Jessica Pratt", title="On Your Own Love Again"),
             make_library_item(id=2, artist="Jessica Pratt", title="Jessica Pratt"),
         ]
-        albums, results, fallback = await self._rank(
+        albums, results, fallback, step_2_search = await self._rank(
             mock_library_db,
             "Jessica Pratt",
             "Epon.",
@@ -1651,6 +1749,7 @@ class TestSelfTitledPlaceholderRanking:
             rows,
         )
 
+        step_2_search.assert_awaited_once()
         assert [r.id for r in results] == [2, 1]
         assert albums == ["Epon.", "Jessica Pratt", "On Your Own Love Again"]
         assert fallback is False

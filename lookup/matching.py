@@ -69,8 +69,8 @@ Adds the eponymous forms listeners type to :data:`SELF_TITLED_PATTERNS`, for ste
 where "Eponymous" can be the real album (R.E.M., library row 27175).
 ``typed_album_axis`` and ``track_on_compilation`` test the typed album but keep
 the narrow set too: Backend-Service enrichment types catalog titles verbatim, so
-widening them would search Discogs for album "R.E.M.". Step 2 is safe because the
-typed album stays first (:func:`order_self_titled_albums`)."""
+widening them would search Discogs for album "R.E.M.". Step 2 skips a placeholder
+that names a shelved record (``runs_album_resolution``'s literal-title guard)."""
 
 
 def is_self_titled_request_placeholder(title: str) -> bool:
@@ -95,9 +95,9 @@ def needs_album_resolution(parsed: ParsedRequest) -> bool:
 
     True when the request has a song and an artist and the typed album is
     missing, normalizes equal to the artist name, or is a self-titled
-    placeholder (:func:`is_self_titled_request_placeholder`, LML#1392). The one
-    trigger for ``resolve_albums_for_track`` and the step-2 Discogs API-call
-    telemetry, so the two cannot disagree.
+    placeholder (:func:`is_self_titled_request_placeholder`, LML#1392). The sync
+    half of ``runs_album_resolution``, which adds the library-side literal-title
+    guard and is the one trigger for step 2 and its Discogs API-call telemetry.
     """
     if not (parsed.song and parsed.artist):
         return False
@@ -110,9 +110,9 @@ def needs_album_resolution(parsed: ParsedRequest) -> bool:
 
 
 def order_self_titled_albums(placeholder: str, discogs_albums: list[str], artist: str) -> list[str]:
-    """Step 2's albums for a self-titled placeholder (LML#1392): the typed album
-    first (ARTIST_PLUS_ALBUM anchors on ``albums[0]``), then Discogs albums titled
-    with the artist's name, then the rest in Discogs order; deduped case-blind."""
+    """Step 2's albums for a placeholder naming no shelved record (LML#1392): the
+    typed album, then Discogs albums titled with the artist's name, then the rest
+    in Discogs order; deduped case-blind. ``albums[0]`` only breaks song-in-title ties."""
     artist_key = normalize_for_comparison(artist).strip()
     named = [a for a in discogs_albums if normalize_for_comparison(a).strip() == artist_key]
     ordered: dict[str, str] = {}

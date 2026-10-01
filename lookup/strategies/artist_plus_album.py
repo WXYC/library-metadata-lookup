@@ -35,7 +35,9 @@ from lookup.matching import (
     _filter_results_by_album_match,
     filter_results_by_artist,
     is_self_titled,
+    is_self_titled_request_placeholder,
     library_artist_for,
+    needs_album_resolution,
 )
 from lookup.name_folding import fold_punctuation_for_comparison
 from services.parser import ParsedRequest
@@ -79,6 +81,42 @@ class ArtistPlusAlbum:
         if items:
             return Outcome.album_match(items)
         return Outcome.empty()
+
+
+async def runs_album_resolution(parsed: ParsedRequest, db: LibraryDB | None) -> bool:
+    """Whether step 2's song->album Discogs lookup runs for this request.
+
+    :func:`~lookup.matching.needs_album_resolution`, minus the LML#1392
+    literal-title guard: a typed self-titled placeholder that already names a
+    record on the artist's shelf skips step 2, so the request behaves exactly
+    as it did before placeholders triggered step 2. It names one when a library
+    row's title equals the typed album under this strategy's album fold
+    (R.E.M. "Eponymous", a literal "S/T"), or when the artist has a row whose
+    title is itself a self-titled placeholder ("s/t"). The guard exists because
+    :func:`search_library_with_fallback` ranks a row whose title contains the
+    song above ``albums[0]``: once step 2 adds Discogs albums, a single shelved
+    under the song's name would outrank the typed record.
+
+    One local query and no Discogs I/O: the artist-only search the fallback
+    below issues, so it shares that call's cache entry. Like that fallback it
+    sees at most ``_FETCH_LIMIT`` rows; an artist with more could miss its
+    literal row and take step 2. Without ``db`` the guard is off.
+    """
+    if not needs_album_resolution(parsed):
+        return False
+    typed = parsed.album or ""
+    lib_artist = library_artist_for(parsed)
+    if db is None or not lib_artist or not is_self_titled_request_placeholder(typed):
+        return True
+    rows = filter_results_by_artist(
+        await db.search(query=lib_artist, limit=_FETCH_LIMIT), lib_artist
+    )
+    typed_folded = fold_punctuation_for_comparison(typed.lower())
+    return not any(
+        is_self_titled(r.title or "")
+        or fold_punctuation_for_comparison((r.title or "").lower()) == typed_folded
+        for r in rows
+    )
 
 
 async def search_library_with_fallback(

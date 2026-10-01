@@ -75,7 +75,6 @@ from lookup.matching import (
     is_self_titled_request_placeholder,
     library_artist_for,
     limit_results,
-    needs_album_resolution,
     order_self_titled_albums,
 )
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
@@ -89,7 +88,7 @@ from lookup.spine_deadline import (
     run_within_spine_deadline,
 )
 from lookup.strategies import build_strategies
-from lookup.strategies.artist_plus_album import search_library_with_fallback
+from lookup.strategies.artist_plus_album import runs_album_resolution, search_library_with_fallback
 from lookup.strategies.library_miss import (
     _library_miss_discogs_search,
     fallback_rows_block_serving,
@@ -113,10 +112,10 @@ async def resolve_albums_for_track(
 ) -> tuple[list[str], bool]:
     """Resolve album names for a track when the typed album doesn't name one.
 
-    Runs when ``needs_album_resolution`` is true (song + artist, with the album
-    missing, equal to the artist, or a self-titled placeholder such as "S/T" or
-    "Epon."; LML#1392); otherwise returns the typed album unchanged. Searches
-    Discogs for ALL releases containing the track, not just the first one.
+    Runs when ``runs_album_resolution`` is true (song + artist, with the album
+    missing, equal to the artist, or a self-titled placeholder such as "Epon." that
+    names no row on the artist's shelf; LML#1392); otherwise returns the typed album
+    unchanged. Searches Discogs for ALL releases containing the track.
 
     When ``db`` is supplied, tracklist validation is gated library-first (LML#866):
     the (corrected-or-typed) query artist must have at least one library row or the
@@ -138,15 +137,15 @@ async def resolve_albums_for_track(
           miss (no release by the artist) or exception ``([], True)``.
         - Self-titled placeholder: hit ``(order_self_titled_albums(...), False)``
           -- placeholder, artist-named Discogs albums, the rest; miss or exception
-          ``([placeholder], False)``. The placeholder leads so ARTIST_PLUS_ALBUM
-          still anchors on a typed catalog title (R.E.M.'s "Eponymous").
+          ``([placeholder], False)``. A placeholder naming a shelved record (R.E.M.'s
+          "Eponymous", a literal "S/T") never gets here (``runs_album_resolution``).
 
         A spine-deadline trip is not a miss: ``run_within_spine_deadline`` cancels
         this coroutine (``CancelledError`` bypasses ``except Exception``) and the
         caller returns the timed-out response.
     """
-    if needs_album_resolution(parsed):
-        assert parsed.song and parsed.artist  # narrowed by needs_album_resolution
+    if await runs_album_resolution(parsed, db):
+        assert parsed.song and parsed.artist  # narrowed by runs_album_resolution
         typed_album = parsed.album or ""
         kept = [typed_album] if is_self_titled_request_placeholder(typed_album) else []
         miss: tuple[list[str], bool] = (kept, False) if kept else ([], True)
@@ -529,8 +528,6 @@ async def _step_prepare_request(
 
     if parsed.artist:
         with services.telemetry.track_step("album_lookup"):
-            if needs_album_resolution(parsed):
-                services.telemetry.record_api_call("discogs")
             # Resolve the fuzzy library-artist correction FIRST (a cached local lookup)
             # so album resolution can gate its Discogs tracklist validation on library
             # membership of the CORRECTED artist (LML#866). Serializing (vs the former
@@ -552,6 +549,8 @@ async def _step_prepare_request(
                 # library-side legs (``db.search`` queries + ``artist_matches_item``
                 # match-backs).
                 parsed.library_artist = corrected
+            if await runs_album_resolution(parsed, services.db):
+                services.telemetry.record_api_call("discogs")
             # LML#865: bound step 2's Discogs pass by the spine deadline. On a
             # trip, run_within_spine_deadline raises SpineDeadlineExceededError,
             # which perform_lookup catches to return the honest timed-out response.
