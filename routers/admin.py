@@ -5,15 +5,15 @@ import logging
 import os
 import sqlite3
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi import Path as PathParam
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from config.settings import Settings, get_settings
 from core.auth import require_admin_token
@@ -679,6 +679,20 @@ async def upload_streaming_db(
     )
 
 
+# How much of a database file a handler holds at once while moving it to or
+# from disk (LML#1407).
+_DB_COPY_CHUNK_BYTES = 1024 * 1024
+
+
+def _iter_file_then_close(file: BinaryIO) -> Iterator[bytes]:
+    """Yield ``file`` a chunk at a time, closing it when the iteration ends or is abandoned."""
+    try:
+        while chunk := file.read(_DB_COPY_CHUNK_BYTES):
+            yield chunk
+    finally:
+        file.close()
+
+
 @router.get(
     "/download-streaming-db",
     summary="Download the current streaming_availability.db backup",
@@ -700,22 +714,35 @@ async def download_streaming_db(
 
     Symmetric with `POST /admin/upload-streaming-db`. Lets the daily
     library-sync pipeline (WXYC/discogs-etl) read the file directly from the
-    store instead of round-tripping it through a GitHub Release. The whole
-    object (~53MB) is buffered and returned in one response; that egress is
-    negligible at the daily sync cadence.
-    """
-    try:
-        data = await object_store.get(STREAMING_DB_FILENAME)
-    except ObjectNotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"{STREAMING_DB_FILENAME} not found in the store",
-        ) from None
+    store instead of round-tripping it through a GitHub Release.
 
-    return Response(
-        content=data,
+    The object (about 60MB) is fetched to a scratch file and sent from there a
+    chunk at a time. It used to be read into one ``bytes`` and returned in a
+    single response, and the process kept about 67MB of resident memory after
+    each daily sync as a result (LML#1407).
+    """
+    with tempfile.TemporaryDirectory(prefix="lml-streaming-download-") as td:
+        scratch = Path(td) / STREAMING_DB_FILENAME
+        try:
+            await object_store.download_to_path(STREAMING_DB_FILENAME, scratch)
+        except ObjectNotFoundError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{STREAMING_DB_FILENAME} not found in the store",
+            ) from None
+        size = scratch.stat().st_size
+        # Opened before the directory is removed: from here the open handle is
+        # all that keeps the file, so nothing stays on disk whether the client
+        # reads the response to the end or drops the connection.
+        scratch_file = scratch.open("rb")
+
+    return StreamingResponse(
+        _iter_file_then_close(scratch_file),
         media_type="application/octet-stream",
-        headers={"content-disposition": f'attachment; filename="{STREAMING_DB_FILENAME}"'},
+        headers={
+            "content-disposition": f'attachment; filename="{STREAMING_DB_FILENAME}"',
+            "content-length": str(size),
+        },
     )
 
 
