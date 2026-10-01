@@ -841,3 +841,100 @@ class TestDownloadStreamingDB:
         assert resp.content == payload
         assert resp.headers["content-type"] == "application/octet-stream"
         assert "streaming_availability.db" in resp.headers.get("content-disposition", "")
+
+    async def _seeded_download(self, admin_settings, payload: bytes):
+        """Store ``payload`` as the streaming DB and download it with a valid token."""
+        from main import app
+
+        streaming_path = (
+            admin_settings.resolved_library_db_path.parent / "streaming_availability.db"
+        )
+        streaming_path.write_bytes(payload)
+        return await self._get(
+            app, admin_settings, headers={"Authorization": "Bearer test-secret-token"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_download_never_reads_the_whole_object_into_memory(
+        self, admin_settings, monkeypatch
+    ):
+        """The handler streams from disk instead of calling the store's ``get`` (LML#1407).
+
+        ``get`` returns the whole ~60MB database as one ``bytes``; the process
+        kept that much resident memory after every daily sync.
+        """
+        from storage.object_store import LocalDirStore
+
+        async def _whole_object_get(self, key):
+            raise AssertionError(f"download buffered the whole object via get({key!r})")
+
+        monkeypatch.setattr(LocalDirStore, "get", _whole_object_get)
+        payload = b"SQLite format 3\x00" + b"streaming-db-test-payload" * 100
+
+        resp = await self._seeded_download(admin_settings, payload)
+
+        assert resp.status_code == 200
+        assert resp.content == payload
+
+    @pytest.mark.asyncio
+    async def test_download_of_a_multi_chunk_file_is_byte_for_byte(self, admin_settings):
+        """A file larger than one copy chunk arrives whole, with its length declared."""
+        payload = bytes(range(256)) * 10_000 + b"tail"  # ~2.5 MB, not chunk-aligned
+
+        resp = await self._seeded_download(admin_settings, payload)
+
+        assert resp.status_code == 200
+        assert resp.content == payload
+        assert resp.headers["content-length"] == str(len(payload))
+        assert (
+            resp.headers["content-disposition"]
+            == 'attachment; filename="streaming_availability.db"'
+        )
+
+    @pytest.mark.asyncio
+    async def test_download_leaves_no_scratch_file(self, admin_settings, tmp_path, monkeypatch):
+        """Nothing stays on disk once the response has been sent (LML#1407)."""
+        scratch_root = tmp_path / "scratch-root"
+        scratch_root.mkdir()
+        monkeypatch.setattr("tempfile.tempdir", str(scratch_root))
+
+        resp = await self._seeded_download(admin_settings, b"SQLite format 3\x00" + b"x" * 4096)
+
+        assert resp.status_code == 200
+        assert list(scratch_root.iterdir()) == []
+
+    def test_an_abandoned_download_closes_its_scratch_file(self, tmp_path):
+        """A client that drops mid-response must not leave the unlinked file open.
+
+        The open handle is the only thing holding the scratch file's disk space,
+        so closing it is what frees the space (LML#1407).
+        """
+        from routers.admin import _DB_COPY_CHUNK_BYTES, _iter_file_then_close
+
+        path = tmp_path / "scratch.db"
+        path.write_bytes(b"x" * (2 * _DB_COPY_CHUNK_BYTES + 1))
+        file = path.open("rb")
+        chunks = _iter_file_then_close(file)
+
+        assert len(next(chunks)) == _DB_COPY_CHUNK_BYTES
+        chunks.close()
+
+        assert file.closed
+
+    @pytest.mark.asyncio
+    async def test_missing_object_leaves_no_scratch_file(
+        self, admin_settings, tmp_path, monkeypatch
+    ):
+        """A 404 cleans up after itself too."""
+        from main import app
+
+        scratch_root = tmp_path / "scratch-root"
+        scratch_root.mkdir()
+        monkeypatch.setattr("tempfile.tempdir", str(scratch_root))
+
+        resp = await self._get(
+            app, admin_settings, headers={"Authorization": "Bearer test-secret-token"}
+        )
+
+        assert resp.status_code == 404
+        assert list(scratch_root.iterdir()) == []
