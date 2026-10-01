@@ -27,7 +27,7 @@ return value is the number of rows appended, which the caller threads into
 miss telemetry so a shelf-only response still reports ``miss_clean`` with
 ``results_count`` 0 (``lookup/miss_kind.py``).
 
-The full rationale (placement, the three ``skip`` conditions, why
+The full rationale (placement, the four ``skip`` conditions, why
 ``/lookup/bulk`` is excluded, telemetry invisibility, and why a
 cache-confirmed ordering tier is not implemented) is in
 ``docs/architecture.md``, "Shelf fallback (step 8): design notes".

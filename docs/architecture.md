@@ -299,19 +299,19 @@ exactly as it is excluded on ``main`` today, because its post-fold
 Every early return in ``perform_lookup`` for the tail-shed/admission-shed
 degraded flavors (``_build_degraded_response``) and the spine-deadline
 timeout returns before this call site, so those are excluded structurally.
-Three conditions still have to be checked explicitly, because each either
-sets its flag and rides the *normal* return path rather than returning
-early, or is simply not visible to any earlier gate: the mid-pipeline
-hard-cap trip (``state.timed_out``, set inside ``core/search.py``'s strategy
-loop), the search-leg Discogs saturation-breaker shed (``state.upstream_shed``,
+Four conditions still have to be checked explicitly, because each either sets
+its flag and rides the *normal* return path rather than returning early, or
+is simply not visible to any earlier gate: the mid-pipeline hard-cap trip
+(``state.timed_out``, set inside ``core/search.py``'s strategy loop), the
+search-leg Discogs saturation-breaker shed (``state.upstream_shed``,
 LML#1126, caught *inside* step 3 and otherwise reaching the final
-``LookupResponse`` with ``degraded=True``), and a low-priority caller
+``LookupResponse`` with ``degraded=True``), a low-priority caller
 (``is_discogs_low_priority()`` — bulk/enrichment/backfill traffic, never a
-DJ-facing request). The caller collapses all three into one ``skip`` flag —
-there is nothing left for this function to do differently between them. A
-fourth term, ``services.spine_deadline.tail_exhausted()``, skips the step's
-one ``db.search`` when the caller's budget (or the hard cap) ran out after the
-last tail-shed check, so the step never spends time the caller no longer has.
+DJ-facing request), and a spent spine deadline
+(``services.spine_deadline.tail_exhausted()``, which skips the step's one
+``db.search`` when the caller's budget — or the hard cap — ran out after the
+last tail-shed check). The caller collapses all four into one ``skip`` flag —
+there is nothing left for this function to do differently between them.
 
 The low-priority exclusion matters beyond "don't bother": `/lookup/bulk`
 unconditionally marks every item low-priority and its per-item

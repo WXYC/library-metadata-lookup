@@ -416,8 +416,8 @@ MODULE_BUDGETS: dict[str, int] = {
     # LML#1391/#1393: the unbound shelf fallback, the new Step 8 at the end of
     # perform_lookup. Extracted straight to its own module -- orchestrator.py
     # sat at 1832/1850, with no headroom for the step's logic even before this
-    # entry existed. Smallest multiple of 50 at or above 1.3x the 161-line
-    # measured size (209.3).
+    # entry existed. Smallest multiple of 50 at or above 1.3x the 155-line
+    # measured size (201.5).
     "lookup/shelf_fallback.py": 250,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line

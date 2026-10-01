@@ -855,6 +855,32 @@ class TestBuildContextMessage:
         context = build_context_message(parsed, False, True, has_results=False)
         assert "not found in library" in context
 
+    def test_album_not_found_context_names_the_typed_artist(self):
+        """LML#626 two-channel seam: the song-bearing, non-empty branch must
+        name the **typed** ``parsed.artist`` in its sentence, not the
+        fuzzy-corrected ``parsed.library_artist`` -- even when a correction is
+        present and the two differ. ``album_not_found_message`` defaults its
+        ``artist`` parameter to ``parsed.artist`` for exactly this reason; this
+        pins the call site passing nothing else through."""
+        parsed = ParsedRequest(
+            song="Back, Baby",
+            artist="Jesica Prat",
+            library_artist="Jessica Pratt",
+            album="Zzyzx Road",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+
+        context = build_context_message(
+            parsed, found_on_compilation=False, song_not_found=True, has_results=True
+        )
+
+        assert context == (
+            '"Zzyzx Road" not found in the library, but here are other albums by Jesica Prat:'
+        )
+        assert "Jessica Pratt" not in context
+
 
 # ---------------------------------------------------------------------------
 # Tests: resolve_albums_for_track
