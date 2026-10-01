@@ -15,7 +15,7 @@ Step labels match the `_step_*` spine in `lookup/orchestrator.py` (`perform_look
 - **Step 5 — Context Message** (`build_context_message`): Generate context string for the caller
 - **Step 6 — Identity Resolution** (`_step_resolve_result_identities`): Resolve external identifiers for each result's artist via the entity store.
 - **Step 7 — External-Cache Fallback** (`_step_external_cache_fallback`): Opt-in (`include_external_caches`) mojibake recovery — see the dedicated External-Cache Fallback section below. The artist>album>song dispatch precedence and per-branch candidate shaping live in `search_external_fallback()` (`lookup/external_search.py`, LML#750); this step sequences the gate + telemetry and builds response rows via the shared `build_external_catalog_item()` sentinel constructor (same module).
-- **Step 8 — Unbound Shelf Fallback** (`apply_shelf_fallback`, `lookup/shelf_fallback.py`, LML#1391/#1393): the true last step of the spine, called after the location-union fold has had its chance to populate `results` — not merely after Step 7. Additive and unbound: **a response that is non-empty on `main` stays byte-for-byte unchanged; only a response whose result list is empty today may change.** When `result_items` is still empty, the response did not time out or get degraded by a search-leg shed (`state.timed_out` / `state.upstream_shed` — both set their flag and ride the normal return path rather than returning early, so both are checked here explicitly), the typed `album` is non-empty, and the library artist resolves to at least one shelved row (the same cached `db.search` + `filter_results_by_artist` call `ARTIST_PLUS_ALBUM`'s own artist-only fallback issues), this returns the artist's shelf as **display-only** rows — `LookupResultItem(library_item=row.to_catalog_item())`, no `artwork` and hence no release id/artwork URL/year/Discogs URL/streaming links. `search_type` is forced to `fallback` (never `direct` — this matters for the album-only shape, where main reports `direct` with zero rows), and `context_message` reuses `lookup.matching.album_not_found_message()` (shared with `build_context_message`'s song-bearing branch) so the album-only shape gets the same wording Backend-Service already expects. `song_not_found`/`found_on_compilation` are left exactly as the caller computed them. Rows are ordered song-in-title-first (case-insensitive) when a song was typed, then the rest in query order, capped at `MAX_SEARCH_RESULTS`; a cache-confirmed-song ordering tier was considered and dropped — the one cache-only primitive that could answer it (`find_library_albums_with_cached_track`, Step 3b's A4 rescue) already runs against these same rows earlier in the pipeline, and a confirmed hit there promotes the row into a non-empty `library_results` before this step can ever run, so re-asking the same cache here would be redundant. Supersedes the larger, closed PR #1396, which repeatedly changed what Backend-Service binds (reordering/replacing/re-binding rows that a `direct`/`compilation` response already carried) and was rejected across five review rounds.
+- **Step 8 — Unbound Shelf Fallback** (`apply_shelf_fallback`, `lookup/shelf_fallback.py`, LML#1391/#1393): the true last step of the spine, called after the location-union fold has had its chance to populate `results` — not merely after Step 7. Additive and unbound: **a response that is non-empty on `main` stays byte-for-byte unchanged; only a response whose result list is empty today may change.** When `result_items` is still empty, the response did not time out or get degraded by a search-leg shed (`state.timed_out` / `state.upstream_shed` — both set their flag and ride the normal return path rather than returning early, so both are checked here explicitly), the caller is not low-priority, the spine deadline is not spent, the typed `album` is non-empty, and the library artist has at least one shelved row of its own (the same cached `db.search` query `ARTIST_PLUS_ALBUM`'s own artist-only fallback issues, then kept only on normalized artist **equality** — the prefix rung in `filter_results_by_artist` would list a Canibus row under "other albums by Can"), this returns the artist's shelf as **display-only** rows — `LookupResultItem(library_item=row.to_catalog_item())`, no `artwork` and hence no release id/artwork URL/year/Discogs URL/streaming links. `search_type` is forced to `fallback` (never `direct` — this matters for the album-only shape, where main reports `direct` with zero rows), `external_source` becomes `"library"`, and `context_message` reuses `lookup.matching.album_not_found_message()` (shared with `build_context_message`'s song-bearing branch) so the album-only shape gets the same wording, naming the library artist whose shelf is shown (the fuzzy-corrected spelling when there is one) and the typed album verbatim. If the `db.search` raises, the step logs a warning and leaves the empty response as it was. `song_not_found`/`found_on_compilation` are left exactly as the caller computed them. Rows are ordered song-in-title-first (case-insensitive) when a song was typed, then the rest in query order, capped at `MAX_SEARCH_RESULTS`; a cache-confirmed-song ordering tier was considered and dropped — the one cache-only primitive that could answer it (`find_library_albums_with_cached_track`, Step 3b's A4 rescue) already runs against these same rows earlier in the pipeline, and a confirmed hit there promotes the row into a non-empty `library_results` before this step can ever run, so re-asking the same cache here would be redundant. Supersedes the larger, closed PR #1396, which repeatedly changed what Backend-Service binds (reordering/replacing/re-binding rows that a `direct`/`compilation` response already carried) and was rejected across five review rounds.
 
 ### `LookupRequest` opt-in flags
 
@@ -308,7 +308,10 @@ LML#1126, caught *inside* step 3 and otherwise reaching the final
 ``LookupResponse`` with ``degraded=True``), and a low-priority caller
 (``is_discogs_low_priority()`` — bulk/enrichment/backfill traffic, never a
 DJ-facing request). The caller collapses all three into one ``skip`` flag —
-there is nothing left for this function to do differently between them.
+there is nothing left for this function to do differently between them. A
+fourth term, ``services.spine_deadline.tail_exhausted()``, skips the step's
+one ``db.search`` when the caller's budget (or the hard cap) ran out after the
+last tail-shed check, so the step never spends time the caller no longer has.
 
 The low-priority exclusion matters beyond "don't bother": `/lookup/bulk`
 unconditionally marks every item low-priority and its per-item
@@ -327,12 +330,19 @@ When every one of these holds —
 
 * ``result_items`` is empty;
 * ``skip`` is false (the caller's ``state.timed_out or state.upstream_shed
-  or is_discogs_low_priority()``);
+  or is_discogs_low_priority()``, plus the spent-deadline term);
 * the typed ``parsed.album`` is non-empty after stripping whitespace;
-* the library artist (``library_artist_for(parsed)``) resolves to at least
-  one shelved row — the same cached ``db.search`` + ``filter_results_by_artist``
-  call ``ARTIST_PLUS_ALBUM``'s own artist-only fallback issues
-  (``lookup/strategies/artist_plus_album.py``);
+* the library artist (``library_artist_for(parsed)``) has at least one
+  shelved row of its own — the same cached ``db.search`` query
+  ``ARTIST_PLUS_ALBUM``'s own artist-only fallback issues
+  (``lookup/strategies/artist_plus_album.py``), kept only when the row's
+  artist EQUALS the library artist under ``normalize_for_comparison``.
+  ``filter_results_by_artist`` is deliberately not the gate here: its prefix
+  rung admits "Canibus" for "Can" and five unrelated "Low ..." artists for
+  "Low", and this lane names the artist in its sentence. When no row
+  survives, the step does not fire;
+* the search does not raise — any exception logs a warning and leaves the
+  empty response exactly as ``main`` returns it;
 
 this returns the artist's shelf as **display-only** rows:
 ``LookupResultItem(library_item=row.to_catalog_item())``, with no
@@ -344,9 +354,11 @@ runs enrichment.
 ``search_type`` is forced to ``SEARCH_TYPE_FALLBACK``, never ``direct`` —
 so Backend-Service's ``requireSearchType: 'direct'`` callers keep rejecting
 this shape, including the album-only request where ``main`` reports
-``direct`` with zero rows (LML#1393). ``context_message`` is the
-typed-album/typed-artist sentence ``build_context_message`` already uses
-for the song-bearing album-miss case (``lookup.matching.album_not_found_message``),
+``direct`` with zero rows (LML#1393). ``external_source`` goes from null
+to ``"library"``. ``context_message`` is the sentence
+``build_context_message`` already uses for the song-bearing album-miss case
+(``lookup.matching.album_not_found_message``), here naming the library
+artist whose shelf is listed rather than the typed spelling,
 now reachable for the album-only shape too — ``main``'s
 ``build_context_message`` never reaches it there, since every branch of
 its "song not found" message requires ``parsed.song``. ``song_not_found``
@@ -369,9 +381,11 @@ alert to exactly the misses it exists to catch (``lookup/miss_kind.py``);
 ``miss_telemetry_properties`` at the router, so the *downstream* telemetry
 (not just the pre-fold trace attrs) also classifies a shelf-only response as
 a miss. The ONE new, separate signal this lane gets is the Sentry trace
-attr set below (``lookup.shelf_fallback_rows``) plus the identically-named
-PostHog property the router adds -- observability for the lane without
-touching any existing series.
+attr ``lookup.shelf_fallback_rows`` (set by ``_mark_shelf_fallback_outcome``)
+plus the identically-named PostHog property the router adds. Both are
+present only when the lane fires (count > 0) and absent otherwise --
+observability for the lane without touching any existing series or event
+shape.
 
 Ordering:
 

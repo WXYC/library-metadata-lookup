@@ -1505,14 +1505,14 @@ async def perform_lookup(
         index_confirmed_existing=index_confirmed_existing,
         external_source=external_source,
     )
-    # Trace attrs projected over the PRE-fallback `result_items` -- Step 8
-    # below must stay invisible to them. See "Telemetry invisibility" in
-    # `lookup/shelf_fallback.py`.
+    # Trace attrs cover the PRE-fallback rows: Step 8 must stay invisible to
+    # them (docs/architecture.md, "Shelf fallback (step 8): design notes").
     _project_post_fold_trace_attrs(result_items, search_type)
 
-    # Step 8 (LML#1391/#1393): additive, unbound shelf fallback. `skip` also
-    # excludes low-priority callers -- see `lookup/shelf_fallback.py`.
+    # Step 8 (LML#1391/#1393): additive, unbound shelf fallback. The `skip`
+    # terms are documented in `lookup/shelf_fallback.py`.
     skip = state.timed_out or state.upstream_shed or is_discogs_low_priority()
+    skip = skip or services.spine_deadline.tail_exhausted()[0]
     shelf_result = await apply_shelf_fallback(
         parsed, services.db, skip, result_items, search_type, context, external_source
     )

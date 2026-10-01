@@ -13,7 +13,8 @@ only ``LibraryDB``/``DiscogsService`` -- the same pattern ``test_orchestrator.py
 and ``test_library_miss_discogs.py`` already use.
 """
 
-from unittest.mock import AsyncMock, patch
+import logging
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -214,6 +215,120 @@ class TestApplyShelfFallback:
 
         assert result_items[0].artwork is None
         assert result_items[0].library_item.on_streaming is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("artist", "found", "expected_ids"),
+        [
+            pytest.param(
+                "Can",
+                [("Canibus", "Can-I-Bus"), ("Can", "Ege Bamyasi"), ("Can", "Future Days")],
+                [2, 3],
+                id="prefix-collision-dropped-own-rows-kept",
+            ),
+            pytest.param(
+                "Low",
+                [("Low Profile", "We're in This Together"), ("The Low Numbers", "Twist Again")],
+                [],
+                id="only-prefix-collisions-does-not-fire",
+            ),
+            pytest.param(
+                "Sun Ra",
+                [("Sun Ra", "Lanquidity"), ("Sun Ra Arkestra", "Swirling")],
+                [1],
+                id="longer-credit-is-a-different-artist",
+            ),
+            pytest.param(
+                "nilufer yanya",
+                [("Nilüfer Yanya", "PAINLESS"), ("Nilüfer Yanya", "My Method Actor")],
+                [1, 2],
+                id="case-and-diacritics-are-normalized",
+            ),
+        ],
+    )
+    async def test_keeps_only_rows_by_the_library_artist(self, artist, found, expected_ids):
+        """``db.search`` (and ``filter_results_by_artist``'s prefix rung) admit
+        any artist that merely *starts with* the query. This lane names the
+        artist in its context line, so it keeps a row only on normalized
+        artist equality -- and does not fire at all when none survives."""
+        db = AsyncMock()
+        db.search = AsyncMock(
+            return_value=[
+                make_library_item(id=i, artist=row_artist, title=title)
+                for i, (row_artist, title) in enumerate(found, start=1)
+            ]
+        )
+
+        out = await apply_shelf_fallback(_parsed(artist=artist), db, False, [], "none", None, None)
+
+        if not expected_ids:
+            assert out == ([], "none", None, None, 0)
+            return
+        result_items, search_type, _context, _external, rows = out
+        assert [item.library_item.id for item in result_items] == expected_ids
+        assert search_type == SEARCH_TYPE_FALLBACK
+        assert rows == len(expected_ids)
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_corrected_artist_is_searched_and_named(self):
+        """LML#626 two-channel seam: the shelf is searched under the corrected
+        ``library_artist``, so that is the artist the sentence names. The typed
+        album stays verbatim."""
+        db = AsyncMock()
+        db.search = AsyncMock(
+            return_value=[make_library_item(id=7, artist="Jessica Pratt", title="Quiet Signs")]
+        )
+        parsed = _parsed(artist="Jesica Prat", library_artist="Jessica Pratt", album="zzyzx rd")
+
+        result_items, _search_type, context, _external, rows = await apply_shelf_fallback(
+            parsed, db, False, [], "none", None, None
+        )
+
+        db.search.assert_awaited_once_with(query="Jessica Pratt", limit=_FETCH_LIMIT)
+        assert [item.library_item.id for item in result_items] == [7]
+        assert rows == 1
+        assert context == (
+            '"zzyzx rd" not found in the library, but here are other albums by Jessica Pratt:'
+        )
+
+    @pytest.mark.asyncio
+    async def test_search_failure_leaves_the_empty_response_unchanged(self, caplog):
+        """On main this path returned an empty 200 with no further I/O, so a
+        failing ``db.search`` must not turn it into a 500."""
+        db = AsyncMock()
+        db.search = AsyncMock(side_effect=RuntimeError("Database not connected"))
+
+        with caplog.at_level(logging.WARNING, logger="lookup.shelf_fallback"):
+            out = await apply_shelf_fallback(_parsed(), db, False, [], "direct", None, None)
+
+        assert out == ([], "direct", None, None, 0)
+        assert any(
+            record.levelno == logging.WARNING and "Database not connected" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("shelf_size", "expected_calls"),
+        [
+            pytest.param(2, [("lookup.shelf_fallback_rows", 2)], id="fires"),
+            pytest.param(0, [], id="does-not-fire"),
+        ],
+    )
+    async def test_sentry_attr_is_set_only_when_the_lane_fires(self, shelf_size, expected_calls):
+        db = AsyncMock()
+        db.search = AsyncMock(
+            return_value=[
+                make_library_item(id=i, artist="Jessica Pratt", title=f"Album {i}")
+                for i in range(1, shelf_size + 1)
+            ]
+        )
+        scope = Mock()
+
+        with patch("lookup.shelf_fallback.sentry_sdk.get_current_scope", return_value=scope):
+            await apply_shelf_fallback(_parsed(), db, False, [], "none", None, None)
+
+        assert [call.args for call in scope.transaction.set_data.call_args_list] == expected_calls
 
 
 # ---------------------------------------------------------------------------
@@ -590,72 +705,124 @@ class TestPerformLookupShelfFallbackInvariance:
         spy.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_timed_out_path_is_unchanged(
-        self, mock_library_db, mock_discogs_service, telemetry
-    ):
-        """A mid-pipeline hard-cap trip (``core/search.py``) sets
-        ``timed_out`` without an early return -- the honest empty response
-        reaches the final builder, and the fallback must still no-op."""
-        mock_library_db.find_similar_artist.return_value = None
-        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
-
-        request = LookupRequest(
-            artist="Chuquimamani-Condori",
-            album="Zzyzx Road",
-            raw_message="Play Zzyzx Road by Chuquimamani-Condori",
-        )
-        timed_out_state = SearchState(results=[], timed_out=True)
-
-        with (
-            patch(
-                "lookup.orchestrator.execute_search_pipeline",
-                AsyncMock(return_value=timed_out_state),
+    @pytest.mark.parametrize(
+        ("state_flags", "low_priority", "deadline_spent", "expected"),
+        [
+            pytest.param({"timed_out": True}, False, False, {"timeout": True}, id="timed-out"),
+            pytest.param(
+                {"upstream_shed": True}, False, False, {"degraded": True}, id="search-leg-shed"
             ),
-            patch("lookup.orchestrator.apply_shelf_fallback", new_callable=AsyncMock) as spy,
-        ):
-            spy.side_effect = _passthrough_side_effect
-            response = await perform_lookup(
-                request, mock_library_db, mock_discogs_service, telemetry
-            )
+            pytest.param({}, True, False, {}, id="low-priority-caller"),
+            pytest.param({}, False, True, {}, id="deadline-spent"),
+        ],
+    )
+    async def test_each_skip_term_keeps_the_response_empty(
+        self,
+        mock_library_db,
+        mock_discogs_service,
+        telemetry,
+        state_flags,
+        low_priority,
+        deadline_spent,
+        expected,
+    ):
+        """Every ``skip`` term in ``perform_lookup``, pinned one at a time
+        against the REAL ``apply_shelf_fallback``. None of them returns early:
+        a mid-pipeline hard-cap trip (``timed_out``), LML#1126's search-leg
+        breaker shed (``upstream_shed``), a low-priority caller and a spent
+        spine deadline all reach the call site with an empty result list, an
+        album and a shelved artist -- every other trigger condition holds, so
+        removing a term makes that case return the shelf. The control case
+        proves the same fixture does fire with no term set."""
+        response = await self._lookup_shelved_artist_album_miss(
+            mock_library_db, mock_discogs_service, telemetry, {}, False, False
+        )
+        assert [item.library_item.id for item in response.results] == [201]
+
+        mock_library_db.search.reset_mock()
+        response = await self._lookup_shelved_artist_album_miss(
+            mock_library_db,
+            mock_discogs_service,
+            telemetry,
+            state_flags,
+            low_priority,
+            deadline_spent,
+        )
 
         assert response.results == []
-        assert response.timeout is True
-        assert response.degraded is False
         assert response._shelf_fallback_rows == 0
-        spy.assert_awaited_once()
+        assert response.context_message is None
+        assert response.external_source is None
+        assert response.timeout is expected.get("timeout", False)
+        assert response.degraded is expected.get("degraded", False)
+        mock_library_db.search.assert_not_awaited()
 
-    @pytest.mark.asyncio
-    async def test_search_leg_shed_degraded_path_is_unchanged(
-        self, mock_library_db, mock_discogs_service, telemetry
+    @staticmethod
+    async def _lookup_shelved_artist_album_miss(
+        mock_library_db, mock_discogs_service, telemetry, state_flags, low_priority, deadline_spent
     ):
-        """LML#1126's search-leg Discogs saturation-breaker shed sets
-        ``state.upstream_shed`` and rides the *normal* return path (unlike
-        the tail-shed/admission-shed flavor below) -- the shelf fallback
-        call site IS reached, and must no-op via the explicit ``skip``
-        check rather than relying on an early return."""
+        """Drive ``perform_lookup`` to step 8 with an empty search state for a
+        shelved artist. ``execute_search_pipeline`` is patched so the state
+        flags are set directly; ``should_shed_tail`` is neutralized so a spent
+        deadline reaches step 8 instead of shedding the tail earlier."""
+        mock_library_db.find_similar_artist.return_value = None
+        mock_library_db.search.return_value = [
+            make_library_item(id=201, artist="Jessica Pratt", title="Quiet Signs")
+        ]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
         request = LookupRequest(
             artist="Jessica Pratt",
-            album="On Your Own Love Again",
-            raw_message="Play On Your Own Love Again by Jessica Pratt",
+            album="Zzyzx Road",
+            raw_message="Play Zzyzx Road by Jessica Pratt",
         )
-        shed_state = SearchState(results=[], upstream_shed=True)
-
+        spent = (deadline_spent, 0.0 if deadline_spent else 25_000.0, "hard_cap")
         with (
             patch(
                 "lookup.orchestrator.execute_search_pipeline",
-                AsyncMock(return_value=shed_state),
+                AsyncMock(return_value=SearchState(results=[], **state_flags)),
             ),
-            patch("lookup.orchestrator.apply_shelf_fallback", new_callable=AsyncMock) as spy,
+            patch("lookup.orchestrator.is_discogs_low_priority", return_value=low_priority),
+            patch("lookup.orchestrator.should_shed_tail", return_value=None),
+            patch("lookup.spine_deadline.SpineDeadline.tail_exhausted", return_value=spent),
         ):
-            spy.side_effect = _passthrough_side_effect
+            return await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+    @pytest.mark.asyncio
+    async def test_existing_trace_attrs_report_the_pre_fallback_response(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Telemetry invisibility, Sentry half: ``lookup.results_count`` and
+        ``lookup.match_type`` are projected BEFORE step 8, so a shelf-only
+        response still reads as the empty ``direct`` response main reports.
+        The last write to each key wins, so a re-projection after step 8
+        fails here. ``lookup.shelf_fallback_rows`` is the lane's one new key."""
+        mock_library_db.find_similar_artist.return_value = None
+        moon_pix = make_library_item(id=301, artist="Cat Power", title="Moon Pix")
+
+        async def fake_search(query=None, **kwargs):
+            return [moon_pix] if query == "Cat Power" else []
+
+        mock_library_db.search.side_effect = fake_search
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        request = LookupRequest(
+            artist="Cat Power", album="Zzyzx Road", raw_message="Play Zzyzx Road by Cat Power"
+        )
+        scope = Mock()
+
+        with (
+            patch("lookup.orchestrator.sentry_sdk.get_current_scope", return_value=scope),
+            patch("lookup.shelf_fallback.sentry_sdk.get_current_scope", return_value=scope),
+        ):
             response = await perform_lookup(
                 request, mock_library_db, mock_discogs_service, telemetry
             )
 
-        assert response.results == []
-        assert response.degraded is True
-        assert response._shelf_fallback_rows == 0
-        spy.assert_awaited_once()
+        assert [item.library_item.id for item in response.results] == [301]
+        assert response.search_type == SEARCH_TYPE_FALLBACK
+        attrs = {call.args[0]: call.args[1] for call in scope.transaction.set_data.call_args_list}
+        assert attrs["lookup.results_count"] == 0
+        assert attrs["lookup.match_type"] == "direct"
+        assert attrs["lookup.shelf_fallback_rows"] == 1
 
     @pytest.mark.asyncio
     async def test_admission_shed_degraded_path_never_calls_shelf_fallback(
