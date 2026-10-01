@@ -46,7 +46,7 @@ A single call to `perform_lookup()` passes through the step-labeled pipeline bel
 ```mermaid
 flowchart TD
     A[POST /lookup] --> B[Artist correction]
-    B --> C{Has song without album?}
+    B --> C{"Song, and album missing,<br/>artist-named, or unshelved placeholder?"}
     C -->|Yes| D[Resolve albums via Discogs]
     C -->|No| E[Execute search strategies]
     D --> E
@@ -60,7 +60,7 @@ flowchart TD
 
 Artist correction (step 1) uses `rapidfuzz.fuzz.ratio()` with an 85-point threshold. It pulls candidates from the catalog by prefix (first 3 characters of the first significant word) and returns the best match above threshold. This catches "lucinda willias" -> "Lucinda Williams" and "Anais Mitchel" -> "Anais Mitchell" without being so loose that it creates false corrections.
 
-Album resolution (step 2) only triggers when a song is provided without an album. It queries Discogs for releases containing that track, deduplicates album names, and feeds them into the strategy pipeline. This transforms a vague "play Your Dreams by Sarah Louise" into a targeted search for "Earth Bow" in the catalog.
+Album resolution (step 2) triggers when a song is provided and the album is missing, equals the artist name, or is a self-titled placeholder ("S/T", "eponymous", "Epon.") that names no row on the artist's shelf. A placeholder that matches a shelved title is a real title and skips step 2. It queries Discogs for releases containing that track, deduplicates album names, and feeds them into the strategy pipeline. This transforms a vague "play Your Dreams by Sarah Louise" into a targeted search for "Earth Bow" in the catalog.
 
 ## Search strategy pattern
 
