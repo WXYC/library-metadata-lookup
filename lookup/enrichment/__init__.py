@@ -89,7 +89,7 @@ async def enrich_artwork_results(
     youtube_music: YouTubeMusicClient | None = None,
     entity_store: EntityStore | None = None,
     discogs_cache_pg: PgSource | None = None,
-    found_on_compilation: bool = False,
+    track_confirmed_ids: frozenset[int] = frozenset(),
     spine_deadline: SpineDeadline | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
@@ -221,7 +221,7 @@ async def enrich_artwork_results(
         request_artist_stripped=request_artist_stripped,
         artist_identity_split_enabled=_artist_identity_split_gate_enabled(),
         extended=extended,
-        found_on_compilation=found_on_compilation,
+        track_confirmed_ids=track_confirmed_ids,
         spine_deadline=spine_deadline,
     )
 
@@ -233,7 +233,7 @@ async def enrich_artwork_results(
     # the "why gating on top-1 alone is safe" argument.
     top1_item, top1_artwork = items_with_artwork[0]
     top1_row_title_matches = item.compute_row_title_matches_requested_album(
-        album, top1_item, top1_artwork, found_on_compilation=found_on_compilation
+        album, top1_item, top1_artwork, track_confirmed=top1_item.id in track_confirmed_ids
     )
     top1_library_row_acceptable = top1_artwork is not None and top1_row_title_matches
     top1_library_row_artist_verified = _artist_pair_verified(

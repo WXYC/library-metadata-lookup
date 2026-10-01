@@ -25,8 +25,12 @@ from entity.library_release_override import get_library_release_overrides
 from entity.sources import PgSource
 from library.db import LibraryDB
 from library.models import LibraryItem
+from lookup.binding_floor import promotable_stash_rows
 from lookup.concurrency import _chunked_gather
-from lookup.fallback_title_floors import _filter_results_by_song_as_album_title
+from lookup.fallback_title_floors import (
+    _filter_results_by_song_as_album_title,
+    row_clears_album_floor,
+)
 from lookup.matching import (
     MAX_SEARCH_RESULTS,
     album_title_acceptable,
@@ -53,6 +57,8 @@ async def filter_results_by_track_validation(
     song: str | None,
     artist: str | None,
     discogs_service: DiscogsService | None,
+    *,
+    confirmed_ids: set[int] | None = None,
 ) -> list[LibraryItem] | None:
     """Filter fallback results to only albums that contain the requested track.
 
@@ -65,6 +71,12 @@ async def filter_results_by_track_validation(
     further chunks — the row that was already in flight when the breaker
     opened is kept (per the R2-4 policy below), but no more probes go out
     once the breaker is known to be open.
+
+    ``confirmed_ids``, when given, collects the id of every returned row whose
+    tracklist actually confirmed the song. A row kept unvalidated on a breaker
+    shed is returned but NOT collected: only a confirmation lets a row serve
+    its own release against a typed album it misses (LML#1391,
+    ``lookup/binding_floor.py``).
 
     Returns:
         Filtered list, or None if validation isn't possible.
@@ -139,6 +151,8 @@ async def filter_results_by_track_validation(
         dispatched += 1
         if validated_item is not None:
             validated.append(validated_item)
+            if confirmed_ids is not None and not shed:
+                confirmed_ids.add(validated_item.id)
         breaker_shed = breaker_shed or shed
         if len(validated) >= MAX_SEARCH_RESULTS:
             break
@@ -402,6 +416,10 @@ class Step3bResult:
     still query for any id it does not cover.
     """
 
+    track_validated_ids: frozenset[int] = frozenset()
+    """Ids of the returned rows per-result validation confirmed the song on (a
+    breaker-shed row is kept, not confirmed). Feeds the LML#1391 serve rule."""
+
     found_on_compilation: bool | None = None
     """Desired ``state.found_on_compilation`` after the caller rebinds this.
 
@@ -429,6 +447,7 @@ async def apply_track_validation_cascade(
     discogs_service: DiscogsService | None,
     allow_release_resolution_fallback: bool,
     pg: PgSource | None = None,
+    album: str | None = None,
 ) -> Step3bResult:
     """Step-3b policy cascade: sequence the tiers that promote/narrow ``library_results``.
 
@@ -445,8 +464,10 @@ async def apply_track_validation_cascade(
     over the previous tier's result only when it finds something.
 
     On-a-compilation tier: validates the artist-fallback rows saved before
-    ``TRACK_ON_COMPILATION`` replaced them, and prepends any confirmed matches
-    ahead of the compilation results. When nothing confirms *and* the matched
+    ``TRACK_ON_COMPILATION`` replaced them, and prepends the matches the serve
+    rule lets keep a release ahead of the compilation results: a track-confirmed
+    row, or a row kept on a breaker shed whose title clears the typed album.
+    When none qualifies *and* the matched
     compilation is row-less (LML#1184), the stashed rows are appended behind it
     rather than dropped, and ``Step3bResult.found_on_compilation`` comes back
     ``False`` — the one case where this cascade overturns the search pipeline's
@@ -460,14 +481,26 @@ async def apply_track_validation_cascade(
     ``pg`` (the discogs-cache PG source that also backs the LML#850 override
     table, best-effort like every other cache read in this pipeline) is
     forwarded to the row-less reverse probe below; ``None`` degrades that
-    probe to no match, never a crash.
+    probe to no match, never a crash. ``album`` is the typed album (LML#1391): it
+    splits "the typed album was found" from "it matched nothing" on the fallback
+    tier, and with ``Step3bResult.track_validated_ids`` decides which stash rows
+    the compilation tier may promote (``promotable_stash_rows``).
     """
+    confirmed: set[int] = set()
     if not found_on_compilation:
         validated = await filter_results_by_track_validation(
-            real_results, song, artist, discogs_service
+            real_results, song, artist, discogs_service, confirmed_ids=confirmed
         )
         if validated:
-            return Step3bResult(validated, False, discogs_titles)
+            shelf, album_missed = validated, False
+            if song_not_found and album and album.strip():
+                album_matched = [r for r in validated if row_clears_album_floor(r, album)]
+                rest = [r for r in real_results if r not in validated]
+                shelf = (album_matched or validated + rest)[:MAX_SEARCH_RESULTS]
+                album_missed = not album_matched
+            return Step3bResult(
+                shelf, album_missed, discogs_titles, track_validated_ids=frozenset(confirmed)
+            )
         if not song_not_found:
             return Step3bResult(library_results, song_not_found, discogs_titles)
 
@@ -608,13 +641,19 @@ async def apply_track_validation_cascade(
         artist_fallback_results[:MAX_SEARCH_RESULTS] if rowless_only else artist_fallback_results
     )
     validated = await filter_results_by_track_validation(
-        fallback_candidates, song, artist, discogs_service
+        fallback_candidates, song, artist, discogs_service, confirmed_ids=confirmed
     )
+    # LML#1391: only rows the serve rule lets keep a release may lead the
+    # compilation. A row that fails the typed album and was merely kept on a
+    # breaker shed would be stripped to a bare sentinel at response assembly.
+    validated = promotable_stash_rows(album, validated or [], confirmed)
     compilation_ids = {r.id for r in library_results}
     if validated:
         merged = [r for r in validated if r.id not in compilation_ids]
         merged.extend(library_results)
-        return Step3bResult(merged, song_not_found, discogs_titles)
+        return Step3bResult(
+            merged, song_not_found, discogs_titles, track_validated_ids=frozenset(confirmed)
+        )
 
     # LML#1184: nothing confirmed, and the compilation that matched is one WXYC
     # does not shelve — every row here is the id=0 carry-through (LML#628/#631).

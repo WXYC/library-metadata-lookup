@@ -90,7 +90,7 @@ def compute_row_title_matches_requested_album(
     item: LibraryItem,
     artwork: DiscogsSearchResult | None,
     *,
-    found_on_compilation: bool,
+    track_confirmed: bool,
 ) -> bool:
     """LML#477: does ``item``'s catalog title plausibly match the requested album?
 
@@ -121,16 +121,17 @@ def compute_row_title_matches_requested_album(
         # the feature exists to avoid. The release_id was validated to carry the
         # track, and item.title IS that release's title, so trust the binding.
         or (item.id == ROWLESS_LIBRARY_ID and artwork is not None and artwork.release_id > 0)
-        # LML#684: an in-library found_on_compilation row is the analog of the
-        # row-less carry-through above — TRACK_ON_COMPILATION located the track
-        # on a release that IS shelved, and validate_release_for_track confirmed
-        # the track sits on it. Its release title ("Orcutt-Shelley-Miller")
-        # legitimately differs from the typed album (the trio/collab name
-        # "Orcutt Shelley Miller", which scores 61.9 here), so the sibling-leak
-        # gate would clobber the validated release_id to the release_id=0
-        # sentinel — the silent-no-artwork bug this fix exists to kill. The row
-        # was track-validated, so the leak concern doesn't apply.
-        or (found_on_compilation and artwork is not None and artwork.release_id > 0)
+        # LML#684, per row since LML#1391: ``track_confirmed`` says the requested
+        # song was confirmed on THIS row's release -- by TRACK_ON_COMPILATION
+        # (validate_release_for_track) or by step-3b validation -- the analog of
+        # the row-less carry-through above. Its title legitimately differs from
+        # the typed album ("Orcutt-Shelley-Miller" vs the typed trio name scores
+        # 61.9; "Kind of Blue" vs a typed "... Legacy Edition" 61.5), so the
+        # sibling-leak gate would clobber a validated release_id to the
+        # release_id=0 sentinel. A track-confirmed release is the right metadata
+        # for the track, so the leak concern doesn't apply. The caller decides it
+        # (``lookup/binding_floor.py``); it is never response-wide.
+        or (track_confirmed and artwork is not None and artwork.release_id > 0)
     )
 
 
@@ -177,7 +178,7 @@ async def enrich_one(
     # prefetch-skip gate in ``lookup/enrichment/__init__.py`` share one
     # implementation).
     row_title_matches_requested_album = compute_row_title_matches_requested_album(
-        ctx.album, item, artwork, found_on_compilation=ctx.found_on_compilation
+        ctx.album, item, artwork, track_confirmed=item.id in ctx.track_confirmed_ids
     )
     # LML#850: a hand-verified library-release override (bound in ``fetch_one``
     # via ``release_overrides``) deliberately gets NO carve-out here. This gate

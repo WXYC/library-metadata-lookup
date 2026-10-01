@@ -62,13 +62,20 @@ MODULE_BUDGETS: dict[str, int] = {
     # bind Discogs results". Three call sites, no import cycle. Do that
     # instead of raising this again.
     "lookup/artwork.py": 550,
-    # The two `token_set_ratio` floors over artist-fallback row titles (the
-    # LML#400 album floor with its drop helper, and the LML#717
-    # song-as-album-title floor), moved verbatim out of `lookup/matching.py`
-    # and `lookup/validation.py` to make room under both ceilings for LML#1391.
-    # On the `title_identity.py` precedent. 103 lines measured;
-    # 1.3x = 133.9 -> 150.
-    "lookup/fallback_title_floors.py": 150,
+    # LML#1391: the one serve rule (may a row keep its own release?) and its
+    # three appliers -- the step-3b stash promotion, the per-row confirmation
+    # set step 4b reads, and the response-assembly chokepoint -- kept out of
+    # orchestrator.py and enrichment/item.py (both at their ceilings). 109 lines
+    # measured, about a third of it the module docstring stating the rule;
+    # 1.3x = 141.7 -> 150.
+    "lookup/binding_floor.py": 150,
+    # LML#1391: the two `token_set_ratio` floors over artist-fallback row titles
+    # (the LML#400 album floor with its rank/drop helpers, and the LML#717
+    # song-as-album-title floor), moved out of `lookup/matching.py` and
+    # `lookup/validation.py` when ranking-not-dropping pushed both past their
+    # ceilings. Verbatim moves, on the `title_identity.py` precedent. 144 lines
+    # measured; 1.3x = 187.2 -> 200.
+    "lookup/fallback_title_floors.py": 200,
     # LML#1290 prep: `_resolve_fallback_artwork` + `_artwork_rungs` moved out of
     # `lookup/artwork.py` (524 -> 406) at the boundary this file's comment above
     # prescribed, rather than raising that budget a second time. 141 lines measured;
@@ -456,12 +463,12 @@ MODULE_BUDGETS: dict[str, int] = {
     # module changes only when this one lane does — so the next edit tripping
     # the ceiling should stop and recalibrate deliberately.
     "lookup/strategies/library_miss.py": 250,
-    # Which step-3a lane a request opens and the `lookup.outcome` value it
-    # reports, named once instead of as parallel if/elif ladders in
-    # `_step_library_miss_probe` (room under the orchestrator ceiling for
-    # LML#1391). Not in `library_miss.py`, which sits at its ceiling. 52 lines
-    # measured, mostly the docstring listing the outcome values;
-    # 1.3x = 67.6 -> 100.
+    # LML#1391: which step-3a lane a request opens and the `lookup.outcome`
+    # value it reports. The third (floor-blocked) lane would have put three
+    # parallel if/elif ladders in `_step_library_miss_probe`; naming the lane
+    # once keeps the spine to its `LookupState` writes. Not in
+    # `library_miss.py`, which sits at its ceiling. 62 lines measured, mostly
+    # the docstring listing the six outcome values; 1.3x = 80.6 -> 100.
     "lookup/strategies/miss_probe_lane.py": 100,
     "lookup/strategies/song_as_artist.py": 250,
     "lookup/strategies/song_as_track.py": 150,

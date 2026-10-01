@@ -57,6 +57,7 @@ from library.db import LibraryDB
 from library.models import LibraryItem
 from lookup.admission import evaluate_admission_shed
 from lookup.artwork import fetch_artwork_for_items
+from lookup.binding_floor import floor_row_binding, track_confirmed_row_ids
 from lookup.candidate_memo import TrackCandidateMemo
 from lookup.enrichment import enrich_artwork_results
 from lookup.external_search import (
@@ -324,7 +325,7 @@ class LookupState:
     """LML#583 outcome marker for the Sentry trace projection (``lookup.outcome``).
     Written by the library-miss probe (step 3a): one hit and one miss value per
     lane, kept distinct because existing slices key on the classic pair meaning
-    "the library returned NOTHING". The four values and their lanes are listed on
+    "the library returned NOTHING". The six values and their lanes are listed on
     ``lookup/strategies/miss_probe_lane.py``."""
 
     serve_blocked_probe_pair: tuple[LibraryItem, DiscogsSearchResult] | None = None
@@ -348,6 +349,10 @@ class LookupState:
     them with compilation results. Written by the search pipeline (step 3);
     read by track validation (3b) to validate the artist's own album against
     Discogs tracklists on the compilation branch."""
+
+    track_validated_ids: frozenset[int] = frozenset()
+    """LML#1391: ids of the rows step-3b validation confirmed the song on.
+    Written by track validation (3b); read through ``track_confirmed_ids``."""
 
     release_overrides: dict[int, int] = field(default_factory=dict)
     """LML#1332: verified LML#850 pins an earlier step already fetched.
@@ -396,6 +401,12 @@ class LookupState:
     def has_results(self) -> bool:
         """True when the response will carry any result rows (see ``result_count``)."""
         return self.result_count > 0
+
+    @property
+    def track_confirmed_ids(self) -> frozenset[int]:
+        """Rows whose own release the song was confirmed on (the LML#1391 serve
+        rule's third clause). Read by enrichment (4b) and the response build."""
+        return track_confirmed_row_ids(self.discogs_titles, self.track_validated_ids)
 
 
 @dataclass(frozen=True)
@@ -731,6 +742,9 @@ async def _step_library_miss_probe(
     racing the artwork fetch for ``items_with_artwork``. Track validation (3b)
     still cannot interfere: this lane is songless by construction and 3b's gate
     requires ``parsed.song``.
+
+    The LML#1391/#717 floor-blocked lane is the opposite: a hit fully replaces
+    ``library_results``, none of which clear the typed album at all.
     """
     # When the entire search pipeline returned no library results AND the request
     # carries both artist and album, probe Discogs directly. A confident match
@@ -756,12 +770,8 @@ async def _step_library_miss_probe(
     # ranks items_with_artwork first).
     if _task_resolved_with_renderable_locations(location_union_task):
         return
-    # LML#1319: the emptiness gate is serve-aware on the songless lane. A
-    # wrong-album artist-fallback row that cannot clear the LML#477 serve
-    # floor would collapse to the release_id=0 streaming-only sentinel
-    # downstream, so letting it close this gate starved the probe of exactly
-    # the lookups the local release cache could answer. Policy on
-    # ``miss_probe_lane``; rationale on ``fallback_rows_block_serving``.
+    # The emptiness gate is lane-aware (LML#1319, LML#1391): rows that cannot
+    # answer the typed album must not close it. Policy on ``miss_probe_lane``.
     lane = miss_probe_lane(parsed, state.library_results, state.search_type)
     if (
         lane is not None
@@ -796,15 +806,15 @@ async def _step_library_miss_probe(
                 # still carries every shelved row behind it.
                 state.serve_blocked_probe_pair = miss_match
             else:
+                # LML#1391/#717: floor-blocked rows miss the typed album, so the
+                # probe's release replaces them outright; clear library_results
+                # (already empty on the classic lane) or step 4 re-fetches them.
+                state.library_results = []
                 state.items_with_artwork = [miss_match]
             state.library_miss_outcome = lane.outcome(matched=True)
             services.telemetry.record_api_call("discogs")
         elif services.discogs_service is not None:
             # Discogs was available and searched but found no confident match.
-            # The serve-blocked arm gets its own value: the classic pair means
-            # "the library returned nothing", and on this lane it DID answer —
-            # reusing it would silently change the population behind every
-            # existing `lookup.outcome` slice and runbook (LML#1319 review).
             state.library_miss_outcome = lane.outcome(matched=False)
 
 
@@ -816,9 +826,10 @@ async def _step_validate_tracks(
     """Step 3b — validate results against Discogs track data.
 
     READS: ``library_results``, ``found_on_compilation``, ``song_not_found``,
-    ``discogs_titles``, ``artist_fallback_results``, ``unranked_fallback_candidates``.
+    ``discogs_titles``, ``artist_fallback_results``, ``unranked_fallback_candidates``;
+    also reads ``parsed.album`` (LML#1391 — see ``apply_track_validation_cascade``).
     WRITES: ``library_results``, ``song_not_found``, ``discogs_titles``,
-    ``found_on_compilation``, ``search_type``.
+    ``found_on_compilation``, ``search_type``, ``track_validated_ids``.
 
     Sequences the gate (should step 3b run at all, timed as "track_validation")
     and delegates the promotion/narrowing policy — per-result validation, the
@@ -876,11 +887,13 @@ async def _step_validate_tracks(
             discogs_service=services.discogs_service,
             allow_release_resolution_fallback=services.allow_release_resolution_fallback,
             pg=services.discogs_cache_pg,
+            album=parsed.album,
         )
     state.library_results = result.library_results
     state.song_not_found = result.song_not_found
     state.discogs_titles = result.discogs_titles
     state.release_overrides = result.release_overrides
+    state.track_validated_ids = result.track_validated_ids
     if result.found_on_compilation is not None:
         state.found_on_compilation = result.found_on_compilation
         if not result.found_on_compilation:
@@ -1047,7 +1060,7 @@ async def _step_enrich_metadata(
 ) -> None:
     """Step 4b — enrich with release year, artist details, streaming links.
 
-    READS: ``items_with_artwork``, ``found_on_compilation``; plus
+    READS: ``items_with_artwork``, ``track_confirmed_ids``; plus
     ``services.extended`` and ``services.warm_cache``.
     WRITES: ``items_with_artwork`` (rebound to the enriched pairs).
 
@@ -1075,7 +1088,7 @@ async def _step_enrich_metadata(
                 youtube_music=services.youtube_music,
                 entity_store=services.entity_store,
                 discogs_cache_pg=services.discogs_cache_pg,
-                found_on_compilation=state.found_on_compilation,
+                track_confirmed_ids=state.track_confirmed_ids,
                 spine_deadline=services.spine_deadline,
             )
 
@@ -1142,15 +1155,15 @@ async def _step_resolve_result_identities(
 
 
 def _build_result_items(
-    state: LookupState,
-    identities_by_artist: dict[str, ReconciledIdentity],
+    state: LookupState, identities_by_artist: dict[str, ReconciledIdentity], album: str | None
 ) -> list[LookupResultItem]:
     """Build the response items (convert internal models to API contract models).
 
     READS: ``items_with_artwork`` (takes precedence when non-empty — the
     canonical rule statement is ``LookupState.result_count``),
-    ``library_results``, ``matched_via_by_id``.
-    WRITES: nothing.
+    ``library_results``, ``matched_via_by_id``, ``track_confirmed_ids``.
+    WRITES: nothing. The LML#400 chokepoint: every served binding passes the
+    serve rule (``floor_row_binding``) here, whichever path built the row.
     """
 
     def _identity_for(item: LibraryItem) -> ReconciledIdentity | None:
@@ -1160,12 +1173,10 @@ def _build_result_items(
 
     result_items = []
     if state.items_with_artwork:
-        for item, artwork in state.items_with_artwork:
-            # Synthesized items (id=0, from Step 3a) have no library call-number
-            # components; build the "(external)" sentinel that Backend-Service
-            # already understands (same contract as the Step 7
-            # include_external_caches path — one construction site for both,
-            # lookup/external_search.py:build_external_catalog_item).
+        for item, raw_artwork in state.items_with_artwork:
+            artwork = floor_row_binding(album, item, raw_artwork, state.track_confirmed_ids)
+            # Synthesized id=0 rows (step 3a) get the "(external)" sentinel BS understands
+            # (one construction site: external_search.build_external_catalog_item).
             catalog_item = (
                 build_external_catalog_item(artist=item.artist, title=item.title)
                 if item.id == 0
@@ -1176,9 +1187,8 @@ def _build_result_items(
                     library_item=catalog_item,
                     artwork=artwork.to_match_result() if artwork else None,
                     reconciled_identity=_identity_for(item),
-                    # Synthesized items (id=0) carry no track-title-provenance hint;
-                    # do not look up key 0 in matched_via_by_id to prevent accidental
-                    # collision with any future strategy that might write to that key.
+                    # id=0 rows carry no track-title provenance; never look up key 0 (a
+                    # future strategy writing that key would otherwise collide).
                     matched_via=None if item.id == 0 else state.matched_via_by_id.get(item.id),
                 )
             )
@@ -1476,7 +1486,7 @@ async def perform_lookup(
             location_union_task=location_union_task,
         )
 
-    result_items = _build_result_items(state, identities_by_artist)
+    result_items = _build_result_items(state, identities_by_artist, parsed.album)
     external_source = await _step_external_cache_fallback(parsed, result_items, services)
 
     # Fold the location-union's other shelf locations into `results` (the
@@ -1802,7 +1812,7 @@ async def _build_degraded_response(
         sentry_sdk.set_tag("lml.degraded_reason", degraded_reason.value)
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Failed to project degraded_reason onto Sentry transaction: %s", e)
-    result_items = _build_result_items(state, {})
+    result_items = _build_result_items(state, {}, parsed.album)
     folded_locations = await _await_location_union_bounded(location_union_task)
     result_items, folded_location_count, index_confirmed_existing = _fold_locations_into_results(
         result_items, folded_locations, state

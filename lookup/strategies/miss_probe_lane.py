@@ -2,7 +2,7 @@
 
 Step 3a (``_step_library_miss_probe`` in ``lookup/orchestrator.py``) probes
 Discogs directly when the library has nothing that answers the typed
-(artist, album). "Nothing" has two shapes, and the lane decides both what a
+(artist, album). "Nothing" has three shapes, and the lane decides both what a
 probe hit does to the rows already in hand and which ``lookup.outcome`` value
 the trace carries:
 
@@ -14,17 +14,24 @@ the trace carries:
   evidence and the rows stay; the probe runs cache-only. Outcomes
   ``serve_blocked_fallback_discogs_match`` /
   ``serve_blocked_fallback_no_discogs_match``.
+- ``FLOOR_BLOCKED`` (LML#1391/#717, song-bearing): rows came back but none
+  clears the typed album at all (``song_bearing_fallback_all_floor_failed``).
+  A hit *replaces* them. Outcomes ``floor_blocked_fallback_discogs_match`` /
+  ``floor_blocked_fallback_no_discogs_match``.
 
 The outcome values are kept distinct per lane because existing
 ``lookup.outcome`` slices and runbooks key on the classic pair meaning "the
-library returned nothing", which is not true on the serve-blocked lane
-(LML#1319 review).
+library returned nothing", which is not true on the other two lanes (LML#1319
+review).
 """
 
 from enum import StrEnum
 
 from library.models import LibraryItem
-from lookup.strategies.library_miss import fallback_rows_block_serving
+from lookup.strategies.library_miss import (
+    fallback_rows_block_serving,
+    song_bearing_fallback_all_floor_failed,
+)
 from services.parser import ParsedRequest
 
 
@@ -33,6 +40,7 @@ class MissProbeLane(StrEnum):
 
     LIBRARY_MISS = "library_miss"
     SERVE_BLOCKED = "serve_blocked_fallback"
+    FLOOR_BLOCKED = "floor_blocked_fallback"
 
     def outcome(self, *, matched: bool) -> str:
         """The ``lookup.outcome`` value for this lane's probe hit or miss."""
@@ -49,4 +57,6 @@ def miss_probe_lane(
         return MissProbeLane.LIBRARY_MISS
     if fallback_rows_block_serving(parsed, library_results, search_type):
         return MissProbeLane.SERVE_BLOCKED
+    if song_bearing_fallback_all_floor_failed(parsed, library_results, search_type):
+        return MissProbeLane.FLOOR_BLOCKED
     return None

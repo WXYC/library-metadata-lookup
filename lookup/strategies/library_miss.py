@@ -18,6 +18,7 @@ from discogs.models import DiscogsSearchRequest, DiscogsSearchResponse, DiscogsS
 from discogs.service import DiscogsService
 from library.models import LibraryItem
 from lookup.enrichment.item import compute_row_title_matches_requested_album
+from lookup.fallback_title_floors import row_clears_album_floor
 from lookup.strategies.va_rescue import find_va_comp_match
 from lookup.typed_pair_floor import floor_best_typed_pair, typed_album_axis
 from services.parser import ParsedRequest
@@ -32,8 +33,9 @@ def fallback_rows_block_serving(
 ) -> bool:
     """LML#1319: is the songless lane holding only fallback rows that can never serve?
 
-    The two-floor contradiction this predicate names: the artist-fallback
-    album filter (``_filter_results_by_album_match``) admits a row via
+    The two-floor contradiction this predicate names: the songless
+    artist-fallback album filter (``_filter_results_by_album_match``; only the
+    song-bearing lane ranks instead of drops, LML#1391) admits a row via
     ``fuzz.token_set_ratio``, which scores 100 for any token subset — so a
     sibling album "E" passes against a typed "E at Home" — while the LML#477
     serve floor (``compute_row_title_matches_requested_album``, via
@@ -57,14 +59,13 @@ def fallback_rows_block_serving(
     The serve-floor check calls the serve gate itself rather than a re-derived
     ``score_match``, so the two floors cannot drift apart again. Both of that
     gate's carve-outs are structurally unreachable from here, which is why this
-    predicate takes no ``found_on_compilation`` argument and passes ``False``:
-    each carve-out requires ``artwork is not None``, and the serve decision this
-    lane asks about happens before any artwork exists (hence the hard-coded
-    ``None``); independently, ``search_type == 'fallback'`` already implies
-    ``found_on_compilation`` is False, because ``get_search_type_from_state``
-    returns "compilation" from its first branch whenever that flag is set
-    (``core/search.py``). A caller that ever needs the compilation lane must
-    revisit the gate call below, not thread a flag through.
+    predicate passes ``track_confirmed=False``: each carve-out requires
+    ``artwork is not None``, and the serve decision this lane asks about happens
+    before any artwork exists (hence the hard-coded ``None``); independently,
+    the lane is songless, and a row is only ever track-confirmed by a step that
+    needs a song (TRACK_ON_COMPILATION, or step-3b validation). A caller that
+    ever needs a song-bearing lane must revisit the gate call below, not thread
+    a flag through.
 
     NOTE for the gap class (LML#1319 review): "cannot serve" is a *token-subset*
     property, not a wrong-album one. Same-record title truncation lands here too
@@ -80,11 +81,29 @@ def fallback_rows_block_serving(
     if not library_results:
         return False
     return not any(
-        compute_row_title_matches_requested_album(
-            parsed.album, item, None, found_on_compilation=False
-        )
+        compute_row_title_matches_requested_album(parsed.album, item, None, track_confirmed=False)
         for item in library_results
     )
+
+
+def song_bearing_fallback_all_floor_failed(
+    parsed: ParsedRequest,
+    library_results: list[LibraryItem],
+    search_type: str,
+) -> bool:
+    """LML#1391/#717: does the song-bearing fallback hold only rows that
+    missed the typed album? Ranking (not dropping) floor-failing rows means
+    ``library_results`` no longer empties on a typed-album miss, which used
+    to close this step's emptiness gate against the real library-miss answer.
+    Uses ``row_clears_album_floor`` -- the same primitive the ranking uses.
+    """
+    if not (parsed.song and parsed.album and parsed.album.strip()):
+        return False
+    if search_type != SEARCH_TYPE_FALLBACK:
+        return False
+    if not library_results:
+        return False
+    return not any(row_clears_album_floor(item, parsed.album) for item in library_results)
 
 
 async def _library_miss_discogs_search(

@@ -101,8 +101,9 @@ class EnrichmentContext:
     extended: bool
     """Extended-payload mode (tracklist, genres, writer credits, profile tokens)."""
 
-    found_on_compilation: bool
-    """True when TRACK_ON_COMPILATION track-validated the surfaced release (LML#684)."""
+    track_confirmed_ids: frozenset[int]
+    """Library ids of rows whose release the requested song was confirmed on
+    (LML#684, per row since LML#1391; ``lookup.binding_floor.track_confirmed_row_ids``)."""
 
     spine_deadline: SpineDeadline | None = None
     """Request-scoped caller deadline (LML#930). When present, the per-item Apple
