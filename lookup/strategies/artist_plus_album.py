@@ -29,7 +29,10 @@ from core.search import (
 )
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
-from lookup.fallback_title_floors import _filter_results_by_album_match
+from lookup.fallback_title_floors import (
+    _filter_results_by_album_match,
+    _partition_results_by_album_match,
+)
 from lookup.matching import (
     _FETCH_LIMIT,
     MAX_SEARCH_RESULTS,
@@ -228,7 +231,11 @@ async def search_library_with_fallback(
         query = f"{lib_artist} {parsed.song}"
         results = await db.search(query=query, limit=_FETCH_LIMIT)
         results = filter_results_by_artist(results, lib_artist)
-        results = _filter_results_by_album_match(results, parsed.album)
+        # LML#1391: rank floor-clearing rows first instead of dropping the
+        # rest — a typed album that matches nothing must not empty the
+        # artist's shelf. The #400 metadata-contamination guard this floor
+        # backed now lives at the enrichment serve gate (per-row).
+        results = _partition_results_by_album_match(results, parsed.album)
 
         if results:
             song_lower = parsed.song.lower()
@@ -242,7 +249,13 @@ async def search_library_with_fallback(
         logger.info(f"No results for albums {albums}, trying artist only: '{lib_artist}'")
         results = await db.search(query=lib_artist, limit=_FETCH_LIMIT)
         results = filter_results_by_artist(results, lib_artist)
-        results = _filter_results_by_album_match(results, parsed.album)
+        # LML#1391 is scoped to the song-bearing lane: a song may still
+        # confirm a floor-failing row, so rank instead of dropping. The
+        # songless lane keeps dropping (LML#1393 follow-up).
+        if parsed.song:
+            results = _partition_results_by_album_match(results, parsed.album)
+        else:
+            results = _filter_results_by_album_match(results, parsed.album)
         if results:
             return results, True
 

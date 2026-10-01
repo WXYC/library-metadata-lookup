@@ -4,13 +4,19 @@ Two ``token_set_ratio`` floors, each scoring a fallback row's catalog title
 against one request field:
 
 - the LML#400 album floor (``_ALBUM_MATCH_FLOOR``): does the row's title
-  plausibly name the typed **album**? ``_filter_results_by_album_match`` drops
-  the artist-fallback rows that do not.
+  plausibly name the typed **album**? The search layer ranks the song-bearing
+  fallback by it (``_partition_results_by_album_match``, LML#1391) and still
+  drops by it on the songless lane (``_filter_results_by_album_match``); step
+  3b and step 3a read the same primitive (``row_clears_album_floor``) to tell
+  "the typed album was found" from "it matched nothing".
 - the LML#717 song-as-album-title floor (``_SONG_AS_ALBUM_TITLE_FLOOR``): does
   the row's title name the typed **song**, i.e. did the listener type an album?
 
-Leaf module, no I/O. Moved verbatim out of ``lookup/matching.py`` and
-``lookup/validation.py``, both near their line ceilings.
+These decide ordering and found/not-found. Neither decides what a row may
+*serve*: that is the one serve rule in ``lookup/binding_floor.py``.
+
+Leaf module, no I/O. Extracted from ``lookup/matching.py`` and
+``lookup/validation.py`` at their line ceilings (LML#1391).
 """
 
 import logging
@@ -45,21 +51,55 @@ _ALBUM_MATCH_FLOOR = 80.0
 _SONG_AS_ALBUM_TITLE_FLOOR = 90.0
 
 
+def row_clears_album_floor(item: LibraryItem, album: str) -> bool:
+    """Does `item`'s title clear `_ALBUM_MATCH_FLOOR` against the typed `album`?
+
+    The one scoring primitive shared by `_partition_results_by_album_match`
+    (search-layer ranking) and `apply_track_validation_cascade` (LML#1391 —
+    telling "the typed album matched a shelf row" apart from "a song-bearing
+    row surfaced but the typed album still didn't match anything"), so the
+    two can't drift onto different floors for the same question.
+    """
+    norm_album = normalize_for_comparison(album)
+    title_norm = normalize_for_comparison(item.title or "")
+    return fuzz.token_set_ratio(norm_album, title_norm) >= _ALBUM_MATCH_FLOOR
+
+
+def _partition_results_by_album_match(
+    results: list[LibraryItem],
+    album: str | None,
+) -> list[LibraryItem]:
+    """Stable-partition artist-fallback rows by `row_clears_album_floor`:
+    floor-clearing rows first, the rest after, each group in its original
+    order. No-ops when `album` is empty or whitespace-only.
+
+    LML#1391, song-bearing lane only: a typed album that matched nothing must
+    not empty the artist's shelf when a song might still confirm one of its
+    rows. The #400 metadata-contamination guard this floor backed is the
+    serve rule in `lookup/binding_floor.py`, which withholds a row's release,
+    artwork and streaming links per row regardless of ranking.
+    The songless lane still drops via `_filter_results_by_album_match` below
+    (LML#1393 follow-up).
+    """
+    if not album or not album.strip():
+        return results
+    return sorted(results, key=lambda item: not row_clears_album_floor(item, album))
+
+
 def _filter_results_by_album_match(
     results: list[LibraryItem],
     album: str | None,
 ) -> list[LibraryItem]:
-    """Drop library rows whose title doesn't clear `_ALBUM_MATCH_FLOOR` against
-    the typed album. No-ops when `album` is empty or whitespace-only.
+    """Drop library rows whose title doesn't clear `row_clears_album_floor`
+    against the typed album. No-ops when `album` is empty or whitespace-only.
+
+    The songless counterpart to `_partition_results_by_album_match` — see its
+    docstring for why the song-bearing lane ranks instead of drops (LML#1391)
+    and the songless lane doesn't yet (LML#1393).
     """
     if not album or not album.strip():
         return results
-    norm_album = normalize_for_comparison(album)
-    kept: list[LibraryItem] = []
-    for item in results:
-        title_norm = normalize_for_comparison(item.title or "")
-        if fuzz.token_set_ratio(norm_album, title_norm) >= _ALBUM_MATCH_FLOOR:
-            kept.append(item)
+    kept = [item for item in results if row_clears_album_floor(item, album)]
     if len(kept) < len(results):
         logger.info(
             f"Album-match floor dropped {len(results) - len(kept)} of {len(results)} "
