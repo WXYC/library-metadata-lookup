@@ -446,6 +446,60 @@ async def test_golden_app_client_resets_the_shelf_fallback_back_channel(monkeypa
         assert corpus.last_shelf_fallback_rows() == 0
 
 
+@pytest.mark.asyncio
+async def test_last_shelf_fallback_rows_resets_before_a_second_request_on_the_same_client(
+    monkeypatch, golden_library_db, golden_discogs
+):
+    """The reset at the *start* of `_spying_perform_lookup` is what keeps the
+    back channel honest request-to-request on one client, not just on open.
+
+    Only the on-open reset (`test_golden_app_client_resets_the_shelf_fallback_back_channel`,
+    above) was pinned before this one -- removing the per-request reset
+    inside `_spying_perform_lookup` still passed the full suite, because on
+    the ordinary success path `response._shelf_fallback_rows` always
+    overwrites the global correctly regardless of whether it was pre-zeroed.
+    The reset only matters when the second call never reaches that
+    assignment at all: here the real `perform_lookup` is left in place for
+    the first (firing) request, then swapped for one that raises, so the
+    assignment line is skipped entirely and the router's own `except
+    Exception` turns the raise into a 500 -- the global is the only place
+    left that can tell the difference. Without the reset, it would still
+    read the first request's leftover row count instead of 0.
+    """
+    import lookup.orchestrator as orchestrator_module
+
+    real_perform_lookup = orchestrator_module.perform_lookup
+    calls = {"n": 0}
+
+    async def flaky_perform_lookup(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await real_perform_lookup(*args, **kwargs)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(orchestrator_module, "perform_lookup", flaky_perform_lookup)
+
+    firing_request = {
+        "artist": "Stereolab",
+        "album": "Not A Real Stereolab Album",
+        "raw_message": "Play Not A Real Stereolab Album by Stereolab",
+    }
+    non_firing_request = {
+        "artist": "A Totally Unshelved Artist",
+        "raw_message": "Play something by A Totally Unshelved Artist",
+    }
+
+    async with corpus.golden_app_client(golden_library_db, golden_discogs) as client:
+        firing_response = await client.post("/api/v1/lookup", json=firing_request)
+        assert firing_response.status_code == 200, firing_response.text
+        assert corpus.last_shelf_fallback_rows() > 0
+
+        failing_response = await client.post("/api/v1/lookup", json=non_firing_request)
+        assert failing_response.status_code == 500
+
+        assert corpus.last_shelf_fallback_rows() == 0
+
+
 def test_build_library_db_raises_on_a_row_missing_a_column(tmp_path):
     """A row missing an expected column must raise, not silently insert NULL.
 
