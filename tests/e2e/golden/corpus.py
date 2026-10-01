@@ -527,7 +527,10 @@ def result_identity(result: dict[str, Any]) -> str:
 #: across both consumers (the test tier's one sequential request per case,
 #: `scripts/rebaseline_golden_corpus.py`'s one request per case) because
 #: nothing reads it except the request that just set it, and xdist workers
-#: are separate processes with their own module state.
+#: are separate processes with their own module state. Reset to 0 when
+#: `golden_app_client` opens and again at the start of every request, so a
+#: request that never reaches `perform_lookup` cannot inherit an earlier
+#: case's count.
 _last_shelf_fallback_rows: int = 0
 
 
@@ -612,10 +615,13 @@ async def golden_app_client(library_db: Any, discogs: Any) -> AsyncIterator[Any]
 
     async def _spying_perform_lookup(*args: Any, **kwargs: Any) -> LookupResponse:
         global _last_shelf_fallback_rows
+        _last_shelf_fallback_rows = 0
         response = await _real_perform_lookup(*args, **kwargs)
         _last_shelf_fallback_rows = response._shelf_fallback_rows
         return response
 
+    global _last_shelf_fallback_rows
+    _last_shelf_fallback_rows = 0
     app.dependency_overrides[get_library_db] = lambda: library_db
     app.dependency_overrides[get_discogs_service] = lambda: discogs
     app.dependency_overrides[get_posthog_client] = lambda: None
