@@ -140,6 +140,32 @@ class TestObjectStoreContract:
         with pytest.raises(ObjectNotFoundError):
             await store.copy("nope.db", "library.db.previous")
 
+    @pytest.mark.asyncio
+    async def test_download_to_path_round_trips_the_object(self, store, tmp_path):
+        """The streaming read lands the same bytes ``get`` returns (LML#1407)."""
+        payload = bytes(range(256)) * 20_000  # ~5 MB, several copy chunks
+        await store.put("streaming_availability.db", payload)
+        dest = tmp_path / "scratch" / "fetched.db"
+        dest.parent.mkdir()
+        await store.download_to_path("streaming_availability.db", dest)
+        assert dest.read_bytes() == payload
+
+    @pytest.mark.asyncio
+    async def test_download_to_path_overwrites_the_destination(self, store, tmp_path):
+        await store.put("library.db", b"current")
+        dest = tmp_path / "scratch.db"
+        dest.write_bytes(b"left over from an earlier, longer download")
+        await store.download_to_path("library.db", dest)
+        assert dest.read_bytes() == b"current"
+
+    @pytest.mark.asyncio
+    async def test_download_to_path_missing_raises_object_not_found(self, store, tmp_path):
+        """Absence is the same signal ``get`` gives, and no file is left behind."""
+        dest = tmp_path / "scratch.db"
+        with pytest.raises(ObjectNotFoundError):
+            await store.download_to_path("missing.db", dest)
+        assert not dest.exists()
+
     def test_satisfies_runtime_protocol(self, store):
         assert isinstance(store, ObjectStore)
 
@@ -170,6 +196,17 @@ class TestLocalDirStore:
         """Keys must be bare filenames — a traversal attempt raises, not escapes."""
         with pytest.raises(ValueError):
             await local_store.get("../escape.db")
+
+    @pytest.mark.asyncio
+    async def test_download_to_path_missing_destination_dir_is_not_a_missing_object(
+        self, local_store, tmp_path
+    ):
+        """A bad destination must not be reported as an absent object (LML#1407)."""
+        await local_store.put("library.db", b"data")
+        with pytest.raises(FileNotFoundError):
+            await local_store.download_to_path(
+                "library.db", tmp_path / "no-such-dir" / "scratch.db"
+            )
 
     def test_exposes_base_dir(self, tmp_path):
         assert LocalDirStore(base_dir=tmp_path).base_dir == tmp_path
@@ -251,3 +288,77 @@ class TestS3ObjectStore:
         monkeypatch.setattr(s3_store._client, "get_object", _boom)
         with pytest.raises(ClientError):
             await s3_store.get("library.db")
+
+    @pytest.mark.asyncio
+    async def test_download_to_path_reads_the_body_in_bounded_chunks(
+        self, s3_store, tmp_path, monkeypatch
+    ):
+        """The object is never read whole: every body read is sized (LML#1407)."""
+        await s3_store.put("streaming_availability.db", b"x" * (3 * 1024 * 1024))
+        real_get_object = s3_store._client.get_object
+        read_sizes: list[int | None] = []
+
+        def _recording_get_object(*args, **kwargs):
+            resp = real_get_object(*args, **kwargs)
+            real_read = resp["Body"].read
+
+            def _read(amt=None):
+                read_sizes.append(amt)
+                return real_read(amt)
+
+            resp["Body"].read = _read
+            return resp
+
+        monkeypatch.setattr(s3_store._client, "get_object", _recording_get_object)
+        dest = tmp_path / "scratch.db"
+        await s3_store.download_to_path("streaming_availability.db", dest)
+
+        assert dest.stat().st_size == 3 * 1024 * 1024
+        assert len(read_sizes) > 1
+        assert all(amt is not None and 0 < amt <= 1024 * 1024 for amt in read_sizes)
+
+    @pytest.mark.asyncio
+    async def test_download_to_path_removes_a_partial_file_on_failure(
+        self, s3_store, tmp_path, monkeypatch
+    ):
+        """A read that dies midway leaves no half-written scratch file (LML#1407)."""
+        await s3_store.put("streaming_availability.db", b"x" * (3 * 1024 * 1024))
+        real_get_object = s3_store._client.get_object
+
+        def _failing_get_object(*args, **kwargs):
+            resp = real_get_object(*args, **kwargs)
+            real_read = resp["Body"].read
+            calls = 0
+
+            def _read(amt=None):
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    raise ConnectionError("stream dropped")
+                return real_read(amt)
+
+            resp["Body"].read = _read
+            return resp
+
+        monkeypatch.setattr(s3_store._client, "get_object", _failing_get_object)
+        dest = tmp_path / "scratch.db"
+        with pytest.raises(ConnectionError):
+            await s3_store.download_to_path("streaming_availability.db", dest)
+        assert not dest.exists()
+
+    @pytest.mark.asyncio
+    async def test_download_to_path_propagates_non_404_client_error(
+        self, s3_store, tmp_path, monkeypatch
+    ):
+        """A non-absence error (e.g. 403) must surface, not be masked as a miss."""
+        forbidden = ClientError(
+            {"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+            "GetObject",
+        )
+
+        def _boom(*args, **kwargs):
+            raise forbidden
+
+        monkeypatch.setattr(s3_store._client, "get_object", _boom)
+        with pytest.raises(ClientError):
+            await s3_store.download_to_path("library.db", tmp_path / "scratch.db")
