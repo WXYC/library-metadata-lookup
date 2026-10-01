@@ -431,6 +431,21 @@ async def test_fake_track_credit_matches_the_production_rule():
     assert substring == exact, "the bidirectional-substring title rule must apply, not equality"
 
 
+@pytest.mark.asyncio
+async def test_golden_app_client_resets_the_shelf_fallback_back_channel(monkeypatch):
+    """A count left over from an earlier case must never label the next one.
+
+    The back channel is a module global written only when the spy on
+    `perform_lookup` runs, so a 200 that never reaches it (or a client that
+    makes no request) would otherwise read the previous case's value and net
+    a real hit down to `miss_clean`.
+    """
+    monkeypatch.setattr(corpus, "_last_shelf_fallback_rows", 5)
+
+    async with corpus.golden_app_client(object(), object()):
+        assert corpus.last_shelf_fallback_rows() == 0
+
+
 def test_build_library_db_raises_on_a_row_missing_a_column(tmp_path):
     """A row missing an expected column must raise, not silently insert NULL.
 
