@@ -129,7 +129,7 @@ ABSENT_ARTIST_QUERIES: tuple[tuple[str, str], ...] = (
 #: hit through a different, narrower mechanism -- see each category below).
 #:
 #: - `"clean_miss"` -- the floor case. `search_library_with_fallback`'s
-#:   album-match rapidfuzz floor (`_ALBUM_MATCH_FLOOR`, `lookup/matching.py`,
+#:   album-match rapidfuzz floor (`_ALBUM_MATCH_FLOOR`, `lookup/fallback_title_floors.py`,
 #:   80.0) correctly rejects the typed album against every real title on the
 #:   shelf, so the query misses.
 #: - `"fuzzy_collision"` -- NOT the artist-only fallback, despite looking
@@ -164,7 +164,7 @@ ABSENT_ALBUM_QUERIES: tuple[tuple[str, str, str], ...] = (
 _ABSENT_ALBUM_NOTES: dict[str, str] = {
     "clean_miss": (
         "Seeded artist, album WXYC does not shelve. The album-match rapidfuzz "
-        "floor (_ALBUM_MATCH_FLOOR, lookup/matching.py) correctly rejects every "
+        "floor (_ALBUM_MATCH_FLOOR, lookup/fallback_title_floors.py) correctly rejects every "
         "real title on the shelf against the typed album, so this cleanly misses."
     ),
     "fuzzy_collision": (

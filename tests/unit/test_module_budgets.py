@@ -62,6 +62,13 @@ MODULE_BUDGETS: dict[str, int] = {
     # bind Discogs results". Three call sites, no import cycle. Do that
     # instead of raising this again.
     "lookup/artwork.py": 550,
+    # The two `token_set_ratio` floors over artist-fallback row titles (the
+    # LML#400 album floor with its drop helper, and the LML#717
+    # song-as-album-title floor), moved verbatim out of `lookup/matching.py`
+    # and `lookup/validation.py` to make room under both ceilings for LML#1391.
+    # On the `title_identity.py` precedent. 103 lines measured;
+    # 1.3x = 133.9 -> 150.
+    "lookup/fallback_title_floors.py": 150,
     # LML#1290 prep: `_resolve_fallback_artwork` + `_artwork_rungs` moved out of
     # `lookup/artwork.py` (524 -> 406) at the boundary this file's comment above
     # prescribed, rather than raising that budget a second time. 141 lines measured;
