@@ -578,3 +578,151 @@ class TestTheProfilerNeverBuildsThePool:
         assert built is sentinel
         assert deps.peek_discogs_pool() is sentinel
         assert asyncio.run(memory_profile._default_pool_getter()) is sentinel
+
+
+_MB = 1024 * 1024
+
+
+class TestRssBound:
+    """LML#1400: a ramp nobody is watching has to announce itself.
+
+    LML#1354's ramp ran for months and was found on the bill. The gauges line
+    is INFO, so it only helps someone already reading logs; the bound turns the
+    same RSS reading into one report per crossing.
+    """
+
+    @pytest.mark.parametrize(
+        "bound_mb, series, expected",
+        [
+            pytest.param(600, [200.0, 400.0, 599.9, 600.0], [], id="at-or-below-never-reports"),
+            pytest.param(600, [500.0, 650.0], [650.0], id="a-crossing-reports-once"),
+            pytest.param(600, [650.0, 700.0, 900.0], [650.0], id="staying-above-does-not-repeat"),
+            pytest.param(600, [650.0, 500.0, 620.0], [650.0, 620.0], id="re-arms-after-falling"),
+            pytest.param(600, [650.0, None, 700.0], [650.0], id="an-unreadable-sample-keeps-state"),
+            pytest.param(0, [5000.0], [], id="zero-disables"),
+        ],
+    )
+    def test_reports_on_the_crossing_not_on_every_sample(self, bound_mb, series, expected):
+        from core.memory_profile import RssBound
+
+        reported: list[tuple[float, int]] = []
+        bound = RssBound(bound_mb, report=lambda rss_mb, limit: reported.append((rss_mb, limit)))
+
+        for rss_mb in series:
+            bound.observe(rss_mb)
+
+        assert reported == [(rss_mb, bound_mb) for rss_mb in expected]
+
+    def test_a_failing_report_neither_raises_nor_repeats(self):
+        """An hourly sampler above the bound must not retry a broken reporter
+        every interval, and must not lose its own log line to one."""
+        from core.memory_profile import RssBound
+
+        calls: list[float] = []
+
+        def exploding_report(rss_mb: float, _limit: int) -> None:
+            calls.append(rss_mb)
+            raise RuntimeError("sentry is down")
+
+        bound = RssBound(600, report=exploding_report)
+        bound.observe(650.0)
+        bound.observe(700.0)
+
+        assert calls == [650.0]
+
+    def test_the_default_report_warns_and_sends_one_sentry_message(self, monkeypatch, caplog):
+        """WARNING records are breadcrumbs only under this service's Sentry
+        logging integration (event_level=ERROR), so the report sends an explicit
+        message an alert rule can key on. The text is constant so every crossing
+        groups into one issue; the numbers travel as context."""
+        sent: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            memory_profile.sentry_sdk,
+            "capture_message",
+            lambda message, level=None, **_kwargs: sent.append((message, level)),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="core.memory_profile"):
+            memory_profile.report_rss_over_bound(650.0, 600)
+
+        assert sent == [(memory_profile.RSS_OVER_BOUND_MESSAGE, "warning")]
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "650.0" in warnings[0].getMessage() and "600" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_report_once_feeds_the_bound_the_rss_it_logged(self, monkeypatch):
+        from core.memory_profile import RssBound, report_once
+
+        monkeypatch.setattr(memory_profile, "read_rss_bytes", lambda: 700 * _MB)
+        reported: list[tuple[float, int]] = []
+        bound = RssBound(600, report=lambda rss_mb, limit: reported.append((rss_mb, limit)))
+
+        for _ in range(2):
+            await report_once(
+                mode="gauges", top_n=5, previous=None, pool_getter=_none_pool, rss_bound=bound
+            )
+
+        assert reported == [(700.0, 600)]
+
+    @pytest.mark.asyncio
+    async def test_the_sampler_holds_one_bound_across_intervals(self, monkeypatch):
+        """The crossing state must outlive a single report, or every interval
+        above the bound would look like a fresh crossing."""
+        from core.memory_profile import run_sampler
+
+        monkeypatch.setattr(memory_profile, "read_rss_bytes", lambda: 700 * _MB)
+        reported: list[float] = []
+        monkeypatch.setattr(
+            memory_profile, "report_rss_over_bound", lambda rss_mb, _limit: reported.append(rss_mb)
+        )
+        slept: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+            if len(slept) >= 4:
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(
+            run_sampler(
+                mode="gauges",
+                interval_s=1,
+                top_n=5,
+                rss_warn_mb=600,
+                sleep=fake_sleep,
+                pool_getter=_none_pool,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(slept) == 4  # three completed reports, all above the bound
+        assert reported == [700.0]
+
+    @pytest.mark.asyncio
+    async def test_start_sampler_passes_the_configured_bound(self, monkeypatch):
+        from core.memory_profile import start_sampler, stop_sampler
+
+        seen: dict[str, object] = {}
+
+        async def fake_run_sampler(**kwargs):
+            seen.update(kwargs)
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(memory_profile, "run_sampler", fake_run_sampler)
+
+        task = start_sampler(Settings(lml_memory_profile_mode="gauges", lml_memory_rss_warn_mb=512))
+        assert task is not None
+        await asyncio.sleep(0)
+        await stop_sampler(task)
+
+        assert seen["rss_warn_mb"] == 512
+
+    def test_the_bound_defaults_on_and_rejects_negatives(self):
+        from pydantic import ValidationError
+
+        assert Settings().lml_memory_rss_warn_mb == 600
+        with pytest.raises(ValidationError):
+            Settings(lml_memory_rss_warn_mb=-1)
