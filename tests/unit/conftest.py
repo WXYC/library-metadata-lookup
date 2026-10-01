@@ -131,6 +131,29 @@ def override_deps(app, overrides):
 
 
 @pytest.fixture
+def unsized_upload_reads(monkeypatch) -> list[int]:
+    """Record every whole-file ``UploadFile.read()`` a handler makes (LML#1407).
+
+    Returns a list that gains one entry per read made without a positive size,
+    i.e. a read that pulls the entire upload into memory. Sized reads pass
+    through unrecorded. A handler that copies its upload in chunks leaves the
+    list empty.
+    """
+    from starlette.datastructures import UploadFile
+
+    real_read = UploadFile.read
+    unsized: list[int] = []
+
+    async def _recording_read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            unsized.append(size)
+        return await real_read(self, size)
+
+    monkeypatch.setattr(UploadFile, "read", _recording_read)
+    return unsized
+
+
+@pytest.fixture
 def mock_settings(monkeypatch):
     """Settings with safe test defaults (no real tokens/DSNs)."""
     monkeypatch.setenv("DISCOGS_TOKEN", "")

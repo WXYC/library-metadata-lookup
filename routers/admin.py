@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import shutil
 import sqlite3
 import tempfile
 from collections.abc import Iterator, Sequence
@@ -293,6 +294,25 @@ async def _send_streaming_webhooks(
     return results
 
 
+# How much of a database file a handler holds at once while moving it to or
+# from disk (LML#1407).
+_DB_COPY_CHUNK_BYTES = 1024 * 1024
+
+
+async def _save_upload(file: UploadFile, dest: Path) -> None:
+    """Copy an upload to ``dest`` a chunk at a time, off the event loop.
+
+    Reading the upload whole (``await file.read()``) put a database-sized buffer
+    in memory on every sync, and the process kept it afterwards (LML#1407).
+    """
+
+    def _copy() -> None:
+        with dest.open("wb") as out:
+            shutil.copyfileobj(file.file, out, _DB_COPY_CHUNK_BYTES)
+
+    await asyncio.to_thread(_copy)
+
+
 @router.post(
     "/upload-library-db",
     summary="Upload a new library.db file",
@@ -369,8 +389,7 @@ async def upload_library_db(
 
     # Write uploaded file to temp location
     try:
-        content = await file.read()
-        tmp_path.write_bytes(content)
+        await _save_upload(file, tmp_path)
     except Exception as e:
         logger.error(f"Failed to write uploaded file: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to write file: {e}") from e
@@ -573,11 +592,7 @@ async def upload_streaming_db(
         upload_tmp = tdir / "upload.tmp"
 
         try:
-            content = await file.read()
-            upload_tmp.write_bytes(content)
-            # Free the ~53MB upload buffer before we fetch the baseline object,
-            # which materializes another full copy in memory (LML memory pressure).
-            del content
+            await _save_upload(file, upload_tmp)
         except Exception as e:
             logger.error(f"Failed to write uploaded streaming DB: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to write file: {e}") from e
@@ -598,15 +613,14 @@ async def upload_streaming_db(
         # its next cycle. (Eventual rejection across cycles, not a lock across
         # concurrent uploads -- the two writers here, a weekly cron and a rare
         # manual run, are effectively non-concurrent.)
+        baseline_tmp = tdir / "baseline.db"
         try:
-            baseline_bytes = await object_store.get(STREAMING_DB_FILENAME)
+            await object_store.download_to_path(STREAMING_DB_FILENAME, baseline_tmp)
         except ObjectNotFoundError:
             # No stored object -> the first-upload baseline (all-zero coverage);
             # the regression check skips zero baselines, so the upload is accepted.
             old_cov = dict.fromkeys(_STREAMING_COVERAGE_METRICS, 0)
         else:
-            baseline_tmp = tdir / "baseline.db"
-            baseline_tmp.write_bytes(baseline_bytes)
             try:
                 old_cov = _streaming_coverage(baseline_tmp)
             except StreamingCoverageUnreadableError:
@@ -677,11 +691,6 @@ async def upload_streaming_db(
             "timestamp": datetime.now(UTC).isoformat(),
         }
     )
-
-
-# How much of a database file a handler holds at once while moving it to or
-# from disk (LML#1407).
-_DB_COPY_CHUNK_BYTES = 1024 * 1024
 
 
 def _iter_file_then_close(file: BinaryIO) -> Iterator[bytes]:

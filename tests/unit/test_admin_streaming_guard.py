@@ -310,6 +310,60 @@ class TestUploadStreamingGuard:
         assert self._volume_path(admin_settings).exists()
 
     @pytest.mark.asyncio
+    async def test_neither_the_upload_nor_the_baseline_is_read_whole(
+        self, tmp_path, admin_settings, monkeypatch, unsized_upload_reads
+    ):
+        """Both files reach disk in chunks, never as one in-memory buffer (LML#1407).
+
+        The handler used to ``await file.read()`` the whole upload and then
+        ``get`` the whole stored object as its baseline: two ~60MB buffers.
+        """
+        from main import app
+        from storage.object_store import LocalDirStore
+
+        async def _whole_object_get(self, key):
+            raise AssertionError(f"upload buffered the stored baseline via get({key!r})")
+
+        monkeypatch.setattr(LocalDirStore, "get", _whole_object_get)
+
+        _make_streaming_db(
+            self._volume_path(admin_settings), albums=100, apple=50, spotify=80, deezer=60
+        )
+        upload = tmp_path / "u.db"
+        # Enough rows that the file spans several copy chunks.
+        _make_streaming_db(upload, albums=30_000, apple=20_000, spotify=25_000, deezer=22_000)
+        assert upload.stat().st_size > 2 * 1024 * 1024
+
+        resp = await self._upload(app, admin_settings, upload)
+
+        assert resp.status_code == 200
+        assert unsized_upload_reads == []
+        assert self._volume_path(admin_settings).read_bytes() == upload.read_bytes()
+
+    @pytest.mark.asyncio
+    async def test_regression_against_a_streamed_baseline_is_still_rejected(
+        self, tmp_path, admin_settings, monkeypatch
+    ):
+        """The guard reads the same baseline it always did, just not through ``get``."""
+        from main import app
+        from storage.object_store import LocalDirStore
+
+        async def _whole_object_get(self, key):
+            raise AssertionError(f"upload buffered the stored baseline via get({key!r})")
+
+        monkeypatch.setattr(LocalDirStore, "get", _whole_object_get)
+
+        vol = self._volume_path(admin_settings)
+        _make_streaming_db(vol, albums=300, apple=288, spotify=200, deezer=150)
+        upload = tmp_path / "u.db"
+        _make_streaming_db(upload, albums=300, apple=0, spotify=200, deezer=150)
+
+        resp = await self._upload(app, admin_settings, upload)
+
+        assert resp.status_code == 409
+        assert _read_apple_count(vol) == 288
+
+    @pytest.mark.asyncio
     async def test_growth_allowed(self, tmp_path, admin_settings):
         from main import app
 

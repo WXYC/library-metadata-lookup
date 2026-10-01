@@ -167,6 +167,52 @@ class TestUploadLibraryDB:
         assert "timestamp" in body
 
     @pytest.mark.asyncio
+    async def test_upload_is_copied_in_chunks_and_stored_byte_for_byte(
+        self, tmp_path, admin_settings, unsized_upload_reads
+    ):
+        """A multi-megabyte catalog is never read into memory whole (LML#1407).
+
+        The handler used to ``await file.read()`` the entire upload (about 29MB
+        in production) before writing it out, and the process kept that memory
+        after the daily sync.
+        """
+        from main import app
+
+        db_file = tmp_path / "upload.db"
+        _make_valid_sqlite_db(db_file)
+        conn = sqlite3.connect(str(db_file))
+        conn.execute("CREATE TABLE padding (blob BLOB)")
+        conn.execute("INSERT INTO padding VALUES (randomblob(2500000))")  # several chunks
+        conn.commit()
+        conn.close()
+
+        mock_db = AsyncMock()
+        mock_db.is_available = AsyncMock(return_value=True)
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: None,
+                get_posthog_client: None,
+                get_settings: admin_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                with open(db_file, "rb") as f:
+                    resp = await client.post(
+                        "/admin/upload-library-db",
+                        headers={"Authorization": "Bearer test-secret-token"},
+                        files={"file": ("library.db", f, "application/octet-stream")},
+                    )
+
+        assert resp.status_code == 200
+        assert unsized_upload_reads == []
+        assert admin_settings.resolved_library_db_path.read_bytes() == db_file.read_bytes()
+
+    @pytest.mark.asyncio
     async def test_invalid_sqlite_file(self, tmp_path, admin_settings):
         """Upload a non-SQLite file and get 400."""
         from main import app
