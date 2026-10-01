@@ -148,6 +148,22 @@ async def search_library_with_fallback(
         return [], bool(parsed.song)
 
     if lib_artist and albums:
+        self_titled_rows: list[LibraryItem] = []
+        if is_self_titled_request_placeholder(parsed.album or "") and await runs_album_resolution(
+            parsed, db
+        ):
+            # LML#1405: the row titled the artist's own name never scores on
+            # word-overlap against a typed placeholder ("Epon."), so promote it
+            # separately rather than teaching search_one_album a new fold.
+            shelf = filter_results_by_artist(
+                await db.search(query=lib_artist, limit=_FETCH_LIMIT), lib_artist
+            )
+            lib_artist_folded = fold_punctuation_for_comparison(lib_artist.lower())
+            self_titled_rows = [
+                item
+                for item in shelf
+                if fold_punctuation_for_comparison((item.title or "").lower()) == lib_artist_folded
+            ]
 
         async def search_one_album(album: str) -> list[LibraryItem]:
             query = f"{lib_artist} {album}"
@@ -213,7 +229,15 @@ async def search_library_with_fallback(
                 )
 
             all_results.sort(key=sort_key, reverse=True)
+            if self_titled_rows:
+                promoted_ids = {item.id for item in self_titled_rows}
+                all_results = self_titled_rows + [
+                    item for item in all_results if item.id not in promoted_ids
+                ]
             return all_results, False
+
+        if self_titled_rows:
+            return self_titled_rows, False
 
         # When Discogs found albums but none matched the library, fall through to
         # artist+song and artist-only search.  filter_results_by_track_validation()
