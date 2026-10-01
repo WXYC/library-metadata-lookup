@@ -1,4 +1,4 @@
-"""Integration test for the artist-fallback album-match floor (LML#400).
+"""Integration test for the artist-fallback album-match floor (LML#400, LML#1391).
 
 End-to-end exercise of ``perform_lookup`` against a real (in-memory)
 ``LibraryDB`` with the seeded Nina Simone fixture (top-2 prod offender from
@@ -8,11 +8,15 @@ across 419 contaminated rows).
 When a DJ types a Nina Simone album that the WXYC library doesn't physically
 carry (e.g. "Wild Is the Wind") plus a song that Nina Simone DOES have on a
 DIFFERENT album in the library ("Sinnerman" → "Pastel Blues"), the
-artist-fallback cascade historically surfaced the wrong-album library row,
-and ``enrich_artwork_results`` then attached Pastel Blues' Discogs release
-year / Apple Music URL / Spotify URL / Discogs URL / artwork URL onto a
-flowsheet row tagged with album "Wild Is the Wind". The floor rejects the
-candidate before enrichment runs.
+artist-fallback cascade used to surface the wrong-album library row, and
+``enrich_artwork_results`` then attached Pastel Blues' Discogs release year /
+Apple Music URL / Spotify URL / Discogs URL / artwork URL onto a flowsheet
+row tagged with album "Wild Is the Wind". LML#400's fix dropped the candidate
+before enrichment ran — which meant a typed album matching nothing emptied
+the artist's whole shelf (LML#1391). Since then, LML#477/#487 moved the
+metadata guard to enrichment's serve gate, so the search layer (LML#1391) now
+ranks instead of drops: Pastel Blues surfaces (it's Nina Simone's only
+shelved row), but carries no Discogs-derived metadata.
 
 Companion to the unit tests in ``tests/unit/test_album_match_floor.py``.
 """
@@ -31,16 +35,16 @@ class TestAlbumMatchFloorIntegration:
     """Pin the #400 prod contamination shape against a real LibraryDB."""
 
     @pytest.mark.asyncio
-    async def test_nina_simone_wild_is_the_wind_does_not_surface_pastel_blues(self, library_db):
-        """The exact prod-evidence failure mode: artist matches the library but
-        the typed album doesn't, and the artist-fallback cascade would otherwise
-        contaminate the flowsheet row with a wrong-album Discogs release.
-
-        Library seed has Nina Simone / Pastel Blues only. Request types album
-        "Wild Is the Wind" + song "Sinnerman" —
-        token_set_ratio("Wild Is the Wind", "Pastel Blues") sits well below 80
-        (no shared significant tokens), so the candidate is dropped and the
-        response mirrors the unknown-artist shape.
+    async def test_nina_simone_wild_is_the_wind_surfaces_pastel_blues_without_metadata(
+        self, library_db
+    ):
+        """LML#1391: artist matches the library but the typed album doesn't —
+        the artist-fallback cascade must not empty the shelf. Library seed has
+        Nina Simone / Pastel Blues only; request types album "Wild Is the
+        Wind" + song "Sinnerman". Pastel Blues still surfaces (it's the only
+        Nina Simone row on the shelf), but with no Discogs-derived metadata:
+        the #400 contamination guard is enforced at enrichment now, not by
+        emptying the search result.
         """
         from wxyc_fastapi.observability import init_cache_stats
 
@@ -76,14 +80,15 @@ class TestAlbumMatchFloorIntegration:
             make_lml_telemetry(),
         )
 
-        # Floor dropped Pastel Blues → no library row surfaces. The response
-        # mirrors the unknown-artist shape and BS won't write any
-        # album-derived metadata onto the flowsheet row.
+        # The shelf survives (LML#1391) -- Pastel Blues is Nina Simone's only
+        # library row, so it comes back rather than an empty response.
+        assert response.song_not_found is True
         result_albums = [r.library_item.title for r in response.results]
-        assert "Pastel Blues" not in result_albums, (
-            "Wrong-album fallback leaked: Pastel Blues surfaced for typed album "
-            "'Wild Is the Wind'. This is the exact #400 prod contamination shape."
-        )
+        assert "Pastel Blues" in result_albums
+        pastel = next(r for r in response.results if r.library_item.title == "Pastel Blues")
+        # No album-derived metadata leaks onto the mismatched-album request
+        # (the #400 guard, now enforced at the enrichment serve gate).
+        assert pastel.artwork is None or pastel.artwork.release_id == 0
 
     @pytest.mark.asyncio
     async def test_nina_simone_pastel_blues_typed_correctly_still_surfaces(self, library_db):

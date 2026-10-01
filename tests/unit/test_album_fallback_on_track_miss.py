@@ -580,15 +580,22 @@ class TestSongBearingLibraryMissDegradesToAlbumMatch:
         assert response.search_type not in ("direct", "compilation")
 
     @pytest.mark.asyncio
-    async def test_crowd_out_shape_serves_the_typed_pair_alone(self, enable_nonlibrary_release):
-        """The artist's unrelated shelf albums were already album-floor-dropped
-        by ARTIST_PLUS_ALBUM (``_filter_results_by_album_match`` — the typed
-        album matches none of them), so the pre-fix response was EMPTY. The
-        degrade serves exactly the typed-pair answer."""
+    async def test_crowd_out_shape_serves_the_typed_pair_ahead_of_the_shelf(
+        self, enable_nonlibrary_release
+    ):
+        """LML#1391: ARTIST_PLUS_ALBUM's artist-only fallback no longer drops
+        the artist's unrelated shelf albums when the typed album matches none
+        of them (``_partition_results_by_album_match`` ranks, never drops) —
+        so ``state.results`` holds Jill Scott's real shelf when
+        TRACK_ON_COMPILATION degrades, and ``_unconfirmed_album_outcome`` merges
+        those rows in behind its answer (``Outcome.unconfirmed_album`` never
+        stashes). The degrade's row-less typed-pair answer still leads (it's the
+        best confirmed guess for the pair the DJ actually typed), with the
+        artist's shelf behind it rather than suppressed."""
         shape = REPRO_SHAPES[2].values[0]
         response = await self._run(shape)
         ids = [item.library_item.id for item in response.results]
-        assert ids == [ROWLESS_LIBRARY_ID]
+        assert ids == [ROWLESS_LIBRARY_ID, 71, 72]
 
 
 class TestUnconfirmedAlbumOutcome:

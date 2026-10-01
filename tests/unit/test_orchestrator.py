@@ -1125,6 +1125,75 @@ class TestPerformLookupAlbumResolution:
 # ---------------------------------------------------------------------------
 
 
+_SHELF_RELEASES = {"DOGA": 111, "Halo": 222, "Segundo": 333}
+
+
+def _shelf_releases_by_title(mock_discogs_service: AsyncMock, *, song_release_id: int) -> None:
+    """Give each Juana Molina shelf row its OWN Discogs release (``_SHELF_RELEASES``,
+    each with real artwork) -- what step 4 binds by row title -- and confirm the
+    requested song only on ``song_release_id``."""
+
+    async def _search(request: object, *_: object, **__: object) -> DiscogsSearchResponse:
+        album = getattr(request, "album", None)
+        if album not in _SHELF_RELEASES:
+            return DiscogsSearchResponse(results=[])
+        release_id = _SHELF_RELEASES[album]
+        return DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=release_id,
+                    album=album,
+                    artist="Juana Molina",
+                    artwork_url=f"https://example.com/{release_id}.jpg",
+                )
+            ]
+        )
+
+    mock_discogs_service.search.side_effect = _search
+    mock_discogs_service.validate_track_on_release.side_effect = lambda release_id, *_a, **_k: (
+        release_id == song_release_id
+    )
+
+
+def _artist_only_shelf(artist: str, shelf: list[LibraryItem]):
+    """A ``LibraryDB.search`` side effect that answers only the artist-only query.
+
+    Keyed by query rather than call order: after LML#1392 a self-titled
+    placeholder album ("Epon.") also takes step 2's literal-title guard, which
+    issues the same artist-only query.
+    """
+
+    async def _search(query: str, *_: object, **__: object) -> list[LibraryItem]:
+        return list(shelf) if query.lower() == artist.lower() else []
+
+    return _search
+
+
+# LML#1391 typed-album misses: a self-titled placeholder (which takes step 2
+# after LML#1392 and misses there) and a title that is neither.
+_TYPED_ALBUM_MISSES = ["Epon.", "Zzyzx Road"]
+
+
+def _assert_only_the_song_bearing_row_is_bound(response: LookupResponse) -> None:
+    """The serve rule on the Juana Molina shelf, per row: step 3b confirmed the
+    song on DOGA's release (111), which is the right metadata for the track
+    whatever album was typed, so that row keeps it. The other rows fail the typed
+    album with nothing to vouch for them (LML#400), so they serve no release."""
+    doga, *rest = response.results
+    assert doga.library_item.title == "DOGA"
+    assert doga.artwork is not None
+    assert doga.artwork.release_id == 111
+    assert rest and all(_carries_no_row_binding(r) for r in rest)
+
+
+def _carries_no_row_binding(result: object) -> bool:
+    """LML#400: a row whose title fails the typed album serves no release of its own."""
+    artwork = getattr(result, "artwork", None)
+    return artwork is None or (
+        artwork.release_id == 0 and artwork.artwork_url is None and artwork.release_year is None
+    )
+
+
 class TestPerformLookupFallback:
     """Test fallback behavior when exact match isn't found."""
 
@@ -1203,6 +1272,375 @@ class TestPerformLookupFallback:
         assert response.song_not_found is False
         assert len(response.results) == 1
         assert response.results[0].library_item.title == "A Night at the Opera"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("typed_album", _TYPED_ALBUM_MISSES)
+    async def test_typed_album_matching_nothing_surfaces_whole_shelf_song_first(
+        self, mock_library_db, mock_discogs_service, telemetry, typed_album
+    ):
+        """LML#1391: a typed album that matches no library title must not empty
+        the artist fallback. "la paradoja" by Juana Molina / "Epon." (a typed
+        album that matches nothing on her shelf) should surface every Juana
+        Molina album the library holds, with the song-confirmed one first, and
+        the response must still read as "album not found, here are others" --
+        not as a confirmed direct hit.
+        """
+        # The song-bearing row (DOGA) is filed LAST, so only step-3b's reorder
+        # can put it first.
+        shelf = [
+            make_library_item(id=2, artist="Juana Molina", title="Halo", call_letters="M"),
+            make_library_item(id=3, artist="Juana Molina", title="Segundo", call_letters="M"),
+            make_library_item(id=1, artist="Juana Molina", title="DOGA", call_letters="M"),
+        ]
+        mock_library_db.find_similar_artist.return_value = None
+        # Only the artist-only query finds rows: neither "Juana Molina <album>"
+        # nor "Juana Molina la paradoja" does.
+        mock_library_db.search.side_effect = _artist_only_shelf("Juana Molina", shelf)
+        # Discogs confirms "la paradoja" only on "DOGA" (release 111).
+        _shelf_releases_by_title(mock_discogs_service, song_release_id=111)
+
+        request = LookupRequest(
+            artist="Juana Molina",
+            song="la paradoja",
+            album=typed_album,
+            raw_message=f"la paradoja - Juana Molina - {typed_album}",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        # The whole shelf survives, song-confirmed row first.
+        assert [r.library_item.title for r in response.results] == ["DOGA", "Halo", "Segundo"]
+        # The typed album still wasn't found -- this isn't a confirmed match.
+        assert response.song_not_found is True
+        assert response.search_type != "direct"
+        assert response.context_message == (
+            f'"{typed_album}" not found in the library, but here are other albums by Juana Molina:'
+        )
+        _assert_only_the_song_bearing_row_is_bound(response)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("typed_album", _TYPED_ALBUM_MISSES)
+    async def test_typed_album_miss_shelf_serves_only_the_confirmed_row_when_enrichment_is_shed(
+        self, mock_library_db, mock_discogs_service, telemetry, typed_album
+    ):
+        """LML#1391 review round 2 / LML#400: the degraded tail-shed response.
+
+        Step 4 binds each shelf row to its OWN Discogs release by row title; the
+        LML#477 serve gate runs only in step 4b. A breaker shed between the two
+        hands ``_build_degraded_response`` the raw step-4 pairs, so without the
+        response-assembly chokepoint every floor-failing row reached the wire
+        with its own release_id and artwork. The chokepoint applies the same
+        serve rule the happy path does: only the row the song was confirmed on
+        keeps its release.
+        """
+        shelf = [
+            make_library_item(id=2, artist="Juana Molina", title="Halo", call_letters="M"),
+            make_library_item(id=3, artist="Juana Molina", title="Segundo", call_letters="M"),
+            make_library_item(id=1, artist="Juana Molina", title="DOGA", call_letters="M"),
+        ]
+        mock_library_db.find_similar_artist.return_value = None
+        mock_library_db.search.side_effect = _artist_only_shelf("Juana Molina", shelf)
+        _shelf_releases_by_title(mock_discogs_service, song_release_id=111)
+
+        request = LookupRequest(
+            artist="Juana Molina",
+            song="la paradoja",
+            album=typed_album,
+            raw_message=f"la paradoja - Juana Molina - {typed_album}",
+        )
+
+        with (
+            patch(
+                "lookup.orchestrator.lookup_releases_by_track",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "lookup.orchestrator.enrich_artwork_results",
+                new_callable=AsyncMock,
+                side_effect=DiscogsBreakerOpenError("open"),
+            ),
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.degraded is True
+        assert [r.library_item.title for r in response.results] == ["DOGA", "Halo", "Segundo"]
+        _assert_only_the_song_bearing_row_is_bound(response)
+        assert response.results[0].artwork.artwork_url == "https://example.com/111.jpg"
+
+    @pytest.mark.asyncio
+    async def test_unshelved_placeholder_leads_with_the_artist_named_row_and_its_release(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#1392 + LML#1391: "Epon." names nothing on this shelf, so step 2
+        resolves it and the artist-named row leads as a direct match. Its title
+        ("Jessica Pratt") scores nothing against the typed "Epon.", so only the
+        step-3b track confirmation lets it serve its own release."""
+        shelf = [
+            make_library_item(id=1, artist="Jessica Pratt", title="On Your Own Love Again"),
+            make_library_item(id=2, artist="Jessica Pratt", title="Jessica Pratt"),
+        ]
+        releases = {"On Your Own Love Again": 701, "Jessica Pratt": 702}
+
+        async def _library_search(query: str, *_: object, **__: object) -> list[LibraryItem]:
+            if query.lower() == "jessica pratt":
+                return list(shelf)
+            album_leg = query.lower().removeprefix("jessica pratt ")
+            return [row for row in shelf if row.title.lower() == album_leg]
+
+        async def _discogs_search(request: object, *_: object, **__: object):
+            album = getattr(request, "album", None)
+            if album not in releases:
+                return DiscogsSearchResponse(results=[])
+            return DiscogsSearchResponse(
+                results=[
+                    make_discogs_result(
+                        release_id=releases[album],
+                        album=album,
+                        artist="Jessica Pratt",
+                        artwork_url=f"https://example.com/{releases[album]}.jpg",
+                    )
+                ]
+            )
+
+        mock_library_db.find_similar_artist.return_value = None
+        mock_library_db.search.side_effect = _library_search
+        mock_discogs_service.search.side_effect = _discogs_search
+        # "Night Faces" is on the self-titled record (702) only.
+        mock_discogs_service.validate_track_on_release.side_effect = lambda release_id, *_a, **_k: (
+            release_id == 702
+        )
+
+        request = LookupRequest(
+            artist="Jessica Pratt",
+            song="Night Faces",
+            album="Epon.",
+            raw_message="Night Faces - Jessica Pratt - Epon.",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[
+                ("Jessica Pratt", "On Your Own Love Again"),
+                ("Jessica Pratt", "Jessica Pratt"),
+            ],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.search_type == "direct"
+        assert response.song_not_found is False
+        lead = response.results[0]
+        assert lead.library_item.title == "Jessica Pratt"
+        assert lead.artwork is not None
+        assert lead.artwork.release_id == 702
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "breaker_open",
+        [
+            pytest.param(False, id="song-is-not-on-the-shelf-rows"),
+            pytest.param(True, id="breaker-open-validation-could-not-ask"),
+        ],
+    )
+    async def test_unconfirmed_shelf_never_rides_a_shelved_compilation_hit(
+        self, mock_library_db, mock_discogs_service, telemetry, breaker_open
+    ):
+        """LML#1391 / LML#400: ranking (not dropping) floor-failing fallback rows
+        must not let them into the compilation tier.
+
+        TRACK_ON_COMPILATION stashes the prior artist-fallback rows and step 3b
+        prepends the ones it validates ahead of the compilation. A row that
+        fails the typed album and that validation did not confirm -- because the
+        song is not on it, or because the Discogs breaker shed the probe and the
+        row was only *kept* -- has nothing vouching for its release, so it is
+        never promoted and never serves that release. Before LML#1391 the album
+        floor emptied this stash, so the response was the compilation alone; it
+        must stay that way.
+        """
+        shelf = [
+            make_library_item(id=31, artist="Juana Molina", title="Halo", call_letters="M"),
+            make_library_item(id=32, artist="Juana Molina", title="Segundo", call_letters="M"),
+        ]
+        comp = make_library_item(
+            id=40,
+            artist="Various Artists - Rock - B",
+            title="Buenos Aires Underground",
+            call_letters="V",
+        )
+
+        async def _search(query: str, *_: object, **__: object) -> list:
+            q = query.lower()
+            if "buenos aires underground" in q:
+                return [comp]
+            if q == "juana molina":
+                return shelf  # artist-only fallback: ranked, not dropped
+            return []
+
+        async def _discogs_search(request: object, *_: object, **__: object):
+            # Every shelf probe would bind a confident release with real artwork:
+            # the worst case for a leak if a shelf row reached the response.
+            if breaker_open and getattr(request, "album", None) in {"Halo", "Segundo"}:
+                raise DiscogsBreakerOpenError("open")
+            return DiscogsSearchResponse(
+                results=[
+                    make_discogs_result(
+                        release_id=9999,
+                        album="Halo",
+                        artist="Juana Molina",
+                        artwork_url="https://example.com/halo.jpg",
+                    )
+                ]
+            )
+
+        mock_library_db.find_similar_artist.return_value = None
+        mock_library_db.search.side_effect = _search
+        mock_discogs_service.search.side_effect = _discogs_search
+        _confirm_wave_a_release(
+            mock_discogs_service,
+            DiscogsReleaseInfo(
+                album="Buenos Aires Underground",
+                artist="Various Artists",
+                release_id=58611,
+                release_url="https://www.discogs.com/release/58611",
+                is_compilation=True,
+            ),
+        )
+        # The song is on the compilation only -- not on Halo's release (9999).
+        mock_discogs_service.validate_track_on_release = AsyncMock(
+            side_effect=lambda release_id, *_a, **_k: release_id == 58611
+        )
+
+        request = LookupRequest(
+            artist="Juana Molina",
+            song="la paradoja",
+            album="Zzyzx Road",
+            raw_message="la paradoja - Juana Molina - Zzyzx Road",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.search_type == "compilation"
+        assert response.found_on_compilation is True
+        assert [r.library_item.title for r in response.results] == ["Buenos Aires Underground"]
+        # No shelf row's own release (id 9999, halo.jpg) reaches the wire.
+        assert all(r.artwork is None or r.artwork.release_id != 9999 for r in response.results)
+        # ...and the compilation hit keeps its own validated binding (LML#684).
+        assert response.results[0].artwork is not None
+        assert response.results[0].artwork.release_id == 58611
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("breaker_open", "titles", "release_ids"),
+        [
+            pytest.param(
+                False, ["Kind of Blue", "Jazz Moods"], [1111, 58611], id="song-confirmed-on-it"
+            ),
+            pytest.param(True, ["Jazz Moods"], [58611], id="breaker-open-unconfirmed"),
+        ],
+    )
+    async def test_edition_name_request_leads_with_the_track_confirmed_shelf_row(
+        self, mock_library_db, mock_discogs_service, telemetry, breaker_open, titles, release_ids
+    ):
+        """LML#1391 round 4: one serve rule decides both what leads a compilation
+        response and what the response chokepoint strips.
+
+        "Kind of Blue" is only a token subset of the typed "Kind of Blue Legacy
+        Edition" (``token_set_ratio`` 100, the serve gate's ``score_match``
+        61.5), so its title alone cannot serve. With the song confirmed on its
+        release (1111) the row leads the response with that release, as on main:
+        a track-confirmed release is the right metadata for the track. With the
+        breaker open nothing confirmed it, so it is not promoted ahead of the
+        shelved compilation and its release never reaches the wire.
+        """
+        shelf = [
+            make_library_item(id=51, artist="Miles Davis", title="Kind of Blue", call_letters="D"),
+            make_library_item(
+                id=52, artist="Miles Davis", title="Sketches of Spain", call_letters="D"
+            ),
+        ]
+        comp = make_library_item(
+            id=60, artist="Various Artists - Jazz - J", title="Jazz Moods", call_letters="V"
+        )
+
+        async def _search(query: str, *_: object, **__: object) -> list:
+            q = query.lower()
+            if "jazz moods" in q:
+                return [comp]
+            if q == "miles davis":
+                return shelf
+            return []
+
+        async def _discogs_search(request: object, *_: object, **__: object):
+            if breaker_open and getattr(request, "album", None) in {
+                "Kind of Blue",
+                "Sketches of Spain",
+            }:
+                raise DiscogsBreakerOpenError("open")
+            return DiscogsSearchResponse(
+                results=[
+                    make_discogs_result(
+                        release_id=1111,
+                        album="Kind of Blue",
+                        artist="Miles Davis",
+                        artwork_url="https://example.com/1111.jpg",
+                    )
+                ]
+            )
+
+        mock_library_db.find_similar_artist.return_value = None
+        mock_library_db.search.side_effect = _search
+        mock_discogs_service.search.side_effect = _discogs_search
+        _confirm_wave_a_release(
+            mock_discogs_service,
+            DiscogsReleaseInfo(
+                album="Jazz Moods",
+                artist="Various Artists",
+                release_id=58611,
+                release_url="https://www.discogs.com/release/58611",
+                is_compilation=True,
+            ),
+        )
+
+        request = LookupRequest(
+            artist="Miles Davis",
+            song="So What",
+            album="Kind of Blue Legacy Edition",
+            raw_message="So What - Miles Davis - Kind of Blue Legacy Edition",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.search_type == "compilation"
+        assert [r.library_item.title for r in response.results] == titles
+        assert [r.artwork.release_id for r in response.results if r.artwork] == release_ids
+        if not breaker_open:
+            assert response.results[0].artwork.artwork_url == "https://example.com/1111.jpg"
 
     @pytest.mark.asyncio
     async def test_promotes_album_known_to_contain_track_from_local_cache(

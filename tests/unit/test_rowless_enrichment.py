@@ -236,8 +236,8 @@ class TestRowlessEnrichmentSplit:
         assert enriched.artist_image_url is None
 
     @pytest.mark.asyncio
-    async def test_found_on_compilation_rowbacked_mismatch_keeps_release(self):
-        """LML#684: a row-*backed* found_on_compilation result whose release title
+    async def test_track_confirmed_rowbacked_mismatch_keeps_release(self):
+        """LML#684: a row-*backed* track-confirmed result whose release title
         differs from the typed album must KEEP its validated release identity (and
         album-derived payload) — NOT collapse to the BS#1185 release_id=0 sentinel.
 
@@ -248,9 +248,10 @@ class TestRowlessEnrichmentSplit:
         as the row-less carry-through bypass above, just for an in-library row.
 
         Identical inputs to ``test_rowbacked_album_mismatch_still_suppresses_album_payload``
-        (a real ``id`` + an album that mismatches the release title); only
-        ``found_on_compilation=True`` is added — so this is its mirror image, and
-        together they pin that the exemption keys exactly on that flag.
+        (a real ``id`` + an album that mismatches the release title); only the
+        row's id in ``track_confirmed_ids`` is added — so this is its mirror
+        image, and together they pin that the exemption keys exactly on the
+        row's own confirmation (per row since LML#1391, never response-wide).
         """
         item = make_library_item(id=999, artist=ARTIST, title=RELEASE_TITLE)
         artwork = make_discogs_result(release_id=RELEASE_ID, artist=ARTIST, album=RELEASE_TITLE)
@@ -266,7 +267,7 @@ class TestRowlessEnrichmentSplit:
             album=MISMATCHED_ALBUM,
             artist=ARTIST,
             extended=True,
-            found_on_compilation=True,
+            track_confirmed_ids=frozenset({item.id}),
         )
 
         _, enriched = results[0]

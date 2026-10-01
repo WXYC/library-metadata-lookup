@@ -721,7 +721,7 @@ class TestRunBandcampLiveProbeGatesDirect:
             "request_artist_stripped": _ARTIST,
             "artist_identity_split_enabled": False,
             "extended": False,
-            "found_on_compilation": False,
+            "track_confirmed_ids": frozenset(),
             "spine_deadline": None,
         }
         defaults.update(overrides)

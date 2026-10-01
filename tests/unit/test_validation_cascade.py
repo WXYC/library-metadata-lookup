@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from config.settings import get_settings
+from discogs.breaker import DiscogsBreakerOpenError
+from discogs.models import DiscogsSearchResponse
 from entity.sources import PgSource
 from lookup.release_resolution import ResolvedRelease
 from lookup.rowless import ROWLESS_LIBRARY_ID, _make_rowless_item
@@ -21,8 +23,9 @@ from lookup.validation import (
     Step3bResult,
     _rebind_rowless_release_via_override,
     apply_track_validation_cascade,
+    filter_results_by_track_validation,
 )
-from tests.factories import make_library_item
+from tests.factories import make_discogs_result, make_library_item
 
 
 @pytest.mark.asyncio
@@ -826,3 +829,205 @@ class TestRebindCarriesTheResolvedRelease:
         """LML#1332 finding 3: the probe already fetched this pin."""
         result = await self._rebind()
         assert result.release_overrides == {BROADCAST_ITEM.id: BROADCAST_RELEASE_ID}
+
+
+@pytest.mark.asyncio
+class TestArtistFallbackAlbumFloorCascade:
+    """LML#1391: the ``album`` param distinguishes "typed album confirmed on a
+    validated row" from "a song-bearing row surfaced but the typed album
+    still matched nothing" — the cascade must not conflate the two just
+    because validation confirmed *something*.
+    """
+
+    async def test_typed_album_confirmed_via_fallback_is_still_a_found_match(self):
+        """LML#1391 review case 1: the typed album IS on the shelf (reachable
+        only through the artist fallback, e.g. a punctuation/whitespace miss
+        on the direct album-leg search) and validation confirms the song on
+        it. That must report as found, not as "other albums by X" — a
+        confirmed match on the album the DJ typed is not a miss.
+        """
+        aquemini_remastered = make_library_item(id=1, title="Aquemini (Remastered)")
+        stankonia = make_library_item(id=2, title="Stankonia")
+        with patch(
+            "lookup.validation.filter_results_by_track_validation",
+            new_callable=AsyncMock,
+            return_value=[aquemini_remastered],
+        ):
+            result = await apply_track_validation_cascade(
+                real_results=[aquemini_remastered, stankonia],
+                library_results=[aquemini_remastered, stankonia],
+                found_on_compilation=False,
+                song_not_found=True,
+                discogs_titles={},
+                artist_fallback_results=[],
+                song="Rosa Parks",
+                artist="Outkast",
+                match_artist="Outkast",
+                db=object(),
+                discogs_service=object(),
+                allow_release_resolution_fallback=True,
+                album="Aquemini",
+            )
+
+        assert result == Step3bResult([aquemini_remastered], False, {})
+
+    async def test_validated_row_that_still_misses_the_typed_album_stays_not_found(self):
+        """LML#1391 review case 2: a single-row shelf validates the song, but
+        that row's title doesn't clear the album floor against the typed
+        album. Row count alone (1 validated == 1 real result) must not read
+        as a confirmed direct hit -- the typed album still wasn't found.
+        """
+        pastel_blues = make_library_item(id=1, title="Pastel Blues")
+        with patch(
+            "lookup.validation.filter_results_by_track_validation",
+            new_callable=AsyncMock,
+            return_value=[pastel_blues],
+        ):
+            result = await apply_track_validation_cascade(
+                real_results=[pastel_blues],
+                library_results=[pastel_blues],
+                found_on_compilation=False,
+                song_not_found=True,
+                discogs_titles={},
+                artist_fallback_results=[],
+                song="Sinnerman",
+                artist="Nina Simone",
+                match_artist="Nina Simone",
+                db=object(),
+                discogs_service=object(),
+                allow_release_resolution_fallback=True,
+                album="Wild Is the Wind",
+            )
+
+        assert result == Step3bResult([pastel_blues], True, {})
+
+
+_KIND_OF_BLUE = make_library_item(id=51, artist="Miles Davis", title="Kind of Blue")
+_SKETCHES = make_library_item(id=52, artist="Miles Davis", title="Sketches of Spain")
+_JAZZ_MOODS = make_library_item(id=60, artist="Various Artists - Jazz - J", title="Jazz Moods")
+_SHELF_RELEASE_IDS = {"Kind of Blue": 1111, "Sketches of Spain": 2222}
+
+
+def _discogs_for_shelf(*, breaker_open: bool = False) -> AsyncMock:
+    """A Discogs service that finds each Miles Davis shelf row's own release, or
+    sheds every probe when the saturation breaker is open."""
+
+    async def _search(request: object, *_: object, **__: object) -> DiscogsSearchResponse:
+        if breaker_open:
+            raise DiscogsBreakerOpenError("open")
+        album = getattr(request, "album", "")
+        return DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=_SHELF_RELEASE_IDS[album], album=album, artist="Miles Davis"
+                )
+            ]
+        )
+
+    service = AsyncMock()
+    service.search.side_effect = _search
+    return service
+
+
+def _so_what_is_on(*release_ids: int):
+    """Patch the tracklist check so the song is confirmed on exactly ``release_ids``."""
+
+    async def _validate(_service: object, release_id: int, *_: object, **__: object) -> bool:
+        return release_id in release_ids
+
+    return patch("lookup.validation.validate_release_for_track", side_effect=_validate)
+
+
+@pytest.mark.asyncio
+class TestTrackConfirmationDecidesWhatStep3bPromotes:
+    """LML#1391 round 4: step 3b reports which rows the song was *confirmed* on
+    (a breaker-shed row is kept, not confirmed), and the compilation tier
+    prepends only the stash rows the serve rule would let keep a binding."""
+
+    async def test_confirmed_ids_exclude_rows_kept_on_a_breaker_shed(self):
+        confirmed: set[int] = set()
+        with _so_what_is_on(1111):
+            validated = await filter_results_by_track_validation(
+                [_KIND_OF_BLUE, _SKETCHES],
+                "So What",
+                "Miles Davis",
+                _discogs_for_shelf(),
+                confirmed_ids=confirmed,
+            )
+        assert validated == [_KIND_OF_BLUE]
+        assert confirmed == {_KIND_OF_BLUE.id}
+
+        shed_confirmed: set[int] = set()
+        kept = await filter_results_by_track_validation(
+            [_KIND_OF_BLUE, _SKETCHES],
+            "So What",
+            "Miles Davis",
+            _discogs_for_shelf(breaker_open=True),
+            confirmed_ids=shed_confirmed,
+        )
+        assert kept == [_KIND_OF_BLUE, _SKETCHES]
+        assert shed_confirmed == set()
+
+    @pytest.mark.parametrize(
+        ("album", "breaker_open", "leading", "confirmed"),
+        [
+            # The edition-name request: the title is only a token subset of the
+            # typed album, but the song is confirmed on it, so it leads.
+            pytest.param("Kind of Blue Legacy Edition", False, [_KIND_OF_BLUE], {51}, id="confirmed"),
+            pytest.param("Zzyzx Road", False, [_KIND_OF_BLUE], {51}, id="album-miss-confirmed"),
+            # Breaker open: validation could not confirm, and neither title
+            # clears the typed album, so nothing is promoted ahead of the comp.
+            pytest.param("Kind of Blue Legacy Edition", True, [], set(), id="unconfirmed-subset"),
+            pytest.param("Zzyzx Road", True, [], set(), id="unconfirmed-album-miss"),
+            # A shed row whose title IS the typed album still leads (LML#755).
+            pytest.param("Kind of Blue", True, [_KIND_OF_BLUE], set(), id="unconfirmed-title-match"),
+            pytest.param(None, True, [_KIND_OF_BLUE, _SKETCHES], set(), id="unconfirmed-no-album"),
+        ],
+    )  # fmt: skip
+    async def test_compilation_tier_prepends_only_rows_the_serve_rule_keeps(
+        self, album, breaker_open, leading, confirmed
+    ):
+        with _so_what_is_on(1111):
+            result = await apply_track_validation_cascade(
+                real_results=[_JAZZ_MOODS],
+                library_results=[_JAZZ_MOODS],
+                found_on_compilation=True,
+                song_not_found=False,
+                discogs_titles={},
+                artist_fallback_results=[_KIND_OF_BLUE, _SKETCHES],
+                song="So What",
+                artist="Miles Davis",
+                match_artist="Miles Davis",
+                db=object(),
+                discogs_service=_discogs_for_shelf(breaker_open=breaker_open),
+                allow_release_resolution_fallback=True,
+                album=album,
+            )
+
+        assert result.library_results == [*leading, _JAZZ_MOODS]
+        assert result.track_validated_ids == confirmed
+        assert result.found_on_compilation is None
+
+    async def test_fallback_tier_reports_the_rows_it_confirmed(self):
+        """The #1391 shape: the typed album matched nothing, the whole shelf
+        rides, and only the song-bearing row is reported as confirmed."""
+        with _so_what_is_on(1111):
+            result = await apply_track_validation_cascade(
+                real_results=[_SKETCHES, _KIND_OF_BLUE],
+                library_results=[_SKETCHES, _KIND_OF_BLUE],
+                found_on_compilation=False,
+                song_not_found=True,
+                discogs_titles={},
+                artist_fallback_results=[],
+                song="So What",
+                artist="Miles Davis",
+                match_artist="Miles Davis",
+                db=object(),
+                discogs_service=_discogs_for_shelf(),
+                allow_release_resolution_fallback=True,
+                album="Zzyzx Road",
+            )
+
+        assert result.library_results == [_KIND_OF_BLUE, _SKETCHES]
+        assert result.song_not_found is True
+        assert result.track_validated_ids == {_KIND_OF_BLUE.id}

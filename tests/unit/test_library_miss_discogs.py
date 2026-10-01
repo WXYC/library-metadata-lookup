@@ -34,6 +34,7 @@ from lookup.orchestrator import perform_lookup
 from lookup.strategies.library_miss import (
     _library_miss_discogs_search,
     fallback_rows_block_serving,
+    song_bearing_fallback_all_floor_failed,
 )
 from services.parser import MessageType, ParsedRequest
 from tests.conftest import make_lml_telemetry
@@ -2105,3 +2106,167 @@ class TestServeBlockedOutcomeTelemetry:
         assert "library_miss_no_discogs_match" not in recorded, (
             "the classic slice must keep meaning 'the library returned nothing'"
         )
+
+
+class TestSongBearingFloorBlockedGate:
+    """perform_lookup wiring for the song-bearing floor-blocked gate (LML#1391/#717).
+
+    The Lone / "Galaxy Garden" shape from the golden corpus
+    (``lml717-lone-galaxy-garden``): the library shelves two OTHER Lone
+    albums, neither of which clears the typed-album floor, and the real
+    "Galaxy Garden" is a non-library Discogs release. Pre-fix, the
+    song-bearing artist-only fallback's ranked (not dropped) shelf rows closed
+    the step-3a gate, so the probe that resolves the real release never ran.
+    """
+
+    @staticmethod
+    def _search_side_effect(artist_only_rows, artist_key="lone"):
+        """db.search stub: only the bare artist-only fallback query hits;
+        every artist+album, artist+song, and keyword query misses."""
+
+        async def _search(query: str, limit: int = 10, **kwargs):
+            if query.strip().lower() == artist_key:
+                return list(artist_only_rows)
+            return []
+
+        return _search
+
+    @pytest.mark.asyncio
+    async def test_unrelated_shelf_no_longer_blocks_probe(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """The probe runs and its confirmed release REPLACES the unrelated
+        shelf rows outright — unlike the songless serve-blocked lane, neither
+        shelved Lone row clears the typed album at all, so there is no shelf
+        location worth keeping behind the confirmed release.
+        """
+        once_in_a_while = make_library_item(id=57624, artist="Lone", title="Once in a While")
+        always_inside = make_library_item(id=69357, artist="Lone", title="Always Inside Your Head")
+        mock_library_db.search = AsyncMock(
+            side_effect=self._search_side_effect([once_in_a_while, always_inside])
+        )
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=3573363,
+                    artist="Lone",
+                    album="Galaxy Garden",
+                    artwork_url="https://img.discogs.com/galaxy-garden.jpg",
+                )
+            ]
+        )
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Lone",
+            album="Galaxy Garden",
+            song="Crystal Caverns 1991",
+            raw_message="Crystal Caverns 1991 - Lone - Galaxy Garden",
+        )
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert len(response.results) == 1, f"got {response.results}"
+        item = response.results[0]
+        assert item.library_item.id == 0
+        assert item.artwork is not None
+        assert item.artwork.release_id == 3573363
+        assert response.song_not_found is False
+
+    @pytest.mark.asyncio
+    async def test_probe_miss_keeps_the_ranked_shelf(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """When the opened probe finds nothing (the Juana Molina / "Epon."
+        shape — a typo, not a real release), the ranked shelf from LML#1391
+        survives untouched: ``search_type`` stays non-direct and
+        ``song_not_found`` stays True."""
+        halo = make_library_item(id=1, artist="Juana Molina", title="Halo")
+        mock_library_db.search = AsyncMock(
+            side_effect=self._search_side_effect([halo], artist_key="juana molina")
+        )
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Juana Molina",
+            album="Epon.",
+            song="la paradoja",
+            raw_message="la paradoja - Juana Molina - Epon.",
+        )
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert len(response.results) == 1
+        assert response.results[0].library_item.id == 1
+        assert response.song_not_found is True
+
+    @pytest.mark.parametrize(
+        ("song", "album", "search_type", "titles", "expected"),
+        [
+            # The gate's one open case: song-bearing fallback, every row misses.
+            (
+                "Crystal Caverns 1991",
+                "Galaxy Garden",
+                SEARCH_TYPE_FALLBACK,
+                ["Once in a While"],
+                True,
+            ),
+            # A row that clears the typed album keeps the gate shut.
+            (
+                "Crystal Caverns 1991",
+                "Galaxy Garden",
+                SEARCH_TYPE_FALLBACK,
+                ["Galaxy Garden"],
+                False,
+            ),
+            # Songless requests belong to the LML#1319 serve-blocked lane.
+            (None, "Galaxy Garden", SEARCH_TYPE_FALLBACK, ["Once in a While"], False),
+            # Only the artist fallback ranks instead of drops.
+            ("Crystal Caverns 1991", "Galaxy Garden", "direct", ["Once in a While"], False),
+            ("Crystal Caverns 1991", "Galaxy Garden", "compilation", ["Once in a While"], False),
+            # Nothing to gate on: no rows, or a whitespace-only album.
+            ("Crystal Caverns 1991", "Galaxy Garden", SEARCH_TYPE_FALLBACK, [], False),
+            ("Crystal Caverns 1991", "   ", SEARCH_TYPE_FALLBACK, ["Once in a While"], False),
+        ],
+    )
+    def test_predicate_guards(self, song, album, search_type, titles, expected):
+        parsed = make_parsed_request(artist="Lone", album=album)
+        parsed.song = song
+        rows = [make_library_item(id=i + 1, artist="Lone", title=t) for i, t in enumerate(titles)]
+        assert song_bearing_fallback_all_floor_failed(parsed, rows, search_type) is expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("discogs_results", "expected_outcome"),
+        [
+            (
+                [make_discogs_result(release_id=3573363, artist="Lone", album="Galaxy Garden")],
+                "floor_blocked_fallback_discogs_match",
+            ),
+            ([], "floor_blocked_fallback_no_discogs_match"),
+        ],
+    )
+    async def test_floor_blocked_outcome_is_distinct(
+        self, mock_library_db, mock_discogs_service, telemetry, discogs_results, expected_outcome
+    ):
+        once_in_a_while = make_library_item(id=57624, artist="Lone", title="Once in a While")
+        mock_library_db.search = AsyncMock(side_effect=self._search_side_effect([once_in_a_while]))
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=discogs_results)
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Lone",
+            album="Galaxy Garden",
+            song="Crystal Caverns 1991",
+            raw_message="Crystal Caverns 1991 - Lone - Galaxy Garden",
+        )
+        recorded, scope = TestServeBlockedOutcomeTelemetry._record_outcomes()
+        with patch("sentry_sdk.get_current_scope", return_value=scope):
+            await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert expected_outcome in recorded
+        # The classic pair keeps meaning "the library returned nothing".
+        assert "library_miss_discogs_match" not in recorded
+        assert "library_miss_no_discogs_match" not in recorded

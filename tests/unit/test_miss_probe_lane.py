@@ -20,6 +20,10 @@ _DOGA = make_library_item(id=2, artist="Juana Molina", title="DOGA")
             MissProbeLane.SERVE_BLOCKED, id="songless-token-subset-row",
         ),
         pytest.param(
+            "la paradoja", "Zzyzx Road", [_HALO], SEARCH_TYPE_FALLBACK,
+            MissProbeLane.FLOOR_BLOCKED, id="song-bearing-rows-all-miss-the-album",
+        ),
+        pytest.param(
             "la paradoja", "DOGA", [_HALO, _DOGA], SEARCH_TYPE_FALLBACK, None,
             id="a-row-clears-the-album",
         ),
@@ -45,7 +49,9 @@ def test_lane_is_chosen_from_the_rows_in_hand(song, album, rows, search_type, la
         (MissProbeLane.LIBRARY_MISS, False, "library_miss_no_discogs_match"),
         (MissProbeLane.SERVE_BLOCKED, True, "serve_blocked_fallback_discogs_match"),
         (MissProbeLane.SERVE_BLOCKED, False, "serve_blocked_fallback_no_discogs_match"),
+        (MissProbeLane.FLOOR_BLOCKED, True, "floor_blocked_fallback_discogs_match"),
+        (MissProbeLane.FLOOR_BLOCKED, False, "floor_blocked_fallback_no_discogs_match"),
     ],
 )
-def test_outcome_values_are_the_four_the_trace_slices_key_on(lane, matched, outcome):
+def test_outcome_values_are_the_six_the_trace_slices_key_on(lane, matched, outcome):
     assert lane.outcome(matched=matched) == outcome

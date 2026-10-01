@@ -73,7 +73,7 @@ def _ctx(
         request_artist_stripped="Stereolab",
         artist_identity_split_enabled=False,
         extended=False,
-        found_on_compilation=False,
+        track_confirmed_ids=frozenset(),
         spine_deadline=spine_deadline,
     )
 
