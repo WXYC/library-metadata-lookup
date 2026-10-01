@@ -302,6 +302,18 @@ def library_artist_for(parsed: ParsedRequest) -> str | None:
     return parsed.library_artist or parsed.artist
 
 
+def album_not_found_message(parsed: ParsedRequest) -> str:
+    """The typed-album-miss sentence, shared by ``build_context_message``'s
+    song-bearing branch (``lookup/orchestrator.py``) and the unbound shelf
+    fallback (``lookup/shelf_fallback.py``, LML#1391/#1393) so the wording
+    lives in one place. Uses the typed ``parsed.album``/``parsed.artist``,
+    never the library-corrected channel.
+    """
+    return (
+        f'"{parsed.album}" not found in the library, but here are other albums by {parsed.artist}:'
+    )
+
+
 def filter_results_by_artist(
     results: list[LibraryItem],
     artist: str | None,

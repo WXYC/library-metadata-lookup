@@ -413,6 +413,12 @@ MODULE_BUDGETS: dict[str, int] = {
     # multiple of 50 at or above 1.3x the 215-line measured size (279.5).
     "lookup/album_level_match.py": 300,
     "lookup/release_resolution.py": 550,
+    # LML#1391/#1393: the unbound shelf fallback, the new Step 8 at the end of
+    # perform_lookup. Extracted straight to its own module -- orchestrator.py
+    # sat at 1832/1850, with no headroom for the step's logic even before this
+    # entry existed. Smallest multiple of 50 at or above 1.3x the 161-line
+    # measured size (209.3).
+    "lookup/shelf_fallback.py": 250,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line
     # ceiling (zero headroom) before this ticket's two mandated Sentry-tag call

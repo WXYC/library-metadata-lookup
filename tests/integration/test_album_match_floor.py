@@ -31,7 +31,7 @@ class TestAlbumMatchFloorIntegration:
     """Pin the #400 prod contamination shape against a real LibraryDB."""
 
     @pytest.mark.asyncio
-    async def test_nina_simone_wild_is_the_wind_does_not_surface_pastel_blues(self, library_db):
+    async def test_nina_simone_wild_is_the_wind_pastel_blues_is_display_only(self, library_db):
         """The exact prod-evidence failure mode: artist matches the library but
         the typed album doesn't, and the artist-fallback cascade would otherwise
         contaminate the flowsheet row with a wrong-album Discogs release.
@@ -39,8 +39,19 @@ class TestAlbumMatchFloorIntegration:
         Library seed has Nina Simone / Pastel Blues only. Request types album
         "Wild Is the Wind" + song "Sinnerman" —
         token_set_ratio("Wild Is the Wind", "Pastel Blues") sits well below 80
-        (no shared significant tokens), so the candidate is dropped and the
-        response mirrors the unknown-artist shape.
+        (no shared significant tokens), so the candidate is dropped by the
+        floor and the response is empty through the rest of the pipeline.
+
+        LML#1391/#1393 re-scope: an empty response is no longer bare. The
+        unbound shelf fallback (Step 8, `lookup/shelf_fallback.py`) now
+        returns the artist's own shelf — Pastel Blues — as a *display-only*
+        row instead of nothing. The #400 invariant this test actually pins
+        is metadata binding, not row presence: Pastel Blues may surface, but
+        only with `artwork=None` (hence no release id, artwork URL, year, or
+        Discogs URL), so Backend-Service still reads
+        `results[0]?.artwork ?? null` exactly as it does for a bare miss, and
+        no wrong-album metadata ever lands on the "Wild Is the Wind"
+        flowsheet row.
         """
         from wxyc_fastapi.observability import init_cache_stats
 
@@ -76,13 +87,17 @@ class TestAlbumMatchFloorIntegration:
             make_lml_telemetry(),
         )
 
-        # Floor dropped Pastel Blues → no library row surfaces. The response
-        # mirrors the unknown-artist shape and BS won't write any
-        # album-derived metadata onto the flowsheet row.
-        result_albums = [r.library_item.title for r in response.results]
-        assert "Pastel Blues" not in result_albums, (
-            "Wrong-album fallback leaked: Pastel Blues surfaced for typed album "
-            "'Wild Is the Wind'. This is the exact #400 prod contamination shape."
+        # Floor dropped Pastel Blues from the normal pipeline, so the
+        # unbound shelf fallback (Step 8) surfaces it as a display-only row.
+        # The actual #400 invariant: no release metadata ever binds to it.
+        pastel_blues_rows = [r for r in response.results if r.library_item.title == "Pastel Blues"]
+        assert pastel_blues_rows, "Expected the shelf fallback to surface Pastel Blues"
+        assert all(row.artwork is None for row in pastel_blues_rows), (
+            "Wrong-album fallback leaked: Pastel Blues surfaced WITH artwork for typed "
+            "album 'Wild Is the Wind'. This is the exact #400 prod contamination shape."
+        )
+        assert response.search_type != "direct", (
+            "The shelf fallback must never report search_type=direct over an unconfirmed row."
         )
 
     @pytest.mark.asyncio

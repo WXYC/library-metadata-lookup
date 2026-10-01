@@ -72,6 +72,7 @@ from lookup.location_union import (
 )
 from lookup.matching import (
     WAVE_A_SEARCH_LIMIT,
+    album_not_found_message,
     is_self_titled_request_placeholder,
     library_artist_for,
     limit_results,
@@ -81,6 +82,7 @@ from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.release_resolution import (
     ResolvedRelease,
 )
+from lookup.shelf_fallback import apply_shelf_fallback
 from lookup.spine_deadline import (
     SpineDeadline,
     SpineDeadlineExceededError,
@@ -198,10 +200,7 @@ def build_context_message(
 
     if song_not_found and has_results:
         if parsed.song and parsed.album:
-            return (
-                f'"{parsed.album}" not found in the library, '
-                f"but here are other albums by {parsed.artist}:"
-            )
+            return album_not_found_message(parsed)
         elif parsed.song:
             return (
                 f'"{parsed.song}" is not on any album in the library, '
@@ -1277,6 +1276,9 @@ async def perform_lookup(
       recompute ``search_type``/``found_on_compilation``/``song_not_found``/
       ``context_message`` (``build_context_message``, Step 5's old call site)/
       ``external_source`` from the final, post-fold list
+    - Step 8.    ``apply_shelf_fallback`` (``lookup/shelf_fallback.py``) —
+      additive, unbound shelf fallback (LML#1391/#1393): a pure pass-through
+      unless ``result_items`` is still empty after the location fold above
     """
     # LML#865: derive the spine deadline once at admission. It bounds step 2's
     # Discogs pass and re-bases step 3's clock so the hard cap + caller budget
@@ -1502,6 +1504,13 @@ async def perform_lookup(
         folded_location_count=folded_location_count,
         index_confirmed_existing=index_confirmed_existing,
         external_source=external_source,
+    )
+    # Step 8 (LML#1391/#1393): additive, unbound shelf fallback -- a pure
+    # pass-through when `result_items` is already non-empty. See
+    # `lookup/shelf_fallback.py` for the full contract.
+    skip = state.timed_out or state.upstream_shed
+    result_items, search_type, context, external_source = await apply_shelf_fallback(
+        parsed, services.db, skip, result_items, search_type, context, external_source
     )
     _project_post_fold_trace_attrs(result_items, search_type)
 

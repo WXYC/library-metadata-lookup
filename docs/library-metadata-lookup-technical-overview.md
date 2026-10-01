@@ -42,6 +42,7 @@ A single call to `perform_lookup()` passes through the step-labeled pipeline bel
 | 5. Context message | Generate human-readable summary of what happened | `build_context_message()` |
 | 6. Identity resolution | Resolve external identifiers for each result's artist | `_step_resolve_result_identities()` |
 | 7. External-cache fallback | Opt-in mojibake recovery over the Discogs/MusicBrainz caches when the pipeline produced nothing | `_step_external_cache_fallback()` |
+| 8. Unbound shelf fallback | If the response is still empty (not timed out/degraded) and the artist has shelved rows, return the artist's shelf as display-only rows (no artwork, `search_type: fallback`) instead of a bare miss | `apply_shelf_fallback()` |
 
 ```mermaid
 flowchart TD
