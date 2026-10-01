@@ -349,6 +349,25 @@ Doing (1) alone and leaving (2)/(3) at their N=3-sized values is the failure mod
 
    Note that production has read `UVICORN_WORKERS=1` since at least 2026-08-09 (verified live then, and again on 2026-09-26) and staging since 2026-09-26, so "revert to N=1" is already the state of both environments; a decision of "N=3 still needed" is therefore a *re-adoption*, not a hold, and has to be applied rather than merely recorded. The staging half of that revert was not a Gate 0 decision and does not discharge LML#983 — see the note at step 6.
 
+## Expected steady-state memory (LML#1354)
+
+LML's memory is the billed quantity on Railway, and until 2026-09-30 it grew without bound between restarts. The cause was not a leak in LML's own data but glibc's per-thread malloc arenas. The container reports the host's 48 CPUs, so asyncio's default executor (`min(32, os.cpu_count() + 4)`) grows to 32 threads; glibc gives each allocating thread its own arena, up to 8 × CPUs, and an arena keeps freed memory until its top can be trimmed. A memory map of production 20 hours after a restart showed 39 secondary arenas holding 183 MB, 46% of the process.
+
+**The bound.** The image sets `MALLOC_ARENA_MAX=4` (`Dockerfile`). glibc reads it once at process start, so it must be in the environment before uvicorn starts; `entrypoint.sh` drops privileges with a plain `su`, which keeps the image's environment, and `tests/unit/test_entrypoint_workers.py` pins that it never becomes a login shell. A Railway service variable of the same name overrides the image value. Use 4, not 2: staging ran at 2 for a day and median `/lookup` latency rose by about 100 ms, consistent with threads contending for two arenas, while production at 4 showed no latency change.
+
+**What to expect, and how to recognise a regression.** Judge memory by process age, not by an uninterrupted soak: split the service's Railway memory history at each restart and compare memory at the same age across lifetimes. Every process grows for its first several hours while the executor widens and the caches fill, so readings before 24 hours do not distinguish a healthy process from a ramping one.
+
+| Age since restart | Before the bound (four lifetimes, 2026-09-19 to 09-29) | Expected with the bound |
+|---|---|---|
+| 24 h | 488–566 MB | at or below 400 MB |
+| 48 h | 665–744 MB | at or below 450 MB |
+
+Figures are Railway container memory, which runs about 40 MB above the process's own RSS. The "expected" column is LML#1354's acceptance threshold, not yet a measured plateau; replace it with measured figures once three lifetimes have reached 24 hours. Before the bound, growth after the start-up rise was roughly 0.2 GB a day.
+
+To reproduce the comparison, fetch the series with `railway metrics -s library-metadata-lookup -e production --since 12d --memory --raw --json` and tabulate it by age (the script is in LML#1354's diagnosis comment). A 12-day window comes back at 4-hour resolution and windows up to about 36 hours come back hourly. The last sample of a lifetime is inflated because the old and new containers overlap during a deploy.
+
+The hourly gauges from `LML_MEMORY_PROFILE_MODE=gauges` (`core/memory_profile.py`) log the process's own RSS alongside fd, task, cache and pool counts, which is what showed that nothing in LML's own structures was growing.
+
 ## Logging
 
 `core/logging.py`'s `setup_logging` writes to a `logging.handlers.RotatingFileHandler`, one file per worker process — `worker_log_path` inserts the worker's own PID into the filename (`library-metadata-lookup.log` becomes `library-metadata-lookup.<pid>.log`) before the handler opens it (LML#1124 Phase 4). This is deliberate, not incidental: `RotatingFileHandler` is not multi-process-safe, and `entrypoint.sh` execs `uvicorn ... --workers ${uvicorn_workers}` against the very `UVICORN_WORKERS` lever the horizontal-scaling runbook above documents, so N sibling workers can call `setup_logging` concurrently against what would otherwise be one shared file — two workers rotating the same file race the rename, and a worker mid-write to the pre-rotation file descriptor loses records. Per-worker filenames make concurrent rollover structurally impossible rather than merely discouraged, and the scheme is correct at any worker count, including today's default of 1, where it costs nothing but a PID in the filename. `WatchedFileHandler` + external `logrotate` was considered and rejected because the Railway image ships no `logrotate`; pinning `RotatingFileHandler` to a single-worker-only guarantee was rejected because it would constrain `UVICORN_WORKERS` as a real scaling lever rather than adapting the log handler to it. Proliferation across restarts is bounded: post-LML#834 there is no mounted volume, so `/app/logs` is ephemeral per container and old per-worker files vanish with the container instead of accumulating. Each worker's file rotates at 10 MB with 3 backups retained (`DEFAULT_LOG_MAX_BYTES` / `DEFAULT_LOG_BACKUP_COUNT` in `core/logging.py`; overridable per call, not yet env-tunable).

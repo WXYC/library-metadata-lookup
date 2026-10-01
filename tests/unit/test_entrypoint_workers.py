@@ -71,3 +71,17 @@ def test_entrypoint_falls_back_to_one_for_invalid_uvicorn_workers(tmp_path, bad_
     assert "--workers 1" in su_args
     assert "WARN: UVICORN_WORKERS must be a positive integer" in result.stderr
     assert f"got '{bad_value}'" in result.stderr
+
+
+def test_entrypoint_keeps_the_image_environment_when_dropping_privileges(tmp_path):
+    """LML#1399: a login shell would discard the image's ``ENV``.
+
+    ``su -`` / ``su -l`` reset the environment, which would silently drop
+    ``MALLOC_ARENA_MAX`` (and every other image-level variable) before uvicorn
+    starts. glibc reads that variable once at process start, so losing it brings
+    back LML#1354's memory ramp with nothing in the logs to say why.
+    """
+    _, su_args = _run_entrypoint(tmp_path, workers=None)
+
+    su_options = su_args.split(" -c ", 1)[0].split()
+    assert not {"-", "-l", "--login"} & set(su_options)
