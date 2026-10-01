@@ -20,6 +20,7 @@ from lookup.matching import (
     is_self_titled,
     is_self_titled_request_placeholder,
     map_library_format_to_discogs,
+    order_self_titled_albums,
 )
 from tests.factories import make_discogs_result
 
@@ -510,7 +511,7 @@ class TestIsSelfTitled:
         """The eponymous forms are request-side only (LML#1392). A catalog row
         whose real title is "Eponymous" (R.E.M., library row 27175) must not
         be reclassified as a self-titled placeholder by the catalog-side
-        consumers (validation, artwork, typed_pair_floor)."""
+        consumers (validation, artwork)."""
         assert is_self_titled(title) is False
 
 
@@ -551,6 +552,53 @@ class TestIsSelfTitledRequestPlaceholder:
         """Every catalog-side self-titled form is also a request placeholder,
         so the two vocabularies cannot drift apart."""
         assert is_self_titled_request_placeholder(title) is True
+
+
+class TestOrderSelfTitledAlbums:
+    @pytest.mark.parametrize(
+        "placeholder, discogs_albums, artist, expected",
+        [
+            pytest.param(
+                "Eponymous",
+                ["Murmur", "Eponymous"],
+                "R.E.M.",
+                ["Eponymous", "Murmur"],
+                id="typed-title-leads-and-dedupes",
+            ),
+            pytest.param(
+                "eponymous",
+                ["Murmur", "Eponymous", "Document"],
+                "R.E.M.",
+                ["eponymous", "Murmur", "Document"],
+                id="dedupe-is-case-insensitive",
+            ),
+            pytest.param(
+                "Epon.",
+                ["On Your Own Love Again", "Jessica Pratt"],
+                "Jessica Pratt",
+                ["Epon.", "Jessica Pratt", "On Your Own Love Again"],
+                id="artist-named-album-before-others",
+            ),
+            pytest.param(
+                "S/T",
+                ["Quiet Signs", "jessica  pratt", "On Your Own Love Again"],
+                "Jessica Pratt",
+                ["S/T", "jessica  pratt", "Quiet Signs", "On Your Own Love Again"],
+                id="artist-match-is-normalized-rest-keep-order",
+            ),
+            pytest.param(
+                "S/T",
+                ["DOGA", "Halo"],
+                "Juana Molina",
+                ["S/T", "DOGA", "Halo"],
+                id="no-artist-named-album",
+            ),
+        ],
+    )
+    def test_order(self, placeholder, discogs_albums, artist, expected):
+        """Typed placeholder first, then Discogs albums titled with the
+        artist's name, then the rest in Discogs order (LML#1392)."""
+        assert order_self_titled_albums(placeholder, discogs_albums, artist) == expected
 
 
 # ---------------------------------------------------------------------------

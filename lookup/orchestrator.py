@@ -76,6 +76,7 @@ from lookup.matching import (
     library_artist_for,
     limit_results,
     needs_album_resolution,
+    order_self_titled_albums,
 )
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.release_resolution import (
@@ -135,9 +136,10 @@ async def resolve_albums_for_track(
 
         - Album missing or equal to the artist: hit ``(discogs_albums, False)``;
           miss (no release by the artist) or exception ``([], True)``.
-        - Self-titled placeholder: hit ``(discogs_albums + [placeholder], False)``;
-          miss or exception ``([placeholder], False)``. Keeping the placeholder
-          preserves main's literal match against a catalog row titled e.g. "S/T".
+        - Self-titled placeholder: hit ``(order_self_titled_albums(...), False)``
+          -- placeholder, artist-named Discogs albums, the rest; miss or exception
+          ``([placeholder], False)``. The placeholder leads so ARTIST_PLUS_ALBUM
+          still anchors on a typed catalog title (R.E.M.'s "Eponymous").
 
         A spine-deadline trip is not a miss: ``run_within_spine_deadline`` cancels
         this coroutine (``CancelledError`` bypasses ``except Exception``) and the
@@ -176,7 +178,8 @@ async def resolve_albums_for_track(
                             albums.append(album)
                 if albums:
                     logger.info(f"Found {len(albums)} albums for song '{parsed.song}': {albums}")
-                    albums += [p for p in kept if p not in albums]
+                    if kept:
+                        albums = order_self_titled_albums(typed_album, albums, parsed.artist)
                     return albums, False
             logger.info(f"Could not find albums for song '{parsed.song}'")
             return miss
