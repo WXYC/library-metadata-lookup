@@ -24,6 +24,7 @@ from lookup.miss_kind import (
     MISS_TIMEOUT,
     OUTCOME_HIT,
     derive_miss_kind,
+    lookup_completed_properties,
     miss_telemetry_properties,
 )
 from lookup.models import LookupResponse, LookupResultItem
@@ -197,6 +198,32 @@ class TestShelfFallbackRows:
             _resp(results_count=2), commit_sha=None, shelf_fallback_rows=2
         )
         assert props["miss_kind"] == MISS_CLEAN
+
+    @pytest.mark.parametrize(
+        ("results_count", "shelf_rows", "expected"),
+        [
+            pytest.param(
+                2,
+                2,
+                {"results_count": 0, "miss_kind": MISS_CLEAN, "shelf_fallback_rows": 2},
+                id="lane-fired",
+            ),
+            pytest.param(0, 0, {"results_count": 0, "miss_kind": MISS_CLEAN}, id="plain-miss"),
+            pytest.param(3, 0, {"results_count": 3, "miss_kind": OUTCOME_HIT}, id="hit"),
+        ],
+    )
+    def test_lookup_completed_carries_shelf_fallback_rows_only_when_the_lane_fired(
+        self, results_count: int, shelf_rows: int, expected: dict[str, object]
+    ) -> None:
+        """`shelf_fallback_rows` is absent, not 0, on every event the lane did
+        not touch, so adding the lane leaves those events exactly as they were."""
+        response = _resp(results_count=results_count)
+        response._shelf_fallback_rows = shelf_rows
+
+        props = lookup_completed_properties(response, commit_sha=None)
+
+        assert {key: props[key] for key in expected} == expected
+        assert ("shelf_fallback_rows" in props) is (shelf_rows > 0)
 
 
 class TestVocabulary:

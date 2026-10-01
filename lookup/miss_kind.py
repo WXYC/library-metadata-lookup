@@ -205,13 +205,16 @@ def lookup_completed_properties(
     ONE new, separate PostHog property this lane gets (mirrors the Sentry
     trace attr `apply_shelf_fallback` sets -- `lookup/shelf_fallback.py`),
     so the lane is observable without touching `results_count` or
-    `miss_kind`'s own meaning. Extracted (rather than built inline) because
-    `lookup/router.py` sits at its module-budget ceiling.
+    `miss_kind`'s own meaning. Like that attr it is present only when the
+    lane fired (count > 0), so every other event keeps its existing shape.
+    Extracted (rather than built inline) because `lookup/router.py` sits at
+    its module-budget ceiling.
     """
     shelf_fallback_rows = response._shelf_fallback_rows
+    fired = {"shelf_fallback_rows": shelf_fallback_rows} if shelf_fallback_rows > 0 else {}
     return {
         "results_count": len(response.results) - shelf_fallback_rows,
-        "shelf_fallback_rows": shelf_fallback_rows,
+        **fired,
         **miss_telemetry_properties(
             response, commit_sha=commit_sha, shelf_fallback_rows=shelf_fallback_rows
         ),
