@@ -1,122 +1,28 @@
-"""Unbound shelf fallback — the final, additive step in ``perform_lookup`` (LML#1391/#1393).
+"""Unbound shelf fallback: the final, additive step in ``perform_lookup`` (LML#1391/#1393).
 
-Re-scope of the original LML#1391 fix after PR #1396 was closed: five review
-rounds each found a way that attempt changed what Backend-Service binds (a
-floor-failing row's own release id/artwork leaking onto a typed-album
-request). The corrected scope is narrower and purely additive:
+Invariant: a response that is non-empty on ``main`` stays byte-for-byte
+unchanged. Only a response whose result list is empty may change.
 
-    **Invariant: a response that is non-empty on ``main`` stays byte-for-byte
-    unchanged. Only a response whose result list is empty today may change.**
+:func:`apply_shelf_fallback` runs once, after the location-union fold. It
+fires only when ``result_items`` is empty, the caller's ``skip`` flag is false
+(``state.timed_out or state.upstream_shed or is_discogs_low_priority()``), an
+album was typed, and the library artist resolves to shelved rows. It then
+returns up to ``MAX_SEARCH_RESULTS`` display-only rows
+(``LookupResultItem(library_item=...)`` with no ``artwork``, so no release id,
+artwork URL, year, Discogs URL or streaming links), forces ``search_type`` to
+``SEARCH_TYPE_FALLBACK`` (never ``direct``), and sets the "not found in the
+library, but here are other albums by X:" context line. Rows whose title
+contains the requested song come first; the rest keep ``db.search`` order.
 
-:func:`apply_shelf_fallback` is called once, as the true last step of the
-spine — after the location-union fold has had its chance to populate
-``results``, not merely after Step 7 (``_step_external_cache_fallback``).
-That placement matters: a request the fold would otherwise resolve (e.g. a
-recall-index hit on the comp-track lane) is excluded from this fallback
-exactly as it is excluded on ``main`` today, because its post-fold
-``result_items`` is non-empty and the invariant above forbids touching it.
-Every early return in ``perform_lookup`` for the tail-shed/admission-shed
-degraded flavors (``_build_degraded_response``) and the spine-deadline
-timeout returns before this call site, so those are excluded structurally.
-Three conditions still have to be checked explicitly, because each either
-sets its flag and rides the *normal* return path rather than returning
-early, or is simply not visible to any earlier gate: the mid-pipeline
-hard-cap trip (``state.timed_out``, set inside ``core/search.py``'s strategy
-loop), the search-leg Discogs saturation-breaker shed (``state.upstream_shed``,
-LML#1126, caught *inside* step 3 and otherwise reaching the final
-``LookupResponse`` with ``degraded=True``), and a low-priority caller
-(``is_discogs_low_priority()`` — bulk/enrichment/backfill traffic, never a
-DJ-facing request). The caller collapses all three into one ``skip`` flag —
-there is nothing left for this function to do differently between them.
+It makes no Discogs call, fetches no artwork and runs no enrichment. Its last
+return value is the number of rows appended, which the caller threads into
+miss telemetry so a shelf-only response still reports ``miss_clean`` with
+``results_count`` 0 (``lookup/miss_kind.py``).
 
-The low-priority exclusion matters beyond "don't bother": `/lookup/bulk`
-unconditionally marks every item low-priority and its per-item
-``BulkLookupResultItem.status`` is ``"match" if lookup.results else
-"no_match"`` -- a real response-field contract, not telemetry, documented as
-"``no_match`` — ``lookup.results`` is empty". Letting this fallback fire
-there would make that contract self-contradictory (``no_match`` alongside a
-non-empty ``results``) for every bulk caller, which never asked for a
-DJ-facing shelf decoration in the first place. Excluding low-priority
-callers — the same signal the location-union gate already uses for the same
-reason (``lookup/orchestrator.py``, "D4: BS enrichment, the CDC firehose,
-and backfills are excluded") — avoids the contradiction at the source
-instead of patching bulk's status derivation to match.
-
-When every one of these holds —
-
-* ``result_items`` is empty;
-* ``skip`` is false (the caller's ``state.timed_out or state.upstream_shed
-  or is_discogs_low_priority()``);
-* the typed ``parsed.album`` is non-empty after stripping whitespace;
-* the library artist (``library_artist_for(parsed)``) resolves to at least
-  one shelved row — the same cached ``db.search`` + ``filter_results_by_artist``
-  call ``ARTIST_PLUS_ALBUM``'s own artist-only fallback issues
-  (``lookup/strategies/artist_plus_album.py``);
-
-this returns the artist's shelf as **display-only** rows:
-``LookupResultItem(library_item=row.to_catalog_item())``, with no
-``artwork`` — hence no release id, artwork URL, year, Discogs URL, or
-streaming links, since none of those ever ride anywhere but on ``artwork``
-— and no ``matched_via``. Nothing here calls Discogs, fetches artwork, or
-runs enrichment.
-
-``search_type`` is forced to ``SEARCH_TYPE_FALLBACK``, never ``direct`` —
-so Backend-Service's ``requireSearchType: 'direct'`` callers keep rejecting
-this shape, including the album-only request where ``main`` reports
-``direct`` with zero rows (LML#1393). ``context_message`` is the
-typed-album/typed-artist sentence ``build_context_message`` already uses
-for the song-bearing album-miss case (``lookup.matching.album_not_found_message``),
-now reachable for the album-only shape too — ``main``'s
-``build_context_message`` never reaches it there, since every branch of
-its "song not found" message requires ``parsed.song``. ``song_not_found``
-and ``found_on_compilation`` are deliberately left untouched: the caller
-already computed them correctly before this step runs.
-
-**Telemetry invisibility.** This function returns the count of rows it
-appended (0 when it does not fire) as its fifth element,
-``shelf_fallback_rows``. The caller must do two things with it, in this
-order, both load-bearing: (1) project the existing Sentry
-``lookup.results_count``/``lookup.match_type`` trace attrs
-(``_project_post_fold_trace_attrs``) *before* calling this function, over
-the pre-fallback ``result_items`` -- those attrs, and the LML#1233
-``lookup_completed`` ``results_count``/``miss_kind`` PostHog properties
-downstream of them, must report exactly what they would without this step
-existing, or a genuine recall miss for a shelved artist inflates
-``results_count`` and reports ``hit``, blinding the Layer 2 recall-regression
-alert to exactly the misses it exists to catch (``lookup/miss_kind.py``);
-(2) thread ``shelf_fallback_rows`` into ``derive_miss_kind``/
-``miss_telemetry_properties`` at the router, so the *downstream* telemetry
-(not just the pre-fold trace attrs) also classifies a shelf-only response as
-a miss. The ONE new, separate signal this lane gets is the Sentry trace
-attr set below (``lookup.shelf_fallback_rows``) plus the identically-named
-PostHog property the router adds -- observability for the lane without
-touching any existing series.
-
-Ordering:
-
-1. rows whose title contains the requested song (case-insensitive), when a
-   song was typed;
-2. *(not implemented — see below)*;
-3. the rest, in the order ``db.search`` returned them.
-
-Capped at ``MAX_SEARCH_RESULTS``.
-
-**Tier 2 (cache-confirmed song) is intentionally not implemented.** The one
-cache-only, no-live-API primitive that answers "does a cached Discogs
-tracklist already show this song on one of these rows" is
-``find_library_albums_with_cached_track`` (``lookup/validation.py``, the
-step-3b A4 rescue). It already runs — with this exact ``(artist, song)``
-pair — against the artist-fallback rows *before* this function can ever see
-them, and when it confirms a row, ``apply_track_validation_cascade``
-promotes that row into ``library_results``, making the pipeline's own
-result non-empty and keeping this fallback from firing at all. Re-running
-that probe here would be a second, redundant cache hit that can only
-confirm what the pipeline already would have surfaced and promoted first —
-it cannot change this function's output, since this function is only ever
-reached in the case where that probe already failed. Wiring in a fresh
-Discogs-cache dependency here, only to re-ask the same question with no
-chance of a different answer, would add a dependency this step does not
-otherwise need, against the re-scope's point of staying small and additive.
+The full rationale (placement, the three ``skip`` conditions, why
+``/lookup/bulk`` is excluded, telemetry invisibility, and why a
+cache-confirmed ordering tier is not implemented) is in
+``docs/architecture.md``, "Shelf fallback (step 8): design notes".
 """
 
 import sentry_sdk
