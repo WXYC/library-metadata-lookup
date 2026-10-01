@@ -165,7 +165,13 @@ _ABSENT_ALBUM_NOTES: dict[str, str] = {
     "clean_miss": (
         "Seeded artist, album WXYC does not shelve. The album-match rapidfuzz "
         "floor (_ALBUM_MATCH_FLOOR, lookup/fallback_title_floors.py) correctly rejects every "
-        "real title on the shelf against the typed album, so this cleanly misses."
+        "real title on the shelf against the typed album, so the typed (artist, album) pair "
+        "itself cleanly misses -- miss_kind stays miss_clean. LML#1391/#1393's unbound shelf "
+        "fallback (lookup/shelf_fallback.py) then appends the artist's own shelf as "
+        "display-only rows (no artwork, search_type=fallback) instead of a bare miss, since "
+        "the artist IS shelved; the miss classification is unaffected because the fallback is "
+        "deliberately invisible to the LML#1233 miss-telemetry derivation "
+        "(lookup/miss_kind.py)."
     ),
     "fuzzy_collision": (
         "Seeded artist, album WXYC does not shelve -- but this one does NOT "

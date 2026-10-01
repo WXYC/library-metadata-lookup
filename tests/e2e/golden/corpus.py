@@ -516,7 +516,29 @@ def result_identity(result: dict[str, Any]) -> str:
     return f"#{library_id} {marker}{item.get('artist')} — {item.get('title')}"
 
 
-def verdict_from_payload(payload: dict[str, Any]) -> Verdict:
+#: Test-only back channel for LML#1391/#1393's `LookupResponse._shelf_fallback_rows`
+#: (see :func:`golden_app_client`). Never on the wire by design -- a real HTTP
+#: client (Backend-Service, this module's own `AsyncClient`) cannot see it, so
+#: `verdict_from_payload` cannot recover it from `payload` alone. Module-level
+#: rather than threaded through `golden_client`'s fixture shape because the
+#: fixture is consumed in exactly one place today
+#: (`test_golden_corpus.py::test_golden_case`) and widening its yield to a
+#: tuple would be a second thing every future caller has to unpack. Safe
+#: across both consumers (the test tier's one sequential request per case,
+#: `scripts/rebaseline_golden_corpus.py`'s one request per case) because
+#: nothing reads it except the request that just set it, and xdist workers
+#: are separate processes with their own module state.
+_last_shelf_fallback_rows: int = 0
+
+
+def last_shelf_fallback_rows() -> int:
+    """The internal signal recorded for the most recent request made through
+    :func:`golden_app_client`. Read this immediately after the one request
+    whose verdict you are about to compute."""
+    return _last_shelf_fallback_rows
+
+
+def verdict_from_payload(payload: dict[str, Any], *, shelf_fallback_rows: int = 0) -> Verdict:
     """Project a `/lookup` response body down to the asserted verdict.
 
     `miss_kind` is not on the wire -- it is a telemetry property, not a
@@ -528,12 +550,22 @@ def verdict_from_payload(payload: dict[str, Any]) -> Verdict:
     being true. LML#1236 may yet change what sets `degraded`; when it does,
     both move together or neither does.
 
+    `shelf_fallback_rows` (LML#1391/#1393) is forwarded to `derive_miss_kind`
+    so a response whose only rows are the unbound shelf fallback's
+    display-only rows classifies as `miss_clean`, exactly as production
+    telemetry does -- callers get this count from :func:`last_shelf_fallback_rows`,
+    never from `payload` (the count is never on the wire). `results` in the
+    returned `Verdict` still carries those rows: only the *classification*
+    is netted out, not the recorded identities.
+
     Validating the payload back into `LookupResponse` on the way is not a
     detour to reach that function -- it is a free extra assertion that the
     body the caller received still parses as the response contract.
     """
     results = payload.get("results") or []
-    miss_kind = derive_miss_kind(LookupResponse.model_validate(payload))
+    miss_kind = derive_miss_kind(
+        LookupResponse.model_validate(payload), shelf_fallback_rows=shelf_fallback_rows
+    )
     return Verdict(
         miss_kind=miss_kind,
         song_not_found=bool(payload.get("song_not_found")),
@@ -560,39 +592,70 @@ async def golden_app_client(library_db: Any, discogs: Any) -> AsyncIterator[Any]
     reads. Overriding the dependency as well would give the router one
     `Settings` and everything under it another.
 
+    Also installs the LML#1391/#1393 shelf-fallback spy (patches
+    `lookup.router.perform_lookup`, calling straight through to the real
+    implementation and recording `response._shelf_fallback_rows` for
+    :func:`last_shelf_fallback_rows` to read) -- the one piece of the real
+    response the HTTP round trip cannot carry, because it is a Pydantic
+    `PrivateAttr` by design (never serialized).
+
     Imports are deferred to the call so importing this module for its pure
     helpers does not drag in the FastAPI app.
     """
+    from unittest.mock import patch
+
     from httpx import ASGITransport, AsyncClient
 
     from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+    from lookup.orchestrator import perform_lookup as _real_perform_lookup
     from main import app
+
+    async def _spying_perform_lookup(*args: Any, **kwargs: Any) -> LookupResponse:
+        global _last_shelf_fallback_rows
+        response = await _real_perform_lookup(*args, **kwargs)
+        _last_shelf_fallback_rows = response._shelf_fallback_rows
+        return response
 
     app.dependency_overrides[get_library_db] = lambda: library_db
     app.dependency_overrides[get_discogs_service] = lambda: discogs
     app.dependency_overrides[get_posthog_client] = lambda: None
     try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://golden"
-        ) as client:
-            yield client
+        with patch("lookup.router.perform_lookup", _spying_perform_lookup):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://golden"
+            ) as client:
+                yield client
     finally:
         app.dependency_overrides.clear()
 
 
 def verdict_shape_is_consistent(verdict: Verdict) -> bool:
-    """`results` is non-empty iff `miss_kind` is a hit.
+    """`results` is non-empty iff `miss_kind` is a hit -- with exactly one
+    deliberate exception, `miss_clean`.
 
-    Mirrors :func:`verdict_from_payload`'s own contract exactly: every miss
-    kind -- `miss_clean`, `miss_timeout`, `miss_degraded` alike -- is derived
-    from an empty `results` list (see the `elif`/`else` chain above), never a
-    populated one. The only bifurcation that can ever be genuinely
-    contradictory is hit-vs-any-miss, not clean-vs-not-clean -- a case
-    expecting `miss_timeout` or `miss_degraded` with no results is well-formed,
-    not a contradiction (LML#1233 review).
+    Mirrors :func:`verdict_from_payload`'s own contract: `miss_timeout` and
+    `miss_degraded` are still derived from an empty `results` list, always --
+    a case expecting either of those with no results is well-formed, not a
+    contradiction (LML#1233 review), and a non-empty `results` under either
+    remains a genuine one, since the unbound shelf fallback (LML#1391/#1393,
+    below) explicitly excludes the timed-out and degraded paths.
+
+    `miss_clean` is different on purpose: LML#1391/#1393's unbound shelf
+    fallback appends the artist's own shelf as display-only rows to an
+    OTHERWISE-empty response, so `results` can legitimately be non-empty
+    while the verdict still classifies as a clean, algorithm-attributable
+    miss (`derive_miss_kind(..., shelf_fallback_rows=N)` nets those rows back
+    out). This function cannot tell a shelf-decorated `miss_clean` apart from
+    a genuinely mis-classified hit from `results` alone -- that
+    classification happened once, correctly, inside `verdict_from_payload`,
+    using the one channel (`last_shelf_fallback_rows`) that can see it. Catching
+    THAT class of regression is what the rebaseline tool's printed diff and
+    the frozen-case refusal are for, not this structural shape check.
     """
     if verdict.miss_kind == OUTCOME_HIT:
         return bool(verdict.results)
+    if verdict.miss_kind == MISS_CLEAN:
+        return True
     return not verdict.results
 
 

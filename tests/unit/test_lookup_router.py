@@ -237,6 +237,61 @@ class TestHandleLookup:
         assert calls[0].kwargs["properties"]["environment"] == "unit-test-env"
 
     @pytest.mark.asyncio
+    async def test_lookup_completed_nets_out_shelf_fallback_rows(
+        self, mock_db, mock_discogs, mock_settings
+    ):
+        """LML#1391/#1393: a response whose only rows are the unbound shelf
+        fallback's display-only rows must report ``results_count=0`` and
+        ``miss_kind=miss_clean`` to ``lookup_completed`` -- exactly what main
+        would report for the same request today. The ONE new, separate
+        signal is ``shelf_fallback_rows``; neither existing key moves.
+        """
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        mock_posthog = Mock()
+        mock_posthog.capture = Mock()
+        mock_posthog.flush = Mock()
+
+        shelf_item = LookupResultItem(
+            library_item=make_catalog_item(id=201, artist="Jessica Pratt", title="Quiet Signs")
+        )
+        response = LookupResponse(results=[shelf_item], search_type="fallback", song_not_found=True)
+        response._shelf_fallback_rows = 1
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: mock_posthog,
+                get_settings: mock_settings,
+            },
+        ):
+            with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+                mock_lookup.return_value = response
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        # The wire response is unaffected -- the DJ still sees the shelf row.
+        assert len(resp.json()["results"]) == 1
+
+        calls = [
+            c
+            for c in mock_posthog.capture.call_args_list
+            if c.kwargs["event"] == "lookup_completed"
+        ]
+        assert len(calls) == 1
+        props = calls[0].kwargs["properties"]
+        assert props["results_count"] == 0
+        assert props["miss_kind"] == "miss_clean"
+        assert props["shelf_fallback_rows"] == 1
+
+    @pytest.mark.asyncio
     async def test_lookup_capture_budget_real_orchestrator(self, mock_library_db, mock_settings):
         """WXYC/library-metadata-lookup#1169: pins the per-lookup PostHog
         capture budget through the REAL orchestrator (``perform_lookup`` is

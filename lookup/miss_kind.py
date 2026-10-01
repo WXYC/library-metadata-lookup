@@ -21,6 +21,16 @@ IS signalled it outranks the residual bucket, because the alternative is
 `miss_clean` absorbing sheds and the alert paging for upstream outages
 instead of recall regressions.
 
+"empty" above means "empty of everything but the LML#1391/#1393 unbound
+shelf fallback's display-only rows": every `hit`/`miss_*` row in the table
+reads `results` net of `shelf_fallback_rows` wherever that parameter is
+passed, never raw `results`. That fallback deliberately appends rows to an
+otherwise-empty response so a DJ sees the artist's shelf instead of nothing;
+without this netting-out, a genuine recall miss for a shelved artist would
+report `hit` and silently blind the Layer 2 alert to exactly the regressions
+it exists to catch. The DJ-facing `/lookup` response is unaffected either
+way -- this module only ever feeds telemetry, never the wire contract.
+
 **Known gap -- `miss_clean` is not yet a pure signal (LML#1236).** This
 function can only classify what the response tells it, and `degraded` /
 `timeout` are narrower than "something upstream failed". They are set by
@@ -105,12 +115,16 @@ unavailable upstream. Carries `degraded_reason` alongside for the split.
 """
 
 
-def derive_miss_kind(response: LookupResponse) -> str:
+def derive_miss_kind(response: LookupResponse, *, shelf_fallback_rows: int = 0) -> str:
     """Classify a completed lookup into the outcome taxonomy above.
 
     Args:
         response: The `LookupResponse` about to be returned to the caller.
             Read for `results`, `timeout`, and `degraded` only.
+        shelf_fallback_rows: The count of LML#1391/#1393 unbound-shelf-fallback
+            rows included in `response.results` (0 when that step did not
+            fire). Keyword-only, defaulting to 0 so every existing call site
+            is unaffected.
 
     Returns:
         One of `OUTCOME_HIT`, `MISS_TIMEOUT`, `MISS_DEGRADED`, `MISS_CLEAN`.
@@ -119,8 +133,19 @@ def derive_miss_kind(response: LookupResponse) -> str:
     counted as a miss: `degraded` means the tail was shed, not that the search
     failed, so the rows that did come back are trustworthy. Counting those
     would inflate the numerator every time a caller budget got tight.
+
+    **`shelf_fallback_rows` (LML#1391/#1393).** The unbound shelf fallback
+    (`lookup/shelf_fallback.py`) only ever appends its display-only rows when
+    `results` was completely empty beforehand, so whenever it fires every row
+    in `results` is one of its rows -- `len(response.results) >
+    shelf_fallback_rows` is therefore true only when something ELSE also
+    contributed a row. A response whose only rows are shelf-fallback rows is
+    classified exactly as it would be with those rows absent: the algorithm
+    did not find the typed request, and the LML#1233 Layer 2 alert (which
+    fires on `miss_clean` alone) must still see that, not a `hit` the
+    DJ-facing display decoration would otherwise manufacture.
     """
-    if response.results:
+    if len(response.results) > shelf_fallback_rows:
         return OUTCOME_HIT
     if response.timeout:
         return MISS_TIMEOUT
@@ -130,13 +155,14 @@ def derive_miss_kind(response: LookupResponse) -> str:
 
 
 def miss_telemetry_properties(
-    response: LookupResponse, *, commit_sha: str | None
+    response: LookupResponse, *, commit_sha: str | None, shelf_fallback_rows: int = 0
 ) -> dict[str, object]:
     """Build the LML#1233 property fragment for `lookup_completed`.
 
     Args:
         response: The `LookupResponse` about to be returned.
         commit_sha: The deployed SHA, bound once at the caller's import.
+        shelf_fallback_rows: Forwarded to `derive_miss_kind` -- see there.
 
     Returns:
         The seven keys the miss-rate alert and its runbook read, ready to be
@@ -153,7 +179,7 @@ def miss_telemetry_properties(
     whereas a null one reads identically to absent in a PostHog filter.
     """
     return {
-        "miss_kind": derive_miss_kind(response),
+        "miss_kind": derive_miss_kind(response, shelf_fallback_rows=shelf_fallback_rows),
         "timeout": response.timeout,
         "degraded": response.degraded,
         # `.value`, not the enum itself: an insight filters on the wire
@@ -163,4 +189,30 @@ def miss_telemetry_properties(
         "song_not_found": response.song_not_found,
         "found_on_compilation": response.found_on_compilation,
         "commit_sha": commit_sha,
+    }
+
+
+def lookup_completed_properties(
+    response: LookupResponse, *, commit_sha: str | None
+) -> dict[str, object]:
+    """The `results_count` + miss-attribution fragment for `/lookup`'s
+    `lookup_completed` event, netted against LML#1391/#1393's unbound shelf
+    fallback in one call.
+
+    `results_count` must stay blind to the fallback for the same reason
+    `derive_miss_kind` does -- a recall miss for a shelved artist must not
+    inflate the series the Layer 2 alert reads. `shelf_fallback_rows` is the
+    ONE new, separate PostHog property this lane gets (mirrors the Sentry
+    trace attr `apply_shelf_fallback` sets -- `lookup/shelf_fallback.py`),
+    so the lane is observable without touching `results_count` or
+    `miss_kind`'s own meaning. Extracted (rather than built inline) because
+    `lookup/router.py` sits at its module-budget ceiling.
+    """
+    shelf_fallback_rows = response._shelf_fallback_rows
+    return {
+        "results_count": len(response.results) - shelf_fallback_rows,
+        "shelf_fallback_rows": shelf_fallback_rows,
+        **miss_telemetry_properties(
+            response, commit_sha=commit_sha, shelf_fallback_rows=shelf_fallback_rows
+        ),
     }

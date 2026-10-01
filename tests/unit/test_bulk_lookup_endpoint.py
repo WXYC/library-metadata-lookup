@@ -1687,6 +1687,60 @@ class TestBulkNeverRunsLocationUnion:
         probe.assert_not_awaited()
 
 
+class TestBulkNeverRunsShelfFallback:
+    """LML#1391/#1393: `/lookup/bulk` must never get the unbound shelf
+    fallback's display-only rows.
+
+    The route sets ``set_discogs_low_priority(True)`` unconditionally for
+    the whole batch (same signal ``TestBulkNeverRunsLocationUnion`` above
+    checks), and `apply_shelf_fallback`'s ``skip`` gate excludes any
+    low-priority caller. Structural, not a per-item flag: this drives the
+    REAL ``perform_lookup`` per item with a shelved artist and an unmatched
+    typed album -- the exact shape that fires the fallback on the single
+    `/lookup` endpoint (``tests/unit/test_shelf_fallback.py``) -- and pins
+    that bulk's ``results``/``status`` stay a bare ``no_match``, never a
+    self-contradictory ``no_match`` alongside non-empty ``results``.
+    """
+
+    @pytest.fixture
+    def app_client_live_orchestrator(self, mock_library_db, mock_discogs_service, mock_settings):
+        with override_deps(
+            app,
+            _live_orchestrator_overrides(mock_library_db, mock_discogs_service, mock_settings),
+        ):
+            yield app
+
+    @pytest.mark.asyncio
+    async def test_bulk_item_with_shelved_artist_stays_no_match(
+        self, app_client_live_orchestrator, mock_library_db, mock_discogs_service
+    ):
+        from tests.factories import make_library_item
+
+        shelf_item = make_library_item(id=201, artist="Jessica Pratt", title="Quiet Signs")
+
+        async def fake_search(query=None, **kwargs):
+            if query == "Jessica Pratt":
+                return [shelf_item]
+            return []
+
+        mock_library_db.search.side_effect = fake_search
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client_live_orchestrator), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/lookup/bulk",
+                json={"items": [{"artist": "Jessica Pratt", "album": "Zzyzx Road"}]},
+            )
+
+        assert resp.status_code == 200
+        item = resp.json()["results"][0]
+        assert item["status"] == "no_match"
+        assert item["lookup"]["results"] == []
+
+
 class TestBulkLookupCaptureBudget:
     """WXYC/library-metadata-lookup#1169: the bulk path emits O(1) PostHog
     events per batch, not O(N) per item.

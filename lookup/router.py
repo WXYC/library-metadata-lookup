@@ -85,7 +85,7 @@ from lookup.location_union import (
     LOCATION_UNION_INDEX_HIT_STAT_KEY,
     LOCATION_UNION_INDEX_MISS_STAT_KEY,
 )
-from lookup.miss_kind import miss_telemetry_properties
+from lookup.miss_kind import lookup_completed_properties
 from lookup.models import (
     BulkLookupRequest,
     BulkLookupResponse,
@@ -813,11 +813,10 @@ async def handle_lookup(
             telemetry.send_to_posthog(
                 posthog_client,
                 {
-                    "results_count": len(results),
                     "search_type": response.search_type,
-                    # LML#1233 miss attribution (7 keys). `search_type` above
-                    # is NOT a miss signal -- see `lookup/miss_kind.py`.
-                    **miss_telemetry_properties(response, commit_sha=COMMIT_SHA),
+                    # LML#1233 miss attribution + LML#1391/#1393's shelf-fallback
+                    # netting (9 keys) -- see `lookup/miss_kind.py`.
+                    **lookup_completed_properties(response, commit_sha=COMMIT_SHA),
                     "had_artist": bool(request.artist),
                     "had_album": bool(request.album),
                     "had_song": bool(request.song),
