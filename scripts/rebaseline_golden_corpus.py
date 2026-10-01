@@ -66,9 +66,12 @@ async def _run_case(case: Any, library_path: Path, discogs_universe: Any) -> Any
     try:
         async with corpus.golden_app_client(database, fake) as client:
             response = await client.post("/api/v1/lookup", json=case.request_body())
+            # Read the LML#1391/#1393 spy signal before the client (and its
+            # patch) goes out of scope -- see `golden_app_client`'s docstring.
+            shelf_fallback_rows = corpus.last_shelf_fallback_rows()
         response.raise_for_status()
         _assert_routes_served(case, fake)
-        return corpus.verdict_from_payload(response.json())
+        return corpus.verdict_from_payload(response.json(), shelf_fallback_rows=shelf_fallback_rows)
     finally:
         await database.close()
         os.environ.clear()

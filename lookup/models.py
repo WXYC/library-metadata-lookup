@@ -17,7 +17,7 @@ existing callers see no behavior change.
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, SerializeAsAny
+from pydantic import BaseModel, Field, PrivateAttr, SerializeAsAny
 
 from generated.api_models import (
     DiscogsMatchResult,
@@ -79,6 +79,19 @@ class LookupResponse(_GeneratedLookupResponse):
             "None for legacy callers that don't set include_external_caches."
         ),
     )
+
+    # LML#1391/#1393 internal signal -- a Pydantic ``PrivateAttr``, never a
+    # field: invisible to both ``.model_dump()``/``.model_dump_json()`` (the
+    # actual wire body) AND ``model_json_schema()`` (the OpenAPI doc), unlike
+    # a `Field(exclude=True)`, which still appears in the schema. The count of
+    # unbound-shelf-fallback display-only rows in `results` (0 when that step
+    # did not fire). Set by `lookup/orchestrator.py`'s `perform_lookup` right
+    # after building the response; read by `lookup/router.py` so the LML#1233
+    # miss telemetry (`results_count`, `miss_kind`) stays blind to this lane
+    # -- see `lookup/miss_kind.py`. A caller that only ever sees the
+    # serialized JSON (Backend-Service, the golden-corpus HTTP harness) can
+    # never observe this attribute, by design.
+    _shelf_fallback_rows: int = PrivateAttr(default=0)
 
 
 BulkLookupResultStatus = Literal["match", "no_match", "error"]

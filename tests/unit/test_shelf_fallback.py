@@ -20,6 +20,7 @@ import pytest
 from core.search import SEARCH_TYPE_FALLBACK, SearchState, SearchStrategyType
 from discogs.models import DiscogsSearchResponse, TrackReleasesResponse
 from lookup.matching import _FETCH_LIMIT, MAX_SEARCH_RESULTS
+from lookup.miss_kind import MISS_CLEAN, derive_miss_kind
 from lookup.models import LookupRequest, LookupResultItem
 from lookup.orchestrator import perform_lookup
 from lookup.shelf_fallback import _order_shelf_rows, apply_shelf_fallback
@@ -93,7 +94,7 @@ class TestApplyShelfFallback:
 
         out = await apply_shelf_fallback(_parsed(), db, False, existing, "direct", None, "library")
 
-        assert out == (existing, "direct", None, "library")
+        assert out == (existing, "direct", None, "library", 0)
         db.search.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -103,7 +104,7 @@ class TestApplyShelfFallback:
 
         out = await apply_shelf_fallback(_parsed(), db, True, [], "fallback", None, None)
 
-        assert out == ([], "fallback", None, None)
+        assert out == ([], "fallback", None, None, 0)
         db.search.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -112,7 +113,7 @@ class TestApplyShelfFallback:
 
         out = await apply_shelf_fallback(_parsed(album=None), db, False, [], "none", None, None)
 
-        assert out == ([], "none", None, None)
+        assert out == ([], "none", None, None, 0)
         db.search.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -121,7 +122,7 @@ class TestApplyShelfFallback:
 
         out = await apply_shelf_fallback(_parsed(album="   "), db, False, [], "none", None, None)
 
-        assert out == ([], "none", None, None)
+        assert out == ([], "none", None, None, 0)
         db.search.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -130,7 +131,7 @@ class TestApplyShelfFallback:
 
         out = await apply_shelf_fallback(_parsed(artist=None), db, False, [], "none", None, None)
 
-        assert out == ([], "none", None, None)
+        assert out == ([], "none", None, None, 0)
         db.search.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -140,7 +141,7 @@ class TestApplyShelfFallback:
 
         out = await apply_shelf_fallback(_parsed(), db, False, [], "none", None, None)
 
-        assert out == ([], "none", None, None)
+        assert out == ([], "none", None, None, 0)
 
     @pytest.mark.asyncio
     async def test_fires_and_builds_display_only_rows(self):
@@ -151,7 +152,7 @@ class TestApplyShelfFallback:
         ]
         db.search = AsyncMock(return_value=shelf)
 
-        result_items, search_type, context, external = await apply_shelf_fallback(
+        result_items, search_type, context, external, rows = await apply_shelf_fallback(
             _parsed(), db, False, [], "none", None, None
         )
 
@@ -163,6 +164,7 @@ class TestApplyShelfFallback:
             '"Zzyzx Road" not found in the library, but here are other albums by Jessica Pratt:'
         )
         assert external == "library"
+        assert rows == 2
         db.search.assert_awaited_once_with(query="Jessica Pratt", limit=_FETCH_LIMIT)
 
     @pytest.mark.asyncio
@@ -188,9 +190,12 @@ class TestApplyShelfFallback:
         ]
         db.search = AsyncMock(return_value=shelf)
 
-        result_items, *_ = await apply_shelf_fallback(_parsed(), db, False, [], "none", None, None)
+        result_items, _search_type, _context, _external, rows = await apply_shelf_fallback(
+            _parsed(), db, False, [], "none", None, None
+        )
 
         assert len(result_items) == MAX_SEARCH_RESULTS
+        assert rows == MAX_SEARCH_RESULTS
 
     @pytest.mark.asyncio
     async def test_no_artwork_even_when_row_has_curated_streaming_links(self):
@@ -266,6 +271,13 @@ class TestPerformLookupShelfFallbackSongBearing:
         assert response.context_message == (
             '"Zzyzx Road" not found in the library, but here are other albums by Jessica Pratt:'
         )
+        # LML#1233 telemetry invisibility: the internal signal reports the
+        # true row count, but the response still classifies as a clean miss.
+        assert response._shelf_fallback_rows == 2
+        assert (
+            derive_miss_kind(response, shelf_fallback_rows=response._shelf_fallback_rows)
+            == MISS_CLEAN
+        )
 
     @pytest.mark.asyncio
     async def test_shelf_capped_at_max_search_results(
@@ -307,6 +319,7 @@ class TestPerformLookupShelfFallbackSongBearing:
             )
 
         assert len(response.results) == MAX_SEARCH_RESULTS
+        assert response._shelf_fallback_rows == MAX_SEARCH_RESULTS
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +362,11 @@ class TestPerformLookupShelfFallbackAlbumOnly:
         assert response.context_message == (
             '"Zzyzx Road" not found in the library, but here are other albums by Cat Power:'
         )
+        assert response._shelf_fallback_rows == 1
+        assert (
+            derive_miss_kind(response, shelf_fallback_rows=response._shelf_fallback_rows)
+            == MISS_CLEAN
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +404,7 @@ class TestPerformLookupShelfFallbackInvariance:
         assert len(response.results) == 1
         assert response.results[0].library_item.id == 10
         assert response.search_type == "direct"
+        assert response._shelf_fallback_rows == 0
         spy.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -434,6 +453,7 @@ class TestPerformLookupShelfFallbackInvariance:
         assert response.results[0].library_item.id == 50
         assert response.found_on_compilation is True
         assert response.search_type == "compilation"
+        assert response._shelf_fallback_rows == 0
         spy.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -469,6 +489,7 @@ class TestPerformLookupShelfFallbackInvariance:
         assert len(response.results) == 1
         assert response.results[0].library_item.id == 0
         assert response.song_not_found is False
+        assert response._shelf_fallback_rows == 0
 
     @pytest.mark.asyncio
     async def test_external_cache_fallback_rows_are_unchanged(
@@ -506,6 +527,7 @@ class TestPerformLookupShelfFallbackInvariance:
         assert response.external_source == "discogs"
         assert len(response.results) == 1
         assert response.results[0].artwork is None
+        assert response._shelf_fallback_rows == 0
 
     @pytest.mark.asyncio
     async def test_artist_not_shelved_stays_empty(
@@ -524,6 +546,7 @@ class TestPerformLookupShelfFallbackInvariance:
 
         assert response.results == []
         assert response.degraded is False
+        assert response._shelf_fallback_rows == 0
 
     @pytest.mark.asyncio
     async def test_no_typed_album_stays_as_main(
@@ -563,6 +586,7 @@ class TestPerformLookupShelfFallbackInvariance:
             )
 
         assert response.results == []
+        assert response._shelf_fallback_rows == 0
         spy.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -597,6 +621,7 @@ class TestPerformLookupShelfFallbackInvariance:
         assert response.results == []
         assert response.timeout is True
         assert response.degraded is False
+        assert response._shelf_fallback_rows == 0
         spy.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -629,6 +654,7 @@ class TestPerformLookupShelfFallbackInvariance:
 
         assert response.results == []
         assert response.degraded is True
+        assert response._shelf_fallback_rows == 0
         spy.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -661,7 +687,43 @@ class TestPerformLookupShelfFallbackInvariance:
             )
 
         assert response.degraded is True
+        assert response._shelf_fallback_rows == 0
         spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_low_priority_caller_excludes_shelf_fallback(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#1391/#1393's own gate: a low-priority caller (bulk/enrichment/
+        backfill, never DJ-facing) on the SINGLE endpoint must not get the
+        shelf decoration either, even though every other trigger condition
+        holds. Mirrors the location-union gate's "D4" exclusion
+        (``lookup/orchestrator.py``) and keeps `/lookup/bulk`'s
+        ``match``/``no_match`` contract from self-contradicting."""
+        mock_library_db.find_similar_artist.return_value = None
+        shelf_item = make_library_item(id=201, artist="Jessica Pratt", title="Quiet Signs")
+
+        async def fake_search(query=None, **kwargs):
+            if query == "Jessica Pratt":
+                return [shelf_item]
+            return []
+
+        mock_library_db.search.side_effect = fake_search
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Jessica Pratt",
+            album="Zzyzx Road",
+            raw_message="Play Zzyzx Road by Jessica Pratt",
+        )
+
+        with patch("lookup.orchestrator.is_discogs_low_priority", return_value=True):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.results == []
+        assert response._shelf_fallback_rows == 0
 
 
 async def _passthrough_side_effect(

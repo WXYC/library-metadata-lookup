@@ -18,19 +18,35 @@ exactly as it is excluded on ``main`` today, because its post-fold
 Every early return in ``perform_lookup`` for the tail-shed/admission-shed
 degraded flavors (``_build_degraded_response``) and the spine-deadline
 timeout returns before this call site, so those are excluded structurally.
-Two conditions still have to be checked explicitly, because each sets its
-flag and rides the *normal* return path rather than returning early: the
-mid-pipeline hard-cap trip (``state.timed_out``, set inside
-``core/search.py``'s strategy loop) and the search-leg Discogs
-saturation-breaker shed (``state.upstream_shed``, LML#1126), which is caught
-*inside* step 3 and otherwise reaches the final ``LookupResponse`` with
-``degraded=True``. The caller collapses both into one ``skip`` flag — there
-is nothing left for this function to do differently between them.
+Three conditions still have to be checked explicitly, because each either
+sets its flag and rides the *normal* return path rather than returning
+early, or is simply not visible to any earlier gate: the mid-pipeline
+hard-cap trip (``state.timed_out``, set inside ``core/search.py``'s strategy
+loop), the search-leg Discogs saturation-breaker shed (``state.upstream_shed``,
+LML#1126, caught *inside* step 3 and otherwise reaching the final
+``LookupResponse`` with ``degraded=True``), and a low-priority caller
+(``is_discogs_low_priority()`` — bulk/enrichment/backfill traffic, never a
+DJ-facing request). The caller collapses all three into one ``skip`` flag —
+there is nothing left for this function to do differently between them.
+
+The low-priority exclusion matters beyond "don't bother": `/lookup/bulk`
+unconditionally marks every item low-priority and its per-item
+``BulkLookupResultItem.status`` is ``"match" if lookup.results else
+"no_match"`` -- a real response-field contract, not telemetry, documented as
+"``no_match`` — ``lookup.results`` is empty". Letting this fallback fire
+there would make that contract self-contradictory (``no_match`` alongside a
+non-empty ``results``) for every bulk caller, which never asked for a
+DJ-facing shelf decoration in the first place. Excluding low-priority
+callers — the same signal the location-union gate already uses for the same
+reason (``lookup/orchestrator.py``, "D4: BS enrichment, the CDC firehose,
+and backfills are excluded") — avoids the contradiction at the source
+instead of patching bulk's status derivation to match.
 
 When every one of these holds —
 
 * ``result_items`` is empty;
-* ``skip`` is false (the caller's ``state.timed_out or state.upstream_shed``);
+* ``skip`` is false (the caller's ``state.timed_out or state.upstream_shed
+  or is_discogs_low_priority()``);
 * the typed ``parsed.album`` is non-empty after stripping whitespace;
 * the library artist (``library_artist_for(parsed)``) resolves to at least
   one shelved row — the same cached ``db.search`` + ``filter_results_by_artist``
@@ -55,6 +71,26 @@ now reachable for the album-only shape too — ``main``'s
 its "song not found" message requires ``parsed.song``. ``song_not_found``
 and ``found_on_compilation`` are deliberately left untouched: the caller
 already computed them correctly before this step runs.
+
+**Telemetry invisibility.** This function returns the count of rows it
+appended (0 when it does not fire) as its fifth element,
+``shelf_fallback_rows``. The caller must do two things with it, in this
+order, both load-bearing: (1) project the existing Sentry
+``lookup.results_count``/``lookup.match_type`` trace attrs
+(``_project_post_fold_trace_attrs``) *before* calling this function, over
+the pre-fallback ``result_items`` -- those attrs, and the LML#1233
+``lookup_completed`` ``results_count``/``miss_kind`` PostHog properties
+downstream of them, must report exactly what they would without this step
+existing, or a genuine recall miss for a shelved artist inflates
+``results_count`` and reports ``hit``, blinding the Layer 2 recall-regression
+alert to exactly the misses it exists to catch (``lookup/miss_kind.py``);
+(2) thread ``shelf_fallback_rows`` into ``derive_miss_kind``/
+``miss_telemetry_properties`` at the router, so the *downstream* telemetry
+(not just the pre-fold trace attrs) also classifies a shelf-only response as
+a miss. The ONE new, separate signal this lane gets is the Sentry trace
+attr set below (``lookup.shelf_fallback_rows``) plus the identically-named
+PostHog property the router adds -- observability for the lane without
+touching any existing series.
 
 Ordering:
 
@@ -116,15 +152,21 @@ def _order_shelf_rows(rows: list[LibraryItem], song: str | None) -> list[Library
     return leading + trailing
 
 
-def _mark_shelf_fallback_outcome() -> None:
-    """Project a ``lookup.outcome``-style marker, mirroring the
-    ``library_miss_outcome`` convention in ``lookup/orchestrator.py``'s
-    ``_step_project_trace_attrs``. Observability must not break the request
-    path."""
+def _mark_shelf_fallback_outcome(row_count: int) -> None:
+    """Project the ONE new, separate Sentry trace attr for this lane.
+
+    Deliberately NOT ``lookup.outcome`` -- that key is the pre-existing
+    ``library_miss_outcome`` projection (``_step_project_trace_attrs``), and
+    overwriting it here would make this lane indistinguishable from whatever
+    step 3a already recorded, violating the "existing trace attrs stay
+    unchanged" half of the telemetry-invisibility contract above. A fresh
+    key name, only ever set when this lane actually fires, is additive by
+    construction. Observability must not break the request path.
+    """
     try:
         scope = sentry_sdk.get_current_scope()
         if scope.transaction is not None:
-            scope.transaction.set_data("lookup.outcome", "unbound_shelf_fallback")
+            scope.transaction.set_data("lookup.shelf_fallback_rows", row_count)
     except Exception:
         pass
 
@@ -137,36 +179,47 @@ async def apply_shelf_fallback(
     search_type: str,
     context_message: str | None,
     external_source: str | None,
-) -> tuple[list[LookupResultItem], str, str | None, str | None]:
+) -> tuple[list[LookupResultItem], str, str | None, str | None, int]:
     """Append the artist's shelf as display-only rows when the response is
     otherwise empty. See the module docstring for the full contract.
 
-    ``skip`` is the caller's ``state.timed_out or state.upstream_shed`` —
-    both set their flag and ride the *normal* return path rather than
-    returning early, so both have to be checked here, same as
-    ``result_items`` itself; see the module docstring for why.
+    ``skip`` is the caller's ``state.timed_out or state.upstream_shed or
+    is_discogs_low_priority()`` -- none of the three return early, or are
+    visible to this function any other way, so all three have to be checked
+    here, same as ``result_items`` itself; see the module docstring for why.
 
-    Returns ``(result_items, search_type, context_message, external_source)``
-    unchanged when any trigger condition fails — a pure pass-through, so the
-    call site in ``perform_lookup`` never needs its own gate.
+    Returns ``(result_items, search_type, context_message, external_source,
+    shelf_fallback_rows)``. The first four are unchanged when any trigger
+    condition fails — a pure pass-through, so the call site in
+    ``perform_lookup`` never needs its own gate. ``shelf_fallback_rows`` is
+    0 on every pass-through and ``len(shelf_items)`` when this fires; the
+    caller threads it into telemetry so this lane stays invisible to the
+    LML#1233 miss classification -- see the module docstring's "Telemetry
+    invisibility" section.
     """
     if result_items or skip:
-        return result_items, search_type, context_message, external_source
+        return result_items, search_type, context_message, external_source, 0
     album = (parsed.album or "").strip()
     if not album:
-        return result_items, search_type, context_message, external_source
+        return result_items, search_type, context_message, external_source, 0
     lib_artist = library_artist_for(parsed)
     if not lib_artist:
-        return result_items, search_type, context_message, external_source
+        return result_items, search_type, context_message, external_source, 0
 
     rows = filter_results_by_artist(
         await db.search(query=lib_artist, limit=_FETCH_LIMIT), lib_artist
     )
     if not rows:
-        return result_items, search_type, context_message, external_source
+        return result_items, search_type, context_message, external_source, 0
 
     ordered = _order_shelf_rows(rows, parsed.song)[:MAX_SEARCH_RESULTS]
     shelf_items = [LookupResultItem(library_item=row.to_catalog_item()) for row in ordered]
 
-    _mark_shelf_fallback_outcome()
-    return shelf_items, SEARCH_TYPE_FALLBACK, album_not_found_message(parsed), "library"
+    _mark_shelf_fallback_outcome(len(shelf_items))
+    return (
+        shelf_items,
+        SEARCH_TYPE_FALLBACK,
+        album_not_found_message(parsed),
+        "library",
+        len(shelf_items),
+    )

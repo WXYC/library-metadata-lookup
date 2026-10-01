@@ -262,6 +262,12 @@ def test_max_recorded_results_is_the_production_cap():
         pytest.param(corpus.OUTCOME_HIT, ("#1 A — B",), True, id="hit-with-results"),
         pytest.param(corpus.OUTCOME_HIT, (), False, id="hit-with-no-results-is-inconsistent"),
         pytest.param(corpus.MISS_CLEAN, (), True, id="clean-miss"),
+        pytest.param(
+            corpus.MISS_CLEAN,
+            ("#67070 Big Thief — Capacity",),
+            True,
+            id="clean-miss-with-shelf-fallback-rows-is-allowed",
+        ),
         pytest.param(corpus.MISS_TIMEOUT, (), True, id="timeout-miss"),
         pytest.param(corpus.MISS_DEGRADED, (), True, id="degraded-miss"),
         pytest.param(
@@ -270,13 +276,17 @@ def test_max_recorded_results_is_the_production_cap():
     ],
 )
 def test_verdict_shape_is_consistent_for_every_miss_kind(miss_kind, results, expected):
-    """`results` is non-empty iff `miss_kind` is a hit -- for EVERY miss kind.
+    """`results` is non-empty iff `miss_kind` is a hit -- for EVERY miss kind
+    except one deliberate exception.
 
     A prior version of this invariant special-cased `miss_clean` only, so a
     `miss_timeout` or `miss_degraded` verdict with (correctly) no results read
     as contradictory -- the opposite of the truth, and the exact shape
     `verdict_from_payload` always produces for those two kinds (LML#1233
-    review).
+    review). `miss_timeout`/`miss_degraded` still never carry results, but
+    `miss_clean` now legitimately can: LML#1391/#1393's unbound shelf
+    fallback appends display-only rows to an otherwise-empty response
+    without changing its (correctly clean-miss) classification.
     """
     verdict = corpus.Verdict(
         miss_kind=miss_kind, song_not_found=False, found_on_compilation=False, results=results
@@ -457,7 +467,13 @@ async def test_golden_case(case, golden_client, golden_discogs):
     response = await golden_client.post("/api/v1/lookup", json=case.request_body())
     assert response.status_code == 200, response.text
 
-    actual = corpus.verdict_from_payload(response.json())
+    # LML#1391/#1393: the shelf-fallback row count never rides the wire (a
+    # Pydantic PrivateAttr, by design) -- `golden_app_client`'s spy is the
+    # only channel that can see it, and it must be read before anything else
+    # issues a second request through the same client.
+    actual = corpus.verdict_from_payload(
+        response.json(), shelf_fallback_rows=corpus.last_shelf_fallback_rows()
+    )
     missing_routes = sorted(set(case.requires_routes) - golden_discogs.served_keys)
     assert not missing_routes, (
         f"{case.id} requires fixture route(s) {missing_routes} to have served a "

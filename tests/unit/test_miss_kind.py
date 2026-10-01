@@ -154,6 +154,51 @@ class TestPrecedence:
         assert derive_miss_kind(_resp(results_count=2, timeout=True, degraded=True)) == OUTCOME_HIT
 
 
+class TestShelfFallbackRows:
+    """LML#1391/#1393: the unbound shelf fallback must stay invisible to miss
+    telemetry -- a response whose only rows are its display-only shelf rows
+    is still an algorithm-attributable miss, not a hit.
+    """
+
+    def test_all_results_are_shelf_fallback_rows_is_miss_clean(self) -> None:
+        """Every row came from the shelf fallback -- net result count is 0."""
+        assert derive_miss_kind(_resp(results_count=5), shelf_fallback_rows=5) == MISS_CLEAN
+
+    def test_shelf_fallback_rows_default_is_zero_and_unaffected(self) -> None:
+        """Omitting the kwarg reproduces today's behavior exactly."""
+        assert derive_miss_kind(_resp(results_count=0)) == MISS_CLEAN
+        assert derive_miss_kind(_resp(results_count=3)) == OUTCOME_HIT
+
+    def test_a_real_row_beyond_the_shelf_fallback_rows_is_still_a_hit(self) -> None:
+        """One genuine, non-fallback row among the shelf rows still counts."""
+        assert derive_miss_kind(_resp(results_count=3), shelf_fallback_rows=2) == OUTCOME_HIT
+
+    def test_shelf_fallback_rows_does_not_override_timeout_or_degraded(self) -> None:
+        """Netting out to zero still falls through to the timeout/degraded
+        branches exactly as a genuine empty response would."""
+        assert (
+            derive_miss_kind(_resp(results_count=5, timeout=True), shelf_fallback_rows=5)
+            == MISS_TIMEOUT
+        )
+        assert (
+            derive_miss_kind(
+                _resp(
+                    results_count=5,
+                    degraded=True,
+                    degraded_reason=DegradedReason.upstream_unavailable,
+                ),
+                shelf_fallback_rows=5,
+            )
+            == MISS_DEGRADED
+        )
+
+    def test_miss_telemetry_properties_forwards_shelf_fallback_rows(self) -> None:
+        props = miss_telemetry_properties(
+            _resp(results_count=2), commit_sha=None, shelf_fallback_rows=2
+        )
+        assert props["miss_kind"] == MISS_CLEAN
+
+
 class TestVocabulary:
     """The emitted strings are a telemetry contract; pin them."""
 

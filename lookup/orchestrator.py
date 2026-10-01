@@ -1505,19 +1505,23 @@ async def perform_lookup(
         index_confirmed_existing=index_confirmed_existing,
         external_source=external_source,
     )
-    # Step 8 (LML#1391/#1393): additive, unbound shelf fallback -- a pure
-    # pass-through when `result_items` is already non-empty. See
-    # `lookup/shelf_fallback.py` for the full contract.
-    skip = state.timed_out or state.upstream_shed
-    result_items, search_type, context, external_source = await apply_shelf_fallback(
+    # Trace attrs projected over the PRE-fallback `result_items` -- Step 8
+    # below must stay invisible to them. See "Telemetry invisibility" in
+    # `lookup/shelf_fallback.py`.
+    _project_post_fold_trace_attrs(result_items, search_type)
+
+    # Step 8 (LML#1391/#1393): additive, unbound shelf fallback. `skip` also
+    # excludes low-priority callers -- see `lookup/shelf_fallback.py`.
+    skip = state.timed_out or state.upstream_shed or is_discogs_low_priority()
+    shelf_result = await apply_shelf_fallback(
         parsed, services.db, skip, result_items, search_type, context, external_source
     )
-    _project_post_fold_trace_attrs(result_items, search_type)
+    result_items, search_type, context, external_source, shelf_fallback_rows = shelf_result
 
     # LML#1126: a search-leg breaker shed must not read as a genuine no-match
     # -- see ``LookupState.upstream_shed``'s docstring.
     degraded = state.upstream_shed
-    return LookupResponse(
+    response = LookupResponse(
         results=result_items,
         search_type=search_type,
         song_not_found=song_not_found,
@@ -1529,6 +1533,9 @@ async def perform_lookup(
         degraded=degraded,
         degraded_reason=DegradedReason.upstream_unavailable if degraded else None,
     )
+    # Internal-only, never serialized -- see `LookupResponse._shelf_fallback_rows`.
+    response._shelf_fallback_rows = shelf_fallback_rows
+    return response
 
 
 def _build_timed_out_response(state: LookupState) -> LookupResponse:
