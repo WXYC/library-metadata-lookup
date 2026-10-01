@@ -456,6 +456,13 @@ MODULE_BUDGETS: dict[str, int] = {
     # module changes only when this one lane does — so the next edit tripping
     # the ceiling should stop and recalibrate deliberately.
     "lookup/strategies/library_miss.py": 250,
+    # Which step-3a lane a request opens and the `lookup.outcome` value it
+    # reports, named once instead of as parallel if/elif ladders in
+    # `_step_library_miss_probe` (room under the orchestrator ceiling for
+    # LML#1391). Not in `library_miss.py`, which sits at its ceiling. 52 lines
+    # measured, mostly the docstring listing the outcome values;
+    # 1.3x = 67.6 -> 100.
+    "lookup/strategies/miss_probe_lane.py": 100,
     "lookup/strategies/song_as_artist.py": 250,
     "lookup/strategies/song_as_track.py": 150,
     "lookup/strategies/swapped_interpretation.py": 300,

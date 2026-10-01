@@ -89,10 +89,8 @@ from lookup.spine_deadline import (
 )
 from lookup.strategies import build_strategies
 from lookup.strategies.artist_plus_album import runs_album_resolution, search_library_with_fallback
-from lookup.strategies.library_miss import (
-    _library_miss_discogs_search,
-    fallback_rows_block_serving,
-)
+from lookup.strategies.library_miss import _library_miss_discogs_search
+from lookup.strategies.miss_probe_lane import MissProbeLane, miss_probe_lane
 from lookup.strategies.song_as_artist import search_song_as_artist
 from lookup.strategies.song_as_track import search_song_as_track
 from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
@@ -324,14 +322,10 @@ class LookupState:
 
     library_miss_outcome: str | None = None
     """LML#583 outcome marker for the Sentry trace projection (``lookup.outcome``).
-    Written by the library-miss probe (step 3a). Four values, two per lane, kept
-    distinct because the lanes describe different situations and existing slices
-    key on the first pair: ``library_miss_discogs_match`` /
-    ``library_miss_no_discogs_match`` mean the library returned NOTHING and the
-    probe did or didn't resolve the pair; ``serve_blocked_fallback_discogs_match``
-    / ``serve_blocked_fallback_no_discogs_match`` are the LML#1319 songless lane,
-    where the library DID answer but only with rows that cannot clear the serve
-    floor."""
+    Written by the library-miss probe (step 3a): one hit and one miss value per
+    lane, kept distinct because existing slices key on the classic pair meaning
+    "the library returned NOTHING". The four values and their lanes are listed on
+    ``lookup/strategies/miss_probe_lane.py``."""
 
     serve_blocked_probe_pair: tuple[LibraryItem, DiscogsSearchResult] | None = None
     """LML#1319: the step-3a probe hit parked on the serve-blocked songless
@@ -766,15 +760,11 @@ async def _step_library_miss_probe(
     # wrong-album artist-fallback row that cannot clear the LML#477 serve
     # floor would collapse to the release_id=0 streaming-only sentinel
     # downstream, so letting it close this gate starved the probe of exactly
-    # the lookups the local release cache could answer. Policy + rationale
-    # live on ``fallback_rows_block_serving``.
-    serve_blocked = fallback_rows_block_serving(
-        parsed,
-        state.library_results,
-        state.search_type,
-    )
+    # the lookups the local release cache could answer. Policy on
+    # ``miss_probe_lane``; rationale on ``fallback_rows_block_serving``.
+    lane = miss_probe_lane(parsed, state.library_results, state.search_type)
     if (
-        (not state.library_results or serve_blocked)
+        lane is not None
         and services.allow_release_resolution_fallback
         and parsed.artist
         and parsed.album
@@ -786,13 +776,13 @@ async def _step_library_miss_probe(
                 services.discogs_service,
                 # LML#1319 review: the serve-blocked lane probes CACHE-ONLY.
                 # Rationale on ``_library_miss_discogs_search``.
-                allow_api_escalation=not serve_blocked,
+                allow_api_escalation=lane is not MissProbeLane.SERVE_BLOCKED,
             )
         if miss_match is not None:
             # A synthesized Discogs match resolves the request — clear song_not_found so
             # build_context_message and LookupResponse.song_not_found reflect reality.
             state.song_not_found = False
-            if serve_blocked:
+            if lane is MissProbeLane.SERVE_BLOCKED:
                 # LML#1319: the probe hit is ADDITIONAL evidence, never a
                 # replacement. The rows that opened this lane are real shelved
                 # records whose call number is the whole point of a card-catalog
@@ -805,10 +795,9 @@ async def _step_library_miss_probe(
                 # so the response leads with the probe's release id/artwork and
                 # still carries every shelved row behind it.
                 state.serve_blocked_probe_pair = miss_match
-                state.library_miss_outcome = "serve_blocked_fallback_discogs_match"
             else:
                 state.items_with_artwork = [miss_match]
-                state.library_miss_outcome = "library_miss_discogs_match"
+            state.library_miss_outcome = lane.outcome(matched=True)
             services.telemetry.record_api_call("discogs")
         elif services.discogs_service is not None:
             # Discogs was available and searched but found no confident match.
@@ -816,11 +805,7 @@ async def _step_library_miss_probe(
             # "the library returned nothing", and on this lane it DID answer —
             # reusing it would silently change the population behind every
             # existing `lookup.outcome` slice and runbook (LML#1319 review).
-            state.library_miss_outcome = (
-                "serve_blocked_fallback_no_discogs_match"
-                if serve_blocked
-                else "library_miss_no_discogs_match"
-            )
+            state.library_miss_outcome = lane.outcome(matched=False)
 
 
 async def _step_validate_tracks(
