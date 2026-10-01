@@ -27,7 +27,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import BinaryIO, Protocol, runtime_checkable
 
 import boto3
 from botocore.config import Config
@@ -35,9 +35,16 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
+# How much of an object a streaming read holds at once. The stored databases are
+# tens of megabytes; a whole-object buffer that size is what the process keeps
+# as resident memory after the request is over (LML#1407).
+_STREAM_CHUNK_BYTES = 1024 * 1024
+
 
 class ObjectNotFoundError(Exception):
     """Raised by :meth:`ObjectStore.get` when the key has no object.
+
+    :meth:`ObjectStore.download_to_path` and :meth:`ObjectStore.copy` raise it too.
 
     A uniform, backend-independent signal so callers branch on absence the same
     way against S3 (a ``NoSuchKey`` ``ClientError``) and the local directory (a
@@ -75,6 +82,8 @@ class ObjectStat:
 class ObjectStore(Protocol):
     """Minimal async key -> blob store: ``get`` / ``put`` / ``copy`` / ``exists`` / ``head``.
 
+    ``download_to_path`` is ``get`` for objects too large to buffer whole.
+
     All methods are async so the S3 implementation can offload blocking boto3
     calls to a thread without changing the call sites.
 
@@ -86,6 +95,17 @@ class ObjectStore(Protocol):
 
     async def get(self, key: str) -> bytes:
         """Return the object's bytes, or raise :class:`ObjectNotFoundError`."""
+        ...
+
+    async def download_to_path(self, key: str, dest: Path) -> None:
+        """Write the object to ``dest`` in bounded chunks, never holding it whole.
+
+        The streaming counterpart of :meth:`get`, for objects too large to be
+        worth a whole-object buffer (LML#1407). ``dest`` is overwritten and its
+        parent directory must already exist. Raises :class:`ObjectNotFoundError`
+        when ``key`` has no object, and leaves no partial file behind on any
+        failure.
+        """
         ...
 
     async def put(self, key: str, data: bytes | Path) -> None:
@@ -119,6 +139,16 @@ def _s3_error_is_not_found(err: ClientError) -> bool:
         return True
     status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
     return status == 404
+
+
+def _write_stream_to_path(src: BinaryIO, dest: Path) -> None:
+    """Copy ``src`` to ``dest`` chunk by chunk, removing ``dest`` if the copy fails."""
+    try:
+        with dest.open("wb") as out:
+            shutil.copyfileobj(src, out, _STREAM_CHUNK_BYTES)
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
 
 
 class S3ObjectStore:
@@ -183,6 +213,22 @@ class S3ObjectStore:
             return data
 
         return await asyncio.to_thread(_get)
+
+    async def download_to_path(self, key: str, dest: Path) -> None:
+        def _download() -> None:
+            try:
+                resp = self._client.get_object(Bucket=self.bucket, Key=key)
+            except ClientError as err:
+                if _s3_error_is_not_found(err):
+                    raise ObjectNotFoundError(key) from err
+                raise
+            body = resp["Body"]
+            try:
+                _write_stream_to_path(body, dest)
+            finally:
+                body.close()
+
+        await asyncio.to_thread(_download)
 
     async def put(self, key: str, data: bytes | Path) -> None:
         def _put() -> None:
@@ -257,6 +303,21 @@ class LocalDirStore:
                 raise ObjectNotFoundError(key) from err
 
         return await asyncio.to_thread(_get)
+
+    async def download_to_path(self, key: str, dest: Path) -> None:
+        path = self._resolve(key)
+
+        def _download() -> None:
+            # Opened on its own so only a missing object reads as absence; a
+            # missing destination directory stays a FileNotFoundError.
+            try:
+                src = path.open("rb")
+            except FileNotFoundError as err:
+                raise ObjectNotFoundError(key) from err
+            with src:
+                _write_stream_to_path(src, dest)
+
+        await asyncio.to_thread(_download)
 
     async def put(self, key: str, data: bytes | Path) -> None:
         dest = self._resolve(key)
