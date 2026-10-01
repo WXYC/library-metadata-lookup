@@ -343,20 +343,6 @@ def _release_matches_library_row(release: ReleaseInfo, item: LibraryItem) -> boo
     return False
 
 
-# Minimum fuzzy score (0-100) for accepting a library-row title as a genuine
-# album match for the DJ-typed album. Mirrors the 80-floor in
-# `clients/streaming/apple_music._APPLE_MUSIC_MATCH_FLOOR` and the
-# streaming-availability batch matcher. When the artist-fallback branches
-# of `search_library_with_fallback` surface a row whose title doesn't clear
-# this floor against the typed album, the row would otherwise carry the
-# matched Discogs release's `release_year` / `apple_music_url` / `spotify_url`
-# / `discogs_url` / `artwork_url` onto a flowsheet row tagged with a
-# completely different album — the contamination shape documented in #400
-# (~184k rows; 16,532 distinct Discogs URLs each attached to many distinct
-# DJ-typed `(artist, album)` pairs). #390 / #398 tightened the result
-# verification; this tightens the LML lookup result itself.
-_ALBUM_MATCH_FLOOR = 80.0
-
 # Lenient artist-overlap backstop for the album-title fallback's
 # ``skip_artist_match_filter=True`` path (``process_release``). That path
 # intentionally drops the strict prefix filter so reordered/collaborative
@@ -370,29 +356,6 @@ _ALBUM_MATCH_FLOOR = 80.0
 # collaborators score ~65 (must survive) while coincidental collisions score
 # ~17 (must drop). Measured on those two anchors; keep the margin if retuning.
 _FALLBACK_ARTIST_SIMILARITY_FLOOR = 40.0
-
-
-def _filter_results_by_album_match(
-    results: list[LibraryItem],
-    album: str | None,
-) -> list[LibraryItem]:
-    """Drop library rows whose title doesn't clear `_ALBUM_MATCH_FLOOR` against
-    the typed album. No-ops when `album` is empty or whitespace-only.
-    """
-    if not album or not album.strip():
-        return results
-    norm_album = normalize_for_comparison(album)
-    kept: list[LibraryItem] = []
-    for item in results:
-        title_norm = normalize_for_comparison(item.title or "")
-        if fuzz.token_set_ratio(norm_album, title_norm) >= _ALBUM_MATCH_FLOOR:
-            kept.append(item)
-    if len(kept) < len(results):
-        logger.info(
-            f"Album-match floor dropped {len(results) - len(kept)} of {len(results)} "
-            f"artist-fallback candidates against typed album '{album}'"
-        )
-    return kept
 
 
 def album_title_acceptable(query_lower: str, result_lower: str) -> bool:

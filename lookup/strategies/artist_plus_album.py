@@ -29,10 +29,10 @@ from core.search import (
 )
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
+from lookup.fallback_title_floors import _filter_results_by_album_match
 from lookup.matching import (
     _FETCH_LIMIT,
     MAX_SEARCH_RESULTS,
-    _filter_results_by_album_match,
     filter_results_by_artist,
     is_self_titled,
     is_self_titled_request_placeholder,
