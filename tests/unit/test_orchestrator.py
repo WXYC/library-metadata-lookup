@@ -1082,6 +1082,43 @@ class TestPerformLookupAlbumResolution:
 
         assert telemetry.api_calls["discogs"] == expected_discogs_calls
 
+    @pytest.mark.asyncio
+    async def test_placeholder_naming_a_shelved_row_skips_step_2(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#1392 literal-title guard, end to end. Backend-Service enrichment
+        types the catalog title "S/T" verbatim; it names the artist's own "s/t"
+        row, so step 2's Discogs search never runs and is not counted, that row
+        leads instead of the 7-inch titled after the song, and the only Discogs
+        call is the one step-4 artwork lookup for that row, as on main."""
+        mock_library_db.find_similar_artist.return_value = None
+        mock_library_db.search.return_value = [
+            make_library_item(id=39020, artist="Astral Social Club", title="s/t"),
+            make_library_item(
+                id=51470, artist="Astral Social Club", title="Metal guru", format='7"'
+            ),
+        ]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        request = LookupRequest(
+            artist="Astral Social Club",
+            album="S/T",
+            song="Metal Guru",
+            raw_message="Astral Social Club - Metal Guru",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[("Astral Social Club", "Metal Guru")],
+        ) as step_2_search:
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        step_2_search.assert_not_awaited()
+        assert [r.library_item.id for r in response.results] == [39020]
+        assert telemetry.api_calls["discogs"] == 1
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - fallback and context messages
