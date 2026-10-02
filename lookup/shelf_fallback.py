@@ -14,15 +14,16 @@ returns up to ``MAX_SEARCH_RESULTS`` display-only rows
 artwork URL, year, Discogs URL or streaming links), forces ``search_type`` to
 ``SEARCH_TYPE_FALLBACK`` (never ``direct``), sets ``external_source`` to
 ``"library"``, and sets the "not found in the library, but here are other
-albums by X:" context line, where X is the library artist whose shelf is shown.
+albums by X:" context line, where X is the artist as the listed rows spell it.
 Rows whose title contains the requested song come first; the rest keep
-``db.search`` order.
+catalog (id) order.
 
-A row is kept only when its artist EQUALS the library artist under
-``normalize_for_comparison``. ``filter_results_by_artist``'s prefix rung is too
-loose for a lane that names the artist: "Can" would list a Canibus row. When no
-row survives, or the search raises, the step does not fire and the response
-stays empty, as on ``main``.
+The shelf is the artist's own rows and no one else's, read by artist rather
+than out of a ``db.search`` window (LML#1406; ``lookup/artist_shelf.py`` has
+the matching rungs). ``filter_results_by_artist``'s prefix rung is too loose
+for a lane that names the artist: "Can" would list a Canibus row. When the
+artist has no rows, or the query raises, the step does not fire and the
+response stays empty, as on ``main``.
 
 It makes no Discogs call, fetches no artwork and runs no enrichment. Its last
 return value is the number of rows appended, which the caller threads into
@@ -51,6 +52,7 @@ import sentry_sdk
 from core.search import SEARCH_TYPE_FALLBACK
 from library.db import LibraryDB
 from library.models import LibraryItem
+from lookup.artist_shelf import rows_for_artist
 from lookup.matching import (
     _FETCH_LIMIT,
     MAX_SEARCH_RESULTS,
@@ -77,7 +79,7 @@ def _rows_by_artist(rows: list[LibraryItem], artist: str) -> list[LibraryItem]:
 
 
 def _order_shelf_rows(rows: list[LibraryItem], song: str | None) -> list[LibraryItem]:
-    """Song-in-title rows first (stable), then the rest in query order.
+    """Song-in-title rows first (stable), then the rest in catalog order.
 
     Tier 2 (cache-confirmed song) is skipped, so this is tiers 1 and 3 only.
     ``docs/architecture.md``, "Shelf fallback (step 8): design notes", says why.
@@ -200,8 +202,7 @@ async def apply_shelf_fallback(
     # On ``main`` this path returned an empty 200 with no further I/O, so a
     # failure here must leave that response exactly as it was.
     try:
-        found = await db.search(query=lib_artist, limit=_FETCH_LIMIT)
-        rows = _order_shelf_rows(_rows_by_artist(found, lib_artist), parsed.song)
+        rows = _order_shelf_rows(await rows_for_artist(db, lib_artist), parsed.song)
         shelf_items = [
             LookupResultItem(library_item=row.to_catalog_item())
             for row in rows[:MAX_SEARCH_RESULTS]
@@ -216,7 +217,7 @@ async def apply_shelf_fallback(
     return (
         shelf_items,
         SEARCH_TYPE_FALLBACK,
-        album_not_found_message(parsed, lib_artist),
+        album_not_found_message(parsed, rows[0].artist or lib_artist),
         "library",
         len(shelf_items),
     )

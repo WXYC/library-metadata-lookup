@@ -419,6 +419,12 @@ MODULE_BUDGETS: dict[str, int] = {
     # entry existed. Smallest multiple of 50 at or above 1.3x the 155-line
     # measured size (201.5).
     "lookup/shelf_fallback.py": 250,
+    # LML#1406: the artist-keyed row read both step-8 lanes need, with its
+    # matching rungs. Its own module because shelf_fallback.py sat at 222/250
+    # and this is a separate concern (which rows are one artist's) from that
+    # file's (when a lane fires and what it returns). Smallest multiple of 50
+    # at or above 1.3x the 87-line measured size (113.1).
+    "lookup/artist_shelf.py": 150,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line
     # ceiling (zero headroom) before this ticket's two mandated Sentry-tag call

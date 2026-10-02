@@ -302,6 +302,15 @@ def _to_fts_match_query(query: str) -> str:
     return " ".join('"' + t.replace('"', '""') + '"' for t in terms)
 
 
+def _to_fts_phrase(phrase: str) -> str:
+    """Quote ``phrase`` as ONE FTS5 string literal, so its terms must be adjacent.
+
+    The phrase counterpart of :func:`_to_fts_match_query`, which quotes each
+    term separately (an AND across terms, in any order and any column).
+    """
+    return '"' + " ".join(phrase.split()).replace('"', '""') + '"'
+
+
 def _fts_normalize(query: str) -> str:
     """Normalize a query for the LIKE/fuzzy fallback tokenizers.
 
@@ -983,6 +992,53 @@ class LibraryDB:
         )
         rows = await cursor.fetchall()
         return [LibraryItem(**dict(row)) for row in rows]
+
+    async def artist_names_matching(self, phrases: list[str]) -> list[str]:
+        """Return the distinct ``library.artist`` values containing any of ``phrases``.
+
+        Each phrase is matched as an FTS5 phrase against the ``artist`` column
+        only, so a title that happens to contain the words never counts. There
+        is no ``LIMIT``: the point is that a caller filtering down to one
+        artist sees every stored spelling, however many other artists share a
+        word with it (LML#1406 -- "Love", "The Band" and 83 others had their
+        own rows crowded out of a 50-row :meth:`search` window). Only the
+        artist strings cross the driver boundary, so a wide phrase ("the")
+        costs a few milliseconds, not a model per row.
+
+        A phrase is a containment test, not equality: "can" also returns "Tin
+        Can Phone". Callers narrow the names themselves, then fetch the rows
+        with :meth:`rows_by_artist`. Phrases with no whitespace-separated term
+        are dropped; with none left the answer is ``[]`` and no SQL runs.
+        """
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        quoted = [_to_fts_phrase(phrase) for phrase in phrases if phrase.split()]
+        if not quoted:
+            return []
+        cursor = await self._conn.execute(
+            "SELECT DISTINCT l.artist FROM library l "
+            "JOIN library_fts fts ON l.id = fts.rowid WHERE library_fts MATCH ?",
+            (f"artist : ({' OR '.join(quoted)})",),
+        )
+        return [row[0] for row in await cursor.fetchall() if row[0]]
+
+    async def rows_by_artist(self, artists: list[str]) -> list[LibraryItem]:
+        """Return every row whose ``artist`` is literally one of ``artists``, in id order.
+
+        Byte-for-byte equality, so ``idx_artist`` covers it; pass the stored
+        spellings :meth:`artist_names_matching` returned. No ``LIMIT``, for the
+        reason :meth:`exact_title` gives.
+        """
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        if not artists:
+            return []
+        cursor = await self._conn.execute(
+            f"SELECT {self._select_columns()} FROM library "
+            f"WHERE artist IN ({', '.join('?' for _ in artists)}) ORDER BY id",
+            artists,
+        )
+        return [LibraryItem(**dict(row)) for row in await cursor.fetchall()]
 
     async def _fuzzy_search(self, query: str, limit: int, threshold: int = 70) -> list[LibraryItem]:
         """

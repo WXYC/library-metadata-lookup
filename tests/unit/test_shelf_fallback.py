@@ -21,14 +21,14 @@ import pytest
 
 from core.search import SEARCH_TYPE_FALLBACK, SearchState, SearchStrategyType
 from discogs.models import DiscogsSearchResponse, TrackReleasesResponse
-from lookup.matching import _FETCH_LIMIT, MAX_SEARCH_RESULTS
+from lookup.matching import MAX_SEARCH_RESULTS
 from lookup.miss_kind import MISS_CLEAN, derive_miss_kind
 from lookup.models import LookupRequest, LookupResultItem
 from lookup.orchestrator import perform_lookup
 from lookup.shelf_fallback import _order_shelf_rows, _rows_by_artist, apply_shelf_fallback
 from services.parser import MessageType, ParsedRequest
 from tests.conftest import make_lml_telemetry
-from tests.factories import make_library_item
+from tests.factories import make_library_item, shelve
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -119,12 +119,12 @@ class TestApplyShelfFallback:
     @pytest.mark.asyncio
     async def test_passthrough_when_timed_out(self):
         db = AsyncMock()
-        db.search = AsyncMock(return_value=[make_library_item(artist="Jessica Pratt")])
+        shelve(db, [make_library_item(artist="Jessica Pratt")])
 
         out = await apply_shelf_fallback(_parsed(), db, True, [], "fallback", None, None)
 
         assert out == ([], "fallback", None, None, 0)
-        db.search.assert_not_awaited()
+        db.artist_names_matching.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_passthrough_when_no_album(self):
@@ -133,7 +133,7 @@ class TestApplyShelfFallback:
         out = await apply_shelf_fallback(_parsed(album=None), db, False, [], "none", None, None)
 
         assert out == ([], "none", None, None, 0)
-        db.search.assert_not_awaited()
+        db.artist_names_matching.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_passthrough_when_album_is_whitespace(self):
@@ -142,7 +142,7 @@ class TestApplyShelfFallback:
         out = await apply_shelf_fallback(_parsed(album="   "), db, False, [], "none", None, None)
 
         assert out == ([], "none", None, None, 0)
-        db.search.assert_not_awaited()
+        db.artist_names_matching.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_passthrough_when_no_library_artist(self):
@@ -151,12 +151,12 @@ class TestApplyShelfFallback:
         out = await apply_shelf_fallback(_parsed(artist=None), db, False, [], "none", None, None)
 
         assert out == ([], "none", None, None, 0)
-        db.search.assert_not_awaited()
+        db.artist_names_matching.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_passthrough_when_artist_not_shelved(self):
         db = AsyncMock()
-        db.search = AsyncMock(return_value=[])
+        shelve(db, [])
 
         out = await apply_shelf_fallback(_parsed(), db, False, [], "none", None, None)
 
@@ -169,7 +169,7 @@ class TestApplyShelfFallback:
             make_library_item(id=201, artist="Jessica Pratt", title="On Your Own Love Again"),
             make_library_item(id=202, artist="Jessica Pratt", title="Quiet Signs"),
         ]
-        db.search = AsyncMock(return_value=shelf)
+        shelve(db, shelf)
 
         result_items, search_type, context, external, rows = await apply_shelf_fallback(
             _parsed(), db, False, [], "none", None, None
@@ -184,7 +184,7 @@ class TestApplyShelfFallback:
         )
         assert external == "library"
         assert rows == 2
-        db.search.assert_awaited_once_with(query="Jessica Pratt", limit=_FETCH_LIMIT)
+        db.artist_names_matching.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_orders_song_matching_title_first(self):
@@ -193,7 +193,7 @@ class TestApplyShelfFallback:
             make_library_item(id=1, artist="Jessica Pratt", title="Unrelated"),
             make_library_item(id=2, artist="Jessica Pratt", title="Zzyzx Road Live"),
         ]
-        db.search = AsyncMock(return_value=shelf)
+        shelve(db, shelf)
 
         result_items, *_ = await apply_shelf_fallback(
             _parsed(song="Zzyzx Road"), db, False, [], "none", None, None
@@ -207,7 +207,7 @@ class TestApplyShelfFallback:
         shelf = [
             make_library_item(id=i, artist="Jessica Pratt", title=f"Album {i}") for i in range(1, 8)
         ]
-        db.search = AsyncMock(return_value=shelf)
+        shelve(db, shelf)
 
         result_items, _search_type, _context, _external, rows = await apply_shelf_fallback(
             _parsed(), db, False, [], "none", None, None
@@ -227,7 +227,7 @@ class TestApplyShelfFallback:
         row = make_library_item(
             id=5, artist="Jessica Pratt", title="Streaming Hit", on_streaming=True
         )
-        db.search = AsyncMock(return_value=[row])
+        shelve(db, [row])
 
         result_items, *_ = await apply_shelf_fallback(_parsed(), db, False, [], "none", None, None)
 
@@ -270,11 +270,12 @@ class TestApplyShelfFallback:
         artist in its context line, so it keeps a row only on normalized
         artist equality -- and does not fire at all when none survives."""
         db = AsyncMock()
-        db.search = AsyncMock(
-            return_value=[
+        shelve(
+            db,
+            [
                 make_library_item(id=i, artist=row_artist, title=title)
                 for i, (row_artist, title) in enumerate(found, start=1)
-            ]
+            ],
         )
 
         out = await apply_shelf_fallback(_parsed(artist=artist), db, False, [], "none", None, None)
@@ -293,16 +294,14 @@ class TestApplyShelfFallback:
         ``library_artist``, so that is the artist the sentence names. The typed
         album stays verbatim."""
         db = AsyncMock()
-        db.search = AsyncMock(
-            return_value=[make_library_item(id=7, artist="Jessica Pratt", title="Quiet Signs")]
-        )
+        shelve(db, [make_library_item(id=7, artist="Jessica Pratt", title="Quiet Signs")])
         parsed = _parsed(artist="Jesica Prat", library_artist="Jessica Pratt", album="zzyzx rd")
 
         result_items, _search_type, context, _external, rows = await apply_shelf_fallback(
             parsed, db, False, [], "none", None, None
         )
 
-        db.search.assert_awaited_once_with(query="Jessica Pratt", limit=_FETCH_LIMIT)
+        db.artist_names_matching.assert_awaited_once()
         assert [item.library_item.id for item in result_items] == [7]
         assert rows == 1
         assert context == (
@@ -310,11 +309,35 @@ class TestApplyShelfFallback:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("typed", "stored"),
+        [
+            pytest.param("jessica pratt", "Jessica Pratt", id="casing"),
+            pytest.param("Nilufer Yanya", "Nilüfer Yanya", id="diacritics"),
+            pytest.param("Clientele", "The Clientele", id="leading-article"),
+            pytest.param("Chuquimamani Condori", "Chuquimamani-Condori", id="punctuation"),
+        ],
+    )
+    async def test_sentence_names_the_artist_as_the_rows_spell_it(self, typed, stored):
+        """LML#1406: the sentence introduces the rows listed under it, so it
+        uses their stored spelling, not the listener's."""
+        db = shelve(AsyncMock(), [make_library_item(id=9, artist=stored, title="An Album")])
+
+        result_items, _search_type, context, _external, _rows = await apply_shelf_fallback(
+            _parsed(artist=typed), db, False, [], "none", None, None
+        )
+
+        assert [item.library_item.id for item in result_items] == [9]
+        assert context == (
+            f'"Zzyzx Road" not found in the library, but here are other albums by {stored}:'
+        )
+
+    @pytest.mark.asyncio
     async def test_search_failure_leaves_the_empty_response_unchanged(self, caplog):
         """On main this path returned an empty 200 with no further I/O, so a
         failing ``db.search`` must not turn it into a 500."""
         db = AsyncMock()
-        db.search = AsyncMock(side_effect=RuntimeError("Database not connected"))
+        db.artist_names_matching = AsyncMock(side_effect=RuntimeError("Database not connected"))
 
         with caplog.at_level(logging.WARNING, logger="lookup.shelf_fallback"):
             out = await apply_shelf_fallback(_parsed(), db, False, [], "direct", None, None)
@@ -333,7 +356,7 @@ class TestApplyShelfFallback:
         the spine deadline) and return the empty-response passthrough instead
         of letting the task actually cancel."""
         db = AsyncMock()
-        db.search = AsyncMock(side_effect=asyncio.CancelledError())
+        db.artist_names_matching = AsyncMock(side_effect=asyncio.CancelledError())
 
         with pytest.raises(asyncio.CancelledError):
             await apply_shelf_fallback(_parsed(), db, False, [], "direct", None, None)
@@ -348,11 +371,12 @@ class TestApplyShelfFallback:
     )
     async def test_sentry_attr_is_set_only_when_the_lane_fires(self, shelf_size, expected_calls):
         db = AsyncMock()
-        db.search = AsyncMock(
-            return_value=[
+        shelve(
+            db,
+            [
                 make_library_item(id=i, artist="Jessica Pratt", title=f"Album {i}")
                 for i in range(1, shelf_size + 1)
-            ]
+            ],
         )
         scope = Mock()
 
@@ -386,6 +410,7 @@ class TestPerformLookupShelfFallbackSongBearing:
             return []
 
         mock_library_db.search.side_effect = fake_search
+        shelve(mock_library_db, [on_your_own, quiet_signs])
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
         mock_discogs_service.validate_track_on_release.return_value = False
         mock_discogs_service.search_releases_by_track = AsyncMock(
@@ -440,6 +465,7 @@ class TestPerformLookupShelfFallbackSongBearing:
             return []
 
         mock_library_db.search.side_effect = fake_search
+        shelve(mock_library_db, shelf)
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
         mock_discogs_service.validate_track_on_release.return_value = False
         mock_discogs_service.search_releases_by_track = AsyncMock(
@@ -491,6 +517,7 @@ class TestPerformLookupShelfFallbackAlbumOnly:
             return []
 
         mock_library_db.search.side_effect = fake_search
+        shelve(mock_library_db, [moon_pix])
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
 
         request = LookupRequest(
@@ -770,7 +797,6 @@ class TestPerformLookupShelfFallbackInvariance:
         )
         assert [item.library_item.id for item in response.results] == [201]
 
-        mock_library_db.search.reset_mock()
         response = await self._lookup_shelved_artist_album_miss(
             mock_library_db,
             mock_discogs_service,
@@ -786,7 +812,7 @@ class TestPerformLookupShelfFallbackInvariance:
         assert response.external_source is None
         assert response.timeout is expected.get("timeout", False)
         assert response.degraded is expected.get("degraded", False)
-        mock_library_db.search.assert_not_awaited()
+        mock_library_db.artist_names_matching.assert_not_awaited()
 
     @staticmethod
     async def _lookup_shelved_artist_album_miss(
@@ -797,9 +823,10 @@ class TestPerformLookupShelfFallbackInvariance:
         flags are set directly; ``should_shed_tail`` is neutralized so a spent
         deadline reaches step 8 instead of shedding the tail earlier."""
         mock_library_db.find_similar_artist.return_value = None
-        mock_library_db.search.return_value = [
-            make_library_item(id=201, artist="Jessica Pratt", title="Quiet Signs")
-        ]
+        shelve(
+            mock_library_db,
+            [make_library_item(id=201, artist="Jessica Pratt", title="Quiet Signs")],
+        )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
         request = LookupRequest(
             artist="Jessica Pratt",
@@ -834,6 +861,7 @@ class TestPerformLookupShelfFallbackInvariance:
             return [moon_pix] if query == "Cat Power" else []
 
         mock_library_db.search.side_effect = fake_search
+        shelve(mock_library_db, [moon_pix])
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
         request = LookupRequest(
             artist="Cat Power", album="Zzyzx Road", raw_message="Play Zzyzx Road by Cat Power"
@@ -907,6 +935,7 @@ class TestPerformLookupShelfFallbackInvariance:
             return []
 
         mock_library_db.search.side_effect = fake_search
+        shelve(mock_library_db, [shelf_item])
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
 
         request = LookupRequest(
