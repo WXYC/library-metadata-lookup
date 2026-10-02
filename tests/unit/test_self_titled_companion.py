@@ -256,10 +256,11 @@ class TestCompanionRow:
         assert out == (existing, "direct", None, "library", 0)
 
     @pytest.mark.asyncio
-    async def test_catalog_failure_leaves_the_response_unchanged(self):
+    @pytest.mark.parametrize("query", ["artist_names_matching", "rows_by_artist"])
+    async def test_catalog_failure_leaves_the_response_unchanged(self, query):
         existing = [_bound(MOON_PIX)]
-        db = AsyncMock()
-        db.artist_names_matching = AsyncMock(side_effect=RuntimeError("db gone"))
+        db = _db([MOON_PIX, SELF_TITLED])
+        setattr(db, query, AsyncMock(side_effect=RuntimeError("db gone")))
 
         out = await _apply(_parsed(), db, existing)
 
@@ -362,10 +363,11 @@ class TestCompanionOverARealIndex:
     @pytest.mark.asyncio
     async def test_another_artists_literal_title_does_not_hold_the_row_back(self, tmp_path):
         """The guard asks whether THIS artist shelves a record called "S/T".
-        Canibus shelving one says nothing about Can."""
-        rows = [("Canibus", "S/T"), ("Can", "Can"), ("Can", "Ege Bamyasi")]
+        Sun Ra Arkestra shelving one says nothing about Sun Ra, though the
+        prefix rung the guard used to read through takes it for a match."""
+        rows = [("Sun Ra Arkestra", "S/T"), ("Sun Ra", "Sun Ra"), ("Sun Ra", "Lanquidity")]
 
-        assert await self._companions(tmp_path, "Can", rows) == [("Can", "Can")]
+        assert await self._companions(tmp_path, "Sun Ra", rows) == [("Sun Ra", "Sun Ra")]
 
 
 class TestPerformLookupCompanionRow:

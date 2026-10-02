@@ -20,10 +20,11 @@ catalog (id) order.
 
 Both lanes work from the artist's own rows and no one else's, read by artist
 rather than out of a ``db.search`` window (LML#1406, LML#1418;
-``lookup/artist_shelf.py`` has the matching rungs). ``filter_results_by_artist``'s prefix rung is too loose
-for a lane that names the artist: "Can" would list a Canibus row. When the
-artist has no rows, or the query raises, the step does not fire and the
-response stays empty, as on ``main``.
+``lookup/artist_shelf.py`` has the matching rungs).
+``filter_results_by_artist``'s prefix rung is too loose for a lane that names
+the artist: "Sun Ra" would list a Sun Ra Arkestra row. When the artist has no
+rows, or the query raises, the step does not fire and the response stays as
+it was.
 
 It makes no Discogs call, fetches no artwork and runs no enrichment. Its last
 return value is the number of rows appended, which the caller threads into
@@ -126,29 +127,28 @@ async def _self_titled_companions(
     Empty unless the typed album is a request-side placeholder ("Epon.",
     "S/T"), the response has room under ``MAX_SEARCH_RESULTS``, and none of
     the artist's titles is itself the typed album or a placeholder (the
-    LML#1392 literal-title guard, as in ``runs_album_resolution``). Rows come
-    from ``rows_for_artist`` (LML#1418), so the artist is this one and never a
-    prefix; the title is the artist's name whole, so a numbered sibling
-    ("X II") is not a companion. Rows already returned are left out.
+    LML#1392 literal-title guard; ``runs_album_resolution`` has the same test
+    over its search window). Rows come from ``rows_for_artist`` (LML#1418),
+    so the artist is this one and never a prefix; the title is the artist's
+    name whole, so a numbered sibling ("X II") is not a companion. Rows
+    already returned are left out.
     """
     room = MAX_SEARCH_RESULTS - len(result_items)
     typed = parsed.album or ""
     if room <= 0 or not is_self_titled_request_placeholder(typed):
         return []
     rows = await rows_for_artist(db, lib_artist)
+    returned = {item.library_item.id for item in result_items}
+    named = [row for row in rows if row.id not in returned and _is_titled_its_artists_name(row)]
     typed_folded = fold_punctuation_for_comparison(typed.lower())
-    if any(
+    # Candidates first: the guard walks every title, and most shelves have none.
+    if not named or any(
         is_self_titled(row.title or "")
         or fold_punctuation_for_comparison((row.title or "").lower()) == typed_folded
         for row in rows
     ):
         return []
-    returned = {item.library_item.id for item in result_items}
-    return [
-        LookupResultItem(library_item=row.to_catalog_item())
-        for row in rows
-        if row.id not in returned and _is_titled_its_artists_name(row)
-    ][:room]
+    return [LookupResultItem(library_item=row.to_catalog_item()) for row in named[:room]]
 
 
 async def apply_shelf_fallback(
