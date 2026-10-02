@@ -25,7 +25,7 @@ from lookup.matching import MAX_SEARCH_RESULTS
 from lookup.miss_kind import MISS_CLEAN, derive_miss_kind
 from lookup.models import LookupRequest, LookupResultItem
 from lookup.orchestrator import perform_lookup
-from lookup.shelf_fallback import _order_shelf_rows, _rows_by_artist, apply_shelf_fallback
+from lookup.shelf_fallback import _order_shelf_rows, apply_shelf_fallback
 from services.parser import MessageType, ParsedRequest
 from tests.conftest import make_lml_telemetry
 from tests.factories import make_library_item, shelve
@@ -79,23 +79,6 @@ class TestOrderShelfRows:
         ordered = _order_shelf_rows([first, second], "Nothing Like Either Title")
 
         assert [row.id for row in ordered] == [1, 2]
-
-
-# ---------------------------------------------------------------------------
-# _rows_by_artist -- the normalized-equality guard
-# ---------------------------------------------------------------------------
-
-
-class TestRowsByArtist:
-    @pytest.mark.parametrize("artist", ["", "   ", "\t\n"], ids=["empty", "spaces", "tab-newline"])
-    def test_artist_normalizing_to_empty_returns_no_rows(self, artist):
-        """A query artist that normalizes to the empty string (blank,
-        whitespace-only) must not match rows whose artist *also* normalizes
-        to empty -- two empty keys are not "equal" here, they are both
-        absent."""
-        rows = [make_library_item(id=1, artist=""), make_library_item(id=2, artist="   ")]
-
-        assert _rows_by_artist(rows, artist) == []
 
 
 # ---------------------------------------------------------------------------

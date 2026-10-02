@@ -18,9 +18,9 @@ albums by X:" context line, where X is the artist as the listed rows spell it.
 Rows whose title contains the requested song come first; the rest keep
 catalog (id) order.
 
-The shelf is the artist's own rows and no one else's, read by artist rather
-than out of a ``db.search`` window (LML#1406; ``lookup/artist_shelf.py`` has
-the matching rungs). ``filter_results_by_artist``'s prefix rung is too loose
+Both lanes work from the artist's own rows and no one else's, read by artist
+rather than out of a ``db.search`` window (LML#1406, LML#1418;
+``lookup/artist_shelf.py`` has the matching rungs). ``filter_results_by_artist``'s prefix rung is too loose
 for a lane that names the artist: "Can" would list a Canibus row. When the
 artist has no rows, or the query raises, the step does not fire and the
 response stays empty, as on ``main``.
@@ -31,8 +31,8 @@ miss telemetry so a shelf-only response still reports ``miss_clean`` with
 ``results_count`` 0 (``lookup/miss_kind.py``).
 
 Self-titled companion (LML#1405): when the response is NOT empty and the
-typed album is a request-side self-titled placeholder ("Epon.", "S/T"), rows
-titled the artist's name that the pipeline did not return are appended after
+typed album is a request-side self-titled placeholder ("Epon.", "S/T"), the
+artist's rows titled its own name that the pipeline did not return are appended after
 the existing rows as the same display-only rows, up to the room left under
 ``MAX_SEARCH_RESULTS``. It does not fire when the response carries a context
 line or is a compilation hit. ``search_type``, ``external_source`` and the
@@ -54,10 +54,8 @@ from library.db import LibraryDB
 from library.models import LibraryItem
 from lookup.artist_shelf import rows_for_artist
 from lookup.matching import (
-    _FETCH_LIMIT,
     MAX_SEARCH_RESULTS,
     album_not_found_message,
-    filter_results_by_artist,
     is_self_titled,
     is_self_titled_request_placeholder,
     library_artist_for,
@@ -70,12 +68,16 @@ from services.parser import ParsedRequest
 logger = logging.getLogger(__name__)
 
 
-def _rows_by_artist(rows: list[LibraryItem], artist: str) -> list[LibraryItem]:
-    """Rows whose artist equals ``artist`` after normalization (never a prefix)."""
-    key = normalize_for_comparison(artist).strip()
-    if not key:
-        return []
-    return [row for row in rows if normalize_for_comparison(row.artist or "").strip() == key]
+def _is_titled_its_artists_name(row: LibraryItem) -> bool:
+    """Whether ``row``'s title is its own artist's name, punctuation aside.
+
+    Compared with the artist as the row stores it, not as the listener typed
+    it: ``rows_for_artist`` reaches "The Clientele" from a typed "Clientele".
+    """
+    title = fold_punctuation_for_comparison(normalize_for_comparison(row.title or ""))
+    return bool(title) and title == fold_punctuation_for_comparison(
+        normalize_for_comparison(row.artist or "")
+    )
 
 
 def _order_shelf_rows(rows: list[LibraryItem], song: str | None) -> list[LibraryItem]:
@@ -122,30 +124,30 @@ async def _self_titled_companions(
     placeholder the pipeline answered with some other album (LML#1405).
 
     Empty unless the typed album is a request-side placeholder ("Epon.",
-    "S/T"), the response has room under ``MAX_SEARCH_RESULTS``, and no shelved
-    title is itself the typed album or a placeholder (the LML#1392
-    literal-title guard, as in ``runs_album_resolution``). Artist and title
-    both match by equality, never a prefix or word overlap, so a numbered
-    sibling ("X II") is not a companion. Rows already returned are left out.
+    "S/T"), the response has room under ``MAX_SEARCH_RESULTS``, and none of
+    the artist's titles is itself the typed album or a placeholder (the
+    LML#1392 literal-title guard, as in ``runs_album_resolution``). Rows come
+    from ``rows_for_artist`` (LML#1418), so the artist is this one and never a
+    prefix; the title is the artist's name whole, so a numbered sibling
+    ("X II") is not a companion. Rows already returned are left out.
     """
     room = MAX_SEARCH_RESULTS - len(result_items)
     typed = parsed.album or ""
     if room <= 0 or not is_self_titled_request_placeholder(typed):
         return []
-    found = await db.search(query=lib_artist, limit=_FETCH_LIMIT)
+    rows = await rows_for_artist(db, lib_artist)
     typed_folded = fold_punctuation_for_comparison(typed.lower())
     if any(
         is_self_titled(row.title or "")
         or fold_punctuation_for_comparison((row.title or "").lower()) == typed_folded
-        for row in filter_results_by_artist(found, lib_artist)
+        for row in rows
     ):
         return []
-    name = normalize_for_comparison(lib_artist).strip()
     returned = {item.library_item.id for item in result_items}
     return [
         LookupResultItem(library_item=row.to_catalog_item())
-        for row in _rows_by_artist(found, lib_artist)
-        if row.id not in returned and normalize_for_comparison(row.title or "").strip() == name
+        for row in rows
+        if row.id not in returned and _is_titled_its_artists_name(row)
     ][:room]
 
 
