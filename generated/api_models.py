@@ -340,11 +340,21 @@ class Order(StrEnum):
 
 
 class PlaylistSearchParams(BaseModel):
-    q: str | None = Field(None, description='Search query (supports AND, OR, NOT, "", *)')
-    page: conint(ge=0) = 0
+    q: str | None = Field(
+        None,
+        description='Search query. Optional — an empty or omitted `q` applies no filter and returns all track entries in the requested sort (most recent first by default). Supports upper-case `AND`, `OR`, `NOT`, and the field prefixes `artist:`, `song:`, `album:`, `label:`, `dj:`, `date:YYYY-MM-DD`, and `dateRange:YYYY-MM-DD..YYYY-MM-DD`. A bare term whole-word matches by default. Under the effective date sort only, when whole-word matching finds no rows the server falls back to matching the last (still-typing) term as a prefix, and then to substring matching — so the same `q` can return rows under the date sort and none under `artist`, `song`, or `dj`. A "quoted" value matches a field whose entire value equals it, case-insensitively — not a phrase match within a longer field value — and never falls back to partial matching, in any sort.',
+    )
+    page: conint(ge=0) = Field(
+        0,
+        description="Send `0` when paging with `cursor` — cursor pagination carries its own position and does not use this as an offset.",
+    )
     limit: conint(ge=1, le=100) = 50
     sort: Sort = "date"
     order: Order = "desc"
+    cursor: str | None = Field(
+        None,
+        description="Opaque pagination token copied verbatim from a previous response's `nextCursor`. Honoured only when the effective sort is `date` (the default, and the fallback when `sort` is omitted or unrecognised); validated and then ignored under any other effective sort. A cursor is tied to the `q`, `sort`, and `order` that produced it, but not to `limit` — discard it whenever `q`, `sort`, or `order` change; the server does not detect a mismatched cursor and returns a page that may skip or repeat rows. `page` and `limit` are still validated even when `cursor` is sent — send `page=0` alongside it, since cursor pagination does not use the page offset. Treat the token as opaque: do not parse its contents or assume a stable format.",
+    )
 
 
 class PlaylistSearchResult(BaseModel):
@@ -375,9 +385,19 @@ class PlaylistSearchResult(BaseModel):
 
 class PlaylistSearchResponse(BaseModel):
     results: list[PlaylistSearchResult]
-    total: int
+    total: int = Field(
+        ...,
+        description="The match count, capped at 10,001 (meaning more than 10,000). Under cursor pagination the count query carries the same cursor predicate as the page itself, so `total` is the count of matching rows from the cursor position onward and shrinks on every later page — it equals the full match count only on the first page (the one sent with no inbound `cursor`). When the underlying count query is unavailable, `total` falls back to a best-effort estimate instead: the rows already paged past, plus this page. That estimate is exact on a partial final page, a lower bound on a full page, and can over-estimate on an empty page past the end. Clients must not use `total` to decide whether more rows exist under the date sort — use `nextCursor` for that.",
+    )
     page: int
-    totalPages: int
+    totalPages: int = Field(
+        ...,
+        description="`ceil(total / limit)`. Exact when `total` itself is an exact count below the 10,001 cap; otherwise approximate, inheriting whichever of `total`'s caveats applies — the cap, the count-unavailable estimate, or (under cursor pagination) the shrinking from-cursor-onward count.",
+    )
+    nextCursor: str | None = Field(
+        None,
+        description="Opaque pagination token for the next page. Present only when the effective sort is `date` (the default, and the fallback when `sort` is omitted or unrecognised) and the page is full; pass it back unchanged as `cursor`. Its absence under the date sort normally means there is no further page — except on a first (uncursored) page, where an empty result with no `nextCursor` can also mean a fallback tier timed out after whole-word matching found nothing, so treat that case as retryable rather than definitive. Absent when the effective sort is `artist`, `song`, or `dj`.",
+    )
 
 
 class FlowsheetEntryType(StrEnum):
