@@ -407,14 +407,14 @@ So the companion is added in step 8, after every step that reads or binds rows:
 - **Only when there is room.** Nothing is inserted into a response that already holds `MAX_SEARCH_RESULTS` rows; nothing is evicted.
 - **Display-only.** The row has no `artwork`, exactly like a shelf-fallback row, so it makes no Discogs call and Backend-Service's all-rows artwork reader (`artwork/providers/discogs.ts`) skips it.
 - **Same `skip` gate.** Low-priority callers (`X-Caller-Class: 5`, `/lookup/bulk`), timed-out and shed responses are byte-identical to before.
-- **Equality, not overlap.** The row's artist equals the library artist and its title equals the artist's name, both under `normalize_for_comparison`. `search_one_album`'s word-overlap rule would also admit numbered siblings ("X II", "X III").
-- **The LML#1392 literal-title guard holds.** When a shelved title is itself the typed album or a placeholder (R.E.M. "Eponymous", a catalog "S/T"), nothing is inserted.
+- **Equality, not overlap.** The row is one of the artist's own (`rows_for_artist`, see "Reading one artist's rows" below) and its title is that row's artist name whole, compared with punctuation folded. `search_one_album`'s word-overlap rule would also admit numbered siblings ("X II", "X III").
+- **The LML#1392 literal-title guard holds.** When one of the artist's shelved titles is itself the typed album or a placeholder (R.E.M. "Eponymous", a catalog "S/T"), nothing is inserted.
 - `search_type`, `context_message` and `external_source` are untouched, and the row is **not** counted in `shelf_fallback_rows`: the response is a hit with or without it, so `miss_kind` cannot move. The PostHog `results_count` property does count it (it reports what the caller received), while the Sentry `lookup.results_count` attr is projected before step 8 and does not. The "Telemetry invisibility" paragraph above is about the shelf lane only. The Sentry trace attr `lookup.self_titled_companion_rows` is set only when this lane fires.
 - **request-o-matic and the row-less probe.** When `results[0]` is a synthesized row-less item (`library_item.id == 0`, step 3a), request-o-matic strips it and used to post "No results found". With the shelved companion behind it, request-o-matic now posts that row.
 
 Known limit: a response that already has `MAX_SEARCH_RESULTS` rows gets no companion.
 
-### Reading one artist's rows (LML#1406)
+### Reading one artist's rows (LML#1406, LML#1418)
 
 Until LML#1406 the shelf lane filtered the first 50 rows of `db.search(query=artist)` down to the artist's own. That query is full-text over every indexed column with no artist constraint, so for a common-word name other artists and other artists' titles filled the window first. Measured over every distinct artist in the 2026-10-02 catalog (23,922 artists): 85 artists holding 248 rows got no shelf (The The, Heart, The Band, Love, James, Mountain). The filter was also strict equality, so "The Stereolab", "Clientele" (for The Clientele) and "Melt Banana" (for Melt-Banana) got nothing either.
 
@@ -431,7 +431,12 @@ Measured over the same catalog by sending each stored artist's name, and variant
 
 Three guards: a rung whose key comes out empty matches nothing, so a typed "The" is not The The; a typed name longer than 120 characters (twice the longest stored name) is not read, because phrase cost is linear in its terms; and the read is two uncached queries, typically under 5 ms, on a path that only an eligible empty response reaches.
 
-The self-titled companion lane still reads the 50-row window.
+The self-titled companion lane reads the same rows (LML#1418). Until then it looked for the row titled the artist's name in the same 50-row window, and compared the title with the typed artist under `normalize_for_comparison`. Two things changed with the read:
+
+- **The literal-title guard looks at the artist's own rows.** It used to run over `filter_results_by_artist(window)`, which also admits prefix and alternate-name matches, so Canibus shelving an "S/T" would have held back Can's row. Over every stored artist and its article and punctuation variants in the 2026-10-02 catalog (49,710 spellings, three placeholders each) the two guards never disagree, and no spelling loses a companion it had.
+- **The title is compared with the row's stored artist, punctuation folded.** `rows_for_artist` reaches "The Clientele" from a typed "Clientele", so the typed name is the wrong yardstick; and the catalog files *Esquivel!* under "Esquivel" and *Peace Loving* under "Peace, Loving" (13 such rows).
+
+Measured the same way, by the spellings that gain a companion: the stored spelling, 29 artists (16 crowded out of the window: Can, God, Heart, James, Spirit, The Band, Voices, Women and eight more; 13 by the punctuation fold); a leading article added or dropped, 2,801; punctuation folded to spaces, 162. The 2,793 artists that already got one are unchanged.
 
 ### Shelf-lane ordering
 

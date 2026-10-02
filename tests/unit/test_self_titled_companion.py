@@ -7,6 +7,8 @@ row after the rows already returned. The invariant under test throughout:
 change is appended rows with no ``artwork``.**
 
 ``TestCompanionRow`` calls ``apply_shelf_fallback`` directly.
+``TestCompanionOverARealIndex`` does the same over a real ``library_fts``
+index (LML#1418: the row is read by artist, not out of a search window).
 ``TestPerformLookupCompanionRow`` drives the real pipeline, mocking only
 ``LibraryDB``/``DiscogsService``, the same way ``test_shelf_fallback.py`` does.
 """
@@ -24,7 +26,8 @@ from lookup.orchestrator import perform_lookup
 from lookup.shelf_fallback import apply_shelf_fallback
 from services.parser import MessageType, ParsedRequest
 from tests.conftest import make_lml_telemetry
-from tests.factories import make_discogs_result, make_library_item
+from tests.factories import make_discogs_result, make_library_item, shelve
+from tests.unit.test_artist_shelf import _catalog, _crowd
 
 PLACEHOLDERS = ["Epon.", "epon", "eponymous", "S/T", "s.t.", "self-titled", "self titled"]
 
@@ -60,9 +63,7 @@ def _bound(row, release_id=555):
 
 
 def _db(rows):
-    db = AsyncMock()
-    db.search = AsyncMock(return_value=list(rows))
-    return db
+    return shelve(AsyncMock(), list(rows))
 
 
 async def _apply(parsed, db, existing, skip=False):
@@ -108,7 +109,7 @@ class TestCompanionRow:
         out = await _apply(_parsed(), db, existing)
 
         assert out == (existing, "direct", None, "library", 0)
-        db.search.assert_not_awaited()
+        db.artist_names_matching.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_insert_is_capped_by_the_room_left(self):
@@ -141,17 +142,17 @@ class TestCompanionRow:
         ],
         ids=["real-album", "album-is-artist", "no-album", "no-artist"],
     )
-    async def test_non_placeholder_requests_never_search(self, parsed):
+    async def test_non_placeholder_requests_never_read_the_catalog(self, parsed):
         existing = [_bound(MOON_PIX)]
         db = _db([SELF_TITLED])
 
         out = await _apply(parsed, db, existing)
 
         assert out == (existing, "direct", None, "library", 0)
-        db.search.assert_not_awaited()
+        db.artist_names_matching.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_skip_never_searches(self):
+    async def test_skip_never_reads_the_catalog(self):
         """Low-priority callers (Backend enrichment, bulk), timed-out and shed
         responses are byte-identical to ``main``."""
         existing = [_bound(MOON_PIX)]
@@ -160,7 +161,7 @@ class TestCompanionRow:
         out = await _apply(_parsed(), db, existing, skip=True)
 
         assert out == (existing, "direct", None, "library", 0)
-        db.search.assert_not_awaited()
+        db.artist_names_matching.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -198,10 +199,10 @@ class TestCompanionRow:
         )
 
         assert out == (existing, search_type, context, "library", 0)
-        db.search.assert_not_awaited()
+        db.artist_names_matching.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_fuzzy_corrected_artist_is_the_one_searched(self):
+    async def test_fuzzy_corrected_artist_is_the_one_read(self):
         existing = [_bound(MOON_PIX)]
         db = _db([MOON_PIX, SELF_TITLED])
         parsed = _parsed(artist="Cat Powr", library_artist="Cat Power")
@@ -209,7 +210,8 @@ class TestCompanionRow:
         items, *_ = await _apply(parsed, db, existing)
 
         assert [item.library_item.id for item in items] == [303, 301]
-        assert db.search.await_args.kwargs["query"] == "Cat Power"
+        phrases = db.artist_names_matching.await_args.args[0]
+        assert "Cat Power" in phrases and "Cat Powr" not in phrases
 
     @pytest.mark.asyncio
     async def test_row_less_probe_item_keeps_the_lead(self):
@@ -230,6 +232,19 @@ class TestCompanionRow:
         assert out == (existing, "direct", None, "library", 0)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("blank", ["", "   ", "!!!"], ids=["empty", "spaces", "punctuation"])
+    async def test_blank_title_is_not_the_artists_name(self, blank):
+        """Two keys that fold to nothing are both absent, not equal."""
+        nameless = make_library_item(id=312, artist=blank, title=blank)
+        existing = [_bound(MOON_PIX)]
+        db = _db([MOON_PIX])
+        db.rows_by_artist = AsyncMock(return_value=[MOON_PIX, nameless])
+
+        out = await _apply(_parsed(), db, existing)
+
+        assert out == (existing, "direct", None, "library", 0)
+
+    @pytest.mark.asyncio
     async def test_another_artists_row_is_never_inserted(self):
         """Artist equality, never a prefix: "Cat" must not pick up Cat Power."""
         cat = make_library_item(id=310, artist="Cat", title="Nine Lives")
@@ -241,10 +256,10 @@ class TestCompanionRow:
         assert out == (existing, "direct", None, "library", 0)
 
     @pytest.mark.asyncio
-    async def test_search_failure_leaves_the_response_unchanged(self):
+    async def test_catalog_failure_leaves_the_response_unchanged(self):
         existing = [_bound(MOON_PIX)]
         db = AsyncMock()
-        db.search = AsyncMock(side_effect=RuntimeError("db gone"))
+        db.artist_names_matching = AsyncMock(side_effect=RuntimeError("db gone"))
 
         out = await _apply(_parsed(), db, existing)
 
@@ -253,7 +268,7 @@ class TestCompanionRow:
     @pytest.mark.asyncio
     async def test_cancellation_propagates(self):
         db = AsyncMock()
-        db.search = AsyncMock(side_effect=asyncio.CancelledError())
+        db.artist_names_matching = AsyncMock(side_effect=asyncio.CancelledError())
 
         with pytest.raises(asyncio.CancelledError):
             await _apply(_parsed(), db, [_bound(MOON_PIX)])
@@ -268,6 +283,91 @@ class TestCompanionRow:
         )
 
 
+class TestCompanionOverARealIndex:
+    """LML#1418. The lane used to look for the row in the first 50 hits of an
+    any-column search for the artist's name, where a common-word artist's own
+    rows never appear."""
+
+    @staticmethod
+    async def _companions(tmp_path, typed_artist, rows, album="S/T"):
+        """``(artist, title)`` of the rows appended behind one already-served row."""
+        db = await _catalog(tmp_path, rows)
+        try:
+            served = (await db.rows_by_artist([rows[-1][0]]))[-1]
+            existing = [_bound(served)]
+            items, *_ = await _apply(_parsed(artist=typed_artist, album=album), db, existing)
+        finally:
+            await db.close()
+        assert items[0] is existing[0]
+        assert all(item.artwork is None for item in items[1:])
+        return [(item.library_item.artist, item.library_item.title) for item in items[1:]]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("artist", ["Can", "Women", "Spirit", "The Band"])
+    async def test_artist_behind_a_full_search_window(self, tmp_path, artist):
+        rows = [*_crowd(artist), (artist, artist), (artist, "Second Album")]
+
+        assert await self._companions(tmp_path, artist, rows) == [(artist, artist)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("typed", "stored", "title"),
+        [
+            pytest.param("Clientele", "The Clientele", "The Clientele", id="article-dropped"),
+            pytest.param("Melt Banana", "Melt-Banana", "Melt-Banana", id="punctuation-dropped"),
+            pytest.param("Peace, Loving", "Peace, Loving", "Peace Loving", id="title-punctuated"),
+            pytest.param("Esquivel", "Esquivel", "Esquivel!", id="title-adds-punctuation"),
+        ],
+    )
+    async def test_title_is_compared_with_the_stored_artist(self, tmp_path, typed, stored, title):
+        """Self-titled means the row's title is its own artist's name, however
+        the listener spelled the artist, and whatever the punctuation."""
+        rows = [(stored, title), (stored, "Second Album")]
+
+        assert await self._companions(tmp_path, typed, rows) == [(stored, title)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            pytest.param([("Can", "Can II"), ("Can", "Ege Bamyasi")], id="numbered-sibling"),
+            pytest.param(
+                [("Canibus", "Can"), ("Tin Can Phone", "Can"), ("Can", "Ege Bamyasi")],
+                id="other-artists-rows-titled-the-name",
+            ),
+            pytest.param(
+                [("A Frames", "Frames"), ("The Frames", "Frames"), ("Frames Quartet", "Hello")],
+                id="name-shared-by-two-artists",
+            ),
+        ],
+    )
+    async def test_nothing_else_is_a_companion(self, tmp_path, rows):
+        typed = "Frames" if rows[0][0] == "A Frames" else "Can"
+
+        assert await self._companions(tmp_path, typed, rows) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("typed", "literal_title"), [("eponymous", "Eponymous"), ("Epon.", "S/T")]
+    )
+    async def test_literal_title_behind_a_full_search_window_wins(
+        self, tmp_path, typed, literal_title
+    ):
+        """The guard reads the whole shelf too: the literal record no longer
+        has to be among the first 50 search hits to be seen."""
+        rows = [*_crowd("Can"), ("Can", literal_title), ("Can", "Can"), ("Can", "Ege Bamyasi")]
+
+        assert await self._companions(tmp_path, "Can", rows, album=typed) == []
+
+    @pytest.mark.asyncio
+    async def test_another_artists_literal_title_does_not_hold_the_row_back(self, tmp_path):
+        """The guard asks whether THIS artist shelves a record called "S/T".
+        Canibus shelving one says nothing about Can."""
+        rows = [("Canibus", "S/T"), ("Can", "Can"), ("Can", "Ege Bamyasi")]
+
+        assert await self._companions(tmp_path, "Can", rows) == [("Can", "Can")]
+
+
 class TestPerformLookupCompanionRow:
     def _wire(self, mock_library_db, mock_discogs_service, shelf):
         mock_library_db.find_similar_artist.return_value = None
@@ -280,6 +380,7 @@ class TestPerformLookupCompanionRow:
             return []
 
         mock_library_db.search.side_effect = fake_search
+        shelve(mock_library_db, list(shelf))
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
         mock_discogs_service.validate_track_on_release.return_value = True
 

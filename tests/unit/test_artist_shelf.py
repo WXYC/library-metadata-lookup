@@ -13,7 +13,6 @@ import pytest
 from library.db import LIBRARY_FTS_CREATE_SQL, LibraryDB
 from lookup.artist_shelf import rows_for_artist
 from lookup.matching import _FETCH_LIMIT
-from lookup.shelf_fallback import _rows_by_artist
 
 CROWD = 60
 """Rows by other artists sharing a word with the artist under test. More than
@@ -63,7 +62,7 @@ class TestCrowdedOutArtists:
         )
         try:
             window = await db.search(query=artist, limit=_FETCH_LIMIT)
-            assert _rows_by_artist(window, artist) == []
+            assert [row for row in window if row.artist == artist] == []
 
             rows = await rows_for_artist(db, artist)
         finally:
