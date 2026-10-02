@@ -15,7 +15,7 @@ Step labels match the `_step_*` spine in `lookup/orchestrator.py` (`perform_look
 - **Step 5 — Context Message** (`build_context_message`): Generate context string for the caller
 - **Step 6 — Identity Resolution** (`_step_resolve_result_identities`): Resolve external identifiers for each result's artist via the entity store.
 - **Step 7 — External-Cache Fallback** (`_step_external_cache_fallback`): Opt-in (`include_external_caches`) mojibake recovery — see the dedicated External-Cache Fallback section below. The artist>album>song dispatch precedence and per-branch candidate shaping live in `search_external_fallback()` (`lookup/external_search.py`, LML#750); this step sequences the gate + telemetry and builds response rows via the shared `build_external_catalog_item()` sentinel constructor (same module).
-- **Step 8 — Unbound Shelf Fallback** (`apply_shelf_fallback`, `lookup/shelf_fallback.py`, LML#1391/#1393): the true last step of the spine, called after the location-union fold has had its chance to populate `results` — not merely after Step 7. Additive and unbound: **a non-empty response keeps every row it has, in the same order, with `results[0]` never displaced; an empty response may gain the artist's shelf.** The one change to a non-empty response is the LML#1405 self-titled companion (see "Self-titled companion (LML#1405)" in the design notes below). When `result_items` is still empty, the response did not time out or get degraded by a search-leg shed (`state.timed_out` / `state.upstream_shed` — both set their flag and ride the normal return path rather than returning early, so both are checked here explicitly), the caller is not low-priority, the spine deadline is not spent, the typed `album` is non-empty, and the library artist has at least one shelved row of its own (the same cached `db.search` query `ARTIST_PLUS_ALBUM`'s own artist-only fallback issues, then kept only on normalized artist **equality** — the prefix rung in `filter_results_by_artist` would list a Canibus row under "other albums by Can"), this returns the artist's shelf as **display-only** rows — `LookupResultItem(library_item=row.to_catalog_item())`, no `artwork` and hence no release id/artwork URL/year/Discogs URL/streaming links. `search_type` is forced to `fallback` (never `direct` — this matters for the album-only shape, where main reports `direct` with zero rows), `external_source` becomes `"library"`, and `context_message` reuses `lookup.matching.album_not_found_message()` (shared with `build_context_message`'s song-bearing branch) so the album-only shape gets the same wording, naming the library artist whose shelf is shown (the fuzzy-corrected spelling when there is one) and the typed album verbatim. If the `db.search` raises, the step logs a warning and leaves the empty response as it was. `song_not_found`/`found_on_compilation` are left exactly as the caller computed them. Rows are ordered song-in-title-first (case-insensitive) when a song was typed, then the rest in query order, capped at `MAX_SEARCH_RESULTS`; a cache-confirmed-song ordering tier was considered and dropped — the one cache-only primitive that could answer it (`find_library_albums_with_cached_track`, Step 3b's A4 rescue) already runs against these same rows earlier in the pipeline, and a confirmed hit there promotes the row into a non-empty `library_results` before this step can ever run, so re-asking the same cache here would be redundant. Supersedes the larger, closed PR #1396, which repeatedly changed what Backend-Service binds (reordering/replacing/re-binding rows that a `direct`/`compilation` response already carried) and was rejected across five review rounds.
+- **Step 8 — Unbound Shelf Fallback** (`apply_shelf_fallback`, `lookup/shelf_fallback.py`, LML#1391/#1393): the true last step of the spine, called after the location-union fold has had its chance to populate `results` — not merely after Step 7. Additive and unbound: **a non-empty response keeps every row it has, in the same order, with `results[0]` never displaced; an empty response may gain the artist's shelf.** The one change to a non-empty response is the LML#1405 self-titled companion (see "Self-titled companion (LML#1405)" in the design notes below). When `result_items` is still empty, the response did not time out or get degraded by a search-leg shed (`state.timed_out` / `state.upstream_shed` — both set their flag and ride the normal return path rather than returning early, so both are checked here explicitly), the caller is not low-priority, the spine deadline is not spent, the typed `album` is non-empty, and the library artist has at least one shelved row of its own (read by artist through `lookup/artist_shelf.py`, LML#1406 — never by the prefix rung in `filter_results_by_artist`, which would list a Canibus row under "other albums by Can"), this returns the artist's shelf as **display-only** rows — `LookupResultItem(library_item=row.to_catalog_item())`, no `artwork` and hence no release id/artwork URL/year/Discogs URL/streaming links. `search_type` is forced to `fallback` (never `direct` — this matters for the album-only shape, where main reports `direct` with zero rows), `external_source` becomes `"library"`, and `context_message` reuses `lookup.matching.album_not_found_message()` (shared with `build_context_message`'s song-bearing branch) so the album-only shape gets the same wording, naming the artist as the listed rows spell it and the typed album verbatim. If the library query raises, the step logs a warning and leaves the empty response as it was. `song_not_found`/`found_on_compilation` are left exactly as the caller computed them. Rows are ordered song-in-title-first (case-insensitive) when a song was typed, then the rest in catalog order, capped at `MAX_SEARCH_RESULTS`; a cache-confirmed-song ordering tier was considered and dropped — the one cache-only primitive that could answer it (`find_library_albums_with_cached_track`, Step 3b's A4 rescue) already runs against these same rows earlier in the pipeline, and a confirmed hit there promotes the row into a non-empty `library_results` before this step can ever run, so re-asking the same cache here would be redundant. Supersedes the larger, closed PR #1396, which repeatedly changed what Backend-Service binds (reordering/replacing/re-binding rows that a `direct`/`compilation` response already carried) and was rejected across five review rounds.
 
 ### `LookupRequest` opt-in flags
 
@@ -66,6 +66,7 @@ For an artist+song lookup, step 2 (`resolve_albums_for_track` → `lookup_releas
 - `lookup/validation.py` -- Step-3b policy: the orchestration cascade (`apply_track_validation_cascade`, LML#750), per-result track validation (`filter_results_by_track_validation`), the A4 cached-track safety net (`find_library_albums_with_cached_track`), and the LML#717 song-as-album-title promotion (`_filter_results_by_song_as_album_title`, in `lookup/fallback_title_floors.py`)
 - `lookup/shelf_fallback.py` -- Step 8, the unbound shelf fallback (LML#1391/#1393, see above): `apply_shelf_fallback`, a pure pass-through unless `result_items` is empty at the very end of the spine or a typed self-titled placeholder is missing the row titled the artist's name (`_self_titled_companions`, LML#1405; appended after the existing rows), plus the song-in-title-first ordering helper `_order_shelf_rows`. Extracted straight to its own module at `perform_lookup`'s module-budget ceiling (`lookup/orchestrator.py` sat at 1832/1850)
 - `lookup/external_search.py` -- External-cache fallback for artist/album/track lookup (Phase 1.5/1.7 mojibake recovery): the discogs-cache/musicbrainz-cache fuzzy search functions, Step 7's dispatch policy (`search_external_fallback`, LML#750), and the single `"(external)"` sentinel construction site (`build_external_catalog_item`)
+- `lookup/artist_shelf.py` -- `rows_for_artist` (LML#1406): every library row by one artist and by no one else, read through `LibraryDB.artist_names_matching` + `rows_by_artist` instead of a `db.search` window, with exact, leading-article and punctuation rungs that never merge two artists. See "Reading one artist's rows" below
 - `lookup/location_union.py` -- Comprehensive multi-location union (LML#1022), folded transparently into `results`: the gate (`should_run_location_union`), the concurrent probe body (`resolve_track_shelf_locations` — recall-index lookup → rank → shelf-metadata join, returning `ResolvedLocation`s that retain the joined `LibraryItem`), and the exclusion + conversion helpers (`primary_library_ids_from_results`, `build_location_result_items`) the orchestrator calls after `_step_external_cache_fallback` resolves. The post-fold signal reconciliation (`_reconcile_post_fold_signals`) lives in `lookup/orchestrator.py`, not here — it needs `build_context_message`, which only the orchestrator defines, so moving it here would create an import cycle. Read side of the LML#1019 recall index lives in `entity/compilation_track_location.py` (`get_compilation_track_locations`)
 - `lookup/artwork.py` -- Step-4 artwork fetch (`fetch_artwork_for_items`) with the LML#478 80/80 floor (`_floor_candidates`) and the LML#604 release trust-and-bind. **Bind order in `fetch_one`, highest-trust first:** a hand-verified `library_release_override` pin (LML#850), the carried-release trust-bind, the found-on-compilation trust-bind, then the floored search. `LML_OVERRIDE_REQUIRES_FLOOR` (LML#1290) grades the pin against `_floor_candidates` first and, on a failure, demotes it past the two trust-binds to the floored search -- except to a track-validated carried release, which outranks it -- falling back to the pin when the matcher finds nothing, so the gate creates no new no-matches. The query-side variant lists are built at the top of `fetch_one` rather than at the search, so the pin and the matcher are scored on the same objects. The cover -> sibling-pressing -> artist-image -> `None` fallback cascade (`_resolve_fallback_artwork`) now lives in `lookup/fallback_artwork.py` -- see that module's key-files entry
 - `lookup/fallback_artwork.py` -- the artwork fallback cascade (`_resolve_fallback_artwork`), extracted verbatim from `lookup/artwork.py` when that file reached its module budget. **There is no label-image rung** -- LML#687 removed it. The cover rung asks Discogs when the bound release was never checked (`artwork_checked_at IS NULL`), via `get_release(..., require_artwork_answer=True)`; on `/lookup/bulk` the LML#671/#652 kill switch suppresses that re-ask and the rung reads whatever PG already holds. The sibling-pressing rung is `resolve_sibling_artwork` in `lookup/sibling_artwork.py` (LML#1237/#1241) -- see that module's key-files entry. The LML#1118 `DiscogsBreakerOpenError` narrowing sits at the cascade boundary here, not per-rung
@@ -335,15 +336,12 @@ When every one of these holds —
 * ``skip`` is false (the caller's ``state.timed_out or state.upstream_shed
   or is_discogs_low_priority()``, plus the spent-deadline term);
 * the typed ``parsed.album`` is non-empty after stripping whitespace;
-* the library artist (``library_artist_for(parsed)``) has at least one
-  shelved row of its own — the same cached ``db.search`` query
-  ``ARTIST_PLUS_ALBUM``'s own artist-only fallback issues
-  (``lookup/strategies/artist_plus_album.py``), kept only when the row's
-  artist EQUALS the library artist under ``normalize_for_comparison``.
-  ``filter_results_by_artist`` is deliberately not the gate here: its prefix
-  rung admits "Canibus" for "Can" and five unrelated "Low ..." artists for
-  "Low", and this lane names the artist in its sentence. When no row
-  survives, the step does not fire;
+* the library artist has at least one shelved row of its own, read by
+  artist rather than out of a ``db.search`` window (LML#1406, see "Reading
+  one artist's rows" below). ``filter_results_by_artist`` is deliberately not
+  the gate here: its prefix rung admits "Canibus" for "Can" and five
+  unrelated "Low ..." artists for "Low", and this lane names the artist in
+  its sentence. When the artist has no rows, the step does not fire;
 * the search does not raise — any exception logs a warning and leaves the
   empty response exactly as ``main`` returns it;
 
@@ -360,8 +358,9 @@ this shape, including the album-only request where ``main`` reports
 ``direct`` with zero rows (LML#1393). ``external_source`` goes from null
 to ``"library"``. ``context_message`` is the sentence
 ``build_context_message`` already uses for the song-bearing album-miss case
-(``lookup.matching.album_not_found_message``), here naming the library
-artist whose shelf is listed rather than the typed spelling,
+(``lookup.matching.album_not_found_message``), here naming the artist as
+the listed rows spell it (``rows[0].artist``, LML#1406) rather than the
+typed spelling,
 now reachable for the album-only shape too — ``main``'s
 ``build_context_message`` never reaches it there, since every branch of
 its "song not found" message requires ``parsed.song``. ``song_not_found``
@@ -415,12 +414,29 @@ So the companion is added in step 8, after every step that reads or binds rows:
 
 Known limit: a response that already has `MAX_SEARCH_RESULTS` rows gets no companion.
 
+### Reading one artist's rows (LML#1406)
+
+Until LML#1406 the shelf lane filtered the first 50 rows of `db.search(query=artist)` down to the artist's own. That query is full-text over every indexed column with no artist constraint, so for a common-word name other artists and other artists' titles filled the window first. Measured over every distinct artist in the 2026-10-02 catalog (23,922 artists): 85 artists holding 248 rows got no shelf (The The, Heart, The Band, Love, James, Mountain). The filter was also strict equality, so "The Stereolab", "Clientele" (for The Clientele) and "Melt Banana" (for Melt-Banana) got nothing either.
+
+`lookup/artist_shelf.py::rows_for_artist` replaces the window with two indexed queries on `LibraryDB`:
+
+1. `artist_names_matching(phrases)` returns the distinct stored `artist` values that contain any phrase, matched against the FTS `artist` column only and with no `LIMIT`. Only the artist strings are read, so a wide phrase costs a few milliseconds.
+2. The spellings that are the artist are picked in Python, and `rows_by_artist(spellings)` fetches exactly those rows through `idx_artist`, in id order.
+
+Picking runs rung by rung and the first rung with a hit wins: equal under `normalize_for_comparison`; equal with a leading article stripped from both sides; equal with punctuation folded; both. **A tolerant rung answers only when every spelling it matched is one artist under the first rung.** The catalog files "Girls" beside "The Girls" and "A Frames" beside "The Frames", and those are different bands. "The Girls" and "Girls" each reach their own rows on rung 1; "Frames" matches two artists on rung 2 and gets no shelf, as before.
+
+`alternate_artist_name` and `cross_reference_names` are not consulted: a cross-reference files a band's release under a member's name, which is not "other albums by" that member.
+
+Measured over the same catalog, per typed variant of each stored artist: the stored spelling, 85 artists recovered and none lost; a leading "the" added, 22,336 recovered; the leading article dropped, 1,504; punctuation folded to spaces, 742. Residue: 26 names whose stored spelling carries a symbol the FTS tokenizer keeps as a token character ("Beak>", "D+", "C+C Music Factory"), which a typed form without the symbol does not reach.
+
+The self-titled companion lane still reads the 50-row window.
+
 ### Shelf-lane ordering
 
 1. rows whose title contains the requested song (case-insensitive), when a
    song was typed;
 2. *(not implemented — see below)*;
-3. the rest, in the order ``db.search`` returned them.
+3. the rest, in catalog (id) order.
 
 Capped at ``MAX_SEARCH_RESULTS``.
 

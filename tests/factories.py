@@ -1,5 +1,7 @@
 """Shared test factories for model construction."""
 
+from unittest.mock import AsyncMock
+
 from discogs.models import DiscogsSearchResult
 from generated.api_models import DiscogsMatchResult, LibraryCatalogItem
 from library.models import LibraryItem
@@ -28,6 +30,26 @@ def make_library_item(id=1, artist="Stereolab", title="Aluminum Tunes", **kwargs
     }
     defaults.update(kwargs)
     return LibraryItem(id=id, artist=artist, title=title, **defaults)
+
+
+def shelve(db, rows):
+    """Point a mocked ``LibraryDB``'s artist-keyed queries at ``rows`` (LML#1406).
+
+    ``artist_names_matching`` returns every stored spelling in ``rows``
+    whatever the phrases (the real query is a containment test, so a superset
+    is the honest stand-in); ``rows_by_artist`` returns the rows filed under
+    exactly the spellings asked for. Returns ``db``.
+    """
+
+    async def artist_names_matching(phrases):
+        return list(dict.fromkeys(row.artist for row in rows))
+
+    async def rows_by_artist(artists):
+        return [row for row in rows if row.artist in artists]
+
+    db.artist_names_matching = AsyncMock(side_effect=artist_names_matching)
+    db.rows_by_artist = AsyncMock(side_effect=rows_by_artist)
+    return db
 
 
 def make_discogs_result(release_id=123, **kwargs):

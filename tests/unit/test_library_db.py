@@ -2447,6 +2447,104 @@ async def _connected_db(tmp_path, artists, **kwargs):
     return db
 
 
+class TestArtistKeyedQueries:
+    """``artist_names_matching`` + ``rows_by_artist`` (LML#1406)."""
+
+    ARTISTS = [
+        "Stereolab",
+        "Cat Power",
+        "Cat Power",
+        "Power Cat Trio",
+        "Jessica Pratt",
+        "Nilüfer Yanya",
+        "Chuquimamani-Condori",
+    ]
+
+    @staticmethod
+    async def _indexed_db(tmp_path, artists):
+        """``_connected_db`` with ``library_fts`` populated: the shared helper
+        creates the index but never fills it, which the pool tests do not need."""
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        _create_library_db(db_file, artists)
+        conn = sqlite3.connect(db_file)
+        conn.execute("INSERT INTO library_fts(library_fts) VALUES ('rebuild')")
+        conn.commit()
+        conn.close()
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        return db
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("phrases", "expected"),
+        [
+            pytest.param(["Cat Power"], ["Cat Power"], id="phrase-is-ordered-and-adjacent"),
+            pytest.param(["cat"], ["Cat Power", "Power Cat Trio"], id="containment-not-equality"),
+            pytest.param(["nilufer yanya"], ["Nilüfer Yanya"], id="diacritics-and-case-fold"),
+            pytest.param(
+                ["chuquimamani condori"], ["Chuquimamani-Condori"], id="punctuation-separates"
+            ),
+            pytest.param(
+                ["stereolab", "jessica pratt"],
+                ["Jessica Pratt", "Stereolab"],
+                id="any-phrase-matches",
+            ),
+            pytest.param(["Album"], [], id="title-words-do-not-count"),
+            pytest.param(['Cat "Power"'], ["Cat Power"], id="embedded-quotes-are-literal"),
+            pytest.param(["", "   "], [], id="blank-phrases-run-no-query"),
+            pytest.param([], [], id="no-phrases"),
+        ],
+    )
+    async def test_artist_names_matching(self, tmp_path, phrases, expected):
+        db = await self._indexed_db(tmp_path, self.ARTISTS)
+        try:
+            names = await db.artist_names_matching(phrases)
+        finally:
+            await db.close()
+
+        assert sorted(names) == expected
+
+    @pytest.mark.asyncio
+    async def test_artist_names_matching_has_no_window(self, tmp_path):
+        """Every stored spelling comes back, however many rows precede it."""
+        artists = [f"Orchestra {i}" for i in range(200)]
+        db = await self._indexed_db(tmp_path, artists)
+        try:
+            names = await db.artist_names_matching(["orchestra"])
+        finally:
+            await db.close()
+
+        assert sorted(names) == sorted(artists)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("artists", "expected_ids"),
+        [
+            pytest.param(["Cat Power"], [2, 3], id="every-row-in-id-order"),
+            pytest.param(["Cat Power", "Stereolab"], [1, 2, 3], id="several-spellings"),
+            pytest.param(["cat power"], [], id="byte-equality-only"),
+            pytest.param(["Cat"], [], id="never-a-prefix"),
+            pytest.param([], [], id="no-artists"),
+        ],
+    )
+    async def test_rows_by_artist(self, tmp_path, artists, expected_ids):
+        db = await self._indexed_db(tmp_path, self.ARTISTS)
+        try:
+            rows = await db.rows_by_artist(artists)
+        finally:
+            await db.close()
+
+        assert [row.id for row in rows] == expected_ids
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["artist_names_matching", "rows_by_artist"])
+    async def test_requires_a_connection(self, tmp_path, method):
+        with pytest.raises(RuntimeError, match="not connected"):
+            await getattr(LibraryDB(db_path=tmp_path / "absent.db"), method)(["Stereolab"])
+
+
 class TestFullPoolCandidateGeneration:
     """The two candidate-generation defects LML#1245 was filed for.
 
