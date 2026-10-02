@@ -1277,8 +1277,8 @@ async def perform_lookup(
       ``context_message`` (``build_context_message``, Step 5's old call site)/
       ``external_source`` from the final, post-fold list
     - Step 8.    ``apply_shelf_fallback`` (``lookup/shelf_fallback.py``) —
-      additive, unbound shelf fallback (LML#1391/#1393): a pure pass-through
-      unless ``result_items`` is still empty after the location fold above
+      additive, unbound shelf fallback (LML#1391/#1393) when ``result_items``
+      is still empty after the fold; else the LML#1405 self-titled companion
     """
     # LML#865: derive the spine deadline once at admission. It bounds step 2's
     # Discogs pass and re-bases step 3's clock so the hard cap + caller budget

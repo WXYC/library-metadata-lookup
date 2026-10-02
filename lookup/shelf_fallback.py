@@ -6,7 +6,7 @@ response may gain the artist's shelf; a non-empty one may gain only the
 self-titled companion rows described at the end of this docstring.
 
 :func:`apply_shelf_fallback` runs once, after the location-union fold. It
-fires only when ``result_items`` is empty, the caller's ``skip`` flag is false
+fires its shelf lane only when ``result_items`` is empty, the caller's ``skip`` flag is false
 (timed out, search-leg shed, low-priority caller, or spine deadline spent), an
 album was typed, and the library artist has shelved rows of its own. It then
 returns up to ``MAX_SEARCH_RESULTS`` display-only rows
@@ -31,11 +31,12 @@ miss telemetry so a shelf-only response still reports ``miss_clean`` with
 
 Self-titled companion (LML#1405): when the response is NOT empty and the
 typed album is a request-side self-titled placeholder ("Epon.", "S/T"), rows
-titled the artist's name that the pipeline did not return are inserted at index
-1 as the same display-only rows, up to the room left under
-``MAX_SEARCH_RESULTS``. ``search_type``, the context line, ``external_source``
-and the netted row count are untouched, and the same ``skip`` flag applies, so
-a low-priority caller never sees one. See :func:`_self_titled_companions`.
+titled the artist's name that the pipeline did not return are appended after
+the existing rows as the same display-only rows, up to the room left under
+``MAX_SEARCH_RESULTS``. It does not fire when the response carries a context
+line or is a compilation hit. ``search_type``, ``external_source`` and the
+netted row count are untouched, and the same ``skip`` flag applies, so a
+low-priority caller never sees one. See :func:`_self_titled_companions`.
 
 The full rationale (placement, the four ``skip`` conditions, why
 ``/lookup/bulk`` is excluded, telemetry invisibility, and why a
@@ -93,7 +94,7 @@ def _order_shelf_rows(rows: list[LibraryItem], song: str | None) -> list[Library
 
 
 def _mark_shelf_fallback_outcome(row_count: int, key: str = "lookup.shelf_fallback_rows") -> None:
-    """Project the ONE new, separate Sentry trace attr for this lane.
+    """Project a lane's own, separate Sentry trace attr (one key per lane).
 
     Deliberately NOT ``lookup.outcome`` -- that key is the pre-existing
     ``library_miss_outcome`` projection (``_step_project_trace_attrs``), and
@@ -180,8 +181,12 @@ async def apply_shelf_fallback(
     if skip or not (parsed.album or "").strip() or not lib_artist:
         return unchanged
     if result_items:
-        # LML#1405: the one change to a non-empty response. ``results[0]`` and
-        # every row already present stay as they are; companions go in at 1.
+        # LML#1405: the one change to a non-empty response. Every row already
+        # present keeps its place; companions go after them. A context line or
+        # a compilation hit is a claim about the rows listed ("Found X on:"),
+        # which a companion would not satisfy, so those responses are left alone.
+        if context_message or search_type == "compilation":
+            return unchanged
         try:
             companions = await _self_titled_companions(parsed, db, lib_artist, result_items)
         except Exception as exc:
@@ -190,8 +195,7 @@ async def apply_shelf_fallback(
         if not companions:
             return unchanged
         _mark_shelf_fallback_outcome(len(companions), "lookup.self_titled_companion_rows")
-        merged = [result_items[0], *companions, *result_items[1:]]
-        return (merged, search_type, context_message, external_source, 0)
+        return ([*result_items, *companions], search_type, context_message, external_source, 0)
 
     # On ``main`` this path returned an empty 200 with no further I/O, so a
     # failure here must leave that response exactly as it was.
