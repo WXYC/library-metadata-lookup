@@ -30,8 +30,8 @@ cross-reference files a band's release under a member's name, which is not
 "other albums by" that member.
 
 Known residue: the FTS tokenizer keeps symbols as token characters, so a
-typed "Beak" does not reach a stored "Beak>" (26 such names measured on the
-2026-10-02 catalog). Those stay as they were before this module.
+typed "Beak" does not reach a stored "Beak>" (about two dozen such names on
+the 2026-10-02 catalog). Those stay as they were before this module.
 """
 
 from collections.abc import Callable
@@ -42,23 +42,26 @@ from lookup.matching import normalize_for_comparison, strip_leading_article
 from lookup.name_folding import fold_punctuation_for_comparison
 
 
-def _without_article(name: str) -> str:
-    return strip_leading_article(name) or name
-
-
 def _folded_without_article(name: str) -> str:
     # Strip THEN fold, as ``artist_matches_item`` does on the query side:
-    # folding first turns "A-Ha" into "a ha", whose "a" then reads as an article.
-    return fold_punctuation_for_comparison(_without_article(name))
+    # folding first turns "A-Bones" into "a bones", whose "a" then reads as an article.
+    return fold_punctuation_for_comparison(strip_leading_article(name))
 
 
 _RUNGS: tuple[Callable[[str], str], ...] = (
     str,
-    _without_article,
+    strip_leading_article,
     fold_punctuation_for_comparison,
     _folded_without_article,
 )
-"""Comparison keys over an already-normalized name, strictest first."""
+"""Comparison keys over an already-normalized name, strictest first. A key
+that comes out empty (a bare "The", an all-punctuation name) matches nothing
+on that rung: a typed "The" is not The The."""
+
+_MAX_NAME_LENGTH = 120
+"""Longest typed artist the lane reads for; twice the longest stored name
+(60). A phrase query costs time linear in its terms on the one SQLite worker
+thread, and the request model does not cap the artist field."""
 
 
 async def rows_for_artist(db: LibraryDB, artist: str) -> list[LibraryItem]:
@@ -68,7 +71,7 @@ async def rows_for_artist(db: LibraryDB, artist: str) -> list[LibraryItem]:
     and it matches more than one artist. See the module docstring.
     """
     name = normalize_for_comparison(artist).strip()
-    if not name:
+    if not name or len(name) > _MAX_NAME_LENGTH:
         return []
     stored = {
         spelling: normalize_for_comparison(spelling).strip()

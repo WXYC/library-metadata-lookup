@@ -312,8 +312,8 @@ LML#1126, caught *inside* step 3 and otherwise reaching the final
 ``LookupResponse`` with ``degraded=True``), a low-priority caller
 (``is_discogs_low_priority()`` — bulk/enrichment/backfill traffic, never a
 DJ-facing request), and a spent spine deadline
-(``services.spine_deadline.tail_exhausted()``, which skips the step's one
-``db.search`` when the caller's budget — or the hard cap — ran out after the
+(``services.spine_deadline.tail_exhausted()``, which skips the step's library
+queries when the caller's budget — or the hard cap — ran out after the
 last tail-shed check). The caller collapses all four into one ``skip`` flag —
 there is nothing left for this function to do differently between them.
 
@@ -342,7 +342,7 @@ When every one of these holds —
   the gate here: its prefix rung admits "Canibus" for "Can" and five
   unrelated "Low ..." artists for "Low", and this lane names the artist in
   its sentence. When the artist has no rows, the step does not fire;
-* the search does not raise — any exception logs a warning and leaves the
+* the library query does not raise — any exception logs a warning and leaves the
   empty response exactly as ``main`` returns it;
 
 this returns the artist's shelf as **display-only** rows:
@@ -427,7 +427,9 @@ Picking runs rung by rung and the first rung with a hit wins: equal under `norma
 
 `alternate_artist_name` and `cross_reference_names` are not consulted: a cross-reference files a band's release under a member's name, which is not "other albums by" that member.
 
-Measured over the same catalog, per typed variant of each stored artist: the stored spelling, 85 artists recovered and none lost; a leading "the" added, 22,336 recovered; the leading article dropped, 1,504; punctuation folded to spaces, 742. Residue: 26 names whose stored spelling carries a symbol the FTS tokenizer keeps as a token character ("Beak>", "D+", "C+C Music Factory"), which a typed form without the symbol does not reach.
+Measured over the same catalog by sending each stored artist's name, and variants of it, through the fuzzy artist correction and then both row sources, counting variants that got no shelf from the window and get the right one now: the stored spelling, 85 artists (none lost); a leading "the" added, 22,336; the leading article dropped, 1,504; punctuation folded to spaces, 742 (another 1,128 already resolved through the artist correction). Residue: about two dozen names whose stored spelling carries a symbol the FTS tokenizer keeps as a token character ("Beak>", "D+", "C+C Music Factory"), which a typed form without the symbol does not reach.
+
+Three guards: a rung whose key comes out empty matches nothing, so a typed "The" is not The The; a typed name longer than 120 characters (twice the longest stored name) is not read, because phrase cost is linear in its terms; and the read is two uncached queries, typically under 5 ms, on a path that only an eligible empty response reaches.
 
 The self-titled companion lane still reads the 50-row window.
 

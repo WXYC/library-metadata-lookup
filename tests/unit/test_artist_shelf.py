@@ -184,10 +184,17 @@ class TestTolerantRungs:
                 id="punctuation-rung-matching-two-artists-returns-neither",
             ),
             pytest.param(
-                "A-Ha",
-                [("Ha", "Laughing"), ("A-Ha", "Hunting High and Low")],
-                ["A-Ha"],
+                "A-Bones",
+                [("Bones", "Laughing")],
+                [],
                 id="initial-is-not-an-article",
+            ),
+            pytest.param("The", [("The The", "Soul Mining")], [], id="bare-article-is-not-a-name"),
+            pytest.param(
+                "Stereolab " * 13,
+                [("Stereolab", "Dots and Loops")],
+                [],
+                id="overlong-name-is-not-read",
             ),
         ],
     )
@@ -213,3 +220,16 @@ class TestTolerantRungs:
             await db.close()
 
         assert [row.title for row in rows] == ["Suburban Light", "Strange Geometry"]
+
+    @pytest.mark.asyncio
+    async def test_every_row_comes_back_in_catalog_order(self, tmp_path):
+        """No window on the rows either, and two stored casings interleave by
+        id rather than grouping by spelling."""
+        catalog = [("Stereolab" if i % 2 else "STEREOLAB", f"Album {i}") for i in range(1, 61)]
+        db = await _catalog(tmp_path, catalog)
+        try:
+            rows = await rows_for_artist(db, "Stereolab")
+        finally:
+            await db.close()
+
+        assert [row.id for row in rows] == list(range(1, 61))

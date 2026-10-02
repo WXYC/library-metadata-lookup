@@ -159,7 +159,7 @@ async def apply_shelf_fallback(
     external_source: str | None,
 ) -> tuple[list[LookupResultItem], str, str | None, str | None, int]:
     """Append the artist's shelf as display-only rows when the response is
-    otherwise empty, or insert the self-titled companion rows when it is not.
+    otherwise empty, or the self-titled companion rows when it is not.
     See the module docstring for the full contract.
 
     ``skip`` is the caller's ``state.timed_out or state.upstream_shed or
@@ -169,7 +169,7 @@ async def apply_shelf_fallback(
 
     Returns ``(result_items, search_type, context_message, external_source,
     shelf_fallback_rows)``. The first four are unchanged when any trigger
-    condition fails, or when the search raises: a pure pass-through, so the
+    condition fails, or when the library query raises: a pure pass-through, so the
     call site in ``perform_lookup`` never needs its own gate.
     ``shelf_fallback_rows`` is 0 on every pass-through and on the companion
     lane (those responses are hits either way), and ``len(shelf_items)`` when
