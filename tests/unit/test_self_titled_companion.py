@@ -2,9 +2,9 @@
 
 A typed self-titled placeholder ("Epon.", "S/T") that the pipeline answered
 with some other album gains the row titled the artist's name as a display-only
-row at index 1. The invariant under test throughout: **``results[0]`` and every
-row ``main`` returns are untouched, in the same order; the only change is one
-inserted row with no ``artwork``.**
+row after the rows already returned. The invariant under test throughout:
+**every row ``main`` returns is untouched and keeps its position; the only
+change is appended rows with no ``artwork``.**
 
 ``TestCompanionRow`` calls ``apply_shelf_fallback`` directly.
 ``TestPerformLookupCompanionRow`` drives the real pipeline, mocking only
@@ -66,13 +66,13 @@ def _db(rows):
 
 
 async def _apply(parsed, db, existing, skip=False):
-    return await apply_shelf_fallback(parsed, db, skip, existing, "direct", "ctx", "library")
+    return await apply_shelf_fallback(parsed, db, skip, existing, "direct", None, "library")
 
 
 class TestCompanionRow:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("placeholder", PLACEHOLDERS)
-    async def test_artist_named_row_is_inserted_at_index_one(self, placeholder):
+    async def test_artist_named_row_is_appended(self, placeholder):
         existing = [_bound(MOON_PIX)]
         db = _db([MOON_PIX, NUMBERED, SELF_TITLED])
 
@@ -83,17 +83,17 @@ class TestCompanionRow:
         assert [item.library_item.id for item in items] == [303, 301]
         assert items[0] is existing[0]
         assert items[1].artwork is None
-        assert (search_type, context, source, netted) == ("direct", "ctx", "library", 0)
+        assert (search_type, context, source, netted) == ("direct", None, "library", 0)
 
     @pytest.mark.asyncio
-    async def test_rows_main_returns_keep_their_order_after_the_insert(self):
+    async def test_rows_main_returns_keep_their_positions(self):
         other = make_library_item(id=304, artist="Cat Power", title="You Are Free")
         existing = [_bound(MOON_PIX), _bound(other, release_id=556)]
 
         items, *_ = await _apply(_parsed(), _db([SELF_TITLED, MOON_PIX, other]), existing)
 
-        assert [item.library_item.id for item in items] == [303, 301, 304]
-        assert items[0] is existing[0] and items[2] is existing[1]
+        assert [item.library_item.id for item in items] == [303, 304, 301]
+        assert items[0] is existing[0] and items[1] is existing[1]
 
     @pytest.mark.asyncio
     async def test_no_insert_when_the_response_is_already_full(self):
@@ -107,7 +107,7 @@ class TestCompanionRow:
 
         out = await _apply(_parsed(), db, existing)
 
-        assert out == (existing, "direct", "ctx", "library", 0)
+        assert out == (existing, "direct", None, "library", 0)
         db.search.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -120,7 +120,7 @@ class TestCompanionRow:
 
         items, *_ = await _apply(_parsed(), _db([SELF_TITLED, lp]), existing)
 
-        assert [item.library_item.id for item in items] == [400, 301, 401, 402, 403]
+        assert [item.library_item.id for item in items] == [400, 401, 402, 403, 301]
 
     @pytest.mark.asyncio
     async def test_no_insert_when_the_row_is_already_returned(self):
@@ -128,7 +128,7 @@ class TestCompanionRow:
 
         out = await _apply(_parsed(), _db([SELF_TITLED, MOON_PIX]), existing)
 
-        assert out == (existing, "direct", "ctx", "library", 0)
+        assert out == (existing, "direct", None, "library", 0)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -147,7 +147,7 @@ class TestCompanionRow:
 
         out = await _apply(parsed, db, existing)
 
-        assert out == (existing, "direct", "ctx", "library", 0)
+        assert out == (existing, "direct", None, "library", 0)
         db.search.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -159,7 +159,7 @@ class TestCompanionRow:
 
         out = await _apply(_parsed(), db, existing, skip=True)
 
-        assert out == (existing, "direct", "ctx", "library", 0)
+        assert out == (existing, "direct", None, "library", 0)
         db.search.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -175,7 +175,51 @@ class TestCompanionRow:
 
         out = await _apply(_parsed(album=typed), _db([literal, SELF_TITLED]), existing)
 
-        assert out == (existing, "direct", "ctx", "library", 0)
+        assert out == (existing, "direct", None, "library", 0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("search_type", "context"),
+        [
+            ("compilation", 'Found "Cross Bones Style" by Cat Power on:'),
+            ("compilation", None),
+            ("direct", 'Found "Cross Bones Style" by Cat Power on:'),
+            ("fallback", '"Epon." not found in the library, but here are other albums by X:'),
+        ],
+    )
+    async def test_no_companion_under_a_claim_about_the_rows(self, search_type, context):
+        """A companion is not known to carry the song, so it is never listed
+        under "Found X on:" or beside the location-union fold's rows."""
+        existing = [_bound(MOON_PIX)]
+        db = _db([MOON_PIX, SELF_TITLED])
+
+        out = await apply_shelf_fallback(
+            _parsed(), db, False, existing, search_type, context, "library"
+        )
+
+        assert out == (existing, search_type, context, "library", 0)
+        db.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_corrected_artist_is_the_one_searched(self):
+        existing = [_bound(MOON_PIX)]
+        db = _db([MOON_PIX, SELF_TITLED])
+        parsed = _parsed(artist="Cat Powr", library_artist="Cat Power")
+
+        items, *_ = await _apply(parsed, db, existing)
+
+        assert [item.library_item.id for item in items] == [303, 301]
+        assert db.search.await_args.kwargs["query"] == "Cat Power"
+
+    @pytest.mark.asyncio
+    async def test_row_less_probe_item_keeps_the_lead(self):
+        """Step 3a's synthesized ``id == 0`` item stays ``results[0]``."""
+        probe = _bound(make_library_item(id=0, artist="Cat Power", title="Cat Power"))
+
+        items, *_ = await _apply(_parsed(), _db([MOON_PIX, SELF_TITLED]), [probe])
+
+        assert items[0] is probe
+        assert [item.library_item.id for item in items] == [0, 301]
 
     @pytest.mark.asyncio
     async def test_artist_without_an_artist_named_row_is_unchanged(self):
@@ -183,7 +227,7 @@ class TestCompanionRow:
 
         out = await _apply(_parsed(), _db([MOON_PIX, NUMBERED]), existing)
 
-        assert out == (existing, "direct", "ctx", "library", 0)
+        assert out == (existing, "direct", None, "library", 0)
 
     @pytest.mark.asyncio
     async def test_another_artists_row_is_never_inserted(self):
@@ -194,7 +238,7 @@ class TestCompanionRow:
 
         out = await _apply(_parsed(artist="Cat"), _db([cat, lookalike]), existing)
 
-        assert out == (existing, "direct", "ctx", "library", 0)
+        assert out == (existing, "direct", None, "library", 0)
 
     @pytest.mark.asyncio
     async def test_search_failure_leaves_the_response_unchanged(self):
@@ -204,7 +248,7 @@ class TestCompanionRow:
 
         out = await _apply(_parsed(), db, existing)
 
-        assert out == (existing, "direct", "ctx", "library", 0)
+        assert out == (existing, "direct", None, "library", 0)
 
     @pytest.mark.asyncio
     async def test_cancellation_propagates(self):
