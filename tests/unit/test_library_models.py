@@ -54,110 +54,132 @@ class TestLibraryItemCallNumber:
         assert item.call_number == expected
 
 
+def _compilation(**overrides) -> LibraryItem:
+    """A library.db-shaped V/A row (Backend's export: `V/A`, artist number 0)."""
+    fields = {
+        "id": 1,
+        "artist": "Various Artists",
+        "genre": "Hiphop",
+        "format": "cd",
+        "call_letters": "V/A",
+        "artist_call_number": 0,
+        "release_call_number": 651,
+    }
+    return LibraryItem(**{**fields, **overrides})
+
+
 class TestLibraryItemCompilationCallNumber:
     """LML#1427: V/A rows are filed by title, not artist, so the regular
     "<Letters> <ArtistNum>/<ReleaseNum>" pattern never existed on the shelf for
     them -- the artist_call_number is always 0 and must not render. Rock and
     Soundtracks additionally split into 26 lettered bins, and the bin letter
-    survives in library.db only as a trailing " - <letter>" on `artist`."""
+    survives in library.db only as a trailing " - <letter>" on `artist`.
+
+    Backend-Service#2822 renders the same rule in TypeScript
+    (`computeCallNumber`); the two must agree character for character, so a
+    case added here belongs in its `it.each` table too, and vice versa."""
 
     @pytest.mark.parametrize(
-        "kwargs, expected",
+        "overrides, expected",
         [
+            pytest.param({}, "Hiphop cd V/A-651", id="single-bin-genre"),
             pytest.param(
                 {
-                    "id": 1,
-                    "artist": "Various Artists",
-                    "genre": "Hiphop",
-                    "format": "cd",
-                    "call_letters": "V/A",
-                    "artist_call_number": 0,
-                    "release_call_number": 651,
-                },
-                "Hiphop cd V/A-651",
-                id="single-bin-genre",
-            ),
-            pytest.param(
-                {
-                    "id": 2,
                     "artist": "Various Artists - Rock - M",
                     "genre": "Rock",
-                    "format": "cd",
-                    "call_letters": "V/A",
-                    "artist_call_number": 0,
                     "release_call_number": 121,
                 },
                 "Rock cd V/A M-121",
                 id="rock-with-bin",
             ),
             pytest.param(
-                {
-                    "id": 3,
-                    "artist": "Soundtracks - M",
-                    "genre": "Soundtracks",
-                    "format": "cd",
-                    "call_letters": "V/A",
-                    "artist_call_number": 0,
-                    "release_call_number": 12,
-                },
+                {"artist": "Soundtracks - M", "genre": "Soundtracks", "release_call_number": 12},
                 "Soundtracks cd M-12",
                 id="soundtracks-with-bin",
             ),
             pytest.param(
-                {
-                    "id": 4,
-                    "artist": "Various Artists",
-                    "genre": "Soundtracks",
-                    "format": "cd",
-                    "call_letters": "V/A",
-                    "artist_call_number": 0,
-                    "release_call_number": 53,
-                },
+                {"genre": "Soundtracks", "release_call_number": 53},
                 "Soundtracks cd V/A-53",
                 id="soundtracks-without-bin",
             ),
             pytest.param(
                 {
-                    "id": 5,
-                    "artist": "Various Artists - Rock - M",
+                    "artist": "Various Artists - Rock - m",
                     "genre": "Rock",
-                    "format": "cd",
-                    "call_letters": "Z-M",
-                    "artist_call_number": 0,
                     "release_call_number": 121,
                 },
                 "Rock cd V/A M-121",
-                id="legacy-z-letter",
+                id="lowercase-name-bin-is-uppercased",
             ),
             pytest.param(
+                {"call_letters": "  v/a  "}, "Hiphop cd V/A-651", id="lowercase-padded-v/a"
+            ),
+            pytest.param(
+                {"genre": "Rock", "call_letters": "Z-M", "release_call_number": 121},
+                "Rock cd V/A M-121",
+                id="legacy-z-letter-read-from-code-not-name",
+            ),
+            pytest.param(
+                {"genre": "Soundtracks", "call_letters": "Z-K", "release_call_number": 12},
+                "Soundtracks cd K-12",
+                id="legacy-z-letter-soundtracks",
+            ),
+            pytest.param({"call_letters": "Z--"}, "Hiphop cd V/A-651", id="legacy-z-no-letter"),
+            pytest.param(
                 {
-                    "id": 6,
-                    "artist": "Various Artists",
-                    "genre": "Hiphop",
-                    "format": "cd",
+                    "artist": "Various Artists - Rock - M",
+                    "genre": "Rock",
                     "call_letters": "Z--",
-                    "artist_call_number": 0,
-                    "release_call_number": 651,
+                    "release_call_number": 121,
                 },
+                "Rock cd V/A-121",
+                id="legacy-z-no-letter-ignores-name",
+            ),
+            pytest.param(
+                {"call_letters": "Z-M"}, "Hiphop cd V/A-651", id="legacy-z-letter-single-bin-genre"
+            ),
+            pytest.param(
+                {"genre": "Rock", "call_letters": "Z-1", "release_call_number": 121},
+                "Rock cd V/A 1-121",
+                id="legacy-z-takes-any-char-like-substring",
+            ),
+            pytest.param(
+                {"artist": "Various Artists - Rock - M"},
                 "Hiphop cd V/A-651",
-                id="legacy-z-no-letter",
+                id="rock-heading-ignored-outside-rock",
+            ),
+            pytest.param(
+                {"artist": "Various Artists - M"},
+                "Hiphop cd V/A-651",
+                id="name-suffix-ignored-on-single-bin-genre",
+            ),
+            pytest.param(
+                {"artist": "Various Artists - Africa", "genre": "Rock", "release_call_number": 121},
+                "Rock cd V/A-121",
+                id="multi-letter-suffix-is-not-a-bin",
+            ),
+            pytest.param(
+                {"artist": " - M", "genre": "Rock", "release_call_number": 121},
+                "Rock cd V/A-121",
+                id="name-trimmed-before-suffix-read",
+            ),
+            pytest.param({"release_call_number": None}, "Hiphop cd V/A", id="no-release-number"),
+            pytest.param(
+                {
+                    "artist": "Various Artists - Rock - M",
+                    "genre": "Rock",
+                    "release_call_number": None,
+                },
+                "Rock cd V/A M",
+                id="no-release-number-with-bin",
+            ),
+            pytest.param(
+                {"artist": "Various Artists - Rock - M", "genre": None, "format": None},
+                "V/A-651",
+                id="no-genre-no-format",
             ),
             pytest.param(
                 {
-                    "id": 7,
-                    "artist": "Various Artists",
-                    "genre": "Hiphop",
-                    "format": "cd",
-                    "call_letters": "  v/a  ",
-                    "artist_call_number": 0,
-                    "release_call_number": 651,
-                },
-                "Hiphop cd V/A-651",
-                id="lowercase-padded-call-letters",
-            ),
-            pytest.param(
-                {
-                    "id": 8,
                     "artist": "Stereolab",
                     "genre": "Rock",
                     "format": "CD",
@@ -170,9 +192,8 @@ class TestLibraryItemCompilationCallNumber:
             ),
         ],
     )
-    def test_compilation_call_number(self, kwargs, expected):
-        item = LibraryItem(**kwargs)
-        assert item.call_number == expected
+    def test_compilation_call_number(self, overrides, expected):
+        assert _compilation(**overrides).call_number == expected
 
 
 class TestLibraryItemLibraryUrl:
