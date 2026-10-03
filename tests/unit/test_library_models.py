@@ -256,17 +256,10 @@ class TestToCatalogItem:
     def test_includes_compilation_call_number(self):
         """LML#1427: the wire call_number must carry the shelf form, not
         "V/A 0/<n>", for a compilation row."""
-        item = LibraryItem(
-            id=1,
-            artist="Various Artists - Rock - M",
-            genre="Rock",
-            format="cd",
-            call_letters="V/A",
-            artist_call_number=0,
-            release_call_number=121,
+        item = _compilation(
+            artist="Various Artists - Rock - M", genre="Rock", release_call_number=121
         )
-        catalog = item.to_catalog_item()
-        assert catalog.call_number == "Rock cd V/A M-121"
+        assert item.to_catalog_item().call_number == "Rock cd V/A M-121"
 
     def test_minimal_item(self):
         item = LibraryItem(id=5)
