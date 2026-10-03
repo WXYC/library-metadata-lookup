@@ -108,7 +108,7 @@ async def runs_album_resolution(parsed: ParsedRequest, db: LibraryDB | None) -> 
     names the artist's self-titled record when the search it would otherwise
     run (:func:`_album_search`, so the same window and cache entry) returns a
     row titled that name and filed under that name. Another artist's row is not
-    enough ("Whitney" by Whitney Houston for the band Whitney), and neither is a
+    enough ("Arlo" by Arlo Guthrie for the band Arlo), and neither is a
     literal "S/T", which Backend-Service sends as a placeholder. The album
     filter always keeps that row, so skipping step 2 never loses it; the
     tiebreak in ``search_library_with_fallback`` ranks it above siblings that
@@ -137,7 +137,13 @@ def _titled(row: LibraryItem, folded_album: str) -> bool:
 
 
 def _is_self_titled_record(row: LibraryItem, folded_name: str) -> bool:
-    """Whether ``row`` is titled ``folded_name`` and filed under an artist of that name."""
+    """Whether ``row`` is titled ``folded_name`` and filed under an artist of that name.
+
+    Both sides use the album filter's fold, not ``shelf_fallback``'s
+    diacritic-stripping one: a row this counts must survive ``search_one_album``,
+    so skipping step 2 never empties the album lane. A typed name whose accents
+    differ from the row's keeps step 2, as before LML#1412.
+    """
     return (
         bool(folded_name)
         and _titled(row, folded_name)
