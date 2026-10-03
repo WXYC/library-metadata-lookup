@@ -2539,10 +2539,49 @@ class TestArtistKeyedQueries:
         assert [row.id for row in rows] == expected_ids
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("method", ["artist_names_matching", "rows_by_artist"])
-    async def test_requires_a_connection(self, tmp_path, method):
+    @pytest.mark.parametrize(
+        ("query", "ids", "expected_ids"),
+        [
+            pytest.param("Cat Power", [1, 2, 4], [2, 4], id="rows-the-search-matches"),
+            pytest.param("Cat Power", [4, 3], [3, 4], id="id-order"),
+            pytest.param("Cat Album 3", [2, 3, 4], [3], id="artist-and-title-columns"),
+            pytest.param("   ", [2, 3], [], id="blank-query-runs-no-query"),
+            pytest.param("Cat Power", [], [], id="no-ids"),
+        ],
+    )
+    async def test_search_among(self, tmp_path, query, ids, expected_ids):
+        """``search``'s full-text match over ``ids`` only (LML#1421)."""
+        db = await self._indexed_db(tmp_path, self.ARTISTS)
+        try:
+            rows = await db.search_among(query, ids)
+        finally:
+            await db.close()
+
+        assert [row.id for row in rows] == expected_ids
+
+    @pytest.mark.asyncio
+    async def test_search_among_has_no_window(self, tmp_path):
+        """The 200th match comes back, where ``search`` stops at its limit."""
+        db = await self._indexed_db(tmp_path, [f"Orchestra {i}" for i in range(200)])
+        try:
+            rows = await db.search_among("orchestra", [200, 1])
+        finally:
+            await db.close()
+
+        assert [row.id for row in rows] == [1, 200]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "args"),
+        [
+            ("artist_names_matching", (["Stereolab"],)),
+            ("rows_by_artist", (["Stereolab"],)),
+            ("search_among", ("Stereolab", [1])),
+        ],
+    )
+    async def test_requires_a_connection(self, tmp_path, method, args):
         with pytest.raises(RuntimeError, match="not connected"):
-            await getattr(LibraryDB(db_path=tmp_path / "absent.db"), method)(["Stereolab"])
+            await getattr(LibraryDB(db_path=tmp_path / "absent.db"), method)(*args)
 
 
 class TestFullPoolCandidateGeneration:
