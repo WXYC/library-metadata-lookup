@@ -10,8 +10,10 @@ if TYPE_CHECKING:
 
 # Rock and Soundtracks are each split into 26 lettered shelf bins, with
 # release numbers restarting in each bin; every other compilation genre
-# shelves under a single bin. See LibraryItem.call_number.
-_COMPILATION_LETTERED_GENRES = {"Rock", "Soundtracks"}
+# shelves under a single "V/A" bin. Maps each lettered genre to how its bin
+# letter renders in the call number's artist half (tubafrenzy's
+# ArtistLibraryCode.getCallLettersAndNumbers). See LibraryItem.call_number.
+_COMPILATION_BIN_FORMS = {"Rock": "V/A {}", "Soundtracks": "{}"}
 
 # A trailing " - <letter>" bin heading, e.g. "Various Artists - Rock - M" or
 # "Soundtracks - M".
@@ -69,87 +71,55 @@ class LibraryItem(BaseModel):
     cross_reference_names: str | None = None
     on_streaming: bool | None = None
 
-    @property
-    def _is_compilation(self) -> bool:
-        """True when `call_letters` is the structural Various-Artists marker.
+    def _compilation_bin_letter(self, letters: str) -> str | None:
+        """The shelf-bin letter for a compilation row, or None if unrecoverable.
 
-        `V/A` is the form Backend's library-etl writes into library.db; `Z-`
-        is the raw tubafrenzy code (`Z--` single-bin, `Z-<letter>` lettered)
-        that a tubafrenzy-shaped export can still carry. Detection is
-        structural only -- never by artist name -- per LML#1427.
+        The raw tubafrenzy `Z-<letter>` code carries it at index 2 (`Z--` has
+        none), taken as-is the way the Java's `substring(2, 3)` does. The `V/A`
+        form Backend's export writes has lost it from `call_letters`; it
+        survives only as the bin heading baked into `artist` ("Various Artists
+        - Rock - M", "Soundtracks - M"). Reading the name is a deliberate,
+        narrow exception: `call_number` calls this only for a row that is
+        already structurally a compilation in a lettered genre.
         """
-        if not self.call_letters:
-            return False
-        letters = self.call_letters.strip()
-        # `Z-` is case-sensitive, as in tubafrenzy's `isVariousArtists` and
-        # dj-site's / Backend-Service's twins of it.
-        return letters.upper() == "V/A" or letters.startswith("Z-")
-
-    def _compilation_bin_letter(self) -> str | None:
-        """The Rock/Soundtracks shelf-bin letter, or None if unrecoverable.
-
-        A compilation is filed by title, so there is no per-artist shelf
-        number and `artist_call_number` is always 0 on these rows -- it must
-        never render. The bin letter is a different story: Rock and
-        Soundtracks split into 26 lettered bins with release numbers that
-        restart per bin, so dropping the letter is ambiguous, not just ugly
-        (up to 23 Rock bins can share one release number). The raw `Z-`
-        tubafrenzy code carries the letter at a fixed offset. The modern
-        `V/A` form does not carry it anywhere on the row itself -- it
-        survives only as a bin heading baked into `artist`
-        ("Various Artists - Rock - M", "Soundtracks - M") -- so recovering it
-        from the name is a deliberate, narrowly-scoped exception: only after
-        the structural V/A gate above, and only for the two lettered genres.
-        """
-        letters = (self.call_letters or "").strip()
         if letters.startswith("Z-"):
-            return letters[2].upper() if len(letters) > 2 and letters[2] != "-" else None
-        if self.genre not in _COMPILATION_LETTERED_GENRES or not self.artist:
-            return None
-        match = _COMPILATION_BIN_SUFFIX.search(self.artist.strip())
+            return letters[2:3].strip("-").upper() or None
+        match = _COMPILATION_BIN_SUFFIX.search((self.artist or "").strip())
         return match.group(1).upper() if match else None
 
-    def _compilation_call_number(self) -> str:
-        bin_letter = self._compilation_bin_letter()
-        if self.genre == "Soundtracks" and bin_letter:
-            artist_half = bin_letter
-        elif self.genre == "Rock" and bin_letter:
-            artist_half = f"V/A {bin_letter}"
-        else:
-            artist_half = "V/A"
-
-        letters = artist_half
-        if self.release_call_number is not None:
-            letters = f"{artist_half}-{self.release_call_number}"
-
-        parts = []
-        if self.genre:
-            parts.append(self.genre)
-        if self.format:
-            parts.append(self.format)
-        parts.append(letters)
-        return " ".join(parts)
+    def _compilation_shelf(self, letters: str) -> str:
+        """The `<artist-half>-<release-half>` locator for a compilation row."""
+        form = _COMPILATION_BIN_FORMS.get(self.genre or "")
+        bin_letter = self._compilation_bin_letter(letters) if form else None
+        artist_half = form.format(bin_letter) if form and bin_letter else "V/A"
+        # LML#1373 extends the release half with the per-release volume letter
+        # (`<ReleaseNum>-<VolumeLetter>`).
+        release_half = "" if self.release_call_number is None else f"-{self.release_call_number}"
+        return artist_half + release_half
 
     @property
     def call_number(self) -> str:
         """Full call number for shelf lookup: <Genre> <Format> <Letters> <ArtistNum>/<ReleaseNum>
 
-        A compilation (`call_letters` structurally `V/A` or a raw `Z-` code;
-        see `_is_compilation`) does not fit that pattern -- it is filed by
-        title, so `artist_call_number` is meaningless (always 0) and must be
-        dropped rather than rendered as "V/A 0/<n>". `_compilation_call_number`
-        renders the shelf form instead, composed as an artist-half (the
-        letters, e.g. "V/A" / "V/A M" / "M") joined to a release-half (the
-        release number) -- the same composition LML#1373 will extend with a
-        per-release volume letter (`<ReleaseNum>-<VolumeLetter>`).
+        A compilation does not fit that pattern. It is detected structurally,
+        never by artist name: `call_letters` is `V/A` (case- and
+        whitespace-insensitive, the form Backend's library-etl writes) or
+        starts with the raw tubafrenzy `Z-` (case-sensitive, as in
+        tubafrenzy's `isVariousArtists`). A compilation shelf is filed by
+        title, so `artist_call_number` (always 0) must not render as
+        "V/A 0/<n>"; the shelf form is `<Genre> <Format> V/A-<ReleaseNum>`,
+        or `Rock <Format> V/A <Bin>-<ReleaseNum>` / `Soundtracks <Format>
+        <Bin>-<ReleaseNum>` for the two genres split into lettered bins, where
+        release numbers restart per bin and the letter is what disambiguates
+        the locator (LML#1427). Backend-Service's `computeCallNumber`
+        (Backend-Service#2822) renders the same rule and must match it
+        character for character.
         """
-        if self._is_compilation:
-            return self._compilation_call_number()
-        parts = []
-        if self.genre:
-            parts.append(self.genre)
-        if self.format:
-            parts.append(self.format)
+        parts = [part for part in (self.genre, self.format) if part]
+        letters = (self.call_letters or "").strip()
+        if letters.upper() == "V/A" or letters.startswith("Z-"):
+            parts.append(self._compilation_shelf(letters))
+            return " ".join(parts)
         if self.call_letters:
             parts.append(self.call_letters)
         if self.artist_call_number is not None:
