@@ -54,6 +54,127 @@ class TestLibraryItemCallNumber:
         assert item.call_number == expected
 
 
+class TestLibraryItemCompilationCallNumber:
+    """LML#1427: V/A rows are filed by title, not artist, so the regular
+    "<Letters> <ArtistNum>/<ReleaseNum>" pattern never existed on the shelf for
+    them -- the artist_call_number is always 0 and must not render. Rock and
+    Soundtracks additionally split into 26 lettered bins, and the bin letter
+    survives in library.db only as a trailing " - <letter>" on `artist`."""
+
+    @pytest.mark.parametrize(
+        "kwargs, expected",
+        [
+            pytest.param(
+                {
+                    "id": 1,
+                    "artist": "Various Artists",
+                    "genre": "Hiphop",
+                    "format": "cd",
+                    "call_letters": "V/A",
+                    "artist_call_number": 0,
+                    "release_call_number": 651,
+                },
+                "Hiphop cd V/A-651",
+                id="single-bin-genre",
+            ),
+            pytest.param(
+                {
+                    "id": 2,
+                    "artist": "Various Artists - Rock - M",
+                    "genre": "Rock",
+                    "format": "cd",
+                    "call_letters": "V/A",
+                    "artist_call_number": 0,
+                    "release_call_number": 121,
+                },
+                "Rock cd V/A M-121",
+                id="rock-with-bin",
+            ),
+            pytest.param(
+                {
+                    "id": 3,
+                    "artist": "Soundtracks - M",
+                    "genre": "Soundtracks",
+                    "format": "cd",
+                    "call_letters": "V/A",
+                    "artist_call_number": 0,
+                    "release_call_number": 12,
+                },
+                "Soundtracks cd M-12",
+                id="soundtracks-with-bin",
+            ),
+            pytest.param(
+                {
+                    "id": 4,
+                    "artist": "Various Artists",
+                    "genre": "Soundtracks",
+                    "format": "cd",
+                    "call_letters": "V/A",
+                    "artist_call_number": 0,
+                    "release_call_number": 53,
+                },
+                "Soundtracks cd V/A-53",
+                id="soundtracks-without-bin",
+            ),
+            pytest.param(
+                {
+                    "id": 5,
+                    "artist": "Various Artists - Rock - M",
+                    "genre": "Rock",
+                    "format": "cd",
+                    "call_letters": "Z-M",
+                    "artist_call_number": 0,
+                    "release_call_number": 121,
+                },
+                "Rock cd V/A M-121",
+                id="legacy-z-letter",
+            ),
+            pytest.param(
+                {
+                    "id": 6,
+                    "artist": "Various Artists",
+                    "genre": "Hiphop",
+                    "format": "cd",
+                    "call_letters": "Z--",
+                    "artist_call_number": 0,
+                    "release_call_number": 651,
+                },
+                "Hiphop cd V/A-651",
+                id="legacy-z-no-letter",
+            ),
+            pytest.param(
+                {
+                    "id": 7,
+                    "artist": "Various Artists",
+                    "genre": "Hiphop",
+                    "format": "cd",
+                    "call_letters": "  v/a  ",
+                    "artist_call_number": 0,
+                    "release_call_number": 651,
+                },
+                "Hiphop cd V/A-651",
+                id="lowercase-padded-call-letters",
+            ),
+            pytest.param(
+                {
+                    "id": 8,
+                    "artist": "Stereolab",
+                    "genre": "Rock",
+                    "format": "CD",
+                    "call_letters": "ST",
+                    "artist_call_number": 1,
+                    "release_call_number": 2,
+                },
+                "Rock CD ST 1/2",
+                id="unchanged-named-artist",
+            ),
+        ],
+    )
+    def test_compilation_call_number(self, kwargs, expected):
+        item = LibraryItem(**kwargs)
+        assert item.call_number == expected
+
+
 class TestLibraryItemLibraryUrl:
     def test_url_format(self):
         item = LibraryItem(id=42, artist="Stereolab", title="Aluminum Tunes")
@@ -105,6 +226,21 @@ class TestToCatalogItem:
         item = LibraryItem(id=42)
         catalog = item.to_catalog_item()
         assert catalog.library_url == "https://dj.wxyc.org/dashboard/album/legacy/42"
+
+    def test_includes_compilation_call_number(self):
+        """LML#1427: the wire call_number must carry the shelf form, not
+        "V/A 0/<n>", for a compilation row."""
+        item = LibraryItem(
+            id=1,
+            artist="Various Artists - Rock - M",
+            genre="Rock",
+            format="cd",
+            call_letters="V/A",
+            artist_call_number=0,
+            release_call_number=121,
+        )
+        catalog = item.to_catalog_item()
+        assert catalog.call_number == "Rock cd V/A M-121"
 
     def test_minimal_item(self):
         item = LibraryItem(id=5)
