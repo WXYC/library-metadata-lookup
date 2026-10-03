@@ -1119,6 +1119,42 @@ class TestPerformLookupAlbumResolution:
         assert [r.library_item.id for r in response.results] == [39020]
         assert telemetry.api_calls["discogs"] == 1
 
+    @pytest.mark.asyncio
+    async def test_album_naming_a_shelved_self_titled_record_skips_step_2(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#1412, end to end. Backend-Service enrichment of a play from
+        Caetano Veloso's 1968 self-titled record sends the catalog title
+        "Caetano Veloso". It names that shelved record, so step 2's Discogs
+        search never runs and is not counted, the record leads instead of the
+        compilation Discogs lists for the song, and the only Discogs calls are
+        step 4's artwork lookups, one per row."""
+        mock_library_db.find_similar_artist.return_value = None
+        mock_library_db.search.return_value = [
+            make_library_item(id=57303, artist="Caetano Veloso", title="A arte de Caetano Veloso"),
+            make_library_item(id=57304, artist="Caetano Veloso", title="Caetano Veloso"),
+        ]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        request = LookupRequest(
+            artist="Caetano Veloso",
+            album="Caetano Veloso",
+            song="Tropicália",
+            raw_message="Caetano Veloso - Tropicália",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[("Caetano Veloso", "A arte de Caetano Veloso")],
+        ) as step_2_search:
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        step_2_search.assert_not_awaited()
+        assert [r.library_item.id for r in response.results] == [57304, 57303]
+        assert telemetry.api_calls["discogs"] == 2
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - fallback and context messages

@@ -56,6 +56,7 @@ from lookup.validation import (
 )
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_discogs_result, make_library_item
+from tests.unit.test_artist_shelf import _catalog, _crowd
 
 # ---------------------------------------------------------------------------
 # Tests: filter_results_by_artist
@@ -1779,6 +1780,260 @@ class TestSelfTitledPlaceholderRanking:
         assert [r.id for r in results] == [2, 1]
         assert albums == ["Epon.", "Jessica Pratt", "On Your Own Love Again"]
         assert fallback is False
+
+
+_CAETANO_VELOSO_SHELF = [
+    make_library_item(id=57303, artist="Caetano Veloso", title="A arte de Caetano Veloso"),
+    make_library_item(id=57304, artist="Caetano Veloso", title="Caetano Veloso"),
+    make_library_item(id=57310, artist="Caetano Veloso", title="Live in Bahia"),
+]
+"""A compilation whose title contains the artist's name, ahead of the 1968 self-titled record."""
+
+
+class TestTypedAlbumEqualToArtist:
+    """A typed album equal to the artist's name (LML#1412). Backend-Service
+    enrichment types the catalog title, which for a self-titled record is the
+    artist's name. When the artist's album search returns that record (titled
+    and filed under the name), the typed album names it: step 2 does not run,
+    and the record leads as any typed album's row does. Otherwise step 2 runs
+    as before."""
+
+    _rank = staticmethod(TestSelfTitledPlaceholderRanking._rank)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "discogs_albums",
+        [
+            pytest.param(
+                ["A arte de Caetano Veloso", "Live in Bahia"],
+                id="discogs-omits-the-self-titled-record",
+            ),
+            pytest.param(
+                ["A arte de Caetano Veloso", "Caetano Veloso"], id="discogs-lists-it-second"
+            ),
+        ],
+    )
+    async def test_shelved_self_titled_record_leads(self, mock_library_db, discogs_albums):
+        """In production on 2026-10-02 this request led with the compilation and
+        omitted the 1968 record: step 2 replaced the typed album with Discogs'
+        song->album answer."""
+        albums, results, fallback, step_2_search = await self._rank(
+            mock_library_db,
+            "Caetano Veloso",
+            "Caetano Veloso",
+            "Tropicália",
+            discogs_albums,
+            _CAETANO_VELOSO_SHELF,
+        )
+
+        step_2_search.assert_not_awaited()
+        assert albums == ["Caetano Veloso"]
+        assert [r.id for r in results] == [57304, 57303]
+        assert fallback is False
+
+    @pytest.mark.asyncio
+    async def test_songless_request_puts_the_self_titled_record_first(self, mock_library_db):
+        """Without a song step 2 never ran, but both rows pass the album filter
+        and tie on containing the typed album, so the search's own order used
+        to decide which led."""
+        mock_library_db.search = AsyncMock(return_value=_CAETANO_VELOSO_SHELF)
+        parsed = ParsedRequest(
+            artist="Caetano Veloso",
+            album="Caetano Veloso",
+            raw_message="Caetano Veloso - Caetano Veloso",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+
+        results, _ = await search_library_with_fallback(mock_library_db, parsed, ["Caetano Veloso"])
+
+        assert [r.id for r in results] == [57304, 57303]
+
+    @pytest.mark.asyncio
+    async def test_row_titled_after_the_song_still_ranks_first(self, mock_library_db):
+        """The tiebreak sits below the song key, as for any typed album: a row
+        whose title carries the song outranks the self-titled record."""
+        single = make_library_item(
+            id=90001, artist="Caetano Veloso", title="Tropicália / Caetano Veloso [single]"
+        )
+        _, results, _, step_2_search = await self._rank(
+            mock_library_db,
+            "Caetano Veloso",
+            "Caetano Veloso",
+            "Tropicália",
+            ["A arte de Caetano Veloso"],
+            [*_CAETANO_VELOSO_SHELF, single],
+        )
+
+        step_2_search.assert_not_awaited()
+        assert [r.id for r in results] == [90001, 57304, 57303]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "artist, shelf, discogs_album, expected_id",
+        [
+            pytest.param(
+                "Jessica Pratt",
+                [
+                    make_library_item(
+                        id=64592, artist="Jessica Pratt", title="On your own love Again"
+                    ),
+                    make_library_item(id=68028, artist="Jessica Pratt", title="Quiet Signs"),
+                ],
+                "On Your Own Love Again",
+                64592,
+                id="no-row-titled-the-name",
+            ),
+            pytest.param(
+                "Whitney",
+                [
+                    make_library_item(id=27380, artist="Whitney Houston", title="Whitney"),
+                    make_library_item(id=69431, artist="Whitney", title="Light upon the Lake"),
+                ],
+                "Light upon the Lake",
+                69431,
+                id="another-artists-row-titled-the-name",
+            ),
+        ],
+    )
+    async def test_step_2_runs_when_the_artist_has_no_self_titled_record(
+        self, mock_library_db, artist, shelf, discogs_album, expected_id
+    ):
+        """Jessica Pratt's shelf has no record titled her name. The band
+        Whitney's has none either: Whitney Houston's "Whitney" passes the artist
+        filter's prefix match but is filed under another artist. Step 2 resolves
+        the song as before."""
+        albums, results, fallback, step_2_search = await self._rank(
+            mock_library_db, artist, artist, "Song", [discogs_album], shelf
+        )
+
+        step_2_search.assert_awaited_once()
+        assert albums == [discogs_album]
+        assert [r.id for r in results] == [expected_id]
+        assert fallback is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "artist, album, song, shelf",
+        [
+            pytest.param(
+                "Arthur Russell",
+                "World of Echo",
+                "Answers Me",
+                [
+                    make_library_item(
+                        id=68927, artist="Arthur Russell", title="Sketches for the world of echo"
+                    ),
+                    make_library_item(id=47635, artist="Arthur Russell", title="World of Echo"),
+                ],
+                id="typed-title-with-a-song",
+            ),
+            pytest.param(
+                "Sun Ra",
+                "Bad and Beautiful",
+                None,
+                [
+                    make_library_item(
+                        id=8418,
+                        artist="Sun Ra",
+                        title="We Travel the Spaceways / Bad and Beautiful",
+                    ),
+                    make_library_item(id=8404, artist="Sun Ra", title="Bad and Beautiful"),
+                ],
+                id="typed-title-without-a-song",
+            ),
+        ],
+    )
+    async def test_other_typed_albums_keep_the_search_order(
+        self, mock_library_db, artist, album, song, shelf
+    ):
+        """The tiebreak applies only when the typed album is the artist's name.
+        Elsewhere a row titled exactly the typed album still ties with a sibling
+        that contains it, and the search's order stands, as on main."""
+        albums, results, _, step_2_search = await self._rank(
+            mock_library_db, artist, album, song, [], shelf
+        )
+
+        step_2_search.assert_not_awaited()
+        assert albums == [album]
+        assert [r.id for r in results] == [row.id for row in shelf]
+
+
+class TestTypedAlbumEqualToArtistOverARealIndex:
+    """LML#1412 over a real FTS index, where the 50-row window that the guard
+    and the album lane share is real rather than mocked."""
+
+    @staticmethod
+    async def _lookup(tmp_path, rows, artist, discogs_album, song="Song"):
+        """``(step-2 awaits, (artist, title) of the album lane's rows)``."""
+        db = await _catalog(tmp_path, rows)
+        parsed = ParsedRequest(
+            song=song,
+            artist=artist,
+            album=artist,
+            raw_message=f"{artist} - {song}",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        try:
+            with patch(
+                "lookup.orchestrator.lookup_releases_by_track",
+                new_callable=AsyncMock,
+                return_value=[(artist, discogs_album)],
+            ) as step_2_search:
+                albums, _ = await resolve_albums_for_track(parsed, AsyncMock(), db=db)
+            results, _ = await search_library_with_fallback(db, parsed, albums)
+        finally:
+            await db.close()
+        return step_2_search.await_count, [(r.artist, r.title) for r in results]
+
+    @pytest.mark.asyncio
+    async def test_self_titled_record_leads(self, tmp_path):
+        rows = [
+            ("Caetano Veloso", "A arte de Caetano Veloso"),
+            ("Caetano Veloso", "Caetano Veloso"),
+            ("Caetano Veloso", "Livro"),
+        ]
+
+        assert await self._lookup(tmp_path, rows, "Caetano Veloso", "Livro") == (
+            0,
+            [("Caetano Veloso", "Caetano Veloso"), ("Caetano Veloso", "A arte de Caetano Veloso")],
+        )
+
+    @pytest.mark.asyncio
+    async def test_record_behind_a_full_search_window_takes_step_2(self, tmp_path):
+        """A common-word name's own rows sit outside the window (LML#1421), so
+        the guard cannot see the record and step 2 runs, as on main."""
+        rows = [*_crowd("Spirit"), ("Spirit", "Spirit"), ("Spirit", "Second Album")]
+
+        assert await self._lookup(tmp_path, rows, "Spirit", "Second Album") == (
+            1,
+            [("Spirit", "Second Album")],
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "song", [pytest.param("Song", id="song"), pytest.param(None, id="no-song")]
+    )
+    async def test_own_record_leads_another_artists_record_of_the_same_title(self, tmp_path, song):
+        """The search returns Sylvie Simmons' "Sylvie" before the band Sylvie's,
+        and the artist filter's prefix match admits both. Only the band's is its
+        self-titled record, so it leads."""
+        rows = [("Sylvie Simmons", "Sylvie"), ("Sylvie", "Sylvie")]
+
+        assert await self._lookup(tmp_path, rows, "Sylvie", "Other Album", song) == (
+            0,
+            [("Sylvie", "Sylvie"), ("Sylvie Simmons", "Sylvie")],
+        )
+
+    @pytest.mark.asyncio
+    async def test_another_artists_record_titled_the_name_takes_step_2(self, tmp_path):
+        rows = [("Whitney Houston", "Whitney"), ("Whitney", "Light upon the Lake")]
+
+        assert await self._lookup(tmp_path, rows, "Whitney", "Light upon the Lake") == (
+            1,
+            [("Whitney", "Light upon the Lake")],
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ from lookup.matching import (
     is_self_titled_request_placeholder,
     library_artist_for,
     needs_album_resolution,
+    typed_album_is_artist,
 )
 from lookup.name_folding import fold_punctuation_for_comparison
 from services.parser import ParsedRequest
@@ -97,26 +98,57 @@ async def runs_album_resolution(parsed: ParsedRequest, db: LibraryDB | None) -> 
     song above ``albums[0]``: once step 2 adds Discogs albums, a single shelved
     under the song's name would outrank the typed record.
 
-    One local query and no Discogs I/O: the artist-only search the fallback
-    below issues, so it shares that call's cache entry. Like that fallback it
-    sees at most ``_FETCH_LIMIT`` rows; an artist with more could miss its
-    literal row and take step 2. Without ``db`` the guard is off.
+    For a placeholder, one local query and no Discogs I/O: the artist-only
+    search the fallback below issues, so it shares that call's cache entry.
+    Like that fallback it sees at most ``_FETCH_LIMIT`` rows; an artist with
+    more could miss its literal row and take step 2. Without ``db`` the guard
+    is off.
+
+    A typed album equal to the artist's name has the same guard (LML#1412): it
+    names the artist's self-titled record when the search it would otherwise
+    run (:func:`_album_search`, so the same window and cache entry) returns a
+    row titled that name and filed under that name. Another artist's row is not
+    enough ("Whitney" by Whitney Houston for the band Whitney), and neither is a
+    literal "S/T", which Backend-Service sends as a placeholder. The album
+    filter always keeps that row, so skipping step 2 never loses it; the
+    tiebreak in ``search_library_with_fallback`` ranks it above siblings that
+    contain the name. Where the window misses the row (a common-word name such
+    as "Spirit", LML#1421), step 2 runs as before.
     """
     if not needs_album_resolution(parsed):
         return False
     typed = parsed.album or ""
     lib_artist = library_artist_for(parsed)
-    if db is None or not lib_artist or not is_self_titled_request_placeholder(typed):
+    if db is None or not lib_artist or not typed:
         return True
+    typed_folded = fold_punctuation_for_comparison(typed.lower())
+    if not is_self_titled_request_placeholder(typed):
+        rows = await _album_search(db, lib_artist, typed)
+        return not any(_is_self_titled_record(r, typed_folded) for r in rows)
     rows = filter_results_by_artist(
         await db.search(query=lib_artist, limit=_FETCH_LIMIT), lib_artist
     )
-    typed_folded = fold_punctuation_for_comparison(typed.lower())
-    return not any(
-        is_self_titled(r.title or "")
-        or fold_punctuation_for_comparison((r.title or "").lower()) == typed_folded
-        for r in rows
+    return not any(is_self_titled(r.title or "") or _titled(r, typed_folded) for r in rows)
+
+
+def _titled(row: LibraryItem, folded_album: str) -> bool:
+    """Whether ``row``'s title is ``folded_album``, under this strategy's album fold."""
+    return fold_punctuation_for_comparison((row.title or "").lower()) == folded_album
+
+
+def _is_self_titled_record(row: LibraryItem, folded_name: str) -> bool:
+    """Whether ``row`` is titled ``folded_name`` and filed under an artist of that name."""
+    return (
+        bool(folded_name)
+        and _titled(row, folded_name)
+        and (fold_punctuation_for_comparison((row.artist or "").lower()) == folded_name)
     )
+
+
+async def _album_search(db: LibraryDB, lib_artist: str, album: str) -> list[LibraryItem]:
+    """The artist's rows that an artist+album search returns, before the title filter."""
+    results = await db.search(query=f"{lib_artist} {album}", limit=_FETCH_LIMIT)
+    return filter_results_by_artist(results, lib_artist)
 
 
 async def search_library_with_fallback(
@@ -150,9 +182,7 @@ async def search_library_with_fallback(
     if lib_artist and albums:
 
         async def search_one_album(album: str) -> list[LibraryItem]:
-            query = f"{lib_artist} {album}"
-            results = await db.search(query=query, limit=_FETCH_LIMIT)
-            results = filter_results_by_artist(results, lib_artist)
+            results = await _album_search(db, lib_artist, album)
 
             # LML#1257: the comparison fidelity of the shared LML#1244 fold --
             # both sides of the check below are folded and then matched
@@ -195,6 +225,15 @@ async def search_library_with_fallback(
         if all_results:
             primary_album_lower = albums[0].lower()
             song_lower = (parsed.song or "").lower()
+            # LML#1412: a typed album equal to the artist's name, with or without
+            # a song, puts the artist's self-titled record ahead of siblings that
+            # also contain the name ("A arte de Caetano Veloso"). A row titled
+            # after the song still ranks first. Constant for every other request.
+            artist_named = (
+                fold_punctuation_for_comparison((parsed.album or "").lower())
+                if typed_album_is_artist(parsed)
+                else None
+            )
 
             # When the request specifies a song, prefer a candidate whose title
             # matches the song name (the title-album beats a same-artist
@@ -205,10 +244,11 @@ async def search_library_with_fallback(
             # semantically correct order. albums[0] is kept as a secondary
             # tiebreak so album-only requests (parsed.song unset) preserve the
             # existing primary-album order.
-            def sort_key(r: LibraryItem) -> tuple[bool, bool]:
+            def sort_key(r: LibraryItem) -> tuple[bool, bool, bool]:
                 title_lower = (r.title or "").lower()
                 return (
                     bool(song_lower) and song_lower in title_lower,
+                    artist_named is not None and _is_self_titled_record(r, artist_named),
                     primary_album_lower in title_lower,
                 )
 

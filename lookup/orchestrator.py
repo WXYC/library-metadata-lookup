@@ -113,9 +113,9 @@ async def resolve_albums_for_track(
     """Resolve album names for a track when the typed album doesn't name one.
 
     Runs when ``runs_album_resolution`` is true (song + artist, with the album
-    missing, equal to the artist, or a self-titled placeholder such as "Epon." that
-    names no row on the artist's shelf; LML#1392); otherwise returns the typed album
-    unchanged. Searches Discogs for ALL releases containing the track.
+    missing, or equal to the artist or a self-titled placeholder such as "Epon." when
+    the artist's search returns no row it names; LML#1392, LML#1412). Otherwise
+    returns the typed album. Searches Discogs for ALL releases containing the track.
 
     When ``db`` is supplied, tracklist validation is gated library-first (LML#866):
     the (corrected-or-typed) query artist must have at least one library row or the
@@ -138,7 +138,8 @@ async def resolve_albums_for_track(
         - Self-titled placeholder: hit ``(order_self_titled_albums(...), False)``
           -- placeholder, artist-named Discogs albums, the rest; miss or exception
           ``([placeholder], False)``. A placeholder naming a shelved record (R.E.M.'s
-          "Eponymous", a literal "S/T") never gets here (``runs_album_resolution``).
+          "Eponymous", a literal "S/T") never gets here (``runs_album_resolution``),
+          nor does an album equal to the artist that names its self-titled record.
 
         A spine-deadline trip is not a miss: ``run_within_spine_deadline`` cancels
         this coroutine (``CancelledError`` bypasses ``except Exception``) and the
