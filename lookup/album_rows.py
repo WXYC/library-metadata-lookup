@@ -1,11 +1,21 @@
 """The library rows the artist+album lane keeps for one album.
 
 ``search_library_with_fallback`` (``lookup/strategies/artist_plus_album.py``)
-reads an artist+album full-text search, keeps the rows filed under the artist
-(:func:`album_search`), and then keeps the rows whose title it accepts for the
-album (:func:`filter_by_album_title`). Step 2's guard in the same module,
-``runs_album_resolution``, reads the same rows, so both live here, moved
-verbatim out of that module.
+asks :func:`album_rows` once per album, and step 2's guard in the same module,
+``runs_album_resolution``, asks it for the typed album, so the two never
+disagree about which rows the lane has.
+
+The lane used to read only :func:`album_search`: the first 50 hits of an
+artist+album full-text search, narrowed to rows whose artist starts with the
+typed name. For a common-word name other artists fill those 50 rows first, so
+God / "God" answered with God Rifle's record and Heads / "Heads" with Heads
+Up's (LML#1421). :func:`album_rows` asks the artist's own shelf first
+(``lookup/artist_shelf.py::rows_for_artist``) through the same full-text
+match with no window (``LibraryDB.search_among``), so it adds no row that an
+unlimited search would not have returned, and therefore no artwork lookup.
+When none of the artist's own rows passes the title filter, the window answers
+as before, so a typed "Sun Ra" still reaches "Sun Ra Arkestra", and an
+alternate or cross-referenced name still reaches its rows.
 """
 
 from wxyc_etl.text import to_match_form as normalize_for_comparison
@@ -60,3 +70,19 @@ def filter_by_album_title(
         elif len(common_words) >= 2:
             filtered_results.append(item)
     return filtered_results
+
+
+async def album_rows(
+    db: LibraryDB, lib_artist: str, album: str, shelf: list[LibraryItem]
+) -> list[LibraryItem]:
+    """The rows the lane keeps for ``album``: the artist's own rows on ``shelf``
+    that the search matches and the title filter accepts, else the window's.
+
+    ``shelf`` is :func:`~lookup.artist_shelf.rows_for_artist` for ``lib_artist``,
+    read once per request by the caller. See the module docstring.
+    """
+    if shelf:
+        own = await db.search_among(f"{lib_artist} {album}", [row.id for row in shelf])
+        if kept := filter_by_album_title(own, album, lib_artist):
+            return kept
+    return filter_by_album_title(await album_search(db, lib_artist, album), album, lib_artist)

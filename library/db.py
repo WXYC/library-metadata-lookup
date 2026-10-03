@@ -1040,6 +1040,27 @@ class LibraryDB:
         )
         return [LibraryItem(**dict(row)) for row in await cursor.fetchall()]
 
+    async def search_among(self, query: str, ids: list[int]) -> list[LibraryItem]:
+        """Return the rows among ``ids`` that the FTS ``query`` matches, in id order.
+
+        The match :meth:`search` runs, with no ``LIMIT``: a caller that already
+        holds an artist's rows (:meth:`rows_by_artist`) asks which of them the
+        query reaches, however many other rows it also reaches (LML#1421). No
+        LIKE or fuzzy fallback; ``[]`` for a query with no terms or no ids.
+        """
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        match_query = _to_fts_match_query(query)
+        if not match_query or not ids:
+            return []
+        cursor = await self._conn.execute(
+            f"SELECT {self._select_columns('l')} FROM library l "
+            "JOIN library_fts fts ON l.id = fts.rowid WHERE library_fts MATCH ? "
+            f"AND l.id IN ({', '.join('?' for _ in ids)}) ORDER BY l.id",
+            [match_query, *ids],
+        )
+        return [LibraryItem(**dict(row)) for row in await cursor.fetchall()]
+
     async def _fuzzy_search(self, query: str, limit: int, threshold: int = 70) -> list[LibraryItem]:
         """
         Fuzzy search fallback using rapidfuzz for typo tolerance.
