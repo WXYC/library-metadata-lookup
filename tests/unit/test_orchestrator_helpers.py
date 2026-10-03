@@ -1885,13 +1885,13 @@ class TestTypedAlbumEqualToArtist:
                 id="no-row-titled-the-name",
             ),
             pytest.param(
-                "Whitney",
+                "Arlo",
                 [
-                    make_library_item(id=27380, artist="Whitney Houston", title="Whitney"),
-                    make_library_item(id=69431, artist="Whitney", title="Light upon the Lake"),
+                    make_library_item(id=23306, artist="Arlo Guthrie", title="Arlo"),
+                    make_library_item(id=21167, artist="Arlo", title="Stab the Unstoppable Hero"),
                 ],
-                "Light upon the Lake",
-                69431,
+                "Stab the Unstoppable Hero",
+                21167,
                 id="another-artists-row-titled-the-name",
             ),
         ],
@@ -1899,10 +1899,10 @@ class TestTypedAlbumEqualToArtist:
     async def test_step_2_runs_when_the_artist_has_no_self_titled_record(
         self, mock_library_db, artist, shelf, discogs_album, expected_id
     ):
-        """Jessica Pratt's shelf has no record titled her name. The band
-        Whitney's has none either: Whitney Houston's "Whitney" passes the artist
-        filter's prefix match but is filed under another artist. Step 2 resolves
-        the song as before."""
+        """Jessica Pratt's shelf has no record titled her name. The band Arlo's
+        has none either: Arlo Guthrie's "Arlo" passes the artist filter's prefix
+        match but is filed under another artist. Step 2 resolves the song as
+        before."""
         albums, results, fallback, step_2_search = await self._rank(
             mock_library_db, artist, artist, "Song", [discogs_album], shelf
         )
@@ -2028,11 +2028,11 @@ class TestTypedAlbumEqualToArtistOverARealIndex:
 
     @pytest.mark.asyncio
     async def test_another_artists_record_titled_the_name_takes_step_2(self, tmp_path):
-        rows = [("Whitney Houston", "Whitney"), ("Whitney", "Light upon the Lake")]
+        rows = [("Arlo Guthrie", "Arlo"), ("Arlo", "Stab the Unstoppable Hero")]
 
-        assert await self._lookup(tmp_path, rows, "Whitney", "Light upon the Lake") == (
+        assert await self._lookup(tmp_path, rows, "Arlo", "Stab the Unstoppable Hero") == (
             1,
-            [("Whitney", "Light upon the Lake")],
+            [("Arlo", "Stab the Unstoppable Hero")],
         )
 
 
