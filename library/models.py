@@ -80,8 +80,10 @@ class LibraryItem(BaseModel):
         """
         if not self.call_letters:
             return False
-        normalized = self.call_letters.strip().upper()
-        return normalized == "V/A" or normalized.startswith("Z-")
+        letters = self.call_letters.strip()
+        # `Z-` is case-sensitive, as in tubafrenzy's `isVariousArtists` and
+        # dj-site's / Backend-Service's twins of it.
+        return letters.upper() == "V/A" or letters.startswith("Z-")
 
     def _compilation_bin_letter(self) -> str | None:
         """The Rock/Soundtracks shelf-bin letter, or None if unrecoverable.
@@ -99,9 +101,9 @@ class LibraryItem(BaseModel):
         from the name is a deliberate, narrowly-scoped exception: only after
         the structural V/A gate above, and only for the two lettered genres.
         """
-        normalized = (self.call_letters or "").strip().upper()
-        if normalized.startswith("Z-"):
-            return normalized[2] if len(normalized) > 2 and normalized[2] != "-" else None
+        letters = (self.call_letters or "").strip()
+        if letters.startswith("Z-"):
+            return letters[2].upper() if len(letters) > 2 and letters[2] != "-" else None
         if self.genre not in _COMPILATION_LETTERED_GENRES or not self.artist:
             return None
         match = _COMPILATION_BIN_SUFFIX.search(self.artist.strip())
