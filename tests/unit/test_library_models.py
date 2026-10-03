@@ -144,6 +144,11 @@ class TestLibraryItemCompilationCallNumber:
                 id="legacy-z-takes-any-char-like-substring",
             ),
             pytest.param(
+                {"genre": "Rock", "call_letters": "z-m", "release_call_number": 121},
+                "Rock cd z-m 0/121",
+                id="lowercase-z-is-not-a-compilation-marker",
+            ),
+            pytest.param(
                 {"artist": "Various Artists - Rock - M"},
                 "Hiphop cd V/A-651",
                 id="rock-heading-ignored-outside-rock",
