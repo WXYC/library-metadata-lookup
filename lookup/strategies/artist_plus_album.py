@@ -27,7 +27,8 @@ from core.search import (
 )
 from library.db import LibraryDB
 from library.models import LibraryItem
-from lookup.album_rows import album_search, filter_by_album_title
+from lookup.album_rows import album_rows
+from lookup.artist_shelf import rows_for_artist
 from lookup.fallback_title_floors import _filter_results_by_album_match
 from lookup.matching import (
     _FETCH_LIMIT,
@@ -104,15 +105,15 @@ async def runs_album_resolution(parsed: ParsedRequest, db: LibraryDB | None) -> 
     is off.
 
     A typed album equal to the artist's name has the same guard (LML#1412): it
-    names the artist's self-titled record when the search it would otherwise
-    run (:func:`~lookup.album_rows.album_search`, so the same window and cache
-    entry) returns a row titled that name and filed under that name. Another
-    artist's row is not enough ("Arlo" by Arlo Guthrie for the band Arlo), and
-    neither is a literal "S/T", which Backend-Service sends as a placeholder.
-    The album filter always keeps that row, so skipping step 2 never loses it;
-    the tiebreak in ``search_library_with_fallback`` ranks it above siblings
-    that contain the name. Where the window misses the row (a common-word name such
-    as "Spirit", LML#1421), step 2 runs as before.
+    names the artist's self-titled record when the rows the album lane would
+    keep for it (:func:`~lookup.album_rows.album_rows`, which reads the
+    artist's own shelf first, LML#1421) include a row titled that name and
+    filed under that name. Another artist's row is not enough ("Arlo" by Arlo
+    Guthrie for the band Arlo), and neither is a literal "S/T", which
+    Backend-Service sends as a placeholder. The guard reads the lane's own
+    rows, so skipping step 2 never loses the record; the tiebreak in
+    ``search_library_with_fallback`` ranks it above siblings that contain the
+    name. Two local queries for the shelf, read again by the lane.
     """
     if not needs_album_resolution(parsed):
         return False
@@ -122,7 +123,7 @@ async def runs_album_resolution(parsed: ParsedRequest, db: LibraryDB | None) -> 
         return True
     typed_folded = fold_punctuation_for_comparison(typed.lower())
     if not is_self_titled_request_placeholder(typed):
-        rows = await album_search(db, lib_artist, typed)
+        rows = await album_rows(db, lib_artist, typed, await rows_for_artist(db, lib_artist))
         return not any(_is_self_titled_record(r, typed_folded) for r in rows)
     rows = filter_results_by_artist(
         await db.search(query=lib_artist, limit=_FETCH_LIMIT), lib_artist
@@ -163,6 +164,10 @@ async def search_library_with_fallback(
     *library* artist still finds its row. The typed ``parsed.artist`` is reserved
     for the Discogs-facing paths elsewhere.
 
+    Each album's rows come from :func:`~lookup.album_rows.album_rows`: the
+    artist's own shelf when it has the album, else the 50-row search window
+    (LML#1421). The artist+song and artist-only fallbacks still read the window.
+
     Returns:
         Tuple of (library_results, song_not_found_flag)
     """
@@ -179,10 +184,10 @@ async def search_library_with_fallback(
         return [], bool(parsed.song)
 
     if lib_artist and albums:
+        shelf = await rows_for_artist(db, lib_artist)
 
         async def search_one_album(album: str) -> list[LibraryItem]:
-            results = await album_search(db, lib_artist, album)
-            return filter_by_album_title(results, album, lib_artist)
+            return await album_rows(db, lib_artist, album, shelf)
 
         album_results = await asyncio.gather(*[search_one_album(a) for a in albums])
 

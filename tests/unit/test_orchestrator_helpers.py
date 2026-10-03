@@ -2001,29 +2001,32 @@ class TestTypedAlbumEqualToArtistOverARealIndex:
         )
 
     @pytest.mark.asyncio
-    async def test_record_behind_a_full_search_window_takes_step_2(self, tmp_path):
-        """A common-word name's own rows sit outside the window (LML#1421), so
-        the guard cannot see the record and step 2 runs, as on main."""
+    async def test_record_behind_a_full_search_window_skips_step_2(self, tmp_path):
+        """A common-word name's own rows sit outside the window. The guard reads
+        the rows the album lane keeps, which come from the artist's own shelf
+        (LML#1421), so it sees the record."""
         rows = [*_crowd("Spirit"), ("Spirit", "Spirit"), ("Spirit", "Second Album")]
 
         assert await self._lookup(tmp_path, rows, "Spirit", "Second Album") == (
-            1,
-            [("Spirit", "Second Album")],
+            0,
+            [("Spirit", "Spirit")],
         )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "song", [pytest.param("Song", id="song"), pytest.param(None, id="no-song")]
     )
-    async def test_own_record_leads_another_artists_record_of_the_same_title(self, tmp_path, song):
+    async def test_own_record_answers_before_another_artists_of_the_same_title(
+        self, tmp_path, song
+    ):
         """The search returns Sylvie Simmons' "Sylvie" before the band Sylvie's,
-        and the artist filter's prefix match admits both. Only the band's is its
-        self-titled record, so it leads."""
+        and the artist filter's prefix match admits both. The band's is on its
+        own shelf, so it answers alone (LML#1421)."""
         rows = [("Sylvie Simmons", "Sylvie"), ("Sylvie", "Sylvie")]
 
         assert await self._lookup(tmp_path, rows, "Sylvie", "Other Album", song) == (
             0,
-            [("Sylvie", "Sylvie"), ("Sylvie Simmons", "Sylvie")],
+            [("Sylvie", "Sylvie")],
         )
 
     @pytest.mark.asyncio
