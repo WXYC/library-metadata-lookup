@@ -44,6 +44,13 @@ MODULE_BUDGETS: dict[str, int] = {
     # LML#930 PR2: shed policy only (predicate + env resolvers + telemetry
     # projection + orchestration). 1.3x its ~152-line measured size -> 200.
     "lookup/admission.py": 200,
+    # LML#1421 prep: the artist+album lane's window read (`album_search`) and
+    # title filter (`filter_by_album_title`), moved verbatim out of
+    # `lookup/strategies/artist_plus_album.py` (295 -> 259) to make room under
+    # that file's ceiling, on the `fallback_title_floors.py` precedent. Step 2's
+    # guard in that module reads the same rows. 62 lines measured; 1.3x = 80.6
+    # -> 100.
+    "lookup/album_rows.py": 100,
     "lookup/artist_resolution.py": 550,
     # LML#1281: raised 500 -> 550 for the cascade-boundary breaker guard. The
     # growth is structural, not prose: `_resolve_fallback_artwork` now wraps

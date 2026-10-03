@@ -19,16 +19,15 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import ClassVar
 
-from wxyc_etl.text import to_match_form as normalize_for_comparison
-
 from core.search import (
     Outcome,
     SearchState,
     SearchStrategyType,
     has_artist_or_album_or_song,
 )
-from library.db import STOPWORDS, LibraryDB
+from library.db import LibraryDB
 from library.models import LibraryItem
+from lookup.album_rows import album_search, filter_by_album_title
 from lookup.fallback_title_floors import _filter_results_by_album_match
 from lookup.matching import (
     _FETCH_LIMIT,
@@ -106,13 +105,13 @@ async def runs_album_resolution(parsed: ParsedRequest, db: LibraryDB | None) -> 
 
     A typed album equal to the artist's name has the same guard (LML#1412): it
     names the artist's self-titled record when the search it would otherwise
-    run (:func:`_album_search`, so the same window and cache entry) returns a
-    row titled that name and filed under that name. Another artist's row is not
-    enough ("Arlo" by Arlo Guthrie for the band Arlo), and neither is a
-    literal "S/T", which Backend-Service sends as a placeholder. The album
-    filter always keeps that row, so skipping step 2 never loses it; the
-    tiebreak in ``search_library_with_fallback`` ranks it above siblings that
-    contain the name. Where the window misses the row (a common-word name such
+    run (:func:`~lookup.album_rows.album_search`, so the same window and cache
+    entry) returns a row titled that name and filed under that name. Another
+    artist's row is not enough ("Arlo" by Arlo Guthrie for the band Arlo), and
+    neither is a literal "S/T", which Backend-Service sends as a placeholder.
+    The album filter always keeps that row, so skipping step 2 never loses it;
+    the tiebreak in ``search_library_with_fallback`` ranks it above siblings
+    that contain the name. Where the window misses the row (a common-word name such
     as "Spirit", LML#1421), step 2 runs as before.
     """
     if not needs_album_resolution(parsed):
@@ -123,7 +122,7 @@ async def runs_album_resolution(parsed: ParsedRequest, db: LibraryDB | None) -> 
         return True
     typed_folded = fold_punctuation_for_comparison(typed.lower())
     if not is_self_titled_request_placeholder(typed):
-        rows = await _album_search(db, lib_artist, typed)
+        rows = await album_search(db, lib_artist, typed)
         return not any(_is_self_titled_record(r, typed_folded) for r in rows)
     rows = filter_results_by_artist(
         await db.search(query=lib_artist, limit=_FETCH_LIMIT), lib_artist
@@ -149,12 +148,6 @@ def _is_self_titled_record(row: LibraryItem, folded_name: str) -> bool:
         and _titled(row, folded_name)
         and (fold_punctuation_for_comparison((row.artist or "").lower()) == folded_name)
     )
-
-
-async def _album_search(db: LibraryDB, lib_artist: str, album: str) -> list[LibraryItem]:
-    """The artist's rows that an artist+album search returns, before the title filter."""
-    results = await db.search(query=f"{lib_artist} {album}", limit=_FETCH_LIMIT)
-    return filter_results_by_artist(results, lib_artist)
 
 
 async def search_library_with_fallback(
@@ -188,37 +181,8 @@ async def search_library_with_fallback(
     if lib_artist and albums:
 
         async def search_one_album(album: str) -> list[LibraryItem]:
-            results = await _album_search(db, lib_artist, album)
-
-            # LML#1257: the comparison fidelity of the shared LML#1244 fold --
-            # both sides of the check below are folded and then matched
-            # against each other, so '_' must fold here or the catalog row
-            # "Super_Collider" can never meet a typed "Super Collider". (The
-            # query-building sites in the sibling strategies deliberately use
-            # the other fidelity; see lookup/name_folding.py.)
-            album_normalized = fold_punctuation_for_comparison(album.lower())
-            album_words = {w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS}
-            album_is_artist = lib_artist and normalize_for_comparison(
-                album
-            ) == normalize_for_comparison(lib_artist)
-
-            filtered_results = []
-            for item in results:
-                if album_is_artist and is_self_titled(item.title or ""):
-                    filtered_results.append(item)
-                    continue
-
-                item_normalized = fold_punctuation_for_comparison((item.title or "").lower())
-                item_words = {
-                    w for w in item_normalized.split() if len(w) > 2 and w not in STOPWORDS
-                }
-                common_words = album_words & item_words
-                if len(item_words) <= 2:
-                    if album_normalized.startswith(item_normalized):
-                        filtered_results.append(item)
-                elif len(common_words) >= 2:
-                    filtered_results.append(item)
-            return filtered_results
+            results = await album_search(db, lib_artist, album)
+            return filter_by_album_title(results, album, lib_artist)
 
         album_results = await asyncio.gather(*[search_one_album(a) for a in albums])
 
