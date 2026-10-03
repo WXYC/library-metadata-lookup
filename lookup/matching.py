@@ -103,9 +103,15 @@ def needs_album_resolution(parsed: ParsedRequest) -> bool:
         return False
     if not parsed.album or is_self_titled_request_placeholder(parsed.album):
         return True
-    return (
-        normalize_for_comparison(parsed.album).strip()
-        == normalize_for_comparison(parsed.artist).strip()
+    return typed_album_is_artist(parsed)
+
+
+def typed_album_is_artist(parsed: ParsedRequest) -> bool:
+    """Whether the typed album normalizes equal to the typed artist's name, as a
+    self-titled record's catalog title does (LML#1412)."""
+    return bool(parsed.album and parsed.artist) and (
+        normalize_for_comparison(parsed.album or "").strip()
+        == normalize_for_comparison(parsed.artist or "").strip()
     )
 
 

@@ -32,7 +32,7 @@ A single call to `perform_lookup()` passes through the step-labeled pipeline bel
 | Step | What it does | Key function |
 |------|-------------|--------------|
 | 1. Artist correction | Fuzzy-match artist against catalog to fix typos | `LibraryDB.find_similar_artist()` |
-| 2. Album resolution | If song provided without a usable album (missing, equal to the artist, or a self-titled placeholder like "Epon." that names no row on the artist's shelf), ask Discogs which albums contain it | `resolve_albums_for_track()` |
+| 2. Album resolution | If song provided without a usable album (missing, or equal to the artist or a self-titled placeholder like "Epon." that names no row the artist's search returns), ask Discogs which albums contain it | `resolve_albums_for_track()` |
 | 3. Strategy execution | Run search strategies in order until results found | `execute_search_pipeline()` |
 | 3a. Library-miss Discogs probe | On a pipeline miss with artist+album, probe Discogs directly; a confident match is synthesized as a row-less result | `lookup/strategies/library_miss.py` |
 | 3b. Track validation | If fallback returned all artist albums, validate each against Discogs tracklists | `filter_results_by_track_validation()` |
@@ -61,7 +61,7 @@ flowchart TD
 
 Artist correction (step 1) uses `rapidfuzz.fuzz.ratio()` with an 85-point threshold. It pulls candidates from the catalog by prefix (first 3 characters of the first significant word) and returns the best match above threshold. This catches "lucinda willias" -> "Lucinda Williams" and "Anais Mitchel" -> "Anais Mitchell" without being so loose that it creates false corrections.
 
-Album resolution (step 2) triggers when a song is provided and the album is missing, equals the artist name, or is a self-titled placeholder ("S/T", "eponymous", "Epon.") that names no row on the artist's shelf. A placeholder that matches a shelved title is a real title and skips step 2. It queries Discogs for releases containing that track, deduplicates album names, and feeds them into the strategy pipeline. This transforms a vague "play Your Dreams by Sarah Louise" into a targeted search for "Earth Bow" in the catalog.
+Album resolution (step 2) triggers when a song is provided and the album is missing, or equals the artist name or is a self-titled placeholder ("S/T", "eponymous", "Epon.") and names no row the artist's search returns. A placeholder that matches a shelved title is a real title and skips step 2, and so does an album equal to the artist's name when the artist's album search returns the self-titled record (LML#1412). It queries Discogs for releases containing that track, deduplicates album names, and feeds them into the strategy pipeline. This transforms a vague "play Your Dreams by Sarah Louise" into a targeted search for "Earth Bow" in the catalog.
 
 ## Search strategy pattern
 
