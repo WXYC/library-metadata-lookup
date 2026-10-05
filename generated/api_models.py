@@ -946,14 +946,20 @@ class CatalogCompilationTrackRow(BaseModel):
 
 class AlbumCreateFields(BaseModel):
     """
-    Every `AddAlbumRequest` field except the artist ones (`artist_name`, `artist_id`) — extracted so `POST /library/filings` (#454) can compose it with a top-level `artist` block without also accepting a second, conflicting artist reference nested inside `release`.
+    Every `AddAlbumRequest` field except the artist ones (`artist_name`, `artist_id`) and `from_rotation_id`, which belongs to `POST /library` alone — extracted so `POST /library/filings` (#454) can compose it with a top-level `artist` block without also accepting a second, conflicting artist reference nested inside `release`.
     At least one of `label` or `label_id` must be provided (BS#2410; the rotation-import plan's D5). With `label_id` alone, Backend resolves `labels.label_name` server-side for the denormalized `library.label` column and skips label creation; a dangling `label_id` is a 400. With `label` alone, the create-or-reuse-by-exact-name behavior is unchanged.
     Both may be sent together — the rule is at-least-one, not exactly-one. `label_id` is validated and written to the FK either way, and an explicitly sent non-empty `label` wins over the name resolved from `label_id` for the denormalized `library.label` column (Backend's `resolveNewAlbumLabel`, pinned by "keeps an explicitly sent label over the resolved name when both are present"). An empty `label` does not win: it falls back to the resolved name rather than storing `''`.
 
     """
 
-    album_title: str
-    label: str | None = None
+    album_title: constr(max_length=128) = Field(
+        ...,
+        description="`library.album_title`, varchar(128); over 128 code points is a 400.\n",
+    )
+    label: constr(max_length=128) | None = Field(
+        None,
+        description="`labels.label_name` / `library.label`, varchar(128); over 128 code points is a 400.\n",
+    )
     label_id: int | None = None
     genre_id: int
     format_id: int
@@ -966,18 +972,27 @@ class AlbumCreateFields(BaseModel):
         description="Optional volume letters for the release call code (BS#2410; `library.code_volume_letters`, varchar(4)). Trimmed server-side; an empty or whitespace-only value is stored as NULL rather than `''`, and over-length input is a 400 measured in code points, not UTF-16 units.\n",
     )
     disc_quantity: int | None = None
-    alternate_artist_name: str | None = None
-    album_artist: str | None = None
+    alternate_artist_name: constr(max_length=128) | None = Field(
+        None, description="varchar(128); over 128 code points is a 400.\n"
+    )
+    album_artist: constr(max_length=128) | None = Field(
+        None,
+        description="varchar(128). On `POST /library`, over 128 code points is a 400. `POST /library/filings` does not read this field from `release`, so there it is accepted and stored as nothing whatever its length; the bound is declared on the shared schema, not enforced by that endpoint.\n",
+    )
 
 
 class AddAlbumRequest(AlbumCreateFields):
     """
-    `AlbumCreateFields` plus the artist reference pair. The label rule travels with it: at least one of `label` or `label_id` must be provided, or the request is a 400 (BS#2410) — restated here, not only on `AlbumCreateFields`, because the Swift and Kotlin generators flatten `allOf` into a standalone type whose doc comment is this description, leaving no link to the composed schema's own text. See `AlbumCreateFields` for the full `label`/`label_id` resolution semantics (which value wins for the denormalized `library.label` column, dangling-`label_id` handling).
+    `AlbumCreateFields` plus the artist reference pair and `from_rotation_id`, the import link that only `POST /library` accepts. The label rule travels with it: at least one of `label` or `label_id` must be provided, or the request is a 400 (BS#2410) — restated here, not only on `AlbumCreateFields`, because the Swift and Kotlin generators flatten `allOf` into a standalone type whose doc comment is this description, leaving no link to the composed schema's own text. See `AlbumCreateFields` for the full `label`/`label_id` resolution semantics (which value wins for the denormalized `library.label` column, dangling-`label_id` handling).
 
     """
 
     artist_name: str | None = None
     artist_id: int | None = None
+    from_rotation_id: int | None = Field(
+        None,
+        description="The id of a rotation row with no library link, added on or before the cutover date (or moved from one that was). This request creates the release for that row and links it in the same transaction, so the import is one request rather than `POST /library` then `PATCH /library/rotation/{rotation_id}/link`, and cannot be replayed to mint more library rows. Omit it for an ordinary add. A row that is linked or not legacy is a 409 `rotation_not_eligible`; a killed row is importable, since killed rows are most of the import queue. Declared ahead of the Backend-Service implementation (WXYC/Backend-Service#2810): the deployed backend silently drops this key and answers 201 without linking the row, so a client must not rely on the link, or drop its `PATCH /library/rotation/{rotation_id}/link` request, until that lands.\n",
+    )
 
 
 class Label(BaseModel):
@@ -1145,11 +1160,44 @@ class RotationCreateFields(BaseModel):
 
 class AddRotationRequest(RotationCreateFields):
     """
-    `RotationCreateFields` plus the album reference required only on the direct-add path — `POST /library/filings` supplies its own release in the same request, so `FilingRotationRequest` omits it.
+    The album arm of `POST /library/rotation`: `RotationCreateFields` plus the album reference required only on the direct-add path — `POST /library/filings` supplies its own release in the same request, so `FilingRotationRequest` omits it. Applies when the release is already in the library.
 
     """
 
     album_id: int
+
+
+class AddRotationTypedTextRequest(RotationCreateFields):
+    """
+    The typed-text arm of `POST /library/rotation`: a rotation row for a record not yet in the library, identified by `artist_name` and `album_title` instead of `album_id`. Backend-Service has accepted this shape since WXYC/Backend-Service#2109, which relaxed WXYC/Backend-Service#1380's `album_id` requirement. After the cutover date it is accepted only with `moved_from_rotation_id`, and only when that source row is legacy. Mutually exclusive with `AddRotationRequest`: a body that carries `album_id` is not this arm (see `AddRotationBody`).
+
+    """
+
+    artist_name: constr(max_length=128) = Field(
+        ...,
+        description="`rotation.artist_name`, varchar(128); over 128 code points is a 400.\n",
+    )
+    album_title: constr(max_length=128) = Field(
+        ...,
+        description="`rotation.album_title`, varchar(128); over 128 code points is a 400.\n",
+    )
+    record_label: constr(max_length=128) | None = Field(
+        None,
+        description="`rotation.record_label`, varchar(128); over 128 code points is a 400.\n",
+    )
+    format_id: int | None = None
+    label_id: int | None = None
+    moved_from_rotation_id: int | None = Field(
+        None,
+        description="The unlinked rotation row this one replaces in a cross-bin move; Backend-Service kills it in the same transaction. The source must be an active typed-text row (`kill_date` null or in the future) added on or before the cutover date, or moved from one; otherwise the request is a 409 `rotation_not_eligible`. Declared ahead of the Backend-Service implementation (WXYC/Backend-Service#2810): the deployed backend silently drops this key, so the new row is added and the source row is left active in its old bin. A client must not rely on the kill until that lands.\n",
+    )
+
+
+class AddRotationBody(RootModel[AddRotationRequest | AddRotationTypedTextRequest]):
+    root: AddRotationRequest | AddRotationTypedTextRequest = Field(
+        ...,
+        description="The `POST /library/rotation` request body: `AddRotationRequest` when `album_id` names a release already in the library, `AddRotationTypedTextRequest` when the record is identified by typed text. Not discriminated, and the arms are disjoint by one rule: the presence of `album_id` selects the album arm. The typed-text arm carries `not: {required: [album_id]}`, so a body with an `album_id` plus typed-text fields matches only the album arm, and a body without `album_id` matches only the typed-text arm; without that rule a body carrying both would match both arms and be invalid under `oneOf`. Backend-Service treats an explicit `album_id: null` as absent, but this contract does not admit it: omit the key. The `not` rule is documentation the pipeline does not enforce. The Kotlin generator collapses the union into one `AddRotationBody` class with `albumId`, `artistName` and `albumTitle` all required, so a Kotlin client cannot send the typed-text arm; no Kotlin client calls this route today (Android and the DJ apps do not add rotation rows).\n",
+    )
 
 
 class KillRotationRequest(BaseModel):
@@ -1220,24 +1268,46 @@ class LibraryFilingResponse(BaseModel):
 
 class LibraryFilingConflictReason(StrEnum):
     """
-    Discriminator for the `POST /library/filings` 409, telling the caller which composed write collided so it can offer the right remedy. Named rather than left inline, pairing with `LibraryFilingConflictError` the way `ShowAlreadyOpenErrorCode` pairs with `ShowAlreadyOpenError`. `artist_code_conflict` and `artist_name_conflict` are the exact strings the deployed `POST /library/artists` controller already answers with — the composite reuses that create path; `rotation_card_bin_mismatch` is defined ahead of the Backend-Service implementation for the rotation arm's card-bin invariant, the same string `RotationConflictReason` declares for the direct `POST /library/rotation` and `DELETE /library/rotation/cards/{id}` 409s (WXYC/Backend-Service#2472, inherited by the composite per WXYC/Backend-Service#2474) — pinned equal by a spec test rather than composed, since OpenAPI enums do not merge cleanly across two purpose-built discriminators.
+    Discriminator for the `POST /library/filings` 409, telling the caller which composed write collided so it can offer the right remedy. Named rather than left inline, pairing with `LibraryFilingConflictError` the way `ShowAlreadyOpenErrorCode` pairs with `ShowAlreadyOpenError`. `artist_code_conflict` and `artist_name_conflict` are the exact strings the deployed `POST /library/artists` controller already answers with — the composite reuses that create path; `rotation_card_bin_mismatch` is the rotation arm's card-bin invariant, the same string `RotationConflictReason` declares for the direct `POST /library/rotation` and `DELETE /library/rotation/cards/{id}` 409s (WXYC/Backend-Service#2472, delivered by WXYC/Backend-Service#2482 and inherited by the composite per WXYC/Backend-Service#2474) — pinned equal by a spec test rather than composed, since OpenAPI enums do not merge cleanly across two purpose-built discriminators. `review_required` fires after the cutover date for any insert not made through `POST /intake/{id}/file`.
 
     """
 
     artist_code_conflict = "artist_code_conflict"
     artist_name_conflict = "artist_name_conflict"
     rotation_card_bin_mismatch = "rotation_card_bin_mismatch"
+    review_required = "review_required"
+
+
+class LibraryAddConflictReason(StrEnum):
+    """
+    Discriminator for the `POST /library` 409. `review_required` fires after the cutover date for any insert not made through `POST /intake/{id}/file`, except a `POST /library` whose `from_rotation_id` names an eligible legacy row, which is accepted after the cutover date. Both values are declared ahead of the Backend-Service implementation (WXYC/Backend-Service#2791's review gate and WXYC/Backend-Service#2810). `rotation_not_eligible` fires when `from_rotation_id` names a row that is linked or not legacy — neither added on or before the cutover date nor moved from a row that was. A killed row is importable.
+
+    """
+
+    review_required = "review_required"
+    rotation_not_eligible = "rotation_not_eligible"
+
+
+class LibraryAddConflictError(BaseModel):
+    """
+    The `POST /library` 409 body.
+    """
+
+    message: str
+    reason: LibraryAddConflictReason
 
 
 class RotationConflictReason(StrEnum):
     """
-    Discriminator for the 409s on `POST /library/rotation` and `DELETE /library/rotation/cards/{id}`, pairing with `RotationConflictError` the way `ShowAlreadyOpenErrorCode` pairs with `ShowAlreadyOpenError`. `rotation_card_bin_mismatch` is the single source of truth for the identically-named value `LibraryFilingConflictReason` carries for the composite's rotation arm — see that schema's description. The other two distinguish the card-delete guard's conjunctive halves: a sibling card with a higher `number` (`card_not_highest_in_bin`) vs. an active rotation row still assigned to this card (`card_has_active_rotations`). All three values are declared ahead of the Backend-Service implementation (WXYC/Backend-Service#2472, delivered by its open PR WXYC/Backend-Service#2482): the deployed backend has no rotation-card code path yet, so no endpoint raises them today — each endpoint's 409 states what the deployed behavior is meanwhile.
+    Discriminator for the 409s on `POST /library/rotation` and `DELETE /library/rotation/cards/{id}`, pairing with `RotationConflictError` the way `ShowAlreadyOpenErrorCode` pairs with `ShowAlreadyOpenError`. `rotation_card_bin_mismatch` is the single source of truth for the identically-named value `LibraryFilingConflictReason` carries for the composite's rotation arm — see that schema's description. `card_not_highest_in_bin` and `card_has_active_rotations` distinguish the card-delete guard's conjunctive halves: a sibling card with a higher `number` vs. an active rotation row still assigned to this card. The three card values shipped with WXYC/Backend-Service#2472 (delivered by WXYC/Backend-Service#2482, merged 2026-09-14), which `POST /library/rotation` and `DELETE /library/rotation/cards/{id}` now raise. `review_required` and `rotation_not_eligible` are raised only by `POST /library/rotation`, never by the card delete, and are declared ahead of the Backend-Service implementation (WXYC/Backend-Service#2791's review gate and WXYC/Backend-Service#2810). `review_required` fires after the cutover date for any insert not made through `POST /intake/{id}/file`, except re-rotating a release already in the library and a typed-text add whose `moved_from_rotation_id` names an eligible legacy row, which is accepted after the cutover date. `rotation_not_eligible` fires on a move whose `moved_from_rotation_id` row is linked, killed, or not legacy — neither added on or before the cutover date nor moved from a row that was. A killed row is not an eligible move source.
 
     """
 
     rotation_card_bin_mismatch = "rotation_card_bin_mismatch"
     card_not_highest_in_bin = "card_not_highest_in_bin"
     card_has_active_rotations = "card_has_active_rotations"
+    review_required = "review_required"
+    rotation_not_eligible = "rotation_not_eligible"
 
 
 class RotationConflictError(BaseModel):
@@ -1262,6 +1332,334 @@ class LibraryFilingConflictError(BaseModel):
         None,
         description="The already-catalogued artist that collided. Present on `artist_code_conflict` (the holder of the taken `(code_letters, genre_id, code_number)` triple) and `artist_name_conflict` (the genre-scoped fold-matched name); absent on `rotation_card_bin_mismatch`, which has no artist to name.\n",
     )
+
+
+class IntakeItemState(StrEnum):
+    """
+    Where an intake item sits in its lifecycle: logged into `pool`, held in the office for a named DJ as `requested` (the DJ it was requested of has not yet accepted), held by its holder as `checked_out`, `reviewed`, `filed` into the catalog, and `finalized` once shelved. `effective_state` on `IntakeItem` reads a stale `requested` as `pool` (WXYC/Backend-Service#2796): a `requested` row is stale once its `requested_at` is more than 7 days old, or once the DJ it was requested of has had their account deleted (`requested_dj_id` turns `null`). `state` itself does not change when a request goes stale — a read never writes — so `state: requested` can outlive the 7-day window on a row no one has touched since; only `effective_state` reflects the lapse.
+
+    """
+
+    pool = "pool"
+    requested = "requested"
+    checked_out = "checked_out"
+    reviewed = "reviewed"
+    filed = "filed"
+    finalized = "finalized"
+
+
+class Pass(BaseModel):
+    dj_name: str
+    passed_at: AwareDatetime
+
+
+class IntakeItem(BaseModel):
+    """
+    One physical copy the station holds, logged by a music director and waiting for a review (WXYC/Backend-Service#2791). Its three DJ-name fields (`requested_dj_name`, `checked_out_by_name`, `passes[].dj_name`) are `auth_user.name`, the public-safe display value; no real name appears in it. `passes` is present only for callers holding `reviews: manage`. `IntakeDeleteResponse.deleted_review_authors` is a different schema with its own, weaker guarantee — see its description.
+
+    """
+
+    id: int
+    artist_name: constr(max_length=128)
+    album_title: constr(max_length=128)
+    record_label: constr(max_length=128) | None = Field(...)
+    label_id: int | None = Field(...)
+    format_id: int
+    discogs_release_id: int | None = Field(...)
+    state: IntakeItemState
+    effective_state: IntakeItemState = Field(
+        ...,
+        description="`state` as actually usable, per WXYC/Backend-Service#2796: equal to `state` except a stale `requested` reads as `pool` — stale meaning `requested_at` is more than 7 days old, or `requested_dj_id` is `null` because the DJ it was requested of had their account deleted. A read never writes, so `state` itself is left untouched by the lapse; only `effective_state` reflects it.\n",
+    )
+    overdue: bool = Field(..., description="True while `checked_out` for more than 14 days.")
+    logged_at: AwareDatetime
+    requested_dj_id: str | None = Field(
+        ...,
+        description="The DJ a music director asked to review the item, set when it enters `requested`. Read it together with `state` and `effective_state`, not as proof of a live request: later transitions may leave it set (a checkout clears a stale request's fields). `null` while `state: requested` means the requested DJ's account has since been deleted, the case that makes `effective_state` read `pool` despite `state` still saying `requested`.\n",
+    )
+    requested_dj_name: str | None = Field(...)
+    requested_at: AwareDatetime | None = Field(...)
+    checked_out_by: str | None = Field(
+        ...,
+        description='Who holds the physical copy, set on checkout. It stays set once the review is submitted: deleting the last review of a `reviewed` item returns it to `checked_out` with the same holder. Read it together with `state`, not as proof of a live checkout. `null` while `state: checked_out` means the holder\'s account has since been deleted, shown to MDs as "holder removed"; an MD may release the item.\n',
+    )
+    checked_out_by_name: str | None = Field(...)
+    checked_out_at: AwareDatetime | None = Field(...)
+    cited_album_id: int | None = Field(...)
+    cited_submission_id: int | None = Field(...)
+    album_id: int | None = Field(...)
+    rotation_id: int | None = Field(...)
+    filed_at: AwareDatetime | None = Field(...)
+    printed_at: AwareDatetime | None = Field(...)
+    finalized_at: AwareDatetime | None = Field(...)
+    passes: list[Pass] | None = Field(
+        None, description="Present only for callers holding `reviews: manage`."
+    )
+
+
+class NewIntakeItemRequest(BaseModel):
+    """
+    Logging fields for `POST /intake`.
+    """
+
+    artist_name: constr(max_length=128)
+    album_title: constr(max_length=128)
+    record_label: constr(max_length=128) | None = None
+    label_id: int | None = None
+    format_id: int
+    discogs_release_id: int | None = None
+
+
+class IntakeItemPatch(BaseModel):
+    """
+    Any subset of the `NewIntakeItemRequest` fields, plus setting or clearing the citation. `cited_album_id` and `cited_submission_id` are mutually exclusive as non-null values (WXYC/Backend-Service#2797's table CHECK enforces this in storage): a patch may not carry both as non-null at once, but may set one while explicitly clearing the other (for example `{cited_album_id: null, cited_submission_id: 12}`) to switch citation kinds in a single request, rather than passing through an uncited state across two. Setting one citation clears the other, so the single-key form `{cited_submission_id: 12}` is the canonical switch every generated client can send (WXYC/Backend-Service#2797); Swift omits nil optionals and cannot send an explicit null. The schema-level `not` rule is documentation the pipeline does not enforce, and the generated `IntakeItemPatchNot` type in swift6 and kotlin is a generator artifact, not part of the wire contract.
+
+    """
+
+    artist_name: constr(max_length=128) | None = None
+    album_title: constr(max_length=128) | None = None
+    record_label: constr(max_length=128) | None = None
+    label_id: int | None = None
+    format_id: int | None = None
+    discogs_release_id: int | None = None
+    cited_album_id: int | None = None
+    cited_submission_id: int | None = None
+
+
+class Kind2(StrEnum):
+    new_release = "new_release"
+
+
+class IntakeFileNewRelease(LibraryFilingRequest):
+    """
+    The new-release arm of `IntakeFileRequest`: the filing bench's body (`LibraryFilingRequest`, i.e. `POST /library/filings` — artist, release and an optional rotation entry) plus the `kind` discriminant. Inherits `LibraryFilingRequest`'s field semantics unchanged.
+
+    """
+
+    kind: Literal["new_release"]
+
+
+class Kind3(StrEnum):
+    existing_release = "existing_release"
+
+
+class IntakeFileExistingRelease(BaseModel):
+    kind: Literal["existing_release"]
+    album_id: int
+
+
+class IntakeFileRequest(RootModel[IntakeFileNewRelease | IntakeFileExistingRelease]):
+    root: IntakeFileNewRelease | IntakeFileExistingRelease = Field(
+        ...,
+        description="Files an intake item into the catalog: either a full new-release payload (`kind: new_release`) or a reference to a release already in the library (`kind: existing_release`). Discriminated rather than left a bare `oneOf` deliberately — the same idiom as `FilingArtist`, `LiveFsEvent` and `AutoDJWebSocketMessage`: without `kind`, a payload carrying both an `album_id` and the new-release trio validates against both arms, and try-order decoders (the generated Swift and Python clients) silently take one arm over the other. The required `kind` makes the caller's intent explicit on the wire and that ambiguous payload rejectable.\n",
+        discriminator="kind",
+    )
+
+
+class IntakeConflictReason(StrEnum):
+    """
+    Discriminator for the intake 409s, pairing with `IntakeConflictError` the way `LibraryFilingConflictReason` pairs with `LibraryFilingConflictError`. `state_changed`: the item was not in a state that allows the transition (two DJs racing for one record, an expired request, an item already filed). `not_reviewed`: filing an item with no submitted review and no valid citation, or printing one with no submitted **typed** review (WXYC/Backend-Service#2804 — a handwritten review is already on the sleeve, so nothing prints). `invalid_citation`: a cited release with no **submitted** review that was catalogued **after** the cutover date (station time; a release catalogued on the cutover date counts as before it), or a cited form submission dated, in station time, after the cutover date (WXYC/Backend-Service#2797). `already_filed`: delete or patch after filing. `in_rotation`: finalize of a filed item while its release has a rotation row (found by `album_id`, not by `rotation_id`) whose `kill_date` is null or after today, station date (WXYC/Backend-Service#2804); the item stays `filed`, and the message names the latest kill date, or says that no kill date is set.
+
+    """
+
+    state_changed = "state_changed"
+    not_reviewed = "not_reviewed"
+    invalid_citation = "invalid_citation"
+    already_filed = "already_filed"
+    in_rotation = "in_rotation"
+
+
+class IntakeConflictError(BaseModel):
+    """
+    The intake 409 body, following `LibraryFilingConflictError`.
+    """
+
+    message: str
+    reason: IntakeConflictReason
+
+
+class IntakeDeleteResponse(BaseModel):
+    """
+    Names the review authors whose reviews went with the item, so the music director's confirmation can say whose work was removed.
+
+    """
+
+    deleted_review_authors: list[str] = Field(
+        ...,
+        description="`reviews.author` snapshots (WXYC/Backend-Service#2805), not `auth_user.name`. For an account-holding DJ's own review this is the same public-safe display value; for a handwritten or on-behalf review an MD typed by hand, it is free text and may be a real name. Unlike `IntakeItem`'s `*_name` fields, this is not guaranteed PII-free — it exists for the MD's own in-station confirmation of what was removed, never for display outside the station or for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+    )
+
+
+class ReviewMedium(StrEnum):
+    """
+    How the review was written. A music director may record a `handwritten` review with no text, and a `typed` or `handwritten` review on someone's behalf; `printed` is for the later OCR backfill.
+    """
+
+    typed = "typed"
+    handwritten = "handwritten"
+    printed = "printed"
+
+
+class ReviewStatus(StrEnum):
+    draft = "draft"
+    submitted = "submitted"
+
+
+class ReviewCredit(StrEnum):
+    """
+    How the author asked to be credited if the review is ever published.
+    """
+
+    dj_name = "dj_name"
+    real_name = "real_name"
+    none = "none"
+
+
+class Review(BaseModel):
+    """
+    An in-app DJ album review, the station's printed slip plus publishing consent. Attached to an intake item or to a library release (at least one of `intake_item_id` and `album_id` is set). FCC notes (`fcc`) are never published outside the station. In v1 the service stores consent (`publish_*`, `credit`) and publishes nothing.
+
+    """
+
+    id: int
+    album_id: int | None = Field(...)
+    intake_item_id: int | None = Field(...)
+    author: constr(max_length=128) | None = Field(
+        ...,
+        description="Null only on a row that predates the in-app model (the column has never been NOT NULL). For an account holder's own review, a snapshot of their display name, the public-safe value. For a handwritten or on-behalf review it is what the music director typed: free text that may be a real name, so it is not guaranteed PII-free. Shown only inside the station; never the published credit (`credit` decides that) and never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+    )
+    author_user_id: str | None = Field(
+        ...,
+        description="The review's author account. When set on an on-behalf review, that account is the author: it may edit and delete the review and is the only account that may set `publish_*` and `credit`.",
+    )
+    recorded_by_user_id: str | None = Field(
+        ...,
+        description="For an on-behalf or handwritten review, the music director who recorded it. Draft visibility names it (a draft is visible to its author and to whoever recorded it).",
+    )
+    medium: ReviewMedium
+    status: ReviewStatus
+    buzzwords: str | None = Field(...)
+    artist_blurb: str | None = Field(...)
+    review: str | None = Field(
+        ...,
+        description="`null`, never an empty string: a blank value is stored as `null`. May be `null` for a draft with no text yet, for a handwritten review, or for one whose OCR text is still pending. A `typed` review cannot be submitted while this is `null`.\n",
+    )
+    recommended_tracks: str | None = Field(...)
+    fcc: str | None = Field(...)
+    publish_website: bool
+    publish_apps: bool
+    publish_instagram: bool
+    credit: ReviewCredit | None = Field(
+        ...,
+        description="`null` means no choice has been made yet (an on-behalf review starts this way); `none` means the author chose no name.",
+    )
+    add_date: date_aliased
+    submitted_at: AwareDatetime | None = Field(...)
+    last_modified: AwareDatetime
+
+
+class IntakeSlip(BaseModel):
+    """
+    The printable review slip for an intake item: the item's identity plus the printed review's text. Each review field is nullable exactly as on `Review`. `fcc` is for the station's own slip and is never published outside it.
+
+    """
+
+    artist_name: constr(max_length=128)
+    album_title: constr(max_length=128)
+    record_label: constr(max_length=128) | None = Field(...)
+    buzzwords: str | None = Field(...)
+    artist_blurb: str | None = Field(...)
+    review: str | None = Field(...)
+    author: constr(max_length=128) | None = Field(
+        ...,
+        description="The printed review's `Review.author`, with the same station-only caveat; never for client telemetry.",
+    )
+    submitted_at: AwareDatetime | None = Field(...)
+    recommended_tracks: str | None = Field(...)
+    fcc: str | None = Field(...)
+
+
+class ReviewFields(BaseModel):
+    """
+    The fields of the station's printed slip, plus publishing consent, shared by `NewReviewRequest` and `ReviewPatch`. None is required. An empty text field is `null`, never `""`: a blank or whitespace-only value is stored and returned as `null`. A draft may be saved with every text field `null`; submitting is where `review` text is required (see `POST /reviews/{id}/submit`).
+
+    """
+
+    buzzwords: str | None = None
+    artist_blurb: str | None = None
+    review: str | None = None
+    recommended_tracks: str | None = None
+    fcc: str | None = Field(None, description="FCC notes. Never published outside the station.")
+    publish_website: bool | None = None
+    publish_apps: bool | None = None
+    publish_instagram: bool | None = None
+    credit: ReviewCredit | None = Field(
+        None,
+        description="How the author asks to be credited. `null` clears the choice.",
+    )
+
+
+class Medium(StrEnum):
+    """
+    Only a caller with `reviews: manage` may send this. A write path takes `typed` or `handwritten`; `printed` (see `ReviewMedium`) is for the later OCR backfill and is never sent here.
+
+    """
+
+    typed = "typed"
+    handwritten = "handwritten"
+
+
+class NewReviewRequest(ReviewFields):
+    """
+    Creates a draft, except an on-behalf or handwritten create that names an `intake_item_id` and does not send `accept: false`, which creates a submitted, accepted review (see `accept`). Send exactly one of `intake_item_id` and `album_id`. A caller with `reviews: manage` may also send `author`, `author_user_id` and `medium`, which makes it an on-behalf review: `author` is free text, `author_user_id` optionally links the reviewer's account, and the caller is recorded as the one who recorded it. When `author_user_id` is sent, that account is the review's author and is told by email that a review was recorded in their name (the email carries no review text). A `handwritten` review is recorded the same way. An on-behalf review starts with no publishing surface ticked and `credit` null, because the author never saw the consent question, so an on-behalf create that sends any `publish_*` as `true`, or a non-null `credit`, answers 400. `author` is required on an on-behalf create, because the service cannot snapshot a display name for someone who is not the caller: a missing or blank `author` answers 400, and so does an `author_user_id` that names no account. An on-behalf create may name an intake item in any state, including `filed` and `finalized`. Without these fields, the review is the caller's own and `typed`: the service sets `author` to a snapshot of the account's display name at creation, and sets the account fields from the caller, so a client never sends them. `author` is never the published credit; the `credit` choice decides that.
+
+    """
+
+    intake_item_id: int | None = None
+    album_id: int | None = None
+    author: constr(max_length=128) | None = Field(
+        None,
+        description="Only a caller with `reviews: manage` may send this. The reviewer's name as typed, free text (see `Review.author`). A value longer than 128 code points is a 400; it is never cut.\n",
+    )
+    author_user_id: str | None = Field(
+        None,
+        description="Only a caller with `reviews: manage` may send this. Optionally links the reviewer's account on an on-behalf review.\n",
+    )
+    medium: Medium | None = Field(
+        None,
+        description="Only a caller with `reviews: manage` may send this. A write path takes `typed` or `handwritten`; `printed` (see `ReviewMedium`) is for the later OCR backfill and is never sent here.\n",
+    )
+    accept: bool | None = Field(
+        None,
+        description="Only a caller with `reviews: manage` may send this, and it only has meaning on an on-behalf or handwritten create whose subject is an `intake_item_id`. When `true` or left out on such a create, the review is created already `submitted` (revision 1 is written) and is accepted for the item in the same step, exactly as `POST /intake/{id}/accept-review` would: there is no draft and no separate submit. Because the review is submitted at once, a `typed` review with a `null` `review` is a 400 at create. `false` creates a draft that is not accepted, like any other create. Sent with an `album_id` subject, with either value, it is a 400.\n",
+    )
+
+
+class ReviewPatch(ReviewFields):
+    """
+    Any subset of the `ReviewFields`. A key left out is unchanged; a text field or `credit` sent as `null` is cleared.
+    """
+
+
+class ReviewConflictReason(StrEnum):
+    """
+    Discriminator for the review 409s, pairing with `ReviewConflictError` the way `IntakeConflictReason` pairs with `IntakeConflictError`. `not_draft`: the review is already submitted (submitting twice). `subject_not_held`: a DJ's `POST /reviews` names an `intake_item_id` the caller does not currently hold (effective state `checked_out` with `checked_out_by` the caller), or the subject is neither an intake item nor a library release; an on-behalf create (`reviews: manage`) is exempt from the hold rule. `in_use`: an author deleting their own review while it is in use, meaning it is the accepted review of an intake item or the review most recently printed for a copy. The author may still edit it. A caller with `reviews: manage` is never refused with `in_use`. `accepted_review`: a caller with `reviews: manage` deleting the accepted review of a `filed` or `finalized` intake item that carries no citation. Accept another review for the item first (`POST /intake/{id}/accept-review`). Deleting the accepted review of an item that is not yet filed is allowed: the item returns to `checked_out` if someone holds it, otherwise to `pool`.
+
+    """
+
+    not_draft = "not_draft"
+    subject_not_held = "subject_not_held"
+    in_use = "in_use"
+    accepted_review = "accepted_review"
+
+
+class ReviewConflictError(BaseModel):
+    """
+    The review 409 body, following `IntakeConflictError`.
+    """
+
+    message: str
+    reason: ReviewConflictReason
 
 
 class RotationRowSummary(BaseModel):
@@ -1586,7 +1984,7 @@ class ReleaseDeleteRefusal(BaseModel):
 class FlowsheetPlayCounts(BaseModel):
     """
     `GET /library/{id}/flowsheet-play-counts`'s 200 (WXYC/Backend-Service#2592). Answers "what would deleting this release damage?" ahead of `DELETE /library/{id}`, which cannot answer that on its own response — BS#2565 removed that delete's prior 409-on-flowsheet-plays refusal, so plays are affected silently unless read here first.
-    **The three counts are disjoint by construction and deliberately NOT summable.** They partition one row set — every flowsheet play naming this release, each counted in exactly one of `direct` / `rotation_linked` / `legacy_linked` — but a total would misstate what the delete actually does: the `legacy_linked` arm STRANDS its plays permanently rather than unlinking them (the delete-denylist guarantees no future release will ever carry that legacy id again), while `direct` and `rotation_linked` are merely unlinked. Summing collapses "permanently orphaned" into the same number as "loses a link," which is precisely the distinction a librarian needs before deleting. Render the three arms separately; never render their sum.
+    **The three counts are disjoint by construction and deliberately NOT summable.** They partition one row set — every flowsheet play naming this release, each counted in exactly one of `direct` / `rotation_linked` / `legacy_linked` — but a total would misstate what the delete actually does: the `legacy_linked` arm STRANDS its plays rather than unlinking them (the delete-denylist stops any new release from taking that legacy id, so nothing re-links them unless the batch is restored: a restore re-inserts the row with its `legacy_release_id` and clears its denylist entry, and `jobs/legacy-linkage-resolve` then re-links those plays on its schedule), while `direct` and `rotation_linked` are merely unlinked. Summing collapses "stranded unless restored" into the same number as "loses a link," which is precisely the distinction a librarian needs before deleting. Render the three arms separately; never render their sum.
     Advisory, not a lock: this is a standalone pre-delete read that takes no lock, so any of the three counts may move, in either direction, before a subsequent `DELETE /library/{id}` actually runs (`jobs/legacy-linkage-resolve` re-links this same data every 30 minutes; ordinary catalog editing can re-link or un-link a play's `album_id`/`rotation_id` by hand at any time).
 
     """
@@ -1601,7 +1999,7 @@ class FlowsheetPlayCounts(BaseModel):
     )
     legacy_linked: int = Field(
         ...,
-        description="Plays naming the release only by a bare `flowsheet.legacy_release_id`, awaiting `jobs/legacy-linkage-resolve`. Deleting STRANDS whatever is still in this arm at delete time permanently rather than unlinking it — see the schema description above for why this is exactly the count that must never be folded into a total.\n",
+        description="Plays naming the release only by a bare `flowsheet.legacy_release_id`, awaiting `jobs/legacy-linkage-resolve`. Deleting STRANDS whatever is still in this arm at delete time (unless the batch is restored) rather than unlinking it — see the schema description above for why this is exactly the count that must never be folded into a total.\n",
     )
 
 
@@ -1641,7 +2039,7 @@ class CatalogDeleteBatch(BaseModel):
     batch_id: UUID
     restorable: bool = Field(
         ...,
-        description="Whether `POST /library/deleted/{batchId}/restore` can EVER bring this batch back (WXYC/Backend-Service#2616), computed off the same restore-plan set the restore's `409 unrestorable_kind` refusal reads, so the two cannot drift.\n\n`false` when any entity's `entity_kind` has no replay plan OR that entity's captured envelope is missing its row. An `artist` batch reads `false` on the first count today: the delete does capture a snapshot, but an artist's shelf slot has no tombstone and needs its own conflict probe, so no replay plan exists for it. The envelope half is the same corruption the restore endpoint's own 500 guards against, so this field answers for envelope health, not just `entity_kind`. A batch holding several entities is restorable only if every one of them is, since the restore refuses the whole batch on the first kind it cannot replay — and a batch whose rows read back empty is `false` rather than vacuously `true`. A `library` batch with an intact envelope reads `true`.\n\n`true` is NOT a promise that a restore attempt will succeed — it means this batch's kind has a working replay plan and a parseable envelope, nothing more. The envelope half is settled here, at listing time, against an immutable capture, so a batch that reads `true` cannot go on to fail on a corrupt envelope; it can still answer `already_restored`, `resolution_required` (a shelf-slot conflict a client must resolve), or `lock_unavailable`. `false` is the hard guarantee: the endpoint refuses every such batch with `409 unrestorable_kind` before any row lock or write.\n",
+        description="Whether this batch's kind and captured envelope allow a `POST /library/deleted/{batchId}/restore` attempt (WXYC/Backend-Service#2616), not whether an attempt can succeed. It is computed off the same restore-plan set the restore's `409 unrestorable_kind` refusal reads, so the two cannot drift.\n\n`false` when any entity's `entity_kind` has no replay plan OR that entity's captured envelope is missing its row. An `artist` batch reads `false` on the first count today: the delete does capture a snapshot, but an artist's shelf slot has no tombstone and needs its own conflict probe, so no replay plan exists for it. The envelope half is the same corruption the restore endpoint's own 500 guards against, so this field answers for envelope health, not just `entity_kind`. A batch holding several entities is restorable only if every one of them is, since the restore refuses the whole batch on the first kind it cannot replay — and a batch whose rows read back empty is `false` rather than vacuously `true`. A `library` batch with an intact envelope reads `true`.\n\n`true` is NOT a promise that a restore attempt will succeed — it means this batch's kind has a working replay plan and a parseable envelope, nothing more. The envelope half is settled here, at listing time, against an immutable capture, so a batch that reads `true` cannot go on to fail on a corrupt envelope; it can still answer `already_restored`, `resolution_required` (a shelf-slot conflict a client must resolve), `lock_unavailable`, or `missing_reference` (a restored row's `NO ACTION` reference to a row deleted since). `already_restored` is terminal (the batch is back); `resolution_required` and `lock_unavailable` clear on a retry; `missing_reference` is PERMANENT today, because no declared endpoint puts the missing row back under its captured id (a deleted artist, or a removed `auth_user` referenced by `digital_asset.ripped_by`), so a `true` batch can be listed with a live Restore that will never succeed. `false` for an unrestorable KIND is the hard guarantee: the endpoint refuses every such batch with `409 unrestorable_kind` before any row lock or write. A batch that reads `false` because its envelope is missing its row passes that check, takes the global advisory restore lock (so it can instead answer 503 `lock_unavailable`), and answers 500, still before any row lock or write.\n",
     )
     captured_at: AwareDatetime
     actor: CatalogDeleteActor
@@ -1664,44 +2062,33 @@ class DeletedArchivePage(BaseModel):
     totalPages: int
 
 
-class RestoredEntity(BaseModel):
+class RestoreDeviationKind(StrEnum):
     """
-    One top-level entity `POST /library/deleted/{batchId}/restore` re-inserted, in FK order (parent before any child that references it). The row comes back under its ORIGINAL primary key — a restore reinserts the captured row rather than minting a new id — which is why `entity_id` is the same value the archive listing reported for it.
-
-    """
-
-    entity_kind: str = Field(
-        ...,
-        description="The archive row's queryable label, matching `CatalogDeleteEntity.entity_kind`.\n",
-    )
-    table: str = Field(
-        ...,
-        description="The table the row was re-inserted into. This, not `entity_kind`, is what names the rows.\n",
-    )
-    entity_id: int = Field(
-        ...,
-        description="The restored row's primary key — the captured id, unchanged.\n",
-    )
-    relocated_code_number: int | None = Field(
-        ...,
-        description="The call number the card actually came back under, and non-null ONLY when the `next_free_code` resolution ran because the original slot was taken. `null` means the original slot was free and the captured `code_number` was re-used as-is. The archive record keeps the ORIGINAL code either way: this is what the live row carries now, not a correction to history.\n",
-    )
-    children: dict[str, int] = Field(
-        ...,
-        description="Child table name to the number of rows replayed under this entity, mirroring `CatalogDeleteEntity.children` from the listing. A table with no captured rows is present with `0` rather than omitted, the same absent-versus-empty distinction the capture itself keeps.\n",
-    )
-
-
-class RestoreBatchResponse(BaseModel):
-    """
-    `POST /library/deleted/{batchId}/restore`'s 200 (WXYC/Backend-Service#2585). The parent row and every captured child row were re-inserted inside one transaction.
-
-    **The relocation result is per entity, not per batch.** Whether the `next_free_code` resolution had to run is reported on each entity's `relocated_code_number`, because the answer can differ between entities of one batch: only the entities whose own slot was taken move. There is no batch-level "resolution applied" field — read `entities[].relocated_code_number` and treat any non-null value as "this card came back somewhere else".
+    `nulled`: a nullable `ON DELETE SET NULL` reference whose target was deleted after the batch came back NULL. `dropped`: a captured child row whose `ON DELETE CASCADE` target is neither live nor restored by this batch is left out of the replay. Named rather than left as an inline enum on `RestoreDeviation.kind` so the Python generator does not emit a numbered `Kind4` that shifts with declaration order (see `OTPType`).
 
     """
 
-    batch_id: UUID
-    entities: list[RestoredEntity]
+    nulled = "nulled"
+    dropped = "dropped"
+
+
+class RestoreDeviation(BaseModel):
+    """
+    One way a restore came back different from its snapshot, reported on `RestoredEntity.deviations`. Carries ids only, never names or any `auth_user` profile field.
+
+    """
+
+    kind: RestoreDeviationKind
+    table: str = Field(..., description="The table of the affected row.")
+    row_id: int = Field(..., description="The affected row's primary key (the captured id).")
+    column: str | None = Field(
+        ...,
+        description="The reference column that was nulled; `null` for a dropped row.",
+    )
+    captured_value: str | None = Field(
+        ...,
+        description="The referenced id the snapshot carried for that column (for `dropped`, the missing parent's id), as a string because some referenced keys (`auth_user.id`) are text.\n",
+    )
 
 
 class RestoreSlotConflict(BaseModel):
@@ -1741,7 +2128,7 @@ class RestoreResolutionRequiredRefusal(BaseModel):
     """
     `POST /library/deleted/{batchId}/restore`'s **400** when at least one captured card's original call-code slot is occupied and the request supplied no `resolution`. Never relocated silently and never refused silently (decision 2026-09-17, mockup screen 6 in `plans/classic-md-interface/mockups/delete-and-restore.html`): this body names every conflict so a client can offer the choice, then retry with `resolution` set.
 
-    **A 400 rather than a 409**, unlike the other refusals on this path, because the request is incomplete rather than in conflict with server state: the same batch restores successfully the moment `resolution` is supplied. Type this branch — a client that falls back to the bare `ApiErrorResponse` shape here discards `conflicts` and has nothing to render the question from.
+    **A 400 rather than a 409**, unlike the other refusals on this path, because the request is incomplete rather than in conflict with server state: supplying `resolution` clears this refusal, though the retry can still meet another one (`missing_reference`, for example). Type this branch — a client that falls back to the bare `ApiErrorResponse` shape here discards `conflicts` and has nothing to render the question from.
 
     """
 
@@ -1773,11 +2160,11 @@ class Reason7(StrEnum):
 
 class RestoreAlreadyRestoredRefusal(BaseModel):
     """
-    `POST /library/deleted/{batchId}/restore`'s 409 when the batch is already back in the catalog. This is the ordinary answer to a double-click or a retry after a timeout, not an error state: the rows are present, so there is nothing to do and nothing was written.
+    `POST /library/deleted/{batchId}/restore`'s 409 when the batch is already back in the catalog. This is the ordinary answer to a double-click or a retry after a timeout, not an error state: the rows are present (except any child rows the original restore dropped, which were reported only on that restore's 200 and are not reported again here, so a retry after a timeout does not surface them), so there is nothing to do and nothing was written.
 
     Detected two ways, which is why it can fire even when the row does not carry its original id any more: the restore probes the captured primary key AND the captured `legacy_release_id`, so a release that came back through a library-etl pass under a new `library.id` still reports as present rather than being inserted a second time.
 
-    Distinct from the code-conflict branch and must not be handled as one — prompting for a call-number decision on a batch that is already fully restored is the failure mode a lenient decoder produces here.
+    Distinct from the code-conflict branch and must not be handled as one — prompting for a call-number decision on a batch that is already restored is the failure mode a lenient decoder produces here.
 
     """
 
@@ -1801,6 +2188,31 @@ class RestoreUnrestorableKindRefusal(BaseModel):
     message: str
     reason: Reason8
     entity_kind: str
+
+
+class Reason9(StrEnum):
+    missing_reference = "missing_reference"
+
+
+class RestoreMissingReferenceRefusal(BaseModel):
+    """
+    `POST /library/deleted/{batchId}/restore`'s 409 when a restored row holds a reference whose delete rule is `NO ACTION` (what a foreign key with no `ON DELETE` clause means, so the delete would have been refused rather than cascaded or nulled) and whose target no longer exists (WXYC/Backend-Service#2818). It names the first missing reference the restore finds, so a retry can name another. Nothing was written and the snapshot is untouched. The refusal clears only once a row with `captured_value`'s id exists again in `target_table`, and today no declared endpoint puts one back, so it is permanent short of an operator re-inserting that row: an `artist` batch is refused as `unrestorable_kind`, a re-created artist gets a new id, and a removed `auth_user` is not re-issued its id. Carries ids only, never names, as `RestoreDeviation` does.
+
+    """
+
+    message: str
+    reason: Reason9
+    table: str = Field(..., description="The table of the captured row that holds the reference.")
+    row_id: int | None = Field(
+        ...,
+        description="The captured row's primary key; `null` for a row with no single-column primary key (`artist_library_crossreference`, keyed only by its `(artist_id, library_id)` pair). Such a row is identified by `table`, `column` and `captured_value` together with the entity being restored.\n",
+    )
+    column: str = Field(..., description="The reference column whose target is missing.")
+    target_table: str = Field(..., description="The table the reference points into.")
+    captured_value: str = Field(
+        ...,
+        description="The referenced id the snapshot carried, as a string because some referenced keys (`auth_user.id`) are text.\n",
+    )
 
 
 class BinEntry(BaseModel):
@@ -2166,12 +2578,13 @@ class AlbumReview(BaseModel):
     Google Form (collected since March 2021) and synced nightly by
     Backend-Service's album-reviews ETL.
 
-    Distinct from ADR 0006's in-app Review model (one-per-album,
-    author-owned, `/reviews`): submissions here are append-only, may
-    number several per album, and identify albums by free text with a
-    best-effort `album_id` link. Reviewer identity is deliberately not
-    exposed — the form promised reviewers their names would not be
-    shared.
+    Distinct from the in-app `Review` model (`/reviews`: many per
+    release, each attached to an intake item or a library release and
+    locked at print): submissions here are append-only and identify
+    albums by free text with a best-effort `album_id` link. The
+    reviewer's name is withheld by this endpoint today. The station
+    allows reviewer names inside the station (dj-site, the DJ apps);
+    they are never shown outside it.
 
     """
 
@@ -4818,6 +5231,50 @@ class Rotation(BaseModel):
         None,
         description="Storage order. Plain strings, not `format: uri` — MDs paste bare domains, so a value carries no scheme guarantee and a renderer must not bind one into an href without checking it. Deliberately an inline twin: `Rotation.urls` and `RotationEntry.urls` are pinned identical by a spec test rather than `$ref`ing a named array schema, because naming a top-level array makes the Python generator wrap the field in a RootModel (`.root` to reach the list) while every other target keeps a plain string list.\n",
     )
+
+
+class RestoredEntity(BaseModel):
+    """
+    One top-level entity `POST /library/deleted/{batchId}/restore` re-inserted, in FK order (parent before any child that references it). The row comes back under its ORIGINAL primary key — a restore reinserts the captured row rather than minting a new id — which is why `entity_id` is the same value the archive listing reported for it.
+
+    """
+
+    entity_kind: str = Field(
+        ...,
+        description="The archive row's queryable label, matching `CatalogDeleteEntity.entity_kind`.\n",
+    )
+    table: str = Field(
+        ...,
+        description="The table the row was re-inserted into. This, not `entity_kind`, is what names the rows.\n",
+    )
+    entity_id: int = Field(
+        ...,
+        description="The restored row's primary key — the captured id, unchanged.\n",
+    )
+    relocated_code_number: int | None = Field(
+        ...,
+        description="The call number the card actually came back under, and non-null ONLY when the `next_free_code` resolution ran because the original slot was taken. `null` means the original slot was free and the captured `code_number` was re-used as-is. The archive record keeps the ORIGINAL code either way: this is what the live row carries now, not a correction to history.\n",
+    )
+    children: dict[str, int] = Field(
+        ...,
+        description="Child table name to the number of rows actually re-inserted under this entity. It follows the shape of `CatalogDeleteEntity.children` from the listing, but counts replayed rows rather than captured ones: a captured child row left out of the replay is not counted here and is listed in `deviations` as `dropped`. A table with no captured rows is present with `0` rather than omitted, the same absent-versus-empty distinction the capture itself keeps.\n",
+    )
+    deviations: list[RestoreDeviation] = Field(
+        ...,
+        description="The departures from the snapshot in this entity's replay, one `RestoreDeviation` per nulled reference or dropped child row. Always present on the 200 (empty when nothing departed).\n",
+    )
+
+
+class RestoreBatchResponse(BaseModel):
+    """
+    `POST /library/deleted/{batchId}/restore`'s 200 (WXYC/Backend-Service#2585). The parent row and its captured child rows were re-inserted inside one transaction, except any child row reported as `dropped` in `entities[].deviations`.
+
+    **The relocation result is per entity, not per batch.** Whether the `next_free_code` resolution had to run is reported on each entity's `relocated_code_number`, because the answer can differ between entities of one batch: only the entities whose own slot was taken move. There is no batch-level "resolution applied" field — read `entities[].relocated_code_number` and treat any non-null value as "this card came back somewhere else".
+
+    """
+
+    batch_id: UUID
+    entities: list[RestoredEntity]
 
 
 class DiscogsMatchResult(BaseModel):
