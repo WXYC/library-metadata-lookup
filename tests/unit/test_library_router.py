@@ -57,6 +57,39 @@ class TestSearchLibrary:
         assert body["results"][0]["artist"] == "Queen"
 
     @pytest.mark.asyncio
+    async def test_results_carry_call_number(self, app_client, mock_db):
+        named = make_library_item(
+            id=1,
+            artist="Stereolab",
+            title="Aluminum Tunes",
+            genre="Rock",
+            format="cd",
+            call_letters="S",
+            artist_call_number=12,
+            release_call_number=3,
+        )
+        compilation = make_library_item(
+            id=2,
+            artist="Various Artists",
+            title="Wild Style",
+            genre="Hiphop",
+            format="cd",
+            call_letters="V/A",
+            artist_call_number=0,
+            release_call_number=651,
+        )
+        mock_db.search = AsyncMock(return_value=[named, compilation])
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/v1/library/search", params={"q": "a"})
+
+        results = resp.json()["results"]
+        assert results[0]["call_number"] == named.call_number
+        assert results[1]["call_number"] == "Hiphop cd V/A-651"
+
+    @pytest.mark.asyncio
     async def test_artist_filter(self, app_client, mock_db):
         item = make_library_item(id=2, artist="Radiohead", title="Album", call_letters="R")
         mock_db.search = AsyncMock(return_value=[item])
