@@ -97,6 +97,7 @@ class LibraryItem(BaseModel):
         release_half = "" if self.release_call_number is None else f"-{self.release_call_number}"
         return artist_half + release_half
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def call_number(self) -> str:
         """Full call number for shelf lookup: <Genre> <Format> <Letters> <ArtistNum>/<ReleaseNum>
