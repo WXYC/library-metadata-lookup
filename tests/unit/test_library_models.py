@@ -47,6 +47,23 @@ class TestLibraryItemCallNumber:
                 "Rock Q 5/3",
                 id="no-format",
             ),
+            pytest.param({"id": 7, "release_call_number": 3}, "3", id="release-only"),
+            pytest.param(
+                {"id": 8, "genre": "Rock", "format": "cd", "release_call_number": 3},
+                "Rock cd 3",
+                id="genre-format-release-no-artist-half",
+            ),
+            pytest.param(
+                {
+                    "id": 9,
+                    "genre": "Rock",
+                    "format": "cd",
+                    "call_letters": "ST",
+                    "release_call_number": 3,
+                },
+                "Rock cd ST/3",
+                id="letters-without-artist-number",
+            ),
         ],
     )
     def test_call_number(self, kwargs, expected):

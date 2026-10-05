@@ -120,13 +120,15 @@ class LibraryItem(BaseModel):
         if letters.upper() == "V/A" or letters.startswith("Z-"):
             parts.append(self._compilation_shelf(letters))
             return " ".join(parts)
-        if self.call_letters:
-            parts.append(self.call_letters)
+        artist_half = [self.call_letters] if self.call_letters else []
         if self.artist_call_number is not None:
-            parts.append(str(self.artist_call_number))
+            artist_half.append(str(self.artist_call_number))
         if self.release_call_number is not None:
-            parts[-1] = f"{parts[-1]}/{self.release_call_number}"
-        return " ".join(parts)
+            if artist_half:
+                artist_half[-1] = f"{artist_half[-1]}/{self.release_call_number}"
+            else:
+                artist_half = [str(self.release_call_number)]
+        return " ".join(parts + artist_half)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
