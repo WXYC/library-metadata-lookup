@@ -677,6 +677,10 @@ class Artist(BaseModel):
     artist_name: str
     code_letters: str
     code_artist_number: int
+    code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
+        None,
+        description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
+    )
     genre_id: int
 
 
@@ -792,8 +796,8 @@ class AlbumUrlsUpdate(BaseModel):
 class CatalogExportRow(BaseModel):
     """
     One row of the WXYC library catalog as served by GET /library/catalog for offline cloning (BS#1468, Epic F #1466). A query-independent snapshot of the core catalog row. Deliberately NOT AlbumSearchResult: it drops the search-only decoration (matched_via, matched_via_alias, album_dist, artist_dist) and the fields the export omits (add_date, label_id, rotation_id, date_lost, date_found), and instead ships rotation RAW (rotation_bin + rotation_kill_date) so the client evaluates rotation expiry against its own clock. See the rotation_bin description for the load-bearing semantic difference from AlbumSearchResult.
-    BS#1965 adds the fields the Backend-sourced library.db producer (discogs-etl#351) needs to build a library.db over HTTP instead of a direct Postgres read: legacy_release_id (the producer emits it AS the library.db id, since BS serials collide with the tubafrenzy id space), album_artist, alternate_artist_name, and cross_reference_names.
-    All four are producer-facing and OPTIONAL on the wire — none is in `required`, so the pre-BS#1965 15-field body still decodes cleanly against a client generated from this spec. That leniency is deliberate and load-bearing: this row is also the iOS Spotlight clone's shape, and wxyc-ios-64 regenerates from this SSOT on its own cadence. A required key the server does not yet emit would not degrade one field — it would fail EVERY NDJSON line and take the whole on-device clone with it. Same reasoning as `popularity` (BS#1486 Phase-2 Track 3). Note that oasdiff does NOT flag adding a required response property, so a green `check:breaking` is not evidence of safety here.
+    BS#1965 adds the fields the Backend-sourced library.db producer (discogs-etl#351) needs to build a library.db over HTTP instead of a direct Postgres read: legacy_release_id (the producer emits it AS the library.db id, since BS serials collide with the tubafrenzy id space), album_artist, alternate_artist_name, and cross_reference_names. code_volume_letters (WXYC/wxyc-shared#548) is a later producer-facing addition of the same kind.
+    Every producer-facing field above is OPTIONAL on the wire — none is in `required`, so the pre-BS#1965 15-field body still decodes cleanly against a client generated from this spec. That leniency is deliberate and load-bearing: this row is also the iOS Spotlight clone's shape, and wxyc-ios-64 regenerates from this SSOT on its own cadence. A required key the server does not yet emit would not degrade one field — it would fail EVERY NDJSON line and take the whole on-device clone with it. Same reasoning as `popularity` (BS#1486 Phase-2 Track 3). Note that oasdiff does NOT flag adding a required response property, so a green `check:breaking` is not evidence of safety here.
 
     """
 
@@ -821,11 +825,19 @@ class CatalogExportRow(BaseModel):
         None,
         description='Names of the artists cataloger-cross-referenced to this row\'s artist, in either FK direction, via artist_crossreference (discogs-etl#334) — e.g. a band filed under its name carries a member\'s personal name. Empty array when the artist has no cross-references.\nAn ARRAY, not the pipe-joined string library.db stores: the producer does the `" | "` join when it writes the SQLite column. The wire must not carry the delimiter, because nothing constrains artists.artist_name from containing "|" or " | " — a joined string would silently split into phantom aliases on the consumer side (library-metadata-lookup splits this field on the pipe) with no escaping rule to recover from, and the legacy MySQL source has the same latent bug plus GROUP_CONCAT\'s silent group_concat_max_len truncation. Array-on-the-wire retires both.\nDerivation (pinned, because the legacy query it replaces is load-bearing for the producer — LIBRARY_CODE_CROSS_REFERENCE in discogs-etl/scripts/sync-library.sh):\n  * BOTH FK directions — an artist_crossreference row matching on\n    either source_artist_id or target_artist_id contributes its\n    OTHER side.\n  * EXCLUDES the row\'s own artist (the legacy query\'s\n    `AND xlc.ID != lc.ID`). A self-referencing crossreference row\n    must not produce a self-alias — LML would match the artist\n    against itself.\n  * Deduplicated.\n  * Ordered by Unicode code point (Postgres `COLLATE "C"`), NOT the\n    database\'s default collation. en_US.UTF-8 ignores punctuation\n    and case at the primary level, so it orders the diacritic- and\n    punctuation-bearing names most likely to carry aliases (Nilüfer\n    Yanya, Csillagrablók, Hermanos Gutiérrez, "C. Spencer Yeh")\n    unstably across locales. The legacy GROUP_CONCAT has no ORDER BY\n    at all, so there is no legacy order to match — pick the\n    deterministic one.\n\nFRESHNESS: this endpoint\'s conditional GET rides library_watermark. Migration 0105 fanned the watermark trigger out to library, artists, genres, format, genre_artist_crossreference, and rotation; artist_crossreference was left uncovered until migration 0138 added touch_library_watermark_from_artist_crossreference (AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ... FOR EACH STATEMENT). A cross-reference write now advances the watermark, the per-watermark gzip cache rebuilds, and the producer\'s next fetch carries the new alias. Before 0138 this was silent and unbounded rather than a bounded lag — a write to an uncovered source table changed nothing observable until an unrelated write on a covered table happened to bump the watermark, which is why every table a field on this row is derived from must carry the trigger.\n',
     )
+    code_volume_letters: constr(max_length=4) | None = Field(
+        None,
+        description="The per-release volume letter, library.code_volume_letters (varchar(4)). Volumes of one set share a call number (e.g. volumes A-G of one compilation at one shelf location), so this tells them apart. Stored RAW: the wire does not trim or case-fold it. Case policy is Backend-Service#2582's; library.db folds it at build time (discogs-etl#439, wxyc_catalog.normalize_volume_letters).\nNOT the compilation-section letter (code_comp_letter, a separate field). Optional and nullable like the other producer-facing fields, for the reason given in the schema description.\n",
+    )
     album_title: str
     code_letters: str = Field(..., description='Shelf call-number letters (e.g. "AU").')
     code_number: int = Field(..., description="Shelf call-number release number.")
     code_artist_number: int = Field(
         ..., description="Shelf call-number artist number (genre-scoped)."
+    )
+    code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
+        None,
+        description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
     )
     label: str | None = Field(
         None,
@@ -1336,7 +1348,7 @@ class LibraryFilingConflictError(BaseModel):
 
 class IntakeItemState(StrEnum):
     """
-    Where an intake item sits in its lifecycle: logged into `pool`, held in the office for a named DJ as `requested` (the DJ it was requested of has not yet accepted), held by its holder as `checked_out`, `reviewed`, `filed` into the catalog, and `finalized` once shelved. `effective_state` on `IntakeItem` reads a stale `requested` as `pool` (WXYC/Backend-Service#2796): a `requested` row is stale once its `requested_at` is more than 7 days old, or once the DJ it was requested of has had their account deleted (`requested_dj_id` turns `null`). `state` itself does not change when a request goes stale — a read never writes — so `state: requested` can outlive the 7-day window on a row no one has touched since; only `effective_state` reflects the lapse.
+    Where an intake item sits in its lifecycle: logged into `pool`, held in the office for a named DJ as `requested` (the DJ it was requested of has not yet accepted), held by its holder as `checked_out`, `reviewed` once a music director has accepted a review for it (submitting a review does not move it), `filed` into the catalog, and `finalized` once shelved. `effective_state` on `IntakeItem` reads a stale `requested` as `pool` (WXYC/Backend-Service#2796): a `requested` row is stale once its `requested_at` is more than 7 days old, or once the DJ it was requested of has had their account deleted (`requested_dj_id` turns `null`). `state` itself does not change when a request goes stale — a read never writes — so `state: requested` can outlive the 7-day window on a row no one has touched since; only `effective_state` reflects the lapse.
 
     """
 
@@ -1355,7 +1367,7 @@ class Pass(BaseModel):
 
 class IntakeItem(BaseModel):
     """
-    One physical copy the station holds, logged by a music director and waiting for a review (WXYC/Backend-Service#2791). Its three DJ-name fields (`requested_dj_name`, `checked_out_by_name`, `passes[].dj_name`) are `auth_user.name`, the public-safe display value; no real name appears in it. `passes` is present only for callers holding `reviews: manage`. `IntakeDeleteResponse.deleted_review_authors` is a different schema with its own, weaker guarantee — see its description.
+    One physical copy the station holds, logged by a music director and waiting for a review (WXYC/Backend-Service#2791). Its three DJ-name fields (`requested_dj_name`, `checked_out_by_name`, `passes[].dj_name`) are `auth_user.name`, the public-safe display value; no real name appears in it. `passes` and `draft_authors` are present only for callers holding `reviews: manage`; `draft_authors` is `reviews.author` free text and carries the weaker guarantee of `IntakeDeleteResponse.deleted_review_authors`; see its description.
 
     """
 
@@ -1381,7 +1393,7 @@ class IntakeItem(BaseModel):
     requested_at: AwareDatetime | None = Field(...)
     checked_out_by: str | None = Field(
         ...,
-        description='Who holds the physical copy, set on checkout. It stays set once the review is submitted: deleting the last review of a `reviewed` item returns it to `checked_out` with the same holder. Read it together with `state`, not as proof of a live checkout. `null` while `state: checked_out` means the holder\'s account has since been deleted, shown to MDs as "holder removed"; an MD may release the item.\n',
+        description='Who holds the physical copy, set on checkout. It stays set when a review is accepted, so a `reviewed` item can still name the DJ who has the copy: deleting the accepted review of an item not yet filed returns it to `checked_out` with the same holder, or to `pool` when there is none. A `reviewed` item keeps its holder until the holder or a music director returns it (`POST /intake/{id}/release`) or the item is filed, which clears it. Read it together with `state`, not as proof of a live checkout. `null` while `state: checked_out` means the holder\'s account has since been deleted, shown to MDs as "holder removed"; an MD may release the item.\n',
     )
     checked_out_by_name: str | None = Field(...)
     checked_out_at: AwareDatetime | None = Field(...)
@@ -1395,6 +1407,31 @@ class IntakeItem(BaseModel):
     passes: list[Pass] | None = Field(
         None, description="Present only for callers holding `reviews: manage`."
     )
+    accepted_review_id: int | None = Field(
+        ...,
+        description="The review a music director accepted for this item: the one its slip prints. It is a review of the item, of the release the item was filed as, or of the release the item cites. `null` until one is accepted, and again if the accepted review is deleted or the citation it was chosen through is changed or cleared. Deleting the cited release from the catalog does not clear it: the item is first given its own copy of that review (WXYC/Backend-Service#2875).\n",
+    )
+    accepted_by: str | None = Field(
+        ...,
+        description="The accepting music director's account id, shaped like `checked_out_by`. `null` when none is accepted or that account has been deleted.\n",
+    )
+    accepted_at: AwareDatetime | None = Field(...)
+    submitted_review_count: conint(ge=0) = Field(
+        ...,
+        description="How many submitted reviews are attached to this item through `intake_item_id`.\n",
+    )
+    draft_authors: list[str] | None = Field(
+        None,
+        description="Present only for callers holding `reviews: manage`. The `author` of each unsubmitted draft attached to this item: names only, never content, so a music director can see whose unfinished work a delete would remove. These are `reviews.author` snapshots and carry the caveat on `IntakeDeleteResponse.deleted_review_authors`: station-only, never for client telemetry.\n",
+    )
+
+
+class IntakeAcceptReviewRequest(BaseModel):
+    """
+    Body for `POST /intake/{id}/accept-review`.
+    """
+
+    review_id: conint(ge=1, le=2147483647)
 
 
 class NewIntakeItemRequest(BaseModel):
@@ -1412,7 +1449,7 @@ class NewIntakeItemRequest(BaseModel):
 
 class IntakeItemPatch(BaseModel):
     """
-    Any subset of the `NewIntakeItemRequest` fields, plus setting or clearing the citation. `cited_album_id` and `cited_submission_id` are mutually exclusive as non-null values (WXYC/Backend-Service#2797's table CHECK enforces this in storage): a patch may not carry both as non-null at once, but may set one while explicitly clearing the other (for example `{cited_album_id: null, cited_submission_id: 12}`) to switch citation kinds in a single request, rather than passing through an uncited state across two. Setting one citation clears the other, so the single-key form `{cited_submission_id: 12}` is the canonical switch every generated client can send (WXYC/Backend-Service#2797); Swift omits nil optionals and cannot send an explicit null. The schema-level `not` rule is documentation the pipeline does not enforce, and the generated `IntakeItemPatchNot` type in swift6 and kotlin is a generator artifact, not part of the wire contract.
+    Any subset of the `NewIntakeItemRequest` fields, plus setting or clearing the citation. `cited_album_id` and `cited_submission_id` are mutually exclusive as non-null values (WXYC/Backend-Service#2797's table CHECK enforces this in storage): a patch may not carry both as non-null at once, but may set one while explicitly clearing the other (for example `{cited_album_id: null, cited_submission_id: 12}`) to switch citation kinds in a single request, rather than passing through an uncited state across two. Setting one citation clears the other, so the single-key form `{cited_submission_id: 12}` is the canonical switch every generated client can send (WXYC/Backend-Service#2797); Swift omits nil optionals and cannot send an explicit null. The schema-level `not` rule is documentation the pipeline does not enforce, and the generated `IntakeItemPatchNot` type in swift6 and kotlin is a generator artifact, not part of the wire contract. Setting `cited_album_id` to a different release, or clearing it, also clears an accepted review that was chosen from the cited release (`accepted_review_id`, `accepted_by` and `accepted_at` become null) and returns the item to `checked_out` if someone holds it, otherwise to `pool`. Citing a submission instead (`{cited_submission_id: 12}`, the switch above) clears `cited_album_id` and counts as clearing it here: an accepted review chosen from that release goes with it. An accepted review of the item itself is kept. Implemented by WXYC/Backend-Service#2860.
 
     """
 
@@ -1458,7 +1495,7 @@ class IntakeFileRequest(RootModel[IntakeFileNewRelease | IntakeFileExistingRelea
 
 class IntakeConflictReason(StrEnum):
     """
-    Discriminator for the intake 409s, pairing with `IntakeConflictError` the way `LibraryFilingConflictReason` pairs with `LibraryFilingConflictError`. `state_changed`: the item was not in a state that allows the transition (two DJs racing for one record, an expired request, an item already filed). `not_reviewed`: filing an item with no submitted review and no valid citation, or printing one with no submitted **typed** review (WXYC/Backend-Service#2804 — a handwritten review is already on the sleeve, so nothing prints). `invalid_citation`: a cited release with no **submitted** review that was catalogued **after** the cutover date (station time; a release catalogued on the cutover date counts as before it), or a cited form submission dated, in station time, after the cutover date (WXYC/Backend-Service#2797). `already_filed`: delete or patch after filing. `in_rotation`: finalize of a filed item while its release has a rotation row (found by `album_id`, not by `rotation_id`) whose `kill_date` is null or after today, station date (WXYC/Backend-Service#2804); the item stays `filed`, and the message names the latest kill date, or says that no kill date is set.
+    Discriminator for the intake 409s, pairing with `IntakeConflictError` the way `LibraryFilingConflictReason` pairs with `LibraryFilingConflictError`. `state_changed`: the item was not in a state that allows the transition (two DJs racing for one record, an expired request, an item already filed). `not_reviewed`: filing an item with no accepted review and no valid citation, or printing one whose accepted review is missing or is handwritten (WXYC/Backend-Service#2804; a handwritten review is already on the sleeve, so nothing prints). `invalid_citation`: a cited release with no **submitted** review that was catalogued **after** the cutover date (station time; a release catalogued on the cutover date counts as before it), a cited form submission dated, in station time, after the cutover date, a cited form submission with no date (`submitted_at` null) once a cutover date is set, because it cannot be shown to predate the cutover (while no cutover date is set it is citable), or a cited id that names no release or no form submission (WXYC/Backend-Service#2797). `already_filed`: delete or patch after filing. `in_rotation`: finalize of a filed item while its release has a rotation row (found by `album_id`, not by `rotation_id`) whose `kill_date` is null or after today, by the database's date, the one every rotation list is filtered by, and not the station's calendar date (WXYC/Backend-Service#2804); the item stays `filed`, and the message names the latest kill date, or says that no kill date is set.
 
     """
 
@@ -1486,7 +1523,7 @@ class IntakeDeleteResponse(BaseModel):
 
     deleted_review_authors: list[str] = Field(
         ...,
-        description="`reviews.author` snapshots (WXYC/Backend-Service#2805), not `auth_user.name`. For an account-holding DJ's own review this is the same public-safe display value; for a handwritten or on-behalf review an MD typed by hand, it is free text and may be a real name. Unlike `IntakeItem`'s `*_name` fields, this is not guaranteed PII-free — it exists for the MD's own in-station confirmation of what was removed, never for display outside the station or for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+        description="`reviews.author` snapshots (WXYC/Backend-Service#2805), not `auth_user.name`. For an account-holding DJ's own review this is the same public-safe display value; for a handwritten or on-behalf review an MD typed by hand, it is free text and may be a real name. Unlike `IntakeItem`'s `*_name` fields, this is not guaranteed PII-free — it exists for the MD's own in-station confirmation of what was removed, never for display outside the station or for client telemetry (analytics properties, error breadcrumbs, logs). Includes the authors of unsubmitted drafts that went with the item, the same names `IntakeItem.draft_authors` showed before the delete.\n",
     )
 
 
@@ -1643,7 +1680,7 @@ class ReviewPatch(ReviewFields):
 
 class ReviewConflictReason(StrEnum):
     """
-    Discriminator for the review 409s, pairing with `ReviewConflictError` the way `IntakeConflictReason` pairs with `IntakeConflictError`. `not_draft`: the review is already submitted (submitting twice). `subject_not_held`: a DJ's `POST /reviews` names an `intake_item_id` the caller does not currently hold (effective state `checked_out` with `checked_out_by` the caller), or the subject is neither an intake item nor a library release; an on-behalf create (`reviews: manage`) is exempt from the hold rule. `in_use`: an author deleting their own review while it is in use, meaning it is the accepted review of an intake item or the review most recently printed for a copy. The author may still edit it. A caller with `reviews: manage` is never refused with `in_use`. `accepted_review`: a caller with `reviews: manage` deleting the accepted review of a `filed` or `finalized` intake item that carries no citation. Accept another review for the item first (`POST /intake/{id}/accept-review`). Deleting the accepted review of an item that is not yet filed is allowed: the item returns to `checked_out` if someone holds it, otherwise to `pool`.
+    Discriminator for the review 409s, pairing with `ReviewConflictError` the way `IntakeConflictReason` pairs with `IntakeConflictError`. `not_draft`: the review is already submitted (submitting twice). `subject_not_held`: a DJ's `POST /reviews` names an `intake_item_id` the caller does not currently hold (effective state `checked_out` or `reviewed`, with `checked_out_by` the caller), or the subject is neither an intake item nor a library release; an on-behalf create (`reviews: manage`) is exempt from the hold rule. `in_use`: an author deleting their own review while it is in use, meaning it is the accepted review of an intake item or the review most recently printed for a copy. The author may still edit it. A caller with `reviews: manage` is never refused with `in_use`. `accepted_review`: a caller with `reviews: manage` deleting the accepted review of a `filed` or `finalized` intake item that carries no citation. Accept another review for the item first (`POST /intake/{id}/accept-review`). Deleting the accepted review of an item that is not yet filed is allowed: the item returns to `checked_out` if someone holds it, otherwise to `pool`.
 
     """
 
@@ -1718,6 +1755,10 @@ class ArtistSearchMatch(BaseModel):
         None,
         description="The genre's display name, from the same INNER join as `genre_id` (`genres.genre_name` is NOT NULL). Same treatment: returned on every row, optional in the contract for the same reason.\n",
     )
+    code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
+        None,
+        description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
+    )
 
 
 class ArtistSearchResponse(BaseModel):
@@ -1736,6 +1777,10 @@ class ArtistCard(BaseModel):
     genre_id: int
     code_letters: str
     code_artist_number: int
+    code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
+        None,
+        description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
+    )
 
 
 class ArtistCardWithDependentCounts(ArtistCard):
@@ -1846,7 +1891,7 @@ class ArtistDeleteRefusal(BaseModel):
 
 class ArtistByCodeMatch(BaseModel):
     """
-    One row of `GET /library/artists/by-code`. Deliberately NOT `ArtistSearchMatch`, which is one field wider and reads `genre_artist_crossreference` joined to `genres`; this lookup projects `(artist_id, artist_name, code_letters)` and never joins `genres`, echoing the already-validated `genre_id`/`code_number` back onto each row rather than reading a per-row fact.
+    One row of `GET /library/artists/by-code`. Deliberately NOT `ArtistSearchMatch`, which is one field wider and reads `genre_artist_crossreference` joined to `genres`; this lookup projects `(artist_id, artist_name, code_letters)` and never joins `genres`, echoing the already-validated `genre_id`/`code_number` back onto each row rather than reading a per-row fact. The exception is `code_comp_letter`, read per row from `genre_artist_crossreference`: it is what tells apart the Rock and Soundtracks compilation sections that share a code.
 
     """
 
@@ -1859,6 +1904,10 @@ class ArtistByCodeMatch(BaseModel):
     )
     genre_id: int = Field(
         ..., description="Echo of the request's `genre_id`, identical on every row."
+    )
+    code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
+        None,
+        description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
     )
 
 
@@ -1892,6 +1941,10 @@ class ArtistRelease(BaseModel):
     genre_id: int
     code_letters: str
     code_artist_number: int
+    code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
+        None,
+        description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
+    )
     code_number: int
     code_volume_letters: str | None = None
     album_title: str
@@ -2242,6 +2295,10 @@ class BinLibraryDetails(BaseModel):
     label: str | None = None
     code_letters: str | None = None
     code_artist_number: int | None = None
+    code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
+        None,
+        description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
+    )
     code_number: int | None = None
     format_name: str | None = None
     genre_name: str | None = None
@@ -2579,16 +2636,22 @@ class AlbumReview(BaseModel):
     Backend-Service's album-reviews ETL.
 
     Distinct from the in-app `Review` model (`/reviews`: many per
-    release, each attached to an intake item or a library release and
-    locked at print): submissions here are append-only and identify
-    albums by free text with a best-effort `album_id` link. The
-    reviewer's name is withheld by this endpoint today. The station
-    allows reviewer names inside the station (dj-site, the DJ apps);
-    they are never shown outside it.
+    release, each attached to an intake item or a library release):
+    submissions here are append-only and identify albums by free text
+    with a best-effort `album_id` link. This endpoint returns the
+    reviewer's name (`reviewer`): the station allows reviewer names
+    inside the station (dj-site, the DJ apps), and this route is
+    reachable only by signed-in station staff. They are never shown
+    outside it; the public review attach (`WxycReviewItem`) carries no
+    reviewer.
 
     """
 
     id: int
+    reviewer: str | None = Field(
+        ...,
+        description="The form's 'Name of reviewer, and date' answer, verbatim: free text, usually a real name followed by a date. Not parsed. `null` when the row has none. For use inside the station only: never show it on a public surface, and never send it to analytics, error reports or logs.",
+    )
     album_id: int | None = Field(
         ...,
         description="WXYC library album id when the free-text artist/album resolved to exactly one catalog row; null otherwise.",
@@ -3256,7 +3319,7 @@ class LibraryCatalogItem(BaseModel):
     label: str | None = Field(None, description="Record label name from the library catalog")
     call_number: str = Field(
         ...,
-        description='Full call number for shelf lookup, e.g. "Rock CD ABC 123/45". Computed from genre, format, call_letters, artist_call_number, and release_call_number.\n',
+        description='A display string: the shelf locator as a librarian reads it. Clients must not parse it or recompose it from other fields. Named artists render as "Rock cd S 1/1"; compilations render as "Hiphop cd V/A-651", "Rock cd V/A M-121" or "Soundtracks cd M-12", with no artist number and a "-" separator. A release with a volume letter may carry it after the release number as "-<Letter>". The artist half follows tubafrenzy\'s `ArtistLibraryCode.getCallLettersAndNumbersWithPunctuation` and the release half its `LibraryRelease.getCallNumbersAndLetters`; unlike tubafrenzy\'s `LibraryRelease.getEntireLibraryCode`, this string also names the format. A row-less item (`id` 0) carries the sentinel "(external)" instead.\n',
     )
     library_url: str = Field(
         ...,
@@ -4187,7 +4250,10 @@ class LibrarySearchItem(BaseModel):
     alternate_artist_name: str | None = None
     label: str | None = None
     on_streaming: bool | None = None
-    call_number: str | None = Field(None, description='Computed call number (e.g. "Rock CD S 1/1")')
+    call_number: str | None = Field(
+        None,
+        description='A display string: the shelf locator as a librarian reads it. Clients must not parse it or recompose it from other fields. Named artists render as "Rock cd S 1/1"; compilations render as "Hiphop cd V/A-651", "Rock cd V/A M-121" or "Soundtracks cd M-12", with no artist number and a "-" separator. A release with a volume letter may carry it after the release number as "-<Letter>". The artist half follows tubafrenzy\'s `ArtistLibraryCode.getCallLettersAndNumbersWithPunctuation` and the release half its `LibraryRelease.getCallNumbersAndLetters`; unlike tubafrenzy\'s `LibraryRelease.getEntireLibraryCode`, this string also names the format.\n',
+    )
     library_url: str | None = Field(
         None,
         description="Per-release dj.wxyc.org permalink for this release. Points at the dj-site legacy front door `/dashboard/album/legacy/{id}`, whose `{id}` segment is the `legacy_release_id` above — not this row's `id`, which the proxy re-map (WXYC/Backend-Service#2168) moves into Backend's serial space. The front door resolves that legacy id to the canonical release route server-side and 308-redirects. Null when unavailable.\n",
@@ -4977,6 +5043,10 @@ class AlbumSearchResult(BaseModel):
     code_letters: str
     code_number: int
     code_artist_number: int
+    code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
+        None,
+        description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
+    )
     format_name: str
     genre_name: str
     label: str | None = Field(
@@ -5113,6 +5183,10 @@ class AlbumDetail(BaseModel):
         ...,
         description="Joined from `genre_artist_crossreference.artist_genre_code` — the artist's number *within* this release's genre, so the same artist has a different one per genre. Part of the call number, not an id.\n",
     )
+    code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
+        None,
+        description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
+    )
     code_volume_letters: constr(max_length=4) | None = Field(
         None,
         description="`library.code_volume_letters`, varchar(4). Writable via `UpdateAlbumRequest.code_volume_letters` since BS#2564; see that field's description for the null-clearing rule this nullability exists to support.\n",
@@ -5168,6 +5242,10 @@ class Rotation(BaseModel):
     code_artist_number: int | None = Field(
         None,
         description="`genre_artist_crossreference.artist_genre_code`. Null on an uncatalogued row (no `library.artist_id` to join the crossreference on).\n",
+    )
+    code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
+        None,
+        description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
     )
     code_number: int | None = Field(
         None,
