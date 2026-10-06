@@ -5047,6 +5047,10 @@ class AlbumSearchResult(BaseModel):
         None,
         description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
     )
+    code_volume_letters: constr(max_length=4) | None = Field(
+        None,
+        description="The per-release volume letter, library.code_volume_letters (varchar(4)). Volumes of one set share a call number (e.g. volumes A-G of one compilation at one shelf location), so this tells them apart. Stored RAW: the wire does not trim or case-fold it. NOT the compilation-section letter (code_comp_letter, a separate field). Optional: GET /library sends it; GET /library/query does not yet (Backend-Service#2886).\n",
+    )
     format_name: str
     genre_name: str
     label: str | None = Field(
