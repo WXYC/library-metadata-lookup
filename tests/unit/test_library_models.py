@@ -1,74 +1,48 @@
 """Unit tests for library/models.py."""
 
+import hashlib
+import json
+from pathlib import Path
+
 import pytest
 
 from generated.api_models import LibraryCatalogItem
 from library.models import LibraryItem, LibrarySearchResponse
 
+_CORPUS_PATH = Path(__file__).parent.parent / "fixtures" / "call-number-cases.json"
+_CORPUS = json.loads(_CORPUS_PATH.read_text(encoding="utf-8"))
+_CASES = {case["id"]: case for case in _CORPUS["cases"]}
 
-class TestLibraryItemCallNumber:
-    @pytest.mark.parametrize(
-        "kwargs, expected",
-        [
-            pytest.param(
-                {
-                    "id": 1,
-                    "genre": "Rock",
-                    "format": "CD",
-                    "call_letters": "Q",
-                    "artist_call_number": 1,
-                    "release_call_number": 2,
-                },
-                "Rock CD Q 1/2",
-                id="all-fields",
-            ),
-            pytest.param(
-                {
-                    "id": 2,
-                    "genre": "Rock",
-                    "format": "CD",
-                    "call_letters": "Q",
-                    "artist_call_number": 1,
-                },
-                "Rock CD Q 1",
-                id="no-release-num",
-            ),
-            pytest.param({"id": 3, "genre": "Jazz"}, "Jazz", id="genre-only"),
-            pytest.param({"id": 4, "format": "LP"}, "LP", id="format-only"),
-            pytest.param({"id": 5}, "", id="all-none"),
-            pytest.param(
-                {
-                    "id": 6,
-                    "genre": "Rock",
-                    "call_letters": "Q",
-                    "artist_call_number": 5,
-                    "release_call_number": 3,
-                },
-                "Rock Q 5/3",
-                id="no-format",
-            ),
-            pytest.param({"id": 7, "release_call_number": 3}, "3", id="release-only"),
-            pytest.param(
-                {"id": 8, "genre": "Rock", "format": "cd", "release_call_number": 3},
-                "Rock cd 3",
-                id="genre-format-release-no-artist-half",
-            ),
-            pytest.param(
-                {
-                    "id": 9,
-                    "genre": "Rock",
-                    "format": "cd",
-                    "call_letters": "ST",
-                    "release_call_number": 3,
-                },
-                "Rock cd ST/3",
-                id="letters-without-artist-number",
-            ),
-        ],
+# Corpus rows this repo does not yet render as the corpus expects, id -> why.
+# Each listed row must still FAIL (the self-check below), so an entry cannot go
+# stale once the row starts passing.
+KNOWN_DIVERGENCES: dict[str, str] = dict.fromkeys(
+    (
+        "volume-letter-named-artist",
+        "volume-letter-rock-compilation",
+        "volume-letter-single-bin-compilation",
+        "volume-letter-soundtracks-compilation",
+        "volume-letter-lowercase",
+        "volume-letter-padded",
+        "volume-letter-letters-without-artist-number",
+        "volume-letter-release-only",
+    ),
+    "LML#1373: volume letters are not rendered yet",
+)
+
+
+def _item_from_case(case: dict) -> LibraryItem:
+    """Map a corpus row onto the library.db-shaped LibraryItem fields."""
+    return LibraryItem(
+        id=1,
+        artist=case["artist_name"],
+        genre=case["genre"],
+        format=case["format"],
+        call_letters=case["call_letters"],
+        artist_call_number=case["artist_number"],
+        release_call_number=case["release_number"],
+        artist_comp_letter=case["comp_letter"],
     )
-    def test_call_number(self, kwargs, expected):
-        item = LibraryItem(**kwargs)
-        assert item.call_number == expected
 
 
 def _compilation(**overrides) -> LibraryItem:
@@ -85,137 +59,67 @@ def _compilation(**overrides) -> LibraryItem:
     return LibraryItem(**{**fields, **overrides})
 
 
-class TestLibraryItemCompilationCallNumber:
-    """LML#1427: V/A rows are filed by title, not artist, so the regular
-    "<Letters> <ArtistNum>/<ReleaseNum>" pattern never existed on the shelf for
-    them -- the artist_call_number is always 0 and must not render. Rock and
-    Soundtracks additionally split into 26 lettered bins, and the bin letter
-    survives in library.db only as a trailing " - <letter>" on `artist`.
+class TestCallNumberCorpus:
+    """Drives LibraryItem.call_number from the shared call-number corpus.
 
-    Backend-Service#2822 renders the same rule in TypeScript
-    (`computeCallNumber`); the two must agree character for character, so a
-    case added here belongs in its `it.each` table too, and vice versa."""
+    The corpus (wxyc-shared `src/test-utils/call-number-cases.json`, vendored at
+    commit 729990225c3f35de6d3362fd52190ca6e1eba0d0 and SHA-256 pinned) is the
+    single hand-sync point with Backend-Service's `computeCallNumber` and
+    dj-site's `libraryCode.ts`: add a case there, not here."""
+
+    def test_vendored_corpus_matches_pinned_hash(self):
+        pinned = _CORPUS_PATH.with_name(_CORPUS_PATH.name + ".sha256").read_text().split()[0]
+        assert hashlib.sha256(_CORPUS_PATH.read_bytes()).hexdigest() == pinned
 
     @pytest.mark.parametrize(
-        "overrides, expected",
-        [
-            pytest.param({}, "Hiphop cd V/A-651", id="single-bin-genre"),
-            pytest.param(
-                {
-                    "artist": "Various Artists - Rock - M",
-                    "genre": "Rock",
-                    "release_call_number": 121,
-                },
-                "Rock cd V/A M-121",
-                id="rock-with-bin",
-            ),
-            pytest.param(
-                {"artist": "Soundtracks - M", "genre": "Soundtracks", "release_call_number": 12},
-                "Soundtracks cd M-12",
-                id="soundtracks-with-bin",
-            ),
-            pytest.param(
-                {"genre": "Soundtracks", "release_call_number": 53},
-                "Soundtracks cd V/A-53",
-                id="soundtracks-without-bin",
-            ),
-            pytest.param(
-                {
-                    "artist": "Various Artists - Rock - m",
-                    "genre": "Rock",
-                    "release_call_number": 121,
-                },
-                "Rock cd V/A M-121",
-                id="lowercase-name-bin-is-uppercased",
-            ),
-            pytest.param(
-                {"call_letters": "  v/a  "}, "Hiphop cd V/A-651", id="lowercase-padded-v/a"
-            ),
-            pytest.param(
-                {"genre": "Rock", "call_letters": "Z-M", "release_call_number": 121},
-                "Rock cd V/A M-121",
-                id="legacy-z-letter-read-from-code-not-name",
-            ),
-            pytest.param(
-                {"genre": "Soundtracks", "call_letters": "Z-K", "release_call_number": 12},
-                "Soundtracks cd K-12",
-                id="legacy-z-letter-soundtracks",
-            ),
-            pytest.param({"call_letters": "Z--"}, "Hiphop cd V/A-651", id="legacy-z-no-letter"),
-            pytest.param(
-                {
-                    "artist": "Various Artists - Rock - M",
-                    "genre": "Rock",
-                    "call_letters": "Z--",
-                    "release_call_number": 121,
-                },
-                "Rock cd V/A-121",
-                id="legacy-z-no-letter-ignores-name",
-            ),
-            pytest.param(
-                {"call_letters": "Z-M"}, "Hiphop cd V/A-651", id="legacy-z-letter-single-bin-genre"
-            ),
-            pytest.param(
-                {"genre": "Rock", "call_letters": "Z-1", "release_call_number": 121},
-                "Rock cd V/A 1-121",
-                id="legacy-z-takes-any-char-like-substring",
-            ),
-            pytest.param(
-                {"genre": "Rock", "call_letters": "z-m", "release_call_number": 121},
-                "Rock cd z-m 0/121",
-                id="lowercase-z-is-not-a-compilation-marker",
-            ),
-            pytest.param(
-                {"artist": "Various Artists - Rock - M"},
-                "Hiphop cd V/A-651",
-                id="rock-heading-ignored-outside-rock",
-            ),
-            pytest.param(
-                {"artist": "Various Artists - M"},
-                "Hiphop cd V/A-651",
-                id="name-suffix-ignored-on-single-bin-genre",
-            ),
-            pytest.param(
-                {"artist": "Various Artists - Africa", "genre": "Rock", "release_call_number": 121},
-                "Rock cd V/A-121",
-                id="multi-letter-suffix-is-not-a-bin",
-            ),
-            pytest.param(
-                {"artist": " - M", "genre": "Rock", "release_call_number": 121},
-                "Rock cd V/A-121",
-                id="name-trimmed-before-suffix-read",
-            ),
-            pytest.param({"release_call_number": None}, "Hiphop cd V/A", id="no-release-number"),
-            pytest.param(
-                {
-                    "artist": "Various Artists - Rock - M",
-                    "genre": "Rock",
-                    "release_call_number": None,
-                },
-                "Rock cd V/A M",
-                id="no-release-number-with-bin",
-            ),
-            pytest.param(
-                {"artist": "Various Artists - Rock - M", "genre": None, "format": None},
-                "V/A-651",
-                id="no-genre-no-format",
-            ),
-            pytest.param(
-                {
-                    "artist": "Stereolab",
-                    "genre": "Rock",
-                    "format": "CD",
-                    "call_letters": "ST",
-                    "artist_call_number": 1,
-                    "release_call_number": 2,
-                },
-                "Rock CD ST 1/2",
-                id="unchanged-named-artist",
-            ),
-        ],
+        "case_id", [i for i in _CASES if i not in KNOWN_DIVERGENCES], ids=lambda i: i
     )
-    def test_compilation_call_number(self, overrides, expected):
-        assert _compilation(**overrides).call_number == expected
+    def test_call_number(self, case_id):
+        case = _CASES[case_id]
+        assert _item_from_case(case).call_number == case["full"]
+
+    @pytest.mark.parametrize("case_id", sorted(KNOWN_DIVERGENCES), ids=lambda i: i)
+    def test_known_divergence_still_diverges(self, case_id):
+        case = _CASES[case_id]
+        assert _item_from_case(case).call_number != case["full"]
+
+    def test_known_divergences_list_only_rows_that_exist(self):
+        assert set(KNOWN_DIVERGENCES) <= set(_CASES)
+
+
+class TestLibraryItemCompilationLetterSource:
+    """LML#1431: the Rock/Soundtracks bin letter comes from library.db's
+    structural `artist_comp_letter`, never from the artist name."""
+
+    def test_renamed_artist_keeps_its_letter(self):
+        item = LibraryItem(
+            id=1,
+            artist="Various Artists",
+            genre="Rock",
+            format="cd",
+            call_letters="V/A",
+            artist_call_number=0,
+            release_call_number=121,
+            artist_comp_letter="M",
+        )
+        assert item.call_number == "Rock cd V/A M-121"
+
+    def test_name_suffix_without_column_value_renders_no_letter(self):
+        item = LibraryItem(
+            id=1,
+            artist="Various Artists - Rock - M",
+            genre="Rock",
+            format="cd",
+            call_letters="V/A",
+            artist_call_number=0,
+            release_call_number=121,
+            artist_comp_letter=None,
+        )
+        assert item.call_number == "Rock cd V/A-121"
+
+    def test_letter_is_not_serialized(self):
+        item = LibraryItem(id=1, artist_comp_letter="M")
+        assert "artist_comp_letter" not in item.model_dump()
 
 
 class TestLibraryItemLibraryUrl:
@@ -273,9 +177,7 @@ class TestToCatalogItem:
     def test_includes_compilation_call_number(self):
         """LML#1427: the wire call_number must carry the shelf form, not
         "V/A 0/<n>", for a compilation row."""
-        item = _compilation(
-            artist="Various Artists - Rock - M", genre="Rock", release_call_number=121
-        )
+        item = _compilation(genre="Rock", release_call_number=121, artist_comp_letter="M")
         assert item.to_catalog_item().call_number == "Rock cd V/A M-121"
 
     def test_minimal_item(self):

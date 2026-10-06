@@ -78,7 +78,18 @@ class TestSearchLibrary:
             artist_call_number=0,
             release_call_number=651,
         )
-        mock_db.search = AsyncMock(return_value=[named, compilation])
+        renamed = make_library_item(
+            id=3,
+            artist="Various Artists",
+            title="Music for Plants",
+            genre="Rock",
+            format="cd",
+            call_letters="V/A",
+            artist_call_number=0,
+            release_call_number=121,
+            artist_comp_letter="M",
+        )
+        mock_db.search = AsyncMock(return_value=[named, compilation, renamed])
 
         async with AsyncClient(
             transport=ASGITransport(app=app_client), base_url="http://test"
@@ -88,6 +99,8 @@ class TestSearchLibrary:
         results = resp.json()["results"]
         assert results[0]["call_number"] == named.call_number
         assert results[1]["call_number"] == "Hiphop cd V/A-651"
+        assert results[2]["call_number"] == "Rock cd V/A M-121"
+        assert "artist_comp_letter" not in results[2]
 
     @pytest.mark.asyncio
     async def test_artist_filter(self, app_client, mock_db):

@@ -381,6 +381,7 @@ class LibraryDB:
         self._has_album_artist: bool = False
         self._has_label: bool = False
         self._has_cross_reference_names: bool = False
+        self._has_artist_comp_letter: bool = False
         self._has_compilation_track_artist: bool = False
         self._has_streaming_links: bool = False
         self._artist_name_pool_lower: set[str] = set()
@@ -476,6 +477,7 @@ class LibraryDB:
         self._has_album_artist = "album_artist" in column_names
         self._has_label = "label" in column_names
         self._has_cross_reference_names = "cross_reference_names" in column_names
+        self._has_artist_comp_letter = "artist_comp_letter" in column_names
 
         # Detect optional tables. compilation_track_artist is probed for the
         # COLUMN the readers actually select, not just the table name: three
@@ -503,6 +505,7 @@ class LibraryDB:
             f"album_artist: {'yes' if self._has_album_artist else 'no'}, "
             f"label: {'yes' if self._has_label else 'no'}, "
             f"cross_reference_names: {'yes' if self._has_cross_reference_names else 'no'}, "
+            f"artist_comp_letter: {'yes' if self._has_artist_comp_letter else 'no'}, "
             f"compilation_track_artist: {'yes' if self._has_compilation_track_artist else 'no'}, "
             f"streaming_links: {'yes' if self._has_streaming_links else 'no'})"
         )
@@ -732,6 +735,8 @@ class LibraryDB:
             cols += f", {p}label"
         if self._has_cross_reference_names:
             cols += f", {p}cross_reference_names"
+        if self._has_artist_comp_letter:
+            cols += f", {p}artist_comp_letter"
         return cols
 
     async def search(
