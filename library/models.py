@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel, Field, computed_field
 
 if TYPE_CHECKING:
     from generated.api_models import LibraryCatalogItem
@@ -14,10 +13,6 @@ if TYPE_CHECKING:
 # letter renders in the call number's artist half (tubafrenzy's
 # ArtistLibraryCode.getCallLettersAndNumbers). See LibraryItem.call_number.
 _COMPILATION_BIN_FORMS = {"Rock": "V/A {}", "Soundtracks": "{}"}
-
-# A trailing " - <letter>" bin heading, e.g. "Various Artists - Rock - M" or
-# "Soundtracks - M".
-_COMPILATION_BIN_SUFFIX = re.compile(r" - ([A-Za-z])$")
 
 
 class LibrarySearchRequest(BaseModel):
@@ -69,6 +64,12 @@ class LibraryItem(BaseModel):
     # under a band name carries a member's personal name). Optional column;
     # absent from library.db files predating WXYC/discogs-etl#334.
     cross_reference_names: str | None = None
+    # The Rock/Soundtracks compilation bin letter (Backend's structural
+    # `genre_artist_crossreference.code_comp_letter`: one upper-case letter or
+    # NULL). Optional column; absent from library.db files predating
+    # WXYC/discogs-etl#440 and NULL until Backend-Service#2834's backfill is in
+    # the file. Excluded from the wire: consumers render `call_number`.
+    artist_comp_letter: str | None = Field(default=None, exclude=True)
     on_streaming: bool | None = None
 
     def _compilation_bin_letter(self, letters: str) -> str | None:
@@ -76,16 +77,13 @@ class LibraryItem(BaseModel):
 
         The raw tubafrenzy `Z-<letter>` code carries it at index 2 (`Z--` has
         none), taken as-is the way the Java's `substring(2, 3)` does. The `V/A`
-        form Backend's export writes has lost it from `call_letters`; it
-        survives only as the bin heading baked into `artist` ("Various Artists
-        - Rock - M", "Soundtracks - M"). Reading the name is a deliberate,
-        narrow exception: `call_number` calls this only for a row that is
-        already structurally a compilation in a lettered genre.
+        form Backend's export writes has lost it from `call_letters`; it lives in
+        `artist_comp_letter`. The artist name is never read: renaming an artist
+        must not move its shelf.
         """
         if letters.startswith("Z-"):
             return letters[2:3].strip("-").upper() or None
-        match = _COMPILATION_BIN_SUFFIX.search((self.artist or "").strip())
-        return match.group(1).upper() if match else None
+        return (self.artist_comp_letter or "").strip().upper() or None
 
     def _compilation_shelf(self, letters: str) -> str:
         """The `<artist-half>-<release-half>` locator for a compilation row."""
@@ -106,7 +104,8 @@ class LibraryItem(BaseModel):
         never by artist name: `call_letters` is `V/A` (case- and
         whitespace-insensitive, the form Backend's library-etl writes) or
         starts with the raw tubafrenzy `Z-` (case-sensitive, as in
-        tubafrenzy's `isVariousArtists`). A compilation shelf is filed by
+        tubafrenzy's `isVariousArtists`). Call letters render upper-case, as
+        in tubafrenzy's `getCallLettersAndNumbers`. A compilation shelf is filed by
         title, so `artist_call_number` (always 0) must not render as
         "V/A 0/<n>"; the shelf form is `<Genre> <Format> V/A-<ReleaseNum>`,
         or `Rock <Format> V/A <Bin>-<ReleaseNum>` / `Soundtracks <Format>
@@ -121,7 +120,7 @@ class LibraryItem(BaseModel):
         if letters.upper() == "V/A" or letters.startswith("Z-"):
             parts.append(self._compilation_shelf(letters))
             return " ".join(parts)
-        artist_half = [self.call_letters] if self.call_letters else []
+        artist_half = [self.call_letters.upper()] if self.call_letters else []
         if self.artist_call_number is not None:
             artist_half.append(str(self.artist_call_number))
         if self.release_call_number is not None:

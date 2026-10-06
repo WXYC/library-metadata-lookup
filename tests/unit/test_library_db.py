@@ -2955,3 +2955,94 @@ class TestArtistCorrectionOneReadTwoViews:
             assert spy.await_count == 1
         finally:
             await db.close()
+
+
+# ---------------------------------------------------------------------------
+# artist_comp_letter column (WXYC/discogs-etl#440, LML#1431)
+# ---------------------------------------------------------------------------
+
+
+def _make_library_db_file(path, extra_columns: str = ""):
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.execute(f"""
+        CREATE TABLE library (
+            id INTEGER PRIMARY KEY,
+            title TEXT,
+            artist TEXT,
+            call_letters TEXT,
+            artist_call_number INTEGER,
+            release_call_number INTEGER,
+            genre TEXT,
+            format TEXT{extra_columns}
+        )
+    """)
+    conn.execute("""
+        CREATE VIRTUAL TABLE library_fts USING fts5(
+            title, artist, content='library', content_rowid='id'
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+class TestArtistCompLetterColumn:
+    """Column detection for artist_comp_letter, present and absent."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra_columns, expected",
+        [(", artist_comp_letter TEXT", True), ("", False)],
+        ids=["present", "absent"],
+    )
+    async def test_connect_detects_column(self, tmp_path, extra_columns, expected):
+        _make_library_db_file(tmp_path / "t.db", extra_columns).close()
+        db = LibraryDB(db_path=tmp_path / "t.db")
+        await db.connect()
+        assert db._has_artist_comp_letter is expected
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_search_returns_letter_and_renders_it(self, tmp_path):
+        conn = _make_library_db_file(tmp_path / "t.db", ", artist_comp_letter TEXT")
+        conn.execute(
+            "INSERT INTO library VALUES (1, 'Music for Plants', 'Various Artists', 'V/A', 0, 121,"
+            " 'Rock', 'cd', 'M')"
+        )
+        conn.execute(
+            "INSERT INTO library_fts(rowid, title, artist) VALUES (1, 'Music for Plants', 'Various Artists')"
+        )
+        conn.commit()
+        conn.close()
+        db = LibraryDB(db_path=tmp_path / "t.db")
+        await db.connect()
+        results = await db.search(query="Music for Plants")
+        await db.close()
+        assert results[0].artist_comp_letter == "M"
+        assert results[0].call_number == "Rock cd V/A M-121"
+
+    @pytest.mark.asyncio
+    async def test_absent_column_falls_back_to_no_letter(self, tmp_path):
+        conn = _make_library_db_file(tmp_path / "t.db")
+        conn.execute(
+            "INSERT INTO library VALUES (1, 'Music for Plants', 'Various Artists - Rock - M',"
+            " 'V/A', 0, 121, 'Rock', 'cd')"
+        )
+        conn.execute(
+            "INSERT INTO library_fts(rowid, title, artist) VALUES (1, 'Music for Plants', 'Various Artists - Rock - M')"
+        )
+        conn.commit()
+        conn.close()
+        db = LibraryDB(db_path=tmp_path / "t.db")
+        await db.connect()
+        results = await db.search(query="Music for Plants")
+        await db.close()
+        assert results[0].call_number == "Rock cd V/A-121"
+
+    def test_select_columns_follows_flag(self):
+        db = LibraryDB()
+        db._has_artist_comp_letter = True
+        assert "artist_comp_letter" in db._select_columns()
+        db._has_artist_comp_letter = False
+        assert "artist_comp_letter" not in db._select_columns()
