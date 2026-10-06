@@ -38,7 +38,7 @@ class FlowsheetJoinIntent(StrEnum):
 
     Neither value is role-gated. `takeover` is reachable by any caller holding `flowsheet: write`, deliberately: it is the escape hatch a DJ needs when the previous DJ walked out, and it restores a capability tubafrenzy's `EndShowServlet` gave every signed-on DJ. That is a deliberate asymmetry with `POST /flowsheet/shows/{id}/force-end`, which closes someone else's show only under `flowsheet: manage` plus an explicit `force=true`; see that endpoint's description for why the two gates differ.
 
-    Not yet live on the wire: Backend-Service gates the whole handshake behind `FLOWSHEET_TAKEOVER_ENABLED`, shipping OFF (WXYC/Backend-Service#2233). See that 409 for what changes at the flip, and why to start sending this field before it rather than after.
+    Backend-Service gates the whole handshake behind `FLOWSHEET_TAKEOVER_ENABLED` (WXYC/Backend-Service#2233); the flag decides whether this field is enforced. See that 409 for what the flag changes; send this field regardless of the flag.
 
     An explicit JSON `null` is folded into absence and answered with the same 409, not a 400. This is not pedantry: the field is optional with no default, and a Kotlin or Swift client that serializes unset optionals explicitly ( kotlinx.serialization with `encodeDefaults = true`, say) emits `"intent": null` for a DJ who simply has not chosen. Answering that with "your choice is invalid" would be the one response they cannot act on.
 
@@ -797,7 +797,7 @@ class CatalogExportRow(BaseModel):
     """
     One row of the WXYC library catalog as served by GET /library/catalog for offline cloning (BS#1468, Epic F #1466). A query-independent snapshot of the core catalog row. Deliberately NOT AlbumSearchResult: it drops the search-only decoration (matched_via, matched_via_alias, album_dist, artist_dist) and the fields the export omits (add_date, label_id, rotation_id, date_lost, date_found), and instead ships rotation RAW (rotation_bin + rotation_kill_date) so the client evaluates rotation expiry against its own clock. See the rotation_bin description for the load-bearing semantic difference from AlbumSearchResult.
     BS#1965 adds the fields the Backend-sourced library.db producer (discogs-etl#351) needs to build a library.db over HTTP instead of a direct Postgres read: legacy_release_id (the producer emits it AS the library.db id, since BS serials collide with the tubafrenzy id space), album_artist, alternate_artist_name, and cross_reference_names. code_volume_letters (WXYC/wxyc-shared#548) is a later producer-facing addition of the same kind.
-    Every producer-facing field above is OPTIONAL on the wire — none is in `required`, so the pre-BS#1965 15-field body still decodes cleanly against a client generated from this spec. That leniency is deliberate and load-bearing: this row is also the iOS Spotlight clone's shape, and wxyc-ios-64 regenerates from this SSOT on its own cadence. A required key the server does not yet emit would not degrade one field — it would fail EVERY NDJSON line and take the whole on-device clone with it. Same reasoning as `popularity` (BS#1486 Phase-2 Track 3). Note that oasdiff does NOT flag adding a required response property, so a green `check:breaking` is not evidence of safety here.
+    Every producer-facing field above is OPTIONAL on the wire — none is in `required`, so the pre-BS#1965 15-field body still decodes cleanly against a client generated from this spec. That leniency is deliberate and load-bearing: this row is also the iOS Spotlight clone's shape, and wxyc-ios-64 regenerates from this SSOT on its own cadence. A required key the server does not emit would not degrade one field — it would fail EVERY NDJSON line and take the whole on-device clone with it. Same reasoning as `popularity` (BS#1486 Phase-2 Track 3). Note that oasdiff does NOT flag adding a required response property, so a green `check:breaking` is not evidence of safety here.
 
     """
 
@@ -1560,7 +1560,7 @@ class ReviewCredit(StrEnum):
 
 class Review(BaseModel):
     """
-    An in-app DJ album review, the station's printed slip plus publishing consent. Attached to an intake item or to a library release (at least one of `intake_item_id` and `album_id` is set). FCC notes (`fcc`) are never published outside the station. In v1 the service stores consent (`publish_*`, `credit`) and publishes nothing.
+    An in-app DJ album review, the station's printed slip plus publishing consent. Attached to an intake item or to a library release (at least one of `intake_item_id` and `album_id` is set). The review's own FCC line (`fcc`) is never published outside the station. In v1 the service stores consent (`publish_*`, `credit`) and publishes nothing.
 
     """
 
@@ -1609,9 +1609,46 @@ class Review(BaseModel):
     )
     printed_revision_id: int | None = Field(
         ...,
-        description="The revision of this review that was most recently printed; `null` if it has never been printed. When it is not the current revision, the printed slip is out of date.\n",
+        description="The revision of this review that was most recently printed; `null` if it has never been printed. When it is not the current revision, the printed slip is out of date. Its `id` is one of the entries of `GET /reviews/{id}/revisions`.\n",
     )
     printed_at: AwareDatetime | None = Field(..., description="When that print happened.")
+    revision_count: conint(ge=0) = Field(
+        ...,
+        description="How many revisions the review has: `0` for a draft, `1` once submitted, more after edits. A review submitted before edit history began counts `0` until its first edit, which brings it to `2`. Above `1` means there is history to show (`GET /reviews/{id}/revisions`).\n",
+    )
+
+
+class ReviewRevision(BaseModel):
+    """
+    One saved version of a submitted review, as listed by `GET /reviews/{id}/revisions`. Publishing consent (`publish_*`, `credit`) is not versioned. Drafts are not versioned: a review has no revisions until it is submitted. Deleting a review deletes its revisions.
+
+    """
+
+    id: int
+    review_id: int
+    revision: conint(ge=1) = Field(
+        ...,
+        description="1-based. Revision 1 is written when the review is submitted; each later edit of the submitted review writes the next. A review submitted before edit history began has none until its first edit, which writes revision 1 (its text before that edit, under its author, dated when it was submitted, or at its last write when that is unknown) and then revision 2 for the edit.\n",
+    )
+    edited_by: constr(max_length=128) | None = Field(
+        ...,
+        description="Display-name snapshot taken at the time. Revision 1 names the review's author: it is a copy of `Review.author`, whoever pressed submit, so for a review a music director recorded on someone's behalf it is the name the music director typed. A later revision names whoever made that edit; for a music director's edit of someone else's review, the music director. Station-only, with the caveat on `Review.author`.\n",
+    )
+    edited_by_user_id: str | None = Field(
+        ...,
+        description="Revision 1 carries the review's `author_user_id` (null for an author with no linked account); a later revision carries the editor's account. `null` once that account has been deleted.\n",
+    )
+    edited_at: AwareDatetime
+    review: str | None = Field(..., description="The review text as saved by this edit.")
+    artist_blurb: str | None = Field(..., description="The artist blurb as saved by this edit.")
+    buzzwords: str | None = Field(..., description="The buzzwords as saved by this edit.")
+    recommended_tracks: str | None = Field(
+        ..., description="The recommended tracks as saved by this edit."
+    )
+    fcc: str | None = Field(
+        ...,
+        description="The FCC notes as saved by this edit. Never published outside the station.",
+    )
 
 
 class IntakeSlipFccNote(BaseModel):
@@ -1619,6 +1656,67 @@ class IntakeSlipFccNote(BaseModel):
     One confirmed FCC note as printed on an `IntakeSlip`.
     """
 
+    track: str
+    note: str
+
+
+class FccNoteStatus(StrEnum):
+    reported = "reported"
+    confirmed = "confirmed"
+
+
+class FccNote(BaseModel):
+    """
+    An FCC note on a record, separate from any review's own `fcc` field. Never published outside the station.
+
+    """
+
+    id: int
+    album_id: int | None = Field(..., description="The library release the note is about.")
+    intake_item_id: int | None = Field(
+        ...,
+        description="The intake item the note is about. At least one of the two is set. Filing an intake item stamps its notes with the release it was filed as, so a note reported against an item then carries both.\n",
+    )
+    track: str = Field(
+        ...,
+        description="Which track, as the reporter wrote it (for example `B2` or `Back, Baby`).",
+    )
+    note: str = Field(..., description="What is in it.")
+    status: FccNoteStatus = Field(
+        ...,
+        description="`reported`: visible to every DJ as reported and not yet confirmed. `confirmed`: a music director has confirmed it; only confirmed notes print on the slip (`IntakeSlip.fcc_notes`).\n",
+    )
+    reported_by: constr(max_length=128) = Field(
+        ...,
+        description="Display-name snapshot of the reporter, the public-safe account display name. Shown inside the station only; never for client telemetry.\n",
+    )
+    reported_by_user_id: str | None = Field(
+        ..., description="`null` once that account has been deleted."
+    )
+    reported_at: AwareDatetime
+    confirmed_by: constr(max_length=128) | None = Field(
+        ...,
+        description="Display-name snapshot of the music director who confirmed the note, taken at the time, like `reported_by`; `null` while `reported`. There is no account-id field for the confirmer.\n",
+    )
+    confirmed_at: AwareDatetime | None = Field(...)
+    artist_name: constr(max_length=128) = Field(
+        ...,
+        description="The record the note is about, read at response time: the library release's artist and title when `album_id` is set, otherwise the intake item's. Carried on every note so a list that spans records can render a row without a second request.\n",
+    )
+    album_title: constr(max_length=128) = Field(
+        ...,
+        description="The record the note is about, read at response time: the library release's artist and title when `album_id` is set, otherwise the intake item's. Carried on every note so a list that spans records can render a row without a second request.\n",
+    )
+
+
+class NewFccNoteRequest(BaseModel):
+    """
+    Send exactly one of `album_id` and `intake_item_id`. `track` and `note` must not be blank.
+
+    """
+
+    album_id: conint(ge=1, le=2147483647) | None = None
+    intake_item_id: conint(ge=1, le=2147483647) | None = None
     track: str
     note: str
 
@@ -1633,7 +1731,10 @@ class ReviewFields(BaseModel):
     artist_blurb: str | None = None
     review: str | None = None
     recommended_tracks: str | None = None
-    fcc: str | None = Field(None, description="FCC notes. Never published outside the station.")
+    fcc: str | None = Field(
+        None,
+        description="The review's own FCC line. Never published outside the station. Notes on the record that any DJ can report are `FccNote`.\n",
+    )
     publish_website: bool | None = None
     publish_apps: bool | None = None
     publish_instagram: bool | None = None
@@ -2309,11 +2410,11 @@ class BinLibraryDetails(BaseModel):
     code_number: int | None = None
     code_volume_letters: constr(max_length=4) | None = Field(
         None,
-        description="The per-release volume letter, `library.code_volume_letters` (varchar(4)). Volumes of one set share a call number, so this tells them apart. Stored RAW: the wire does not trim or case-fold it. NOT the compilation-section letter (`code_comp_letter`, a separate field). Optional: Backend does not send it yet; it will with WXYC/Backend-Service#2917.\n",
+        description="The per-release volume letter, `library.code_volume_letters` (varchar(4)). Volumes of one set share a call number, so this tells them apart. Stored RAW: the wire does not trim or case-fold it. NOT the compilation-section letter (`code_comp_letter`, a separate field). Optional.\n",
     )
     genre_id: int | None = Field(
         None,
-        description="The release's shelf genre (`library.genre_id`). The id that gates `code_comp_letter`: a consumer rendering the section letter needs it to know whether the letter applies. Optional: Backend does not send it yet; it will with WXYC/Backend-Service#2917.\n",
+        description="The release's shelf genre (`library.genre_id`). The id that gates `code_comp_letter`: a consumer rendering the section letter needs it to know whether the letter applies. Optional.\n",
     )
     format_name: str | None = None
     genre_name: str | None = None
@@ -3618,7 +3719,7 @@ class TracksContractVersion(IntEnum):
     """
     Present and equal to 1 only when the request set `include_tracks: true`, the producer understands the flag, AND the producer has emitted `tracks_attempted` for both `kind: single_artist` and `kind: compilation` results — see `BulkResolveResult.tracks_attempted`. The two producer arms ship independently (LML#1138, LML#1021); setting the marker with one arm unimplemented tells a consumer to trust `tracks_attempted` on rows where it is still meaningless.
 
-    Absent or NULL otherwise: both when `include_tracks` was false or omitted, and when the producer predates this field entirely, or has implemented only one of the two arms above. LML does not set this field anywhere yet and serves this endpoint without `response_model_exclude_none`, so it ships `null` — never an omitted key — on every response in production today (WXYC/wxyc-shared#310); `nullable: true` documents that wire instead of describing one nobody emits, the same treatment as `tracks` / `tracks_attempted` above.
+    Absent or NULL otherwise: both when `include_tracks` was false or omitted, and when the producer predates this field entirely, or has implemented only one of the two arms above. LML serves this endpoint without `response_model_exclude_none`, so when LML leaves the field unset it ships `null` — never an omitted key (WXYC/wxyc-shared#310); `nullable: true` documents that wire, the same treatment as `tracks` / `tracks_attempted` above.
 
     Because of that, a consumer MUST test for the value `1` and must never test for key presence — `!== undefined` against the generated TypeScript reads TRUE for a producer that implements none of this, the inverse of what the marker exists to signal. Absent, `null`, and a producer that predates this field must all read "not supported", and only the literal value `1` reads "supported" — which keeps the check immune to whether any given producer omits or nulls its unset optionals. Same precedent as `LookupResponse.api_version` (`LookupRequest.include_identity`): a producer-echoed capability marker that lets a consumer distinguish "the producer understood my flag and the answer is genuinely nothing" from "the producer predates my flag" — a distinction `tracks_attempted`/`tracks` cannot make alone, because both are spelled `null` in either case (WXYC/wxyc-shared#303). No schema-level `default`, for the same `openapi-typescript` `defaultNonNullable` reason documented on `BulkResolveLibrariesRequest.include_tracks`.
 
@@ -3635,7 +3736,7 @@ class BulkResolveLibrariesResponse(BaseModel):
 
     tracks_contract_version: TracksContractVersion | None = Field(
         None,
-        description='Present and equal to 1 only when the request set `include_tracks: true`, the producer understands the flag, AND the producer has emitted `tracks_attempted` for both `kind: single_artist` and `kind: compilation` results — see `BulkResolveResult.tracks_attempted`. The two producer arms ship independently (LML#1138, LML#1021); setting the marker with one arm unimplemented tells a consumer to trust `tracks_attempted` on rows where it is still meaningless.\n\nAbsent or NULL otherwise: both when `include_tracks` was false or omitted, and when the producer predates this field entirely, or has implemented only one of the two arms above. LML does not set this field anywhere yet and serves this endpoint without `response_model_exclude_none`, so it ships `null` — never an omitted key — on every response in production today (WXYC/wxyc-shared#310); `nullable: true` documents that wire instead of describing one nobody emits, the same treatment as `tracks` / `tracks_attempted` above.\n\nBecause of that, a consumer MUST test for the value `1` and must never test for key presence — `!== undefined` against the generated TypeScript reads TRUE for a producer that implements none of this, the inverse of what the marker exists to signal. Absent, `null`, and a producer that predates this field must all read "not supported", and only the literal value `1` reads "supported" — which keeps the check immune to whether any given producer omits or nulls its unset optionals. Same precedent as `LookupResponse.api_version` (`LookupRequest.include_identity`): a producer-echoed capability marker that lets a consumer distinguish "the producer understood my flag and the answer is genuinely nothing" from "the producer predates my flag" — a distinction `tracks_attempted`/`tracks` cannot make alone, because both are spelled `null` in either case (WXYC/wxyc-shared#303). No schema-level `default`, for the same `openapi-typescript` `defaultNonNullable` reason documented on `BulkResolveLibrariesRequest.include_tracks`.\n',
+        description='Present and equal to 1 only when the request set `include_tracks: true`, the producer understands the flag, AND the producer has emitted `tracks_attempted` for both `kind: single_artist` and `kind: compilation` results — see `BulkResolveResult.tracks_attempted`. The two producer arms ship independently (LML#1138, LML#1021); setting the marker with one arm unimplemented tells a consumer to trust `tracks_attempted` on rows where it is still meaningless.\n\nAbsent or NULL otherwise: both when `include_tracks` was false or omitted, and when the producer predates this field entirely, or has implemented only one of the two arms above. LML serves this endpoint without `response_model_exclude_none`, so when LML leaves the field unset it ships `null` — never an omitted key (WXYC/wxyc-shared#310); `nullable: true` documents that wire, the same treatment as `tracks` / `tracks_attempted` above.\n\nBecause of that, a consumer MUST test for the value `1` and must never test for key presence — `!== undefined` against the generated TypeScript reads TRUE for a producer that implements none of this, the inverse of what the marker exists to signal. Absent, `null`, and a producer that predates this field must all read "not supported", and only the literal value `1` reads "supported" — which keeps the check immune to whether any given producer omits or nulls its unset optionals. Same precedent as `LookupResponse.api_version` (`LookupRequest.include_identity`): a producer-echoed capability marker that lets a consumer distinguish "the producer understood my flag and the answer is genuinely nothing" from "the producer predates my flag" — a distinction `tracks_attempted`/`tracks` cannot make alone, because both are spelled `null` in either case (WXYC/wxyc-shared#303). No schema-level `default`, for the same `openapi-typescript` `defaultNonNullable` reason documented on `BulkResolveLibrariesRequest.include_tracks`.\n',
     )
     results: list[BulkResolveResult]
     cache_stats: CacheStats | None = None
@@ -5272,10 +5373,13 @@ class IntakeSlip(BaseModel):
     submitted_at: AwareDatetime | None = Field(...)
     recommended_tracks: str | None = Field(...)
     fcc: str | None = Field(...)
-    revision_id: int = Field(..., description="The id of the review revision this slip printed.")
+    revision_id: int = Field(
+        ...,
+        description="The id of the review revision this slip printed. Its `id` is one of the entries of `GET /reviews/{id}/revisions`.\n",
+    )
     fcc_notes: list[IntakeSlipFccNote] = Field(
         ...,
-        description="The record's confirmed FCC notes, printed beside the review's own `fcc` line. A note that is reported but not yet confirmed does not print. Empty when there are none.\n",
+        description="The record's confirmed FCC notes, printed beside the review's own `fcc` line. A note that is reported but not yet confirmed does not print. Empty when there are none. See `GET /fcc-notes`.\n",
     )
 
 
@@ -5298,11 +5402,11 @@ class Rotation(BaseModel):
     )
     code_volume_letters: constr(max_length=4) | None = Field(
         None,
-        description="The per-release volume letter, `library.code_volume_letters` (varchar(4)). Volumes of one set share a call number, so this tells them apart. Stored RAW: the wire does not trim or case-fold it. NOT the compilation-section letter (`code_comp_letter`, a separate field). Null when the release has no volume letter (most catalogued rows), and always null on an unlinked rotation row (no library row). Optional: Backend does not send it yet; it will with WXYC/Backend-Service#2917.\n",
+        description="The per-release volume letter, `library.code_volume_letters` (varchar(4)). Volumes of one set share a call number, so this tells them apart. Stored RAW: the wire does not trim or case-fold it. NOT the compilation-section letter (`code_comp_letter`, a separate field). Null when the release has no volume letter (most catalogued rows), and always null on an unlinked rotation row (no library row). Optional.\n",
     )
     genre_id: int | None = Field(
         None,
-        description="The release's shelf genre (`library.genre_id`), the id that gates `code_comp_letter`. Null on an unlinked rotation row (no library row). Optional: Backend does not send it yet; it will with WXYC/Backend-Service#2917.\n",
+        description="The release's shelf genre (`library.genre_id`), the id that gates `code_comp_letter`. Null on an unlinked rotation row (no library row). Optional.\n",
     )
     code_number: int | None = Field(
         None,
