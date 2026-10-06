@@ -1383,17 +1383,20 @@ class IntakeItem(BaseModel):
         ...,
         description="`state` as actually usable, per WXYC/Backend-Service#2796: equal to `state` except a stale `requested` reads as `pool` — stale meaning `requested_at` is more than 7 days old, or `requested_dj_id` is `null` because the DJ it was requested of had their account deleted. A read never writes, so `state` itself is left untouched by the lapse; only `effective_state` reflects it.\n",
     )
-    overdue: bool = Field(..., description="True while `checked_out` for more than 14 days.")
+    overdue: bool = Field(
+        ...,
+        description="True while the record's checkout is more than 14 days old (`checked_out_at`), in `checked_out` or `reviewed`; a reviewed record that has been returned has no checkout and is never overdue.\n",
+    )
     logged_at: AwareDatetime
     requested_dj_id: str | None = Field(
         ...,
-        description="The DJ a music director asked to review the item, set when it enters `requested`. Read it together with `state` and `effective_state`, not as proof of a live request: later transitions may leave it set (a checkout clears a stale request's fields). `null` while `state: requested` means the requested DJ's account has since been deleted, the case that makes `effective_state` read `pool` despite `state` still saying `requested`.\n",
+        description="The DJ a music director asked to review the item, set when it enters `requested`. Read it together with `state` and `effective_state`, not as proof of a live request: later transitions may leave it set (a checkout clears the request's fields, and accepting a review withdraws a pending request). `null` while `state: requested` means the requested DJ's account has since been deleted, the case that makes `effective_state` read `pool` despite `state` still saying `requested`.\n",
     )
     requested_dj_name: str | None = Field(...)
     requested_at: AwareDatetime | None = Field(...)
     checked_out_by: str | None = Field(
         ...,
-        description='Who holds the physical copy, set on checkout. It stays set when a review is accepted, so a `reviewed` item can still name the DJ who has the copy: deleting the accepted review of an item not yet filed returns it to `checked_out` with the same holder, or to `pool` when there is none. A `reviewed` item keeps its holder until the holder or a music director returns it (`POST /intake/{id}/release`) or the item is filed, which clears it. Read it together with `state`, not as proof of a live checkout. `null` while `state: checked_out` means the holder\'s account has since been deleted, shown to MDs as "holder removed"; an MD may release the item.\n',
+        description='Who holds the physical copy, set on checkout. It stays set when a review is accepted, so a `reviewed` item can still name the DJ who has the copy: deleting the accepted review of an item not yet filed returns it to `checked_out` with the same holder, or to `pool` when there is none. A `reviewed` item keeps its holder until the holder or a music director returns it (`POST /intake/{id}/release`) or the item is filed, which clears it. Read it together with `state`, not as proof of a live checkout. `null` while `checked_out_at` is set, in `checked_out` or `reviewed`, means the holder\'s account has since been deleted, shown to MDs as "holder removed"; an MD may release the item.\n',
     )
     checked_out_by_name: str | None = Field(...)
     checked_out_at: AwareDatetime | None = Field(...)
@@ -1402,7 +1405,10 @@ class IntakeItem(BaseModel):
     album_id: int | None = Field(...)
     rotation_id: int | None = Field(...)
     filed_at: AwareDatetime | None = Field(...)
-    printed_at: AwareDatetime | None = Field(...)
+    printed_at: AwareDatetime | None = Field(
+        ...,
+        description="When this item's slip was last printed: the time of its latest print-log entry.\n",
+    )
     finalized_at: AwareDatetime | None = Field(...)
     passes: list[Pass] | None = Field(
         None, description="Present only for callers holding `reviews: manage`."
@@ -1495,7 +1501,7 @@ class IntakeFileRequest(RootModel[IntakeFileNewRelease | IntakeFileExistingRelea
 
 class IntakeConflictReason(StrEnum):
     """
-    Discriminator for the intake 409s, pairing with `IntakeConflictError` the way `LibraryFilingConflictReason` pairs with `LibraryFilingConflictError`. `state_changed`: the item was not in a state that allows the transition (two DJs racing for one record, an expired request, an item already filed). `not_reviewed`: filing an item with no accepted review and no valid citation, or printing one whose accepted review is missing or is handwritten (WXYC/Backend-Service#2804; a handwritten review is already on the sleeve, so nothing prints). `invalid_citation`: a cited release with no **submitted** review that was catalogued **after** the cutover date (station time; a release catalogued on the cutover date counts as before it), a cited form submission dated, in station time, after the cutover date, a cited form submission with no date (`submitted_at` null) once a cutover date is set, because it cannot be shown to predate the cutover (while no cutover date is set it is citable), or a cited id that names no release or no form submission (WXYC/Backend-Service#2797). `already_filed`: delete or patch after filing. `in_rotation`: finalize of a filed item while its release has a rotation row (found by `album_id`, not by `rotation_id`) whose `kill_date` is null or after today, by the database's date, the one every rotation list is filtered by, and not the station's calendar date (WXYC/Backend-Service#2804); the item stays `filed`, and the message names the latest kill date, or says that no kill date is set.
+    Discriminator for the intake 409s, pairing with `IntakeConflictError` the way `LibraryFilingConflictReason` pairs with `LibraryFilingConflictError`. `state_changed`: the item was not in a state that allows the transition (two DJs racing for one record, an expired request, an item already filed). `not_reviewed`: filing an item with no accepted review, or printing one whose accepted review is missing or is handwritten (WXYC/Backend-Service#2804; a handwritten review is already on the sleeve, so nothing prints). `invalid_citation`: a cited release with no **submitted** review that was catalogued **after** the cutover date (station time; a release catalogued on the cutover date counts as before it), a cited form submission dated, in station time, after the cutover date, a cited form submission with no date (`submitted_at` null) once a cutover date is set, because it cannot be shown to predate the cutover (while no cutover date is set it is citable), or a cited id that names no release or no form submission (WXYC/Backend-Service#2797). `already_filed`: delete or patch after filing. `in_rotation`: finalize of a filed item while its release has a rotation row (found by `album_id`, not by `rotation_id`) whose `kill_date` is null or after today, by the database's date, the one every rotation list is filtered by, and not the station's calendar date (WXYC/Backend-Service#2804); the item stays `filed`, and the message names the latest kill date, or says that no kill date is set.
 
     """
 
@@ -1593,27 +1599,28 @@ class Review(BaseModel):
     add_date: date_aliased
     submitted_at: AwareDatetime | None = Field(...)
     last_modified: AwareDatetime
-
-
-class IntakeSlip(BaseModel):
-    """
-    The printable review slip for an intake item: the item's identity plus the printed review's text. Each review field is nullable exactly as on `Review`. `fcc` is for the station's own slip and is never published outside it.
-
-    """
-
-    artist_name: constr(max_length=128)
-    album_title: constr(max_length=128)
-    record_label: constr(max_length=128) | None = Field(...)
-    buzzwords: str | None = Field(...)
-    artist_blurb: str | None = Field(...)
-    review: str | None = Field(...)
-    author: constr(max_length=128) | None = Field(
+    in_use: bool = Field(
         ...,
-        description="The printed review's `Review.author`, with the same station-only caveat; never for client telemetry.",
+        description="Computed. `true` when this review is the accepted review of an intake item, or is the review in the latest print-log entry of a copy or of a library release. An author cannot delete a review that is in use (`ReviewConflictReason` `in_use`), but may still edit it.\n",
     )
-    submitted_at: AwareDatetime | None = Field(...)
-    recommended_tracks: str | None = Field(...)
-    fcc: str | None = Field(...)
+    on_cover: bool = Field(
+        ...,
+        description="Computed, and meaningful only in a list filtered by `album_id` (`GET /reviews?album_id=`): `true` when this review is on the cover of a copy of that release. That is, it is the accepted review of an intake item filed or finalized as that release, or the review in the latest print-log entry of such an item, or the review in the release's latest print-log entry that has no intake item. These are the reviews that list puts first. `false` in every other response: a single review, the write responses, and the unfiltered, `mine` and `intake_item_id` lists. It differs from `in_use`, which is true when the review is in use for any record: a review reached through `cited_album_id` is in use for the release it belongs to, and is on the cover here only once it has been chosen or printed for a copy of this release.\n",
+    )
+    printed_revision_id: int | None = Field(
+        ...,
+        description="The revision of this review that was most recently printed; `null` if it has never been printed. When it is not the current revision, the printed slip is out of date.\n",
+    )
+    printed_at: AwareDatetime | None = Field(..., description="When that print happened.")
+
+
+class IntakeSlipFccNote(BaseModel):
+    """
+    One confirmed FCC note as printed on an `IntakeSlip`.
+    """
+
+    track: str
+    note: str
 
 
 class ReviewFields(BaseModel):
@@ -1680,7 +1687,7 @@ class ReviewPatch(ReviewFields):
 
 class ReviewConflictReason(StrEnum):
     """
-    Discriminator for the review 409s, pairing with `ReviewConflictError` the way `IntakeConflictReason` pairs with `IntakeConflictError`. `not_draft`: the review is already submitted (submitting twice). `subject_not_held`: a DJ's `POST /reviews` names an `intake_item_id` the caller does not currently hold (effective state `checked_out` or `reviewed`, with `checked_out_by` the caller), or the subject is neither an intake item nor a library release; an on-behalf create (`reviews: manage`) is exempt from the hold rule. `in_use`: an author deleting their own review while it is in use, meaning it is the accepted review of an intake item or the review most recently printed for a copy. The author may still edit it. A caller with `reviews: manage` is never refused with `in_use`. `accepted_review`: a caller with `reviews: manage` deleting the accepted review of a `filed` or `finalized` intake item that carries no citation. Accept another review for the item first (`POST /intake/{id}/accept-review`). Deleting the accepted review of an item that is not yet filed is allowed: the item returns to `checked_out` if someone holds it, otherwise to `pool`.
+    Discriminator for the review 409s, pairing with `ReviewConflictError` the way `IntakeConflictReason` pairs with `IntakeConflictError`. `not_draft`: the review is already submitted (submitting twice). `subject_not_held`: a DJ's `POST /reviews` names an `intake_item_id` the caller does not currently hold (effective state `checked_out` or `reviewed`, with `checked_out_by` the caller), or the subject is neither an intake item nor a library release; an on-behalf create (`reviews: manage`) is exempt from the hold rule. `in_use`: an author deleting their own review while it is in use, meaning it is the accepted review of an intake item or the review in the latest print-log entry of a copy or of a library release. The author may still edit it. A caller with `reviews: manage` is never refused with `in_use`. `accepted_review`: a caller with `reviews: manage` deleting the accepted review of a `filed` or `finalized` intake item, whether or not the item carries a citation. Accept another review for the item first (`POST /intake/{id}/accept-review`). Deleting the accepted review of an item that is not yet filed is allowed: the item returns to `checked_out` if someone holds it, otherwise to `pool`.
 
     """
 
@@ -2300,6 +2307,14 @@ class BinLibraryDetails(BaseModel):
         description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
     )
     code_number: int | None = None
+    code_volume_letters: constr(max_length=4) | None = Field(
+        None,
+        description="The per-release volume letter, `library.code_volume_letters` (varchar(4)). Volumes of one set share a call number, so this tells them apart. Stored RAW: the wire does not trim or case-fold it. NOT the compilation-section letter (`code_comp_letter`, a separate field). Optional: Backend does not send it yet; it will with WXYC/Backend-Service#2917.\n",
+    )
+    genre_id: int | None = Field(
+        None,
+        description="The release's shelf genre (`library.genre_id`). The id that gates `code_comp_letter`: a consumer rendering the section letter needs it to know whether the letter applies. Optional: Backend does not send it yet; it will with WXYC/Backend-Service#2917.\n",
+    )
     format_name: str | None = None
     genre_name: str | None = None
     legacy_release_id: int | None = Field(
@@ -5049,7 +5064,11 @@ class AlbumSearchResult(BaseModel):
     )
     code_volume_letters: constr(max_length=4) | None = Field(
         None,
-        description="The per-release volume letter, library.code_volume_letters (varchar(4)). Volumes of one set share a call number (e.g. volumes A-G of one compilation at one shelf location), so this tells them apart. Stored RAW: the wire does not trim or case-fold it. NOT the compilation-section letter (code_comp_letter, a separate field). Optional: GET /library sends it; GET /library/query does not yet (Backend-Service#2886).\n",
+        description="The per-release volume letter, library.code_volume_letters (varchar(4)). Volumes of one set share a call number (e.g. volumes A-G of one compilation at one shelf location), so this tells them apart. Stored RAW: the wire does not trim or case-fold it. NOT the compilation-section letter (code_comp_letter, a separate field). Optional: both GET /library and GET /library/query send it.\n",
+    )
+    genre_id: int | None = Field(
+        None,
+        description="The release's shelf genre (`library.genre_id`). The id that gates `code_comp_letter`: a consumer rendering the section letter needs it to know whether the letter applies. Optional.\n",
     )
     format_name: str
     genre_name: str
@@ -5234,6 +5253,32 @@ class AlbumDetail(BaseModel):
     reconciled_identity: ReconciledIdentity | None = None
 
 
+class IntakeSlip(BaseModel):
+    """
+    The printable review slip for an intake item: the item's identity plus the printed review's text. Each review field is nullable exactly as on `Review`. `fcc` is for the station's own slip and is never published outside it.
+
+    """
+
+    artist_name: constr(max_length=128)
+    album_title: constr(max_length=128)
+    record_label: constr(max_length=128) | None = Field(...)
+    buzzwords: str | None = Field(...)
+    artist_blurb: str | None = Field(...)
+    review: str | None = Field(...)
+    author: constr(max_length=128) | None = Field(
+        ...,
+        description="The printed review's `Review.author`, with the same station-only caveat; never for client telemetry.",
+    )
+    submitted_at: AwareDatetime | None = Field(...)
+    recommended_tracks: str | None = Field(...)
+    fcc: str | None = Field(...)
+    revision_id: int = Field(..., description="The id of the review revision this slip printed.")
+    fcc_notes: list[IntakeSlipFccNote] = Field(
+        ...,
+        description="The record's confirmed FCC notes, printed beside the review's own `fcc` line. A note that is reported but not yet confirmed does not print. Empty when there are none.\n",
+    )
+
+
 class Rotation(BaseModel):
     id: int | None = Field(
         None,
@@ -5250,6 +5295,14 @@ class Rotation(BaseModel):
     code_comp_letter: constr(pattern=r"^[A-Z]$", max_length=1) | None = Field(
         None,
         description="The section letter of a Rock or Soundtracks compilation (`V/A`) shelf slot (release numbers restart per section, so *Music for Plants* is `Rock V/A M-121`); null on every other slot. It stands where the artist number would be in the call number: Rock renders `V/A <L>-<n>`, Soundtracks `<L>-<n>`. Not `code_volume_letters`, the per-release volume letter. Optional: a server that predates WXYC/Backend-Service#2835, which exposes it, omits it.\n",
+    )
+    code_volume_letters: constr(max_length=4) | None = Field(
+        None,
+        description="The per-release volume letter, `library.code_volume_letters` (varchar(4)). Volumes of one set share a call number, so this tells them apart. Stored RAW: the wire does not trim or case-fold it. NOT the compilation-section letter (`code_comp_letter`, a separate field). Null when the release has no volume letter (most catalogued rows), and always null on an unlinked rotation row (no library row). Optional: Backend does not send it yet; it will with WXYC/Backend-Service#2917.\n",
+    )
+    genre_id: int | None = Field(
+        None,
+        description="The release's shelf genre (`library.genre_id`), the id that gates `code_comp_letter`. Null on an unlinked rotation row (no library row). Optional: Backend does not send it yet; it will with WXYC/Backend-Service#2917.\n",
     )
     code_number: int | None = Field(
         None,
