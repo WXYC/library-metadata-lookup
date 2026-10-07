@@ -23,8 +23,9 @@ never Canibus, "Sun Ra" is never "Sun Ra Arkestra". Rungs 2-4 are tolerance,
 and tolerance must not merge two artists: the catalog files "Girls" beside
 "The Girls" and "A Frames" beside "The Frames" as different bands. So a
 tolerant rung is consulted only when the stricter ones found nothing, and it
-answers only when every spelling it matched is one artist under rung 1.
-"Frames" matches both bands on rung 2, so it gets no rows.
+answers only when every spelling it matched is one artist under rung 1, or
+one act under the variant rule below. "Frames" matches both bands on rung 2,
+so it gets no rows.
 
 Whichever rung answers, its hits are followed by their punctuation variants
 on the same ``call_letters`` (LML#1449): the librarian files variants of one
@@ -41,6 +42,7 @@ typed "Beak" does not reach a stored "Beak>" (about two dozen such names on
 the 2026-10-02 catalog). Those stay as they were before this module.
 """
 
+import functools
 from collections.abc import Callable
 
 from library.db import LibraryDB
@@ -75,10 +77,10 @@ async def artist_spellings(db: LibraryDB, artist: str) -> list[str]:
     """The stored ``library.artist`` spellings that ARE ``artist``: the rung pick.
 
     Empty when the artist is not shelved, or when only a tolerant rung matches
-    and it matches more than one artist. Reads artist names only, never rows,
-    so a caller that restricts its own query to these spellings
-    (``LibraryDB.search_among``) never materializes the shelf. See the module
-    docstring.
+    and it matches more than one act. Reads artist names, and the call letters of
+    punctuation-sibling spellings (``LibraryDB.artist_call_letters``), never a
+    ``LibraryItem``: a caller restricting its own query to these spellings
+    (``LibraryDB.search_among``) never materializes the shelf. See the module docstring.
     """
     name = normalize_for_comparison(artist).strip()
     if not name or len(name) > _MAX_NAME_LENGTH:
@@ -97,35 +99,37 @@ async def artist_spellings(db: LibraryDB, artist: str) -> list[str]:
         if not hits:
             continue
         if tolerant and len({stored[spelling] for spelling in hits}) > 1:
-            return []
-        return hits + await _punctuation_variants(db, stored, hits)
+            # Several artists under rung 1 are still one act under the variant rule.
+            if len(set((await _shelves(db, stored, hits)).values())) > 1:
+                return []
+        return hits + await _variants(db, stored, hits)
     return []
 
 
-async def _punctuation_variants(
-    db: LibraryDB, stored: dict[str, str], hits: list[str]
-) -> list[str]:
+_fold = functools.lru_cache(maxsize=1 << 15)(fold_punctuation_for_comparison)
+"""Cached: each pick folds every stored spelling its search returned."""
+_Shelf = tuple[str, frozenset[str]]
+
+
+async def _shelves(db: LibraryDB, stored: dict[str, str], names: list[str]) -> dict[str, _Shelf]:
+    """Each spelling's punctuation-folded name and call letters, equal for one act (LML#1449)."""
+    filed = await db.artist_call_letters(names)
+    return {s: (_fold(stored[s]), frozenset(c for n, c in filed if n == s)) for s in names}
+
+
+async def _variants(db: LibraryDB, stored: dict[str, str], hits: list[str]) -> list[str]:
     """The stored spellings equal to a hit under punctuation folding and filed
     on its call letters (LML#1449). Articles are not folded here."""
-    fold = {spelling: fold_punctuation_for_comparison(key) for spelling, key in stored.items()}
-    keys = {fold[spelling] for spelling in hits} - {""}
-    candidates = [
-        spelling for spelling in stored if spelling not in hits and fold[spelling] in keys
-    ]
+    keys = {_fold(stored[spelling]) for spelling in hits} - {""}
+    candidates = [s for s, key in stored.items() if s not in hits and _fold(key) in keys]
     if not candidates:
         return []
-    filed = await db.artist_call_letters([*hits, *candidates])
-
-    def shelf(spelling: str) -> tuple[str, frozenset[str]]:
-        return fold[spelling], frozenset(letters for name, letters in filed if name == spelling)
-
-    shelves = {shelf(spelling) for spelling in hits}
-    return [spelling for spelling in candidates if shelf(spelling) in shelves]
+    shelf = await _shelves(db, stored, [*hits, *candidates])
+    return [spelling for spelling in candidates if shelf[spelling] in {shelf[h] for h in hits}]
 
 
 def _own_rows_first(rows: list[LibraryItem], spellings: list[str]) -> list[LibraryItem]:
-    """``rows`` (id order) with the picked artist's rows ahead of its punctuation
-    variants', id order within each (LML#1449)."""
+    """``rows`` (id order), the picked artist's ahead of its punctuation variants' (LML#1449)."""
     own = normalize_for_comparison(spellings[0]).strip() if spellings else ""
     return sorted(rows, key=lambda row: normalize_for_comparison(row.artist or "").strip() != own)
 
