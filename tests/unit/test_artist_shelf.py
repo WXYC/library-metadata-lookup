@@ -6,11 +6,13 @@ what the full-text index returns and what the lane keeps, which a mock cannot
 show.
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from lookup.artist_shelf import artist_spellings, rows_for_artist
 from lookup.matching import _FETCH_LIMIT
-from tests.factories import crowd_rows, make_library_catalog
+from tests.factories import crowd_rows, make_library_catalog, make_library_item, shelve
 
 
 class TestCrowdedOutArtists:
@@ -143,8 +145,8 @@ class TestTolerantRungs:
             pytest.param(
                 "Alaska",
                 [("Alaska!", "Emotions"), ("Alaska?", "Rescue")],
-                [],
-                id="punctuation-rung-matching-two-artists-returns-neither",
+                ["Alaska!", "Alaska?"],
+                id="punctuation-rung-matching-one-act-on-one-call-letters",
             ),
             pytest.param(
                 "A-Bones",
@@ -318,6 +320,79 @@ class TestPunctuationVariants:
     @pytest.mark.parametrize(
         ("typed", "expected"),
         [
+            pytest.param("Mark Almond", ["The Stars We Are"], id="one-letter-set"),
+            pytest.param("Mark-Almond", ["Rising", "To the Heart"], id="two-letter-set"),
+        ],
+    )
+    async def test_sharing_one_call_letter_is_not_the_same_letters(self, tmp_path, typed, expected):
+        """The band has one row misfiled under AL beside its MA rows: {AL, MA}
+        is not {AL}, so the two spellings stay two acts."""
+        db = await make_library_catalog(
+            tmp_path,
+            [
+                ("Mark-Almond", "Rising"),
+                ("Mark Almond", "The Stars We Are"),
+                ("Mark-Almond", "To the Heart"),
+            ],
+            call_letters={
+                "Mark Almond": "AL",
+                "Mark-Almond": "MA",
+                ("Mark-Almond", "Rising"): "AL",
+            },
+        )
+        try:
+            rows = await rows_for_artist(db, typed)
+        finally:
+            await db.close()
+
+        assert [row.title for row in rows] == expected
+
+    @pytest.mark.asyncio
+    async def test_an_unstored_spelling_reads_both_spellings_of_one_act(self, tmp_path):
+        """ "Alaska?" matches "Alaska" and "Alaska!" on the punctuation rung: two
+        rung-1 keys, one act on one call letters, so not ambiguous."""
+        db = await make_library_catalog(tmp_path, [("Alaska!", "Wide Awake"), ("Alaska", "Rescue")])
+        try:
+            rows = await rows_for_artist(db, "Alaska?")
+        finally:
+            await db.close()
+
+        assert [(row.artist, row.title) for row in rows] == [
+            ("Alaska", "Rescue"),
+            ("Alaska!", "Wide Awake"),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("catalog", "queried"),
+        [
+            pytest.param([("Stereolab", "Dots and Loops")], False, id="no-sibling-no-query"),
+            pytest.param(
+                [("STEREOLAB", "Mars Audiac Quintet"), ("Stereolab", "Dots and Loops")],
+                False,
+                id="case-sibling-no-query",
+            ),
+            pytest.param(
+                [("Stereolab", "Dots and Loops"), ("Stereolab!", "Margerine Eclipse")],
+                True,
+                id="punctuation-sibling-queries",
+            ),
+        ],
+    )
+    async def test_call_letters_are_read_only_for_a_punctuation_sibling(self, catalog, queried):
+        db = shelve(
+            AsyncMock(),
+            [make_library_item(id=i, artist=a, title=t) for i, (a, t) in enumerate(catalog)],
+        )
+
+        await artist_spellings(db, "Stereolab")
+
+        assert db.artist_call_letters.await_count == int(queried)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("typed", "expected"),
+        [
             pytest.param(
                 "Cherry Point",
                 [
@@ -341,6 +416,14 @@ class TestPunctuationVariants:
                     ("The Cherry Point,", "Black Witchery"),
                 ],
                 id="variant-filed-first-still-follows",
+            ),
+            pytest.param(
+                "Cherry Point!",
+                [
+                    ("The Cherry Point", "Night of the Bloody Tapes"),
+                    ("The Cherry Point,", "Black Witchery"),
+                ],
+                id="unstored-spelling-reads-the-whole-act",
             ),
         ],
     )

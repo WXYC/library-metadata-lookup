@@ -76,7 +76,9 @@ the 50-row ``db.search`` window the artist-keyed lanes used to read."""
 
 
 async def make_library_catalog(
-    tmp_path, rows: list[tuple[str, ...]], call_letters: dict[str, str] | None = None
+    tmp_path,
+    rows: list[tuple[str, ...]],
+    call_letters: dict[str | tuple[str, str], str] | None = None,
 ) -> LibraryDB:
     """A connected ``LibraryDB`` over ``rows`` of ``(artist, title)``, ids from 1.
 
@@ -85,10 +87,12 @@ async def make_library_catalog(
     which a mocked ``LibraryDB`` cannot show (LML#1406, LML#1421). A row may
     carry a third element, its ``alternate_artist_name``; when one does, the
     table gains that column and the index covers it, as the production
-    ``library.db`` built by discogs-etl does. ``call_letters`` maps an artist
-    to the letters its rows are filed under; every other row is filed under "A".
+    ``library.db`` built by discogs-etl does. ``call_letters`` maps an artist,
+    or one ``(artist, title)`` row, to the letters it is filed under; every
+    other row is filed under "A".
     """
     alternates = any(len(row) > 2 for row in rows)
+    letters = call_letters or {}
     db_file = tmp_path / "library.db"
     conn = sqlite3.connect(db_file)
     conn.execute(
@@ -109,7 +113,7 @@ async def make_library_catalog(
                 i,
                 row[1],
                 row[0],
-                (call_letters or {}).get(row[0], "A"),
+                letters.get((row[0], row[1]), letters.get(row[0], "A")),
                 *([row[2] if len(row) > 2 else None] if alternates else []),
             )
             for i, row in enumerate(rows, start=1)

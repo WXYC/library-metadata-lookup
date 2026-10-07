@@ -421,6 +421,36 @@ class TestShelfFallbackPunctuationVariants:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        ("typed", "song", "named"),
+        [
+            pytest.param("Blo", "Step Three", "Blo", id="song-row-spelling"),
+            pytest.param("BLO", "Step Three", "Blo", id="song-row-spelling-whatever-typed"),
+            pytest.param("Blo", None, "BLO", id="no-song-first-row"),
+        ],
+    )
+    async def test_case_variants_keep_naming_the_leading_rows_spelling(
+        self, tmp_path, typed, song, named
+    ):
+        """Two casings of one artist are not punctuation variants: the sentence
+        names the first listed row's spelling, as before LML#1449."""
+        db = await make_library_catalog(tmp_path, [("BLO", "Step One"), ("Blo", "Step Three")])
+        try:
+            _items, _type, context, _external, _rows = await apply_shelf_fallback(
+                _parsed(artist=typed, album="Nonexistent Album", song=song),
+                db,
+                False,
+                [],
+                "none",
+                None,
+                None,
+            )
+        finally:
+            await db.close()
+
+        assert context is not None and context.endswith(f"other albums by {named}:")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         ("typed", "expected"),
         [
             pytest.param("Mark Almond", ["The Stars We Are", "Jacques"], id="solo-records"),

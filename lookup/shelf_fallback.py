@@ -216,12 +216,14 @@ async def apply_shelf_fallback(
     if not shelf_items:
         return unchanged
 
+    # The first listed row filed as the picked artist, not a song-led variant's (LML#1449).
+    own = normalize_for_comparison(shelf[0].artist or "").strip()
+    named = next(r.artist for r in rows if normalize_for_comparison(r.artist or "").strip() == own)
     _mark_shelf_fallback_outcome(len(shelf_items))
     return (
         shelf_items,
         SEARCH_TYPE_FALLBACK,
-        # The picked spelling's first row, not a song-led variant's (LML#1449).
-        album_not_found_message(parsed, shelf[0].artist or lib_artist),
+        album_not_found_message(parsed, named or lib_artist),
         "library",
         len(shelf_items),
     )
