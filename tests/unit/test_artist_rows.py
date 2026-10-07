@@ -13,30 +13,26 @@ from lookup.artist_shelf import artist_spellings
 from tests.factories import make_library_catalog
 
 
-def _keep_titled(title):
-    def keep(rows: list[LibraryItem]) -> list[LibraryItem]:
-        return [row for row in rows if row.title == title]
+async def _rows(tmp_path, rows, artist, title):
+    """``artist_rows`` the way the album lane calls it, keeping rows titled ``title``.
 
-    return keep
+    The window is the artist+title search filtered by the same ``keep``, and the
+    compilation-shelf query is the title alone, as ``album_rows`` passes them.
+    """
 
+    def keep(found: list[LibraryItem]) -> list[LibraryItem]:
+        return [row for row in found if row.title == title]
 
-async def _rows(tmp_path, rows, artist, title, window_titles=None, shelf_query=None):
     db = await make_library_catalog(tmp_path, rows)
     try:
-        spellings = await artist_spellings(db, artist)
-        window = [
-            r
-            for r in await db.search(query=f"{artist} {title}", limit=50)
-            if window_titles is None or r.title in window_titles
-        ]
         got = await artist_rows(
             db,
-            f"{artist} {title}",
-            _keep_titled(title),
-            shelf_query or title,
-            window,
-            artist,
-            spellings,
+            query=f"{artist} {title}",
+            keep=keep,
+            shelf_query=title,
+            window=keep(await db.search(query=f"{artist} {title}", limit=50)),
+            lib_artist=artist,
+            spellings=await artist_spellings(db, artist),
         )
     finally:
         await db.close()
@@ -59,16 +55,29 @@ class TestArtistRows:
 
     @pytest.mark.asyncio
     async def test_window_answers_when_no_own_row_survives_the_filter(self, tmp_path):
-        rows = [("Sun Ra Arkestra", "Lanquidity"), ("Sun Ra", "Nuits de la Fondation Maeght")]
+        # The full-text query reaches Sun Ra's own "Lanquidity Live", and the
+        # filter rejects it: the window answers, prefix-only row included.
+        rows = [("Sun Ra Arkestra", "Lanquidity"), ("Sun Ra", "Lanquidity Live")]
 
         assert await _rows(tmp_path, rows, "Sun Ra", "Lanquidity") == [
             ("Sun Ra Arkestra", "Lanquidity")
         ]
 
     @pytest.mark.asyncio
+    async def test_an_own_row_the_window_also_credits_appears_once(self, tmp_path):
+        rows = [("Sun Ra", "Lanquidity", "Sun Ra & His Arkestra")]
+
+        assert await _rows(tmp_path, rows, "Sun Ra", "Lanquidity") == [("Sun Ra", "Lanquidity")]
+
+    @pytest.mark.asyncio
     async def test_various_artists_shelf_rows_sit_between_own_and_credited_rows(self, tmp_path):
+        # "Soundtracks - S" lacks the words "various artists", so only the
+        # title-only shelf query reaches it. The filter drops "Nuggets Vol. 2"
+        # from the shelf rows as it does from own rows.
         rows = [
             ("Various Artists - Rock - H", "Nuggets"),
+            ("Various Artists - Rock - N", "Nuggets Vol. 2"),
+            ("Soundtracks - S", "Nuggets"),
             ("Various Artists", "Nuggets"),
             ("Pebbles", "Nuggets", "Various Artists"),
         ]
@@ -76,5 +85,6 @@ class TestArtistRows:
         assert await _rows(tmp_path, rows, "Various Artists", "Nuggets") == [
             ("Various Artists", "Nuggets"),
             ("Various Artists - Rock - H", "Nuggets"),
+            ("Soundtracks - S", "Nuggets"),
             ("Pebbles", "Nuggets"),
         ]

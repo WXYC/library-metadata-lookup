@@ -87,10 +87,10 @@ async def album_rows(
     window = filter_by_album_title(await album_search(db, lib_artist, album), album, lib_artist)
     return await artist_rows(
         db,
-        f"{lib_artist} {album}",
-        lambda rows: filter_by_album_title(rows, album, lib_artist),
-        album,
-        window,
-        lib_artist,
-        spellings,
+        query=f"{lib_artist} {album}",
+        keep=lambda rows: filter_by_album_title(rows, album, lib_artist),
+        shelf_query=album,
+        window=window,
+        lib_artist=lib_artist,
+        spellings=spellings,
     )

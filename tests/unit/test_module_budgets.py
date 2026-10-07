@@ -53,7 +53,7 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/album_rows.py": 100,
     # LML#1452: the own-first row ordering, moved verbatim out of
     # `album_rows` and parameterized so LML#1445's fallbacks reuse it.
-    # Smallest multiple of 50 at or above 1.3x the 45-line measured size (58.5).
+    # Smallest multiple of 50 at or above 1.3x the 52-line measured size (67.6).
     "lookup/artist_rows.py": 100,
     # LML#1421 (#1425 decision 5): the alternate-name credit predicate the
     # album lane keeps alternate-name rows by, and LML#1444 will tag them by.
