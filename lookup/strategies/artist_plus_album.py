@@ -28,6 +28,7 @@ from core.search import (
 from library.db import LibraryDB
 from library.models import LibraryItem
 from lookup.album_rows import album_rows
+from lookup.artist_rows import artist_rows
 from lookup.artist_shelf import artist_spellings
 from lookup.fallback_title_floors import _filter_results_by_album_match
 from lookup.matching import (
@@ -173,7 +174,8 @@ async def search_library_with_fallback(
     Each album's rows come from :func:`~lookup.album_rows.album_rows`: the
     artist's own rows when they have the album, then its alternate-name rows,
     else the 50-row search window (LML#1421). The artist+song and artist-only
-    fallbacks still read the window (LML#1425).
+    fallbacks order their rows the same way through
+    :func:`~lookup.artist_rows.artist_rows` (LML#1445).
 
     Returns:
         Tuple of (library_results, song_not_found_flag)
@@ -190,8 +192,9 @@ async def search_library_with_fallback(
                 return results[:MAX_SEARCH_RESULTS], False
         return [], bool(parsed.song)
 
+    spellings = await artist_spellings(db, lib_artist) if lib_artist else []
+
     if lib_artist and albums:
-        spellings = await artist_spellings(db, lib_artist)
         album_results = await asyncio.gather(
             *(album_rows(db, lib_artist, a, spellings) for a in albums)
         )
@@ -245,24 +248,46 @@ async def search_library_with_fallback(
         )
 
     if lib_artist and parsed.song:
-        query = f"{lib_artist} {parsed.song}"
-        results = await db.search(query=query, limit=_FETCH_LIMIT)
-        results = filter_results_by_artist(results, lib_artist)
-        results = _filter_results_by_album_match(results, parsed.album)
+        song_lower = parsed.song.lower()
 
-        if results:
-            song_lower = parsed.song.lower()
-            results.sort(
-                key=lambda r: song_lower in (r.title or "").lower(),
-                reverse=True,
+        def song_first(rows: list[LibraryItem]) -> list[LibraryItem]:
+            return sorted(rows, key=lambda r: song_lower in (r.title or "").lower(), reverse=True)
+
+        query = f"{lib_artist} {parsed.song}"
+        window = await db.search(query=query, limit=_FETCH_LIMIT)
+        window = song_first(
+            _filter_results_by_album_match(
+                filter_results_by_artist(window, lib_artist), parsed.album
             )
+        )
+        results = await artist_rows(
+            db,
+            query=query,
+            keep=lambda rows: song_first(_filter_results_by_album_match(rows, parsed.album)),
+            shelf_query=parsed.song,
+            window=window,
+            lib_artist=lib_artist,
+            spellings=spellings,
+        )
+        if results:
             return results, True
 
     if not all_results and lib_artist:
         logger.info(f"No results for albums {albums}, trying artist only: '{lib_artist}'")
-        results = await db.search(query=lib_artist, limit=_FETCH_LIMIT)
-        results = filter_results_by_artist(results, lib_artist)
-        results = _filter_results_by_album_match(results, parsed.album)
+        window = await db.search(query=lib_artist, limit=_FETCH_LIMIT)
+        # shelf_query "" skips the compilation shelves: with no title to narrow
+        # them, Various Artists' would list every shelf row (LML#1445).
+        results = await artist_rows(
+            db,
+            query=lib_artist,
+            keep=lambda rows: _filter_results_by_album_match(rows, parsed.album),
+            shelf_query="",
+            window=_filter_results_by_album_match(
+                filter_results_by_artist(window, lib_artist), parsed.album
+            ),
+            lib_artist=lib_artist,
+            spellings=spellings,
+        )
         if results:
             return results, True
 
