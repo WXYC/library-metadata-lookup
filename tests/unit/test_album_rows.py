@@ -171,3 +171,31 @@ class TestVariousArtistsCompilationShelves:
             [("Goblin", "Suspiria")],
             False,
         )
+
+
+class TestPunctuationVariantSpellings:
+    """One act filed under spellings that differ only in punctuation (LML#1449):
+    the typed spelling's rows lead, the variant's follow, in either direction."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("typed", "stored", "variant"),
+        [
+            pytest.param("Alaska", "Alaska", "Alaska!", id="alaska-typed-plain"),
+            pytest.param("Alaska!", "Alaska!", "Alaska", id="alaska-typed-bang"),
+            pytest.param(
+                "The Cherry Point", "The Cherry Point", "The Cherry Point,", id="cp-plain"
+            ),
+            pytest.param(
+                "The Cherry Point,", "The Cherry Point,", "The Cherry Point", id="cp-comma"
+            ),
+        ],
+    )
+    async def test_exact_spelling_leads_its_variant(self, tmp_path, typed, stored, variant):
+        # The variant is filed first (lower id) so id order alone would lead with it.
+        rows = [(variant, "Emotions"), (stored, "Emotions")]
+
+        assert await _lane(tmp_path, rows, typed, "Emotions") == (
+            [(stored, "Emotions"), (variant, "Emotions")],
+            False,
+        )
