@@ -65,24 +65,36 @@ CROWD = 60
 the 50-row ``db.search`` window the artist-keyed lanes used to read."""
 
 
-async def make_library_catalog(tmp_path, rows: list[tuple[str, str]]) -> LibraryDB:
+async def make_library_catalog(tmp_path, rows: list[tuple[str, ...]]) -> LibraryDB:
     """A connected ``LibraryDB`` over ``rows`` of ``(artist, title)``, ids from 1.
 
     A real ``library_fts`` index built with the repo's own DDL, for tests of
     the gap between what the full-text index returns and what a lane keeps,
-    which a mocked ``LibraryDB`` cannot show (LML#1406, LML#1421).
+    which a mocked ``LibraryDB`` cannot show (LML#1406, LML#1421). A row may
+    carry a third element, its ``alternate_artist_name``; when one does, the
+    table gains that column and the index covers it, as the production
+    ``library.db`` built by discogs-etl does.
     """
+    alternates = any(len(row) > 2 for row in rows)
     db_file = tmp_path / "library.db"
     conn = sqlite3.connect(db_file)
     conn.execute(
         "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
         "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
-        "genre TEXT, format TEXT)"
+        "genre TEXT, format TEXT" + (", alternate_artist_name TEXT)" if alternates else ")")
     )
-    conn.execute(LIBRARY_FTS_CREATE_SQL)
+    conn.execute(
+        LIBRARY_FTS_CREATE_SQL.replace("title, artist,", "title, artist, alternate_artist_name,")
+        if alternates
+        else LIBRARY_FTS_CREATE_SQL
+    )
     conn.executemany(
-        "INSERT INTO library VALUES (?, ?, ?, 'A', 1, 1, 'Rock', 'LP')",
-        [(i, title, artist) for i, (artist, title) in enumerate(rows, start=1)],
+        "INSERT INTO library VALUES (?, ?, ?, 'A', 1, 1, 'Rock', 'LP'"
+        + (", ?)" if alternates else ")"),
+        [
+            (i, row[1], row[0], *([row[2] if len(row) > 2 else None] if alternates else []))
+            for i, row in enumerate(rows, start=1)
+        ],
     )
     conn.execute("INSERT INTO library_fts(library_fts) VALUES ('rebuild')")
     conn.commit()

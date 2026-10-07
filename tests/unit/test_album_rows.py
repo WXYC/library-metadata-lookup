@@ -90,3 +90,53 @@ class TestOwnRowsUnderTheSameSearch:
             [("Juana Molina", "DOGA (Deluxe Edition)")],
             False,
         )
+
+
+class TestAlternateNameRowsAfterOwnRows:
+    """LML#1425 decisions 1 and 5, applied to the album lane: while the
+    artist's own rows answer, a row filed under another artist stays only when
+    its ``alternate_artist_name`` credits the typed artist as a whole name at
+    its start, and it follows the own rows."""
+
+    MALI_MUSIC_CREDIT = "Afel Bocoum, Damon Albarn, Toumani Diabate and friends"
+
+    @pytest.mark.asyncio
+    async def test_alternate_credit_row_follows_the_own_row(self, tmp_path):
+        rows = [
+            ("Damon Albarn", "Mali Music", self.MALI_MUSIC_CREDIT),
+            ("Afel Bocoum", "Mali Music"),
+        ]
+
+        assert await _lane(tmp_path, rows, "Afel Bocoum", "Mali Music") == (
+            [("Afel Bocoum", "Mali Music"), ("Damon Albarn", "Mali Music")],
+            False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_prefix_only_row_is_dropped_while_the_artist_has_the_album(self, tmp_path):
+        """ "Sun Ra Arkestra" reaches "Sun Ra" only by the artist filter's
+        prefix match, and Sun Ra has "Lanquidity" on its own shelf."""
+        rows = [("Sun Ra Arkestra", "Lanquidity"), ("Sun Ra", "Lanquidity")]
+
+        assert await _lane(tmp_path, rows, "Sun Ra", "Lanquidity") == (
+            [("Sun Ra", "Lanquidity")],
+            False,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("artist", "credit"),
+        [
+            pytest.param("Damon Albarn", MALI_MUSIC_CREDIT, id="named-mid-list"),
+            pytest.param("Agnes", "Agnes Obel & Friends", id="prefix-of-a-longer-name"),
+        ],
+    )
+    async def test_credit_that_does_not_start_with_the_whole_name_is_dropped(
+        self, tmp_path, artist, credit
+    ):
+        rows = [("Toumani Diabate", "Mali Music", credit), (artist, "Mali Music")]
+
+        assert await _lane(tmp_path, rows, artist, "Mali Music") == (
+            [(artist, "Mali Music")],
+            False,
+        )
