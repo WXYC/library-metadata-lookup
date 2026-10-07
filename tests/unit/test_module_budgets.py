@@ -51,6 +51,10 @@ MODULE_BUDGETS: dict[str, int] = {
     # guard in that module reads the same rows. 62 lines measured; 1.3x = 80.6
     # -> 100.
     "lookup/album_rows.py": 100,
+    # LML#1452: the own-first row ordering, moved verbatim out of
+    # `album_rows` and parameterized so LML#1445's fallbacks reuse it.
+    # Smallest multiple of 50 at or above 1.3x the 45-line measured size (58.5).
+    "lookup/artist_rows.py": 100,
     # LML#1421 (#1425 decision 5): the alternate-name credit predicate the
     # album lane keeps alternate-name rows by, and LML#1444 will tag them by.
     # Its own module so both share one definition. 36 lines measured; 1.3x =
