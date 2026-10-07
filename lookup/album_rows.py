@@ -25,9 +25,7 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
-from lookup.alternate_credit import credits_artist
-from lookup.artist_shelf import search_own
-from lookup.compilation_shelves import shelf_rows
+from lookup.artist_rows import artist_rows
 from lookup.matching import _FETCH_LIMIT, filter_results_by_artist, is_self_titled
 from lookup.name_folding import fold_punctuation_for_comparison
 
@@ -87,14 +85,12 @@ async def album_rows(
     ``lib_artist``, read once per request by the caller.
     """
     window = filter_by_album_title(await album_search(db, lib_artist, album), album, lib_artist)
-    if spellings:
-        own = await search_own(db, f"{lib_artist} {album}", spellings)
-        own += await shelf_rows(db, album, spellings)
-        if kept := filter_by_album_title(own, album, lib_artist):
-            ids = {row.id for row in kept}
-            return kept + [
-                row
-                for row in window
-                if row.id not in ids and credits_artist(row.alternate_artist_name, lib_artist)
-            ]
-    return window
+    return await artist_rows(
+        db,
+        f"{lib_artist} {album}",
+        lambda rows: filter_by_album_title(rows, album, lib_artist),
+        album,
+        window,
+        lib_artist,
+        spellings,
+    )
