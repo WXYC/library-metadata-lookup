@@ -26,8 +26,13 @@ from lookup.orchestrator import perform_lookup
 from lookup.shelf_fallback import apply_shelf_fallback
 from services.parser import MessageType, ParsedRequest
 from tests.conftest import make_lml_telemetry
-from tests.factories import make_discogs_result, make_library_item, shelve
-from tests.unit.test_artist_shelf import _catalog, _crowd
+from tests.factories import (
+    crowd_rows,
+    make_discogs_result,
+    make_library_catalog,
+    make_library_item,
+    shelve,
+)
 
 PLACEHOLDERS = ["Epon.", "epon", "eponymous", "S/T", "s.t.", "self-titled", "self titled"]
 
@@ -292,7 +297,7 @@ class TestCompanionOverARealIndex:
     @staticmethod
     async def _companions(tmp_path, typed_artist, rows, album="S/T"):
         """``(artist, title)`` of the rows appended behind one already-served row."""
-        db = await _catalog(tmp_path, rows)
+        db = await make_library_catalog(tmp_path, rows)
         try:
             served = (await db.rows_by_artist([rows[-1][0]]))[-1]
             existing = [_bound(served)]
@@ -306,7 +311,7 @@ class TestCompanionOverARealIndex:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("artist", ["Can", "Women", "Spirit", "The Band"])
     async def test_artist_behind_a_full_search_window(self, tmp_path, artist):
-        rows = [*_crowd(artist), (artist, artist), (artist, "Second Album")]
+        rows = [*crowd_rows(artist), (artist, artist), (artist, "Second Album")]
 
         assert await self._companions(tmp_path, artist, rows) == [(artist, artist)]
 
@@ -356,7 +361,7 @@ class TestCompanionOverARealIndex:
     ):
         """The guard reads the whole shelf too: the literal record no longer
         has to be among the first 50 search hits to be seen."""
-        rows = [*_crowd("Can"), ("Can", literal_title), ("Can", "Can"), ("Can", "Ege Bamyasi")]
+        rows = [*crowd_rows("Can"), ("Can", literal_title), ("Can", "Can"), ("Can", "Ege Bamyasi")]
 
         assert await self._companions(tmp_path, "Can", rows, album=typed) == []
 

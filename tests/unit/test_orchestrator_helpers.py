@@ -55,8 +55,12 @@ from lookup.validation import (
     find_library_albums_with_cached_track,
 )
 from services.parser import MessageType, ParsedRequest
-from tests.factories import make_discogs_result, make_library_item
-from tests.unit.test_artist_shelf import _catalog, _crowd
+from tests.factories import (
+    crowd_rows,
+    make_discogs_result,
+    make_library_catalog,
+    make_library_item,
+)
 
 # ---------------------------------------------------------------------------
 # Tests: filter_results_by_artist
@@ -1966,7 +1970,7 @@ class TestTypedAlbumEqualToArtistOverARealIndex:
     @staticmethod
     async def _lookup(tmp_path, rows, artist, discogs_album, song="Song"):
         """``(step-2 awaits, (artist, title) of the album lane's rows)``."""
-        db = await _catalog(tmp_path, rows)
+        db = await make_library_catalog(tmp_path, rows)
         parsed = ParsedRequest(
             song=song,
             artist=artist,
@@ -2005,7 +2009,7 @@ class TestTypedAlbumEqualToArtistOverARealIndex:
         """A common-word name's own rows sit outside the window. The guard reads
         the rows the album lane keeps, which come from the artist's own shelf
         (LML#1421), so it sees the record."""
-        rows = [*_crowd("Spirit"), ("Spirit", "Spirit"), ("Spirit", "Second Album")]
+        rows = [*crowd_rows("Spirit"), ("Spirit", "Spirit"), ("Spirit", "Second Album")]
 
         assert await self._lookup(tmp_path, rows, "Spirit", "Second Album") == (
             0,

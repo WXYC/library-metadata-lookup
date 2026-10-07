@@ -6,47 +6,11 @@ what the full-text index returns and what the lane keeps, which a mock cannot
 show.
 """
 
-import sqlite3
-
 import pytest
 
-from library.db import LIBRARY_FTS_CREATE_SQL, LibraryDB
 from lookup.artist_shelf import rows_for_artist
 from lookup.matching import _FETCH_LIMIT
-
-CROWD = 60
-"""Rows by other artists sharing a word with the artist under test. More than
-the 50-row ``db.search`` window the shelf lane used to read."""
-
-
-async def _catalog(tmp_path, rows: list[tuple[str, str]]) -> LibraryDB:
-    """A connected ``LibraryDB`` over ``rows`` of ``(artist, title)``, ids from 1."""
-    db_file = tmp_path / "library.db"
-    conn = sqlite3.connect(db_file)
-    conn.execute(
-        "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
-        "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
-        "genre TEXT, format TEXT)"
-    )
-    conn.execute(LIBRARY_FTS_CREATE_SQL)
-    conn.executemany(
-        "INSERT INTO library VALUES (?, ?, ?, 'A', 1, 1, 'Rock', 'LP')",
-        [(i, title, artist) for i, (artist, title) in enumerate(rows, start=1)],
-    )
-    conn.execute("INSERT INTO library_fts(library_fts) VALUES ('rebuild')")
-    conn.commit()
-    conn.close()
-    db = LibraryDB(db_path=db_file)
-    await db.connect()
-    return db
-
-
-def _crowd(word: str) -> list[tuple[str, str]]:
-    """``CROWD`` rows that match ``word`` in full-text search and are not by it."""
-    half = CROWD // 2
-    return [(f"{word} Ensemble {i}", f"Volume {i}") for i in range(half)] + [
-        (f"Orchestra {i}", f"{word} Suite {i}") for i in range(CROWD - half)
-    ]
+from tests.factories import crowd_rows, make_library_catalog
 
 
 class TestCrowdedOutArtists:
@@ -56,9 +20,9 @@ class TestCrowdedOutArtists:
         """The artist's rows sit after 60 rows that share its name's words.
         The 50-row window holds none of them; the artist-keyed read holds all,
         and nothing else."""
-        db = await _catalog(
+        db = await make_library_catalog(
             tmp_path,
-            [*_crowd(artist), (artist, "First Album"), (artist, "Second Album")],
+            [*crowd_rows(artist), (artist, "First Album"), (artist, "Second Album")],
         )
         try:
             window = await db.search(query=artist, limit=_FETCH_LIMIT)
@@ -114,7 +78,7 @@ class TestThisArtistOnly:
         ],
     )
     async def test_exact_rung(self, tmp_path, typed, catalog, expected):
-        db = await _catalog(tmp_path, catalog)
+        db = await make_library_catalog(tmp_path, catalog)
         try:
             rows = await rows_for_artist(db, typed)
         finally:
@@ -198,7 +162,7 @@ class TestTolerantRungs:
         ],
     )
     async def test_variant_spellings(self, tmp_path, typed, catalog, expected):
-        db = await _catalog(tmp_path, catalog)
+        db = await make_library_catalog(tmp_path, catalog)
         try:
             rows = await rows_for_artist(db, typed)
         finally:
@@ -210,7 +174,7 @@ class TestTolerantRungs:
     async def test_tolerant_rung_keeps_case_variants_of_one_artist(self, tmp_path):
         """Two stored casings are one artist under the exact rung, so a
         tolerant rung matching both is not ambiguous."""
-        db = await _catalog(
+        db = await make_library_catalog(
             tmp_path, [("The Clientele", "Suburban Light"), ("THE CLIENTELE", "Strange Geometry")]
         )
         try:
@@ -225,7 +189,7 @@ class TestTolerantRungs:
         """No window on the rows either, and two stored casings interleave by
         id rather than grouping by spelling."""
         catalog = [("Stereolab" if i % 2 else "STEREOLAB", f"Album {i}") for i in range(1, 61)]
-        db = await _catalog(tmp_path, catalog)
+        db = await make_library_catalog(tmp_path, catalog)
         try:
             rows = await rows_for_artist(db, "Stereolab")
         finally:

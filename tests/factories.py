@@ -1,9 +1,11 @@
 """Shared test factories for model construction."""
 
+import sqlite3
 from unittest.mock import AsyncMock
 
 from discogs.models import DiscogsSearchResult
 from generated.api_models import DiscogsMatchResult, LibraryCatalogItem
+from library.db import LIBRARY_FTS_CREATE_SQL, LibraryDB
 from library.models import LibraryItem
 from lookup.release_resolution import ResolvedRelease
 from services.parser import MessageType, ParsedRequest
@@ -50,6 +52,46 @@ def shelve(db, rows):
     db.artist_names_matching = AsyncMock(side_effect=artist_names_matching)
     db.rows_by_artist = AsyncMock(side_effect=rows_by_artist)
     return db
+
+
+CROWD = 60
+"""Rows by other artists sharing a word with the artist under test. More than
+the 50-row ``db.search`` window the artist-keyed lanes used to read."""
+
+
+async def make_library_catalog(tmp_path, rows: list[tuple[str, str]]) -> LibraryDB:
+    """A connected ``LibraryDB`` over ``rows`` of ``(artist, title)``, ids from 1.
+
+    A real ``library_fts`` index built with the repo's own DDL, for tests of
+    the gap between what the full-text index returns and what a lane keeps,
+    which a mocked ``LibraryDB`` cannot show (LML#1406, LML#1421).
+    """
+    db_file = tmp_path / "library.db"
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+        "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+        "genre TEXT, format TEXT)"
+    )
+    conn.execute(LIBRARY_FTS_CREATE_SQL)
+    conn.executemany(
+        "INSERT INTO library VALUES (?, ?, ?, 'A', 1, 1, 'Rock', 'LP')",
+        [(i, title, artist) for i, (artist, title) in enumerate(rows, start=1)],
+    )
+    conn.execute("INSERT INTO library_fts(library_fts) VALUES ('rebuild')")
+    conn.commit()
+    conn.close()
+    db = LibraryDB(db_path=db_file)
+    await db.connect()
+    return db
+
+
+def crowd_rows(word: str) -> list[tuple[str, str]]:
+    """``CROWD`` rows that match ``word`` in full-text search and are not by it."""
+    half = CROWD // 2
+    return [(f"{word} Ensemble {i}", f"Volume {i}") for i in range(half)] + [
+        (f"Orchestra {i}", f"{word} Suite {i}") for i in range(CROWD - half)
+    ]
 
 
 def make_discogs_result(release_id=123, **kwargs):
