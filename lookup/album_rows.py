@@ -1,28 +1,30 @@
 """The library rows the artist+album lane keeps for one album.
 
-``search_library_with_fallback`` (``lookup/strategies/artist_plus_album.py``)
-asks :func:`album_rows` once per album, and step 2's guard in the same module,
-``runs_album_resolution``, asks it for the typed album, so the two never
-disagree about which rows the lane has.
+``search_library_with_fallback`` and step 2's guard ``runs_album_resolution``
+(both in ``lookup/strategies/artist_plus_album.py``) ask :func:`album_rows`,
+so the two never disagree about which rows the lane has.
 
 The lane used to read only :func:`album_search`: the first 50 hits of an
 artist+album full-text search, narrowed to rows whose artist starts with the
 typed name. For a common-word name other artists fill those 50 rows first, so
-God / "God" answered with God Rifle's record and Heads / "Heads" with Heads
-Up's (LML#1421). :func:`album_rows` first runs the same full-text match with
-no window, restricted to rows filed under the artist's own stored spellings
-(``lookup/artist_shelf.py::artist_spellings``, via ``LibraryDB.search_among``),
-so it adds no row that an unlimited search would not have returned, and
-therefore no artwork lookup.
-When none of the artist's own rows passes the title filter, the window answers
-as before, so a typed "Sun Ra" still reaches "Sun Ra Arkestra", and an
-alternate or cross-referenced name still reaches its rows.
+God / "God" answered with God Rifle's record (LML#1421). :func:`album_rows`
+first runs the same match with no window, restricted to the artist's own
+stored spellings (``lookup/artist_shelf.py::artist_spellings``, via
+``LibraryDB.search_among``), so it adds no row an unlimited search would not
+return, and therefore no artwork lookup. When own rows pass the title filter,
+they lead, followed by the window's rows filed under another artist whose
+``alternate_artist_name`` credits the typed one
+(``lookup/alternate_credit.py``); rows the window admitted only by an
+artist-name prefix ("Sun Ra Arkestra" for "Sun Ra") drop, per LML#1425
+decisions 1 and 5. Otherwise the window answers as before, prefix matches
+and alternate or cross-referenced names included.
 """
 
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
+from lookup.alternate_credit import credits_artist
 from lookup.matching import _FETCH_LIMIT, filter_results_by_artist, is_self_titled
 from lookup.name_folding import fold_punctuation_for_comparison
 
@@ -76,14 +78,20 @@ def filter_by_album_title(
 async def album_rows(
     db: LibraryDB, lib_artist: str, album: str, spellings: list[str]
 ) -> list[LibraryItem]:
-    """The rows the lane keeps for ``album``: the artist's own rows that the
-    search matches and the title filter accepts, else the window's.
+    """The rows the lane keeps for ``album``; see the module docstring.
 
     ``spellings`` is :func:`~lookup.artist_shelf.artist_spellings` for
-    ``lib_artist``, read once per request by the caller. See the module docstring.
+    ``lib_artist``, read once per request by the caller.
     """
+    window = filter_by_album_title(await album_search(db, lib_artist, album), album, lib_artist)
     if spellings:
         own = await db.search_among(f"{lib_artist} {album}", spellings)
         if kept := filter_by_album_title(own, album, lib_artist):
-            return kept
-    return filter_by_album_title(await album_search(db, lib_artist, album), album, lib_artist)
+            # Filed under another artist, so never a duplicate of an own row.
+            return kept + [
+                row
+                for row in window
+                if row.artist not in spellings
+                and credits_artist(row.alternate_artist_name, lib_artist)
+            ]
+    return window
