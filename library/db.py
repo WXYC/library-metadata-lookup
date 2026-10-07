@@ -1040,6 +1040,25 @@ class LibraryDB:
         )
         return [LibraryItem(**dict(row)) for row in await cursor.fetchall()]
 
+    async def titles_by_artist(self, artists: list[str]) -> list[str]:
+        """Return the ``title`` of every row whose ``artist`` is literally one of
+        ``artists``, in id order.
+
+        :meth:`rows_by_artist` without the rows, for a caller that only reads
+        titles (``runs_album_resolution``'s placeholder guard, LML#1421): an
+        artist with thousands of rows costs no ``LibraryItem`` per row.
+        """
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        if not artists:
+            return []
+        cursor = await self._conn.execute(
+            f"SELECT title FROM library WHERE artist IN ({', '.join('?' for _ in artists)}) "
+            "ORDER BY id",
+            artists,
+        )
+        return [row[0] or "" for row in await cursor.fetchall()]
+
     async def search_among(self, query: str, artists: list[str]) -> list[LibraryItem]:
         """Return the rows filed under ``artists`` that the FTS ``query`` matches, in id order.
 
