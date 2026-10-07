@@ -21,7 +21,8 @@ if TYPE_CHECKING:
 def build_result_items(
     state: LookupState,
     identities_by_artist: dict[str, ReconciledIdentity],
-    artist: str | None = None,
+    *,
+    artist: str | None,
 ) -> list[LookupResultItem]:
     """Build the response items (convert internal models to API contract models).
 

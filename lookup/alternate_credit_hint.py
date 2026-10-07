@@ -4,7 +4,9 @@ A row filed under another artist is in the response because its
 ``alternate_artist_name`` credits the typed artist (LML#1425 decision 5, the
 artist+album lane's :func:`~lookup.alternate_credit.credits_artist`). The label
 carries the stored credit line verbatim and is computed from the row and the
-typed artist alone, so every lane that returns such a row labels it.
+typed artist alone, so ``build_result_items`` labels such a row (with a
+library id) whichever lane found it. Rows the location union folds in
+afterwards (``lookup/location_union.py``) are not labelled.
 """
 
 from generated.api_models import ArtistMatchHint, ArtistSearchAliasSource
@@ -18,14 +20,15 @@ def alternate_credit_hint(item: LibraryItem, artist: str | None) -> list[ArtistM
     """The one-hint list when ``item`` is not filed under ``artist`` but credits it, else None.
 
     "Filed under" is the equality ``lookup/artist_shelf.py`` uses to pick an
-    artist's own rows: exact, article-stripped, punctuation-folded, or both.
+    artist's own rows: exact, article-stripped, punctuation-folded, or both. A
+    rung key that comes out empty matches nothing there, as in ``artist_shelf``.
     """
     credit = item.alternate_artist_name
     if not artist or not credit or not credits_artist(credit, artist):
         return None
     filed = normalize_for_comparison(item.artist or "").strip()
     want = normalize_for_comparison(artist).strip()
-    if any(rung(filed) == rung(want) for rung in _RUNGS):
+    if any(rung(want) and rung(filed) == rung(want) for rung in _RUNGS):
         return None
     return [
         ArtistMatchHint(matched_variant=credit, source=ArtistSearchAliasSource.wxyc_library_alt)
