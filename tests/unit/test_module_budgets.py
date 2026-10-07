@@ -51,6 +51,11 @@ MODULE_BUDGETS: dict[str, int] = {
     # guard in that module reads the same rows. 62 lines measured; 1.3x = 80.6
     # -> 100.
     "lookup/album_rows.py": 100,
+    # LML#1421 (#1425 decision 5): the alternate-name credit predicate the
+    # album lane keeps alternate-name rows by, and LML#1444 will tag them by.
+    # Its own module so both share one definition. 36 lines measured; 1.3x =
+    # 46.8 -> 50.
+    "lookup/alternate_credit.py": 50,
     "lookup/artist_resolution.py": 550,
     # LML#1281: raised 500 -> 550 for the cascade-boundary breaker guard. The
     # growth is structural, not prose: `_resolve_fallback_artwork` now wraps
