@@ -144,7 +144,7 @@ async def rows_for_artist(db: LibraryDB, artist: str) -> list[LibraryItem]:
     punctuation variants' rows in id order.
 
     Empty when the artist is not shelved, or when only a tolerant rung matches
-    and it matches more than one artist. See the module docstring.
+    and it matches more than one act. See the module docstring.
     """
     spellings = await artist_spellings(db, artist)
     return _own_rows_first(await db.rows_by_artist(spellings), spellings)
