@@ -1001,9 +1001,9 @@ class AddAlbumRequest(AlbumCreateFields):
 
     artist_name: str | None = None
     artist_id: int | None = None
-    from_rotation_id: int | None = Field(
+    from_rotation_id: conint(ge=1, le=2147483647) | None = Field(
         None,
-        description="The id of a rotation row with no library link, added on or before the cutover date (or moved from one that was). This request creates the release for that row and links it in the same transaction, so the import is one request rather than `POST /library` then `PATCH /library/rotation/{rotation_id}/link`, and cannot be replayed to mint more library rows. Omit it for an ordinary add. A row that is linked or not legacy is a 409 `rotation_not_eligible`; a killed row is importable, since killed rows are most of the import queue. Declared ahead of the Backend-Service implementation (WXYC/Backend-Service#2810): the deployed backend silently drops this key and answers 201 without linking the row, so a client must not rely on the link, or drop its `PATCH /library/rotation/{rotation_id}/link` request, until that lands.\n",
+        description="The id of a rotation row with no library link, added on or before the cutover date (or moved from one that was). This request creates the release for that row and links it in the same transaction, plays included, so the import is one request rather than `POST /library` then `PATCH /library/rotation/{rotation_id}/link`, and cannot be replayed to mint more library rows. Omit it for an ordinary add; null means omitted. A row that is linked, not legacy, missing (no such row) or moved to another bin is a 409 `rotation_not_eligible`; a killed row is importable, since killed rows are most of the import queue. A moved record's chain is one record: only its newest row is importable.\n",
     )
 
 
@@ -1199,9 +1199,9 @@ class AddRotationTypedTextRequest(RotationCreateFields):
     )
     format_id: int | None = None
     label_id: int | None = None
-    moved_from_rotation_id: int | None = Field(
+    moved_from_rotation_id: conint(ge=1, le=2147483647) | None = Field(
         None,
-        description="The unlinked rotation row this one replaces in a cross-bin move; Backend-Service kills it in the same transaction. The source must be an active typed-text row (`kill_date` null or in the future) added on or before the cutover date, or moved from one; otherwise the request is a 409 `rotation_not_eligible`. Declared ahead of the Backend-Service implementation (WXYC/Backend-Service#2810): the deployed backend silently drops this key, so the new row is added and the source row is left active in its old bin. A client must not rely on the kill until that lands.\n",
+        description="The unlinked rotation row this one replaces in a cross-bin move; Backend-Service kills it in the same transaction. The source must be an active typed-text row (`kill_date` null or in the future) added on or before the cutover date, or moved from one; otherwise the request is a 409 `rotation_not_eligible`. Null means omitted.\n",
     )
 
 
@@ -1292,7 +1292,7 @@ class LibraryFilingConflictReason(StrEnum):
 
 class LibraryAddConflictReason(StrEnum):
     """
-    Discriminator for the `POST /library` 409. `review_required` fires after the cutover date for any insert not made through `POST /intake/{id}/file`, except a `POST /library` whose `from_rotation_id` names an eligible legacy row, which is accepted after the cutover date. Both values are declared ahead of the Backend-Service implementation (WXYC/Backend-Service#2791's review gate and WXYC/Backend-Service#2810). `rotation_not_eligible` fires when `from_rotation_id` names a row that is linked or not legacy — neither added on or before the cutover date nor moved from a row that was. A killed row is importable.
+    Discriminator for the `POST /library` 409. `review_required` fires after the cutover date for any insert not made through `POST /intake/{id}/file`, except a `POST /library` whose `from_rotation_id` names an eligible legacy row, which is accepted after the cutover date. `rotation_not_eligible` fires when `from_rotation_id` names a row that is linked, not legacy (neither added on or before the cutover date nor moved from a row that was), missing (no such row), or moved to another bin: only the newest row of a moved record's chain is importable. A killed row is importable.
 
     """
 
@@ -1311,7 +1311,7 @@ class LibraryAddConflictError(BaseModel):
 
 class RotationConflictReason(StrEnum):
     """
-    Discriminator for the 409s on `POST /library/rotation` and `DELETE /library/rotation/cards/{id}`, pairing with `RotationConflictError` the way `ShowAlreadyOpenErrorCode` pairs with `ShowAlreadyOpenError`. `rotation_card_bin_mismatch` is the single source of truth for the identically-named value `LibraryFilingConflictReason` carries for the composite's rotation arm — see that schema's description. `card_not_highest_in_bin` and `card_has_active_rotations` distinguish the card-delete guard's conjunctive halves: a sibling card with a higher `number` vs. an active rotation row still assigned to this card. The three card values shipped with WXYC/Backend-Service#2472 (delivered by WXYC/Backend-Service#2482, merged 2026-09-14), which `POST /library/rotation` and `DELETE /library/rotation/cards/{id}` now raise. `review_required` and `rotation_not_eligible` are raised only by `POST /library/rotation`, never by the card delete, and are declared ahead of the Backend-Service implementation (WXYC/Backend-Service#2791's review gate and WXYC/Backend-Service#2810). `review_required` fires after the cutover date for any insert not made through `POST /intake/{id}/file`, except re-rotating a release already in the library and a typed-text add whose `moved_from_rotation_id` names an eligible legacy row, which is accepted after the cutover date. `rotation_not_eligible` fires on a move whose `moved_from_rotation_id` row is linked, killed, or not legacy — neither added on or before the cutover date nor moved from a row that was. A killed row is not an eligible move source.
+    Discriminator for the 409s on `POST /library/rotation` and `DELETE /library/rotation/cards/{id}`, pairing with `RotationConflictError` the way `ShowAlreadyOpenErrorCode` pairs with `ShowAlreadyOpenError`. `rotation_card_bin_mismatch` is the single source of truth for the identically-named value `LibraryFilingConflictReason` carries for the composite's rotation arm — see that schema's description. `card_not_highest_in_bin` and `card_has_active_rotations` distinguish the card-delete guard's conjunctive halves: a sibling card with a higher `number` vs. an active rotation row still assigned to this card. The three card values shipped with WXYC/Backend-Service#2472 (delivered by WXYC/Backend-Service#2482, merged 2026-09-14), which `POST /library/rotation` and `DELETE /library/rotation/cards/{id}` now raise. `review_required` and `rotation_not_eligible` are raised only by `POST /library/rotation`, never by the card delete (WXYC/Backend-Service#2791's review gate and WXYC/Backend-Service#2810). `review_required` fires after the cutover date for any insert not made through `POST /intake/{id}/file`, except re-rotating a release already in the library and a typed-text add whose `moved_from_rotation_id` names an eligible legacy row, which is accepted after the cutover date. `rotation_not_eligible` fires on a move whose `moved_from_rotation_id` row is linked, killed, or not legacy — neither added on or before the cutover date nor moved from a row that was. A killed row is not an eligible move source.
 
     """
 
@@ -1435,6 +1435,14 @@ class IntakeItem(BaseModel):
 class IntakeAcceptReviewRequest(BaseModel):
     """
     Body for `POST /intake/{id}/accept-review`.
+    """
+
+    review_id: conint(ge=1, le=2147483647)
+
+
+class LibraryPrintRequest(BaseModel):
+    """
+    Body for `POST /library/{id}/print`.
     """
 
     review_id: conint(ge=1, le=2147483647)
@@ -1601,7 +1609,7 @@ class Review(BaseModel):
     last_modified: AwareDatetime
     in_use: bool = Field(
         ...,
-        description="Computed. `true` when this review is the accepted review of an intake item, or is the review in the latest print-log entry of a copy or of a library release. An author cannot delete a review that is in use (`ReviewConflictReason` `in_use`), but may still edit it.\n",
+        description="Computed. `true` when this review is the accepted review of an intake item, or is the review in the latest print-log entry of a copy or of a library release (`POST /library/{id}/print`). An author cannot delete a review that is in use (`ReviewConflictReason` `in_use`), but may still edit it.\n",
     )
     on_cover: bool = Field(
         ...,
@@ -1875,7 +1883,7 @@ class ArtistSearchResponse(BaseModel):
 
 class ArtistCard(BaseModel):
     """
-    The classic-librarian artist-card field set (`artist_id`, not `id` — a different shape from `Artist`, the raw `POST /library/artists` insert row above). Not returned directly by either artist-card endpoint: both `GET /library/artists/{id}` and its `PATCH` 200 answer `ArtistCardWithDependentCounts`, which embeds this shape via `allOf`.
+    The classic-librarian artist-card field set (`artist_id`, not `id` — a different shape from `Artist`, the raw `POST /library/artists` insert row above). Not returned bare by the artist-card endpoints: both `GET /library/artists/{id}` and its `PATCH` 200 answer `ArtistCardWithDependentCounts`, and `POST /library/artists/{id}/refile` answers `ArtistRefileResult`; each embeds this shape via `allOf`.
 
     """
 
@@ -1921,7 +1929,7 @@ class ArtistCardWithDependentCounts(ArtistCard):
 
 class UpdateArtistRequest(BaseModel):
     """
-    Partial-update payload for `PATCH /library/artists/{id}` (WXYC/Backend-Service#2156, `artist_name` restored by BS#2563). Two writable fields, either or both; a body with neither is a 400. `genre_id`, `code_letters`, and `code_artist_number` are real fields on the `/wxycdb` artist-card form but have no write path on this endpoint — sending one is a 400 naming why, not silently dropped. Do not confuse this `artist_name` with `UpdateAlbumRequest`'s absent one: this endpoint renames the artist row directly; the album PATCH never accepts `artist_name` at all, on any artist.
+    Partial-update payload for `PATCH /library/artists/{id}` (WXYC/Backend-Service#2156, `artist_name` restored by BS#2563). Two writable fields, either or both; a body with neither is a 400. `genre_id`, `code_letters`, and `code_artist_number` are real fields on the `/wxycdb` artist-card form but are not writable on this endpoint — sending one is a 400 naming why, not silently dropped. `code_artist_number`, `code_letters` and `genre_id` are all changed with `POST /library/artists/{id}/refile`. Do not confuse this `artist_name` with `UpdateAlbumRequest`'s absent one: this endpoint renames the artist row directly; the album PATCH never accepts `artist_name` at all, on any artist.
 
     """
 
@@ -1962,6 +1970,106 @@ class ArtistNameConflictError(BaseModel):
         ...,
         description="The conflicting artist, so a client can offer merging into it rather than reporting a bare failure.\n",
     )
+
+
+class RefileArtistRequest(BaseModel):
+    """
+    Body of `POST /library/artists/{id}/refile` (WXYC/Backend-Service#2643). Changes where one artist is filed, in any combination of three ways: the call number (`code_artist_number`), the call letters (`code_letters`) and the genre (`to_genre_id`). `genre_id` always names the membership being re-filed, as it stands before the request. Any other key is a 400 naming it. Call letters are artist-global, so a letters change on an artist with more than one genre membership is refused (409 `letters_shared_across_genres`) rather than re-lettering the other shelves too. A genre move carries the membership and every release filed under it into `to_genre_id`.
+
+    **What counts as a change.** Letters change when `code_letters` is present and its normalized form (trimmed, upper-cased) differs from the normalized stored `code_letters`. Sending the stored value back, in any case or spacing, is never a change, so a client that pre-fills the field from the card cannot turn a number-only edit into a re-letter; omitting the field also keeps the letters. A real change writes the normalized value, and occupancy is checked against artists whose stored `code_letters` equal the destination letters exactly (every stored value is already trimmed and upper-case; WXYC/Backend-Service#2199 tracks the create paths that could store another). The genre changes when `to_genre_id` is present and differs from `genre_id`; a `to_genre_id` equal to `genre_id` is treated as absent before any check. The number changes when `code_artist_number` differs from the stored number. A request that changes none of the three is a no-op 200 (`changed: false`). `letters_shared_across_genres` fires only on a letters change, and only when the artist has another genre membership or any release filed in a genre other than `genre_id` (letters are artist-global, so those releases would be re-lettered too, outside `releases_to_relabel`).
+
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    genre_id: conint(ge=1, le=2147483647) = Field(
+        ...,
+        description="The genre membership to re-file. Required: an artist id alone does not identify a membership.\n",
+    )
+    code_artist_number: conint(ge=0, le=2147483647) = Field(
+        ...,
+        description="The artist call number the membership should have. Within the same genre it is the new number in that shelf; on a genre move it is the number in the destination shelf.\n",
+    )
+    code_letters: str | None = Field(
+        None,
+        description='Optional. The new call letters: 1 to 4 characters from A-Z, a-z, 0-9 and `/`, after trimming surrounding whitespace (the set `GET /library/artists/by-code` accepts). The server trims and upper-cases it. Not constrained by a schema pattern; the server validates. `V/A` (after trimming and upper-casing) is a 400, before any lock. Omit it to keep the current letters; sending the stored value back is not a change (see "What counts as a change" on `RefileArtistRequest`). Letters are artist-global: a change on an artist with another genre membership, or any release in another genre, is refused (409 `letters_shared_across_genres`).\n',
+    )
+    to_genre_id: conint(ge=1, le=2147483647) | None = Field(
+        None,
+        description="Optional. The destination genre. Absent or equal to `genre_id` means the artist stays in that genre; an equal value is treated as absent before any check, so the `genre_not_found` check does not apply to it. An unknown id is a 404 `genre_not_found`; a different genre in which the artist already has a membership or any release is refused (409 `already_filed_in_genre`).\n",
+    )
+
+
+class ArtistRefileResult(ArtistCard):
+    """
+    The 200 of `POST /library/artists/{id}/refile`: the re-filed membership as an `ArtistCard` (the destination membership, after any genre move), plus what changed. The full shelf code (for example `Hiphop IS 31`) is composed client-side from the card's `genre_id`, `code_letters` and `code_artist_number`.
+
+    """
+
+    changed: bool = Field(
+        ...,
+        description='`false` when the letters, the genre and the number all were unchanged, by the rule in `RefileArtistRequest` ("What counts as a change"); nothing was written.\n',
+    )
+    previous_code_artist_number: int = Field(
+        ..., description="The artist number before this request."
+    )
+    previous_code_letters: str | None = Field(
+        None,
+        description="Optional: a server that predates WXYC/Backend-Service#3035 omits it. The call letters before this request. Equals the card's `code_letters` when the letters did not change.\n",
+    )
+    previous_genre_id: int | None = Field(
+        None,
+        description="Optional: a server that predates WXYC/Backend-Service#3035 omits it. The genre before this request. Equals the card's `genre_id` when the artist did not move. The card is the destination membership, so after a genre move its `genre_id` is `to_genre_id`.\n",
+    )
+    releases_to_relabel: int = Field(
+        ...,
+        description="How many releases are filed under the destination (artist, genre) membership, counted after the writes. Every one re-labels in the database at once, so this is the count of physical records whose shelf labels now need replacing. Also present when `changed` is `false`, where nothing re-labelled and the count is informational; the `previous_*` fields that are present then equal the card's values.\n",
+    )
+
+
+class ArtistRefileConflictReason(StrEnum):
+    """
+    Discriminator for the `POST /library/artists/{id}/refile` 409. `artist_code_conflict` is the exact string `LibraryFilingConflictReason` and the `POST /library/artists` controller carry for the same class of refusal, so a client's existing conflict handling recognizes it. `lettered_compilation_section` means the membership is a lettered compilation section, whose artist number is fixed at 0. `various_artists_section` means the source membership is a Various Artists bucket, identified structurally and never by the artist's name: its `code_letters` (trimmed, case-insensitive) is `V/A`, or (trimmed, case-sensitive) starts with `Z-`, the legacy spelling, matching dj-site's `isVariousArtists`. Every compilation filed in that bucket shares its number, so re-numbering it would move all of them. A lettered Rock/Soundtracks section is still `lettered_compilation_section`; that check comes first. `letters_shared_across_genres` means the request changes `code_letters` on an artist with another genre membership or any release filed in a genre other than `genre_id`, and letters are artist-global, so the change would re-letter that shelf or those releases too; the 409 lists every membership in `memberships`. A letters change is defined in `RefileArtistRequest` ("What counts as a change"). `already_filed_in_genre` means the artist already has a membership, or any release, in `to_genre_id`, a genre different from `genre_id`; it is also the answer when a concurrent insert of that membership lands after the check, at the write step.
+
+    """
+
+    artist_code_conflict = "artist_code_conflict"
+    lettered_compilation_section = "lettered_compilation_section"
+    various_artists_section = "various_artists_section"
+    letters_shared_across_genres = "letters_shared_across_genres"
+    already_filed_in_genre = "already_filed_in_genre"
+
+
+class ArtistRefileNotFoundCode(StrEnum):
+    """
+    Discriminator for the `POST /library/artists/{id}/refile` 404. `artist_not_found` means no such artist. `artist_not_filed_in_genre` means the artist exists but has no membership in the requested `genre_id`. `genre_not_found` means `to_genre_id` names no genre.
+
+    """
+
+    artist_not_found = "artist_not_found"
+    artist_not_filed_in_genre = "artist_not_filed_in_genre"
+    genre_not_found = "genre_not_found"
+
+
+class ArtistRefileNotFoundError(BaseModel):
+    """
+    The `POST /library/artists/{id}/refile` 404 body. Purpose-built rather than the shared `ApiErrorResponse`, following `ArtistRefileConflictError`, so `code` is a closed enum. Wire compatible with `ApiErrorResponse`: `message` and `code` are both strings.
+
+    """
+
+    message: str
+    code: ArtistRefileNotFoundCode
+
+
+class ArtistGenreMembership(BaseModel):
+    """
+    One genre membership of an artist: the genre and the artist's call number within it. Carried in `ArtistRefileConflictError.memberships`.
+
+    """
+
+    genre_id: int
+    code_artist_number: int
 
 
 class Reason1(StrEnum):
@@ -2030,7 +2138,7 @@ class Reason2(StrEnum):
 
 class ArtistByCodeError(BaseModel):
     """
-    `GET /library/artists/by-code`'s 404. Two distinct outcomes, told apart by `reason`, never by `message` text: `genre_not_found` (no genre has that `genre_id`) vs. `code_not_assigned` (the genre exists and no artist is filed under that exact code — NOT a guarantee that creating an artist under the code is safe; the column has no case-fold constraint and neither writer canonicalizes it the same way).
+    `GET /library/artists/by-code`'s 404. Two distinct outcomes, told apart by `reason`, never by `message` text: `genre_not_found` (no genre has that `genre_id`) vs. `code_not_assigned` (the genre exists and no artist is filed under that exact code — NOT a guarantee that creating an artist under the code is safe; the column has no case-fold constraint: the create paths store `code_letters` raw (WXYC/Backend-Service#2199) while refile trims and upper-cases it).
 
     """
 
@@ -2085,9 +2193,9 @@ class Reason3(StrEnum):
 
 class LockUnavailableRefusal(BaseModel):
     """
-    503 shared by `DELETE /library/{id}`, `DELETE /library/artists/{id}`, and `POST /library/deleted/{batchId}/restore`: the operation stood down rather than wait on rows a live writer holds. Retryable, and says nothing about whether the target is deletable/restorable — deliberately not a 409, which on these endpoints means "refused on the merits". Each transaction sets a `lock_timeout` below Postgres's deadlock-detection threshold on purpose, so it is always the librarian's write that stands down rather than the side that wins a deadlock arbitration.
+    503 shared by `DELETE /library/{id}`, `DELETE /library/artists/{id}`, `POST /library/artists/{id}/refile`, and `POST /library/deleted/{batchId}/restore`: the operation stood down rather than wait on rows (or, for the refile, an advisory lock) a live writer holds. Retryable, and says nothing about whether the target is deletable, restorable or re-fileable — deliberately not a 409, which on these endpoints means "refused on the merits". Each transaction sets a `lock_timeout` below Postgres's deadlock-detection threshold on purpose (and the refile's advisory lock stands down the same way), so it is always the librarian's write that stands down rather than the side that wins a deadlock arbitration.
 
-    **What it stands down TO differs by endpoint.** `DELETE /library/{id}` really does contend with a DJ's play insert — `flowsheet.album_id` references `library.id`, so the insert takes `FOR KEY SHARE` on the row being deleted. `DELETE /library/artists/{id}` cannot: `flowsheet` stores `artist_name` as text and has no FK to `artists`, so its contenders are the catalog ETL jobs and a concurrent artist edit. Standing down is still right — a librarian retries a click in a second, where a job that loses a row may skip it until its next run — but a 503 from the artist delete is not evidence that a DJ was logging a play.
+    **What it stands down TO differs by endpoint.** `DELETE /library/{id}` really does contend with a DJ's play insert — `flowsheet.album_id` references `library.id`, so the insert takes `FOR KEY SHARE` on the row being deleted. `DELETE /library/artists/{id}` cannot: `flowsheet` stores `artist_name` as text and has no FK to `artists`, so its contenders are the catalog ETL jobs and a concurrent artist edit. Standing down is still right — a librarian retries a click in a second, where a job that loses a row may skip it until its next run — but a 503 from the artist delete is not evidence that a DJ was logging a play. `POST /library/artists/{id}/refile` is the same: its contenders are a concurrent re-file into the same destination (`genre_id`, `code_letters`) bucket (an advisory lock keyed on it), a rename or any other write to the same artist row, a release edit on one of the artist's releases during a genre move, an artist delete, and the catalog jobs.
 
     """
 
@@ -5356,7 +5464,7 @@ class AlbumDetail(BaseModel):
 
 class IntakeSlip(BaseModel):
     """
-    The printable review slip for an intake item: the item's identity plus the printed review's text. Each review field is nullable exactly as on `Review`. `fcc` is for the station's own slip and is never published outside it.
+    The printable review slip: the record's identity (the intake item's, or the library release's for `POST /library/{id}/print`) plus the printed review's text. Each review field is nullable exactly as on `Review`. `fcc` is for the station's own slip and is never published outside it.
 
     """
 
@@ -5469,6 +5577,24 @@ class Rotation(BaseModel):
     urls: list[str] | None = Field(
         None,
         description="Storage order. Plain strings, not `format: uri` — MDs paste bare domains, so a value carries no scheme guarantee and a renderer must not bind one into an href without checking it. Deliberately an inline twin: `Rotation.urls` and `RotationEntry.urls` are pinned identical by a spec test rather than `$ref`ing a named array schema, because naming a top-level array makes the Python generator wrap the field in a RootModel (`.root` to reach the list) while every other target keeps a plain string list.\n",
+    )
+
+
+class ArtistRefileConflictError(BaseModel):
+    """
+    The `POST /library/artists/{id}/refile` 409 body. Purpose-built rather than the shared `ApiErrorResponse`, following `LibraryFilingConflictError`: it carries a named `reason` discriminant and, on `artist_code_conflict`, the occupant a client acts on and, on `letters_shared_across_genres`, the artist's `memberships`.
+
+    """
+
+    message: str
+    reason: ArtistRefileConflictReason
+    artist: Artist | None = Field(
+        None,
+        description="Present on `artist_code_conflict`: the first holder of the target slot, ordered by `artist_name` then id, excluding the artist being re-filed. Its `code_artist_number` is the contested target number, and its `code_letters` and `genre_id` are those of the destination bucket. Absent on `lettered_compilation_section`, `various_artists_section`, `letters_shared_across_genres` and `already_filed_in_genre`, which have no occupant to name.\n",
+    )
+    memberships: list[ArtistGenreMembership] | None = Field(
+        None,
+        description="Present only on `letters_shared_across_genres`: lists every genre membership, including the requested one, so the client can show which shelves a letters change would touch.\n",
     )
 
 
