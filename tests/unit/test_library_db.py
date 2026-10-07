@@ -2575,11 +2575,34 @@ class TestArtistKeyedQueries:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        ("artists", "expected"),
+        [
+            pytest.param(["Cat Power"], ["Album 2", "Album 3"], id="every-title-in-id-order"),
+            pytest.param(
+                ["Jessica Pratt", "Stereolab"], ["Album 1", "Album 5"], id="several-spellings"
+            ),
+            pytest.param(["cat power"], [], id="spellings-are-literal"),
+            pytest.param([], [], id="no-artists"),
+        ],
+    )
+    async def test_titles_by_artist(self, tmp_path, artists, expected):
+        """Titles only, for a caller that needs no row (LML#1421's placeholder guard)."""
+        db = await self._indexed_db(tmp_path, self.ARTISTS)
+        try:
+            titles = await db.titles_by_artist(artists)
+        finally:
+            await db.close()
+
+        assert titles == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         ("method", "args"),
         [
             ("artist_names_matching", (["Stereolab"],)),
             ("rows_by_artist", (["Stereolab"],)),
             ("search_among", ("Stereolab", ["Stereolab"])),
+            ("titles_by_artist", (["Stereolab"],)),
         ],
     )
     async def test_requires_a_connection(self, tmp_path, method, args):

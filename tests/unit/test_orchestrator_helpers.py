@@ -46,7 +46,10 @@ from lookup.orchestrator import (
 )
 from lookup.release_resolution import ResolvedRelease
 from lookup.rowless import ROWLESS_LIBRARY_ID, ROWLESS_NO_ALBUM_CONFIDENCE
-from lookup.strategies.artist_plus_album import search_library_with_fallback
+from lookup.strategies.artist_plus_album import (
+    runs_album_resolution,
+    search_library_with_fallback,
+)
 from lookup.strategies.song_as_track import search_song_as_track
 from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
 from lookup.strategies.track_on_compilation import search_compilations_for_track
@@ -2041,6 +2044,49 @@ class TestTypedAlbumEqualToArtistOverARealIndex:
             1,
             [("Arlo", "Stab the Unstoppable Hero")],
         )
+
+
+class TestPlaceholderGuardOverARealIndex:
+    """LML#1392's placeholder guard over a real FTS index. Since LML#1421 the
+    album lane reads the artist's own rows, so the guard must too: otherwise a
+    common-word artist whose "s/t" row sits outside the 50-row window takes
+    step 2, and the lane ranks the song's single above the record."""
+
+    @staticmethod
+    async def _takes_step_2(tmp_path, rows, artist):
+        db = await make_library_catalog(tmp_path, rows)
+        parsed = ParsedRequest(
+            song="Metal Guru",
+            artist=artist,
+            album="S/T",
+            raw_message=f"{artist} - Metal Guru",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        try:
+            return await runs_album_resolution(parsed, db)
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_own_placeholder_row_behind_a_full_search_window_skips_step_2(self, tmp_path):
+        rows = [*crowd_rows("Spirit"), ("Spirit", "s/t"), ("Spirit", "Metal Guru")]
+
+        assert await self._takes_step_2(tmp_path, rows, "Spirit") is False
+
+    @pytest.mark.asyncio
+    async def test_artist_without_a_shelf_still_reads_the_window(self, tmp_path):
+        """No row is filed under "Sun Ra", so the window's prefix match answers,
+        as before LML#1421."""
+        rows = [("Sun Ra Arkestra", "s/t"), ("Sun Ra Arkestra", "Metal Guru")]
+
+        assert await self._takes_step_2(tmp_path, rows, "Sun Ra") is False
+
+    @pytest.mark.asyncio
+    async def test_shelf_without_the_record_takes_step_2(self, tmp_path):
+        rows = [*crowd_rows("Spirit"), ("Spirit", "Twelve Dreams"), ("Spirit", "Metal Guru")]
+
+        assert await self._takes_step_2(tmp_path, rows, "Spirit") is True
 
 
 # ---------------------------------------------------------------------------

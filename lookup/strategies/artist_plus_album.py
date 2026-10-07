@@ -98,22 +98,25 @@ async def runs_album_resolution(parsed: ParsedRequest, db: LibraryDB | None) -> 
     song above ``albums[0]``: once step 2 adds Discogs albums, a single shelved
     under the song's name would outrank the typed record.
 
-    For a placeholder, one local query and no Discogs I/O: the artist-only
-    search the fallback below issues, so it shares that call's cache entry.
-    Like that fallback it sees at most ``_FETCH_LIMIT`` rows; an artist with
-    more could miss its literal row and take step 2. Without ``db`` the guard
-    is off.
+    For a placeholder, two local queries and no Discogs I/O: the artist's
+    stored spellings (:func:`~lookup.artist_shelf.artist_spellings`), then the
+    title of every row filed under them (``LibraryDB.titles_by_artist``, no
+    window), so the guard sees every own row the album lane can rank (LML#1421).
+    An artist with no shelf of its own reads the artist-only search window the
+    fallback below issues, sharing that call's cache entry, so a prefix-matched
+    artist still counts there as before. Without ``db`` the guard is off.
 
     A typed album equal to the artist's name has the same guard (LML#1412): it
     names the artist's self-titled record when the rows the album lane would
     keep for it (:func:`~lookup.album_rows.album_rows`, which reads the
-    artist's own shelf first, LML#1421) include a row titled that name and
+    artist's own rows first, LML#1421) include a row titled that name and
     filed under that name. Another artist's row is not enough ("Arlo" by Arlo
     Guthrie for the band Arlo), and neither is a literal "S/T", which
     Backend-Service sends as a placeholder. The guard reads the lane's own
     rows, so skipping step 2 never loses the record; the tiebreak in
     ``search_library_with_fallback`` ranks it above siblings that contain the
-    name. Two local queries for the shelf, read again by the lane.
+    name. Three local queries (the spellings, the restricted match and the
+    window), which the lane issues again; only the window's is cached.
     """
     if not needs_album_resolution(parsed):
         return False
@@ -122,31 +125,34 @@ async def runs_album_resolution(parsed: ParsedRequest, db: LibraryDB | None) -> 
     if db is None or not lib_artist or not typed:
         return True
     typed_folded = fold_punctuation_for_comparison(typed.lower())
+    spellings = await artist_spellings(db, lib_artist)
     if not is_self_titled_request_placeholder(typed):
-        rows = await album_rows(db, lib_artist, typed, await artist_spellings(db, lib_artist))
+        rows = await album_rows(db, lib_artist, typed, spellings)
         return not any(_is_self_titled_record(r, typed_folded) for r in rows)
-    rows = filter_results_by_artist(
-        await db.search(query=lib_artist, limit=_FETCH_LIMIT), lib_artist
-    )
-    return not any(is_self_titled(r.title or "") or _titled(r, typed_folded) for r in rows)
+    if spellings:
+        titles = await db.titles_by_artist(spellings)
+    else:
+        window = await db.search(query=lib_artist, limit=_FETCH_LIMIT)
+        titles = [r.title or "" for r in filter_results_by_artist(window, lib_artist)]
+    return not any(is_self_titled(t) or _titled(t, typed_folded) for t in titles)
 
 
-def _titled(row: LibraryItem, folded_album: str) -> bool:
-    """Whether ``row``'s title is ``folded_album``, under this strategy's album fold."""
-    return fold_punctuation_for_comparison((row.title or "").lower()) == folded_album
+def _titled(title: str | None, folded_album: str) -> bool:
+    """Whether ``title`` is ``folded_album``, under this strategy's album fold."""
+    return fold_punctuation_for_comparison((title or "").lower()) == folded_album
 
 
 def _is_self_titled_record(row: LibraryItem, folded_name: str) -> bool:
     """Whether ``row`` is titled ``folded_name`` and filed under an artist of that name.
 
     Both sides use the album filter's fold, not ``shelf_fallback``'s
-    diacritic-stripping one: a row this counts must survive ``search_one_album``,
-    so skipping step 2 never empties the album lane. A typed name whose accents
+    diacritic-stripping one: a row this counts must survive ``album_rows``'s
+    title filter, so skipping step 2 never empties the album lane. A typed name whose accents
     differ from the row's keeps step 2, as before LML#1412.
     """
     return (
         bool(folded_name)
-        and _titled(row, folded_name)
+        and _titled(row.title, folded_name)
         and (fold_punctuation_for_comparison((row.artist or "").lower()) == folded_name)
     )
 
@@ -165,8 +171,9 @@ async def search_library_with_fallback(
     for the Discogs-facing paths elsewhere.
 
     Each album's rows come from :func:`~lookup.album_rows.album_rows`: the
-    artist's own shelf when it has the album, else the 50-row search window
-    (LML#1421). The artist+song and artist-only fallbacks still read the window.
+    artist's own rows when they have the album, then its alternate-name rows,
+    else the 50-row search window (LML#1421). The artist+song and artist-only
+    fallbacks still read the window (LML#1425).
 
     Returns:
         Tuple of (library_results, song_not_found_flag)
