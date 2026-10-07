@@ -100,6 +100,11 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/override_floor.py": 250,
     "lookup/caller_reason.py": 100,
     "lookup/candidate_memo.py": 150,
+    # LML#1421: Various Artists' compilation shelves ("Various Artists - Rock -
+    # H", "Soundtracks - S"), which the album lane keeps after the plain
+    # shelf's own rows. Its own module because album_rows.py sat at 97/100.
+    # 44 lines measured; 1.3x = 57.2 -> 100.
+    "lookup/compilation_shelves.py": 100,
     "lookup/concurrency.py": 200,
     "lookup/endpoint_family.py": 100,
     # Recalibrated again (LML#1192 review round 3, finding 10): the round-2
