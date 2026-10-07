@@ -31,4 +31,5 @@ def test_items_with_artwork_take_precedence_and_synthesized_item_is_external():
     items = build_result_items(state, {})
     assert len(items) == 1
     assert items[0].library_item.artist == "Juana Molina"
+    assert items[0].library_item.call_number == "(external)"
     assert items[0].matched_via is None

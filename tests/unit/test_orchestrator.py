@@ -2106,7 +2106,7 @@ class TestPerformLookupLocationUnion:
     ):
         """LML#1026: with an album typed and no library results, step 3a used
         to live-search Discogs and synthesize a rowless id-0 'not in your
-        library' item -- which _build_result_items ranks FIRST, preempting
+        library' item -- which build_result_items ranks FIRST, preempting
         the folded shelf location as primary. An index hit must skip 3a: the
         fold supplies in-library rows, so the id-0 synthesis would be both a
         wasted live call and a wrong primary."""
@@ -3397,7 +3397,7 @@ class TestLookupStateResultPrecedence:
     """LookupState.result_count / has_results encode the response precedence rule.
 
     ``items_with_artwork`` takes precedence over ``library_results`` when
-    non-empty — the same rule ``_build_result_items`` dispatches on.
+    non-empty — the same rule ``build_result_items`` dispatches on.
     """
 
     @pytest.mark.parametrize(

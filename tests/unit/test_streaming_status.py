@@ -399,7 +399,7 @@ class TestStreamingStatusOmission:
         """The wire-boundary conversion (``DiscogsSearchResult.to_match_result``)
         must carry ``streaming_status`` through unchanged — this is the single
         conversion both ``/lookup`` and ``/lookup/bulk`` share (via
-        ``lookup/orchestrator.py::_build_result_items``), so a passing
+        ``lookup/result_items.py::build_result_items``), so a passing
         assertion here is what guarantees the LML#681 parity rule for this
         field without needing two separate HTTP round-trips.
         """

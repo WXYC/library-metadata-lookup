@@ -3,7 +3,7 @@ and ``/lookup/bulk`` must emit ``streaming_status`` identically for the same
 input.
 
 Both endpoints share ONE result-conversion path
-(``lookup/orchestrator.py::_build_result_items`` ->
+(``lookup/result_items.py::build_result_items`` ->
 ``DiscogsSearchResult.to_match_result()``), and ``apple_music`` /
 ``spotify`` clients are forwarded to ``perform_lookup`` unchanged on both
 paths (only ``bandcamp`` is intentionally pinned ``None`` on bulk, LML#573
