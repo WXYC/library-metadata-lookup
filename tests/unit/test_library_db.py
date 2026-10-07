@@ -18,6 +18,7 @@ from library.db import (
     _to_fts_match_query,
     clear_library_caches,
 )
+from tests.factories import make_library_catalog
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2597,9 +2598,44 @@ class TestArtistKeyedQueries:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        ("artists", "expected"),
+        [
+            pytest.param(
+                ["Mark Almond", "Mark-Almond"],
+                {("Mark Almond", "AL"), ("Mark-Almond", "MA"), ("Mark-Almond", "MB")},
+                id="each-spelling-its-own-letters",
+            ),
+            pytest.param(["Mark Almond"], {("Mark Almond", "AL")}, id="only-the-asked-spellings"),
+            pytest.param(["mark almond"], set(), id="spellings-are-literal"),
+            pytest.param([], set(), id="no-artists"),
+        ],
+    )
+    async def test_artist_call_letters(self, tmp_path, artists, expected):
+        """The letters each spelling's rows are filed under (LML#1449)."""
+        db = await make_library_catalog(
+            tmp_path,
+            [
+                ("Mark Almond", "The Stars We Are"),
+                ("Mark-Almond", "Rising"),
+                ("Mark-Almond", "To the Heart"),
+            ],
+            call_letters={"Mark Almond": "AL", "Mark-Almond": "MA"},
+        )
+        assert db._conn is not None
+        await db._conn.execute("UPDATE library SET call_letters = 'MB' WHERE id = 3")
+        try:
+            letters = await db.artist_call_letters(artists)
+        finally:
+            await db.close()
+
+        assert letters == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         ("method", "args"),
         [
             ("artist_names_matching", (["Stereolab"],)),
+            ("artist_call_letters", (["Stereolab"],)),
             ("rows_by_artist", (["Stereolab"],)),
             ("search_among", ("Stereolab", ["Stereolab"])),
             ("titles_by_artist", (["Stereolab"],)),

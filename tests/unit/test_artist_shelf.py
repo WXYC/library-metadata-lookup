@@ -272,3 +272,89 @@ class TestArtistSpellings:
             await db.close()
 
         assert spellings[0].lower() == typed.lower() and len(spellings) == 2
+
+    @pytest.mark.asyncio
+    async def test_the_typed_spelling_comes_first_whatever_the_catalog_order(self, tmp_path):
+        db = await make_library_catalog(
+            tmp_path, [("STEREOLAB", "Emperor Tomato Ketchup"), ("Stereolab", "Dots and Loops")]
+        )
+        try:
+            spellings = await artist_spellings(db, "Stereolab")
+        finally:
+            await db.close()
+
+        assert spellings == ["Stereolab", "STEREOLAB"]
+
+
+class TestPunctuationVariants:
+    """One act filed under spellings that differ only in punctuation, on the
+    same call letters (LML#1449); a different act on its own letters."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("typed", "expected"),
+        [
+            pytest.param("Mark Almond", ["Mark Almond"], id="solo-records-only"),
+            pytest.param("Mark-Almond", ["Mark-Almond"], id="band-only"),
+            pytest.param("Mark_Almond", [], id="tolerant-rung-still-ambiguous"),
+        ],
+    )
+    async def test_a_variant_on_other_call_letters_is_another_act(self, tmp_path, typed, expected):
+        """Marc Almond's solo records are filed as "Mark Almond" under AL; the
+        1970s band Mark-Almond is filed under MA."""
+        db = await make_library_catalog(
+            tmp_path,
+            [("Mark-Almond", "Rising"), ("Mark Almond", "The Stars We Are")],
+            call_letters={"Mark Almond": "AL", "Mark-Almond": "MA"},
+        )
+        try:
+            rows = await rows_for_artist(db, typed)
+        finally:
+            await db.close()
+
+        assert [row.artist for row in rows] == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("typed", "expected"),
+        [
+            pytest.param(
+                "Cherry Point",
+                [
+                    ("The Cherry Point", "Night of the Bloody Tapes"),
+                    ("The Cherry Point,", "Black Witchery"),
+                ],
+                id="article-rung-reads-the-variant",
+            ),
+            pytest.param(
+                "The Cherry Point,",
+                [
+                    ("The Cherry Point,", "Black Witchery"),
+                    ("The Cherry Point", "Night of the Bloody Tapes"),
+                ],
+                id="typed-spelling-leads-its-variant",
+            ),
+            pytest.param(
+                "The Cherry Point",
+                [
+                    ("The Cherry Point", "Night of the Bloody Tapes"),
+                    ("The Cherry Point,", "Black Witchery"),
+                ],
+                id="variant-filed-first-still-follows",
+            ),
+        ],
+    )
+    async def test_variant_rows_follow_the_picked_spellings_rows(self, tmp_path, typed, expected):
+        db = await make_library_catalog(
+            tmp_path,
+            [
+                ("The Cherry Point,", "Black Witchery"),
+                ("The Cherry Point", "Night of the Bloody Tapes"),
+            ],
+        )
+        try:
+            rows = await rows_for_artist(db, typed)
+        finally:
+            await db.close()
+
+        assert [(row.artist, row.title) for row in rows] == expected
