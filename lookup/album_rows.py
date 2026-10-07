@@ -11,13 +11,14 @@ God / "God" answered with God Rifle's record (LML#1421). :func:`album_rows`
 first runs the same match with no window, restricted to the artist's own
 stored spellings (``lookup/artist_shelf.py::artist_spellings``, via
 ``LibraryDB.search_among``), so it adds no row an unlimited search would not
-return, and therefore no artwork lookup. When own rows pass the title filter,
-they lead, followed by the window's rows filed under another artist whose
-``alternate_artist_name`` credits the typed one
-(``lookup/alternate_credit.py``); rows the window admitted only by an
-artist-name prefix ("Sun Ra Arkestra" for "Sun Ra") drop, per LML#1425
-decisions 1 and 5. Otherwise the window answers as before, prefix matches
-and alternate or cross-referenced names included.
+return, and therefore no artwork lookup. When own rows pass the title filter
+they lead (for Various Artists, followed by its compilation shelves' rows:
+``lookup/compilation_shelves.py``), then the window's rows filed under
+another artist whose ``alternate_artist_name`` credits the typed one
+(``lookup/alternate_credit.py``); rows admitted only by an artist-name prefix
+("Sun Ra Arkestra" for "Sun Ra") drop, per LML#1425 decisions 1 and 5.
+Otherwise the window answers as before, prefix matches and alternate or
+cross-referenced names included.
 """
 
 from wxyc_etl.text import to_match_form as normalize_for_comparison
@@ -25,6 +26,7 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
 from lookup.alternate_credit import credits_artist
+from lookup.compilation_shelves import shelf_rows
 from lookup.matching import _FETCH_LIMIT, filter_results_by_artist, is_self_titled
 from lookup.name_folding import fold_punctuation_for_comparison
 
@@ -86,12 +88,12 @@ async def album_rows(
     window = filter_by_album_title(await album_search(db, lib_artist, album), album, lib_artist)
     if spellings:
         own = await db.search_among(f"{lib_artist} {album}", spellings)
+        own += await shelf_rows(db, album, spellings)
         if kept := filter_by_album_title(own, album, lib_artist):
-            # Filed under another artist, so never a duplicate of an own row.
+            ids = {row.id for row in kept}
             return kept + [
                 row
                 for row in window
-                if row.artist not in spellings
-                and credits_artist(row.alternate_artist_name, lib_artist)
+                if row.id not in ids and credits_artist(row.alternate_artist_name, lib_artist)
             ]
     return window

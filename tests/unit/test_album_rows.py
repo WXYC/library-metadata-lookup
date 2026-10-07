@@ -140,3 +140,34 @@ class TestAlternateNameRowsAfterOwnRows:
             [(artist, "Mali Music")],
             False,
         )
+
+
+class TestVariousArtistsCompilationShelves:
+    """Various Artists' compilation shelves ("Various Artists - Rock - H",
+    "Soundtracks - S") hold second copies of compilations and count as Various
+    Artists: their rows follow the plain shelf's own rows."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("shelf", "title"),
+        [
+            pytest.param("Various Artists - Rock - H", "Hard as Hell", id="genre-shelf"),
+            pytest.param("Soundtracks - S", "Suspiria", id="soundtracks-shelf"),
+        ],
+    )
+    async def test_shelf_copy_follows_the_plain_shelf(self, tmp_path, shelf, title):
+        rows = [(shelf, title), ("Various Artists", title), ("Various Artists - Rock - B", "Bliss")]
+
+        assert await _lane(tmp_path, rows, "Various Artists", title) == (
+            [("Various Artists", title), (shelf, title)],
+            False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_artist_gains_no_shelf(self, tmp_path):
+        rows = [("Soundtracks - S", "Suspiria"), ("Goblin", "Suspiria")]
+
+        assert await _lane(tmp_path, rows, "Goblin", "Suspiria") == (
+            [("Goblin", "Suspiria")],
+            False,
+        )
