@@ -221,6 +221,36 @@ class TestArtistSpellings:
                 id="ambiguous-tolerant-rung",
             ),
             pytest.param("Sun Ra", [("Sun Ra Arkestra", "Lanquidity")], [], id="not-shelved"),
+            pytest.param(
+                "Alaska",
+                [("Alaska!", "Emotions"), ("Alaska", "Emotions")],
+                ["Alaska", "Alaska!"],
+                id="exact-then-punctuation-variant",
+            ),
+            pytest.param(
+                "Alaska!",
+                [("Alaska", "Emotions"), ("Alaska!", "Emotions")],
+                ["Alaska!", "Alaska"],
+                id="variant-typed-first",
+            ),
+            pytest.param(
+                "Girls",
+                [("Girls", "Album"), ("The Girls", "Other")],
+                ["Girls"],
+                id="article-stays-strict-girls",
+            ),
+            pytest.param(
+                "The Girls",
+                [("Girls", "Album"), ("The Girls", "Other")],
+                ["The Girls"],
+                id="article-stays-strict-the-girls",
+            ),
+            pytest.param(
+                "Alaska",
+                [("Alaska", "Emotions"), ("The Alaska!", "Other")],
+                ["Alaska"],
+                id="variant-with-article-is-another-act",
+            ),
         ],
     )
     async def test_artist_spellings(self, tmp_path, typed, catalog, expected):
@@ -231,3 +261,14 @@ class TestArtistSpellings:
             await db.close()
 
         assert sorted(spellings) == sorted(expected)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("typed", ["Alaska", "Alaska!"])
+    async def test_typed_spelling_leads_its_variants(self, tmp_path, typed):
+        db = await make_library_catalog(tmp_path, [("Alaska!", "Emotions"), ("Alaska", "Emotions")])
+        try:
+            spellings = await artist_spellings(db, typed)
+        finally:
+            await db.close()
+
+        assert spellings[0].lower() == typed.lower() and len(spellings) == 2
