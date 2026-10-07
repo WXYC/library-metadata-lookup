@@ -19,6 +19,7 @@ from lookup.compilation_shelves import shelf_rows
 
 async def artist_rows(
     db: LibraryDB,
+    *,
     query: str,
     keep: Callable[[list[LibraryItem]], list[LibraryItem]],
     shelf_query: str,
@@ -31,6 +32,12 @@ async def artist_rows(
     ``query`` is the full-text query for the artist's own rows, ``shelf_query``
     the one for the compilation shelves, and ``window`` the caller's rows, already
     filtered. ``spellings`` is :func:`~lookup.artist_shelf.artist_spellings`.
+
+    ``keep`` gets the own rows followed by the compilation-shelf rows and returns
+    the ones to lead with, in the order it returns them: it may reorder as well
+    as drop (LML#1445's artist+song fallback puts song-in-title rows first
+    within each tier this way). The credited rows that follow keep their order
+    in ``window``, so a caller that wants them ordered sorts ``window`` first.
     """
     if spellings:
         own = await search_own(db, query, spellings)
