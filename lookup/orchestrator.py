@@ -1427,7 +1427,7 @@ async def perform_lookup(
             location_union_task=location_union_task,
         )
 
-    result_items = build_result_items(state, identities_by_artist)
+    result_items = build_result_items(state, identities_by_artist, library_artist_for(parsed))
     external_source = await _step_external_cache_fallback(parsed, result_items, services)
 
     # Fold the location-union's other shelf locations into `results` (the
@@ -1767,7 +1767,7 @@ async def _build_degraded_response(
         sentry_sdk.set_tag("lml.degraded_reason", degraded_reason.value)
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Failed to project degraded_reason onto Sentry transaction: %s", e)
-    result_items = build_result_items(state, {})
+    result_items = build_result_items(state, {}, library_artist_for(parsed))
     folded_locations = await _await_location_union_bounded(location_union_task)
     result_items, folded_location_count, index_confirmed_existing = _fold_locations_into_results(
         result_items, folded_locations, state

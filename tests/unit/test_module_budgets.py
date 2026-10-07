@@ -56,6 +56,9 @@ MODULE_BUDGETS: dict[str, int] = {
     # Its own module so both share one definition. 36 lines measured; 1.3x =
     # 46.8 -> 50.
     "lookup/alternate_credit.py": 50,
+    # LML#1444: the matched_via_alias label for alternate-credit rows. Smallest
+    # multiple of 50 at or above 1.3x the 30-line measured size (39).
+    "lookup/alternate_credit_hint.py": 50,
     "lookup/artist_resolution.py": 550,
     # LML#1281: raised 500 -> 550 for the cascade-boundary breaker guard. The
     # growth is structural, not prose: `_resolve_fallback_artwork` now wraps

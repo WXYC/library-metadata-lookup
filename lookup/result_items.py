@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from generated.api_models import ReconciledIdentity
 from library.models import LibraryItem
+from lookup.alternate_credit_hint import alternate_credit_hint
 from lookup.external_search import build_external_catalog_item
 from lookup.models import LookupResultItem
 
@@ -20,12 +21,15 @@ if TYPE_CHECKING:
 def build_result_items(
     state: LookupState,
     identities_by_artist: dict[str, ReconciledIdentity],
+    artist: str | None = None,
 ) -> list[LookupResultItem]:
     """Build the response items (convert internal models to API contract models).
 
     READS: ``items_with_artwork`` (takes precedence when non-empty — the
     canonical rule statement is ``LookupState.result_count``),
-    ``library_results``, ``matched_via_by_id``.
+    ``library_results``, ``matched_via_by_id``. ``artist`` is the requested
+    library-channel artist; a library row it is credited on, not filed under,
+    carries ``matched_via_alias`` (LML#1444).
     WRITES: nothing.
     """
 
@@ -56,6 +60,7 @@ def build_result_items(
                     # do not look up key 0 in matched_via_by_id to prevent accidental
                     # collision with any future strategy that might write to that key.
                     matched_via=None if item.id == 0 else state.matched_via_by_id.get(item.id),
+                    matched_via_alias=None if item.id == 0 else alternate_credit_hint(item, artist),
                 )
             )
     elif state.library_results:
@@ -65,6 +70,7 @@ def build_result_items(
                     library_item=item.to_catalog_item(),
                     reconciled_identity=_identity_for(item),
                     matched_via=state.matched_via_by_id.get(item.id),
+                    matched_via_alias=alternate_credit_hint(item, artist),
                 )
             )
     return result_items
