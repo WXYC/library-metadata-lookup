@@ -1059,6 +1059,18 @@ class LibraryDB:
         )
         return [row[0] or "" for row in await cursor.fetchall()]
 
+    async def artist_call_letters(self, artists: list[str]) -> set[tuple[str, str]]:
+        """The distinct ``(artist, call_letters)`` of the rows filed under ``artists``
+        (literal stored spellings); ``idx_artist`` covers it (LML#1449)."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        cursor = await self._conn.execute(
+            "SELECT DISTINCT artist, call_letters FROM library "
+            f"WHERE artist IN ({', '.join('?' for _ in artists)})",
+            artists,
+        )
+        return {(row[0], row[1] or "") for row in await cursor.fetchall()}
+
     async def search_among(self, query: str, artists: list[str]) -> list[LibraryItem]:
         """Return the rows filed under ``artists`` that the FTS ``query`` matches, in id order.
 

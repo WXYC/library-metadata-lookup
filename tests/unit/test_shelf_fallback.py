@@ -28,7 +28,7 @@ from lookup.orchestrator import perform_lookup
 from lookup.shelf_fallback import _order_shelf_rows, apply_shelf_fallback
 from services.parser import MessageType, ParsedRequest
 from tests.conftest import make_lml_telemetry
-from tests.factories import make_library_item, shelve
+from tests.factories import make_library_catalog, make_library_item, shelve
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -367,6 +367,88 @@ class TestApplyShelfFallback:
             await apply_shelf_fallback(_parsed(), db, False, [], "none", None, None)
 
         assert [call.args for call in scope.transaction.set_data.call_args_list] == expected_calls
+
+
+class TestShelfFallbackPunctuationVariants:
+    """Step 8 over a real ``library_fts`` index, for one act filed under two
+    spellings that differ only in punctuation (LML#1449)."""
+
+    _ALASKA = [("Alaska", "Rescue"), ("Alaska", "Emotions"), ("Alaska!", "Wide Awake")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("typed", "song", "expected"),
+        [
+            pytest.param(
+                "Alaska!",
+                None,
+                [("Alaska!", "Wide Awake"), ("Alaska", "Rescue"), ("Alaska", "Emotions")],
+                id="typed-spelling-leads-its-variants-rows",
+            ),
+            pytest.param(
+                "Alaska",
+                None,
+                [("Alaska", "Rescue"), ("Alaska", "Emotions"), ("Alaska!", "Wide Awake")],
+                id="variant-rows-follow",
+            ),
+            pytest.param(
+                "Alaska!",
+                "Rescue",
+                [("Alaska", "Rescue"), ("Alaska!", "Wide Awake"), ("Alaska", "Emotions")],
+                id="song-row-leads-sentence-still-names-the-typed-spelling",
+            ),
+        ],
+    )
+    async def test_rows_and_sentence(self, tmp_path, typed, song, expected):
+        db = await make_library_catalog(tmp_path, self._ALASKA)
+        try:
+            result_items, _type, context, _external, _rows = await apply_shelf_fallback(
+                _parsed(artist=typed, album="Nonexistent Album", song=song),
+                db,
+                False,
+                [],
+                "none",
+                None,
+                None,
+            )
+        finally:
+            await db.close()
+
+        assert [(i.library_item.artist, i.library_item.title) for i in result_items] == expected
+        assert context == (
+            f'"Nonexistent Album" not found in the library, but here are other albums by {typed}:'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("typed", "expected"),
+        [
+            pytest.param("Mark Almond", ["The Stars We Are", "Jacques"], id="solo-records"),
+            pytest.param("Mark-Almond", ["Rising", "To the Heart"], id="band"),
+        ],
+    )
+    async def test_another_act_on_other_call_letters_is_not_listed(self, tmp_path, typed, expected):
+        """ "Mark Almond" (Marc Almond's solo records, AL) and "Mark-Almond" (the
+        1970s band, MA) are two acts: neither shelf lists the other's rows."""
+        db = await make_library_catalog(
+            tmp_path,
+            [
+                ("Mark-Almond", "Rising"),
+                ("Mark Almond", "The Stars We Are"),
+                ("Mark-Almond", "To the Heart"),
+                ("Mark Almond", "Jacques"),
+            ],
+            call_letters={"Mark Almond": "AL", "Mark-Almond": "MA"},
+        )
+        try:
+            result_items, _type, context, _external, _rows = await apply_shelf_fallback(
+                _parsed(artist=typed, album="Nonexistent Album"), db, False, [], "none", None, None
+            )
+        finally:
+            await db.close()
+
+        assert [i.library_item.title for i in result_items] == expected
+        assert context is not None and context.endswith(f"other albums by {typed}:")
 
 
 # ---------------------------------------------------------------------------

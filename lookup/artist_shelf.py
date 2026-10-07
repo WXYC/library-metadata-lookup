@@ -19,15 +19,18 @@ first hit wins:
 4. both.
 
 Rung 1 is the "this artist only" rule the lanes have always had: "Can" is
-never Canibus, "Sun Ra" is never "Sun Ra Arkestra". When rung 1 answers it
-also returns, after its hits, every stored spelling equal to a hit under
-punctuation folding ("Alaska!" for "Alaska", LML#1449): one act filed under
-two spellings. Articles are never folded there. Rungs 2-4 are tolerance,
+never Canibus, "Sun Ra" is never "Sun Ra Arkestra". Rungs 2-4 are tolerance,
 and tolerance must not merge two artists: the catalog files "Girls" beside
 "The Girls" and "A Frames" beside "The Frames" as different bands. So a
 tolerant rung is consulted only when the stricter ones found nothing, and it
 answers only when every spelling it matched is one artist under rung 1.
 "Frames" matches both bands on rung 2, so it gets no rows.
+
+Whichever rung answers, its hits are followed by their punctuation variants
+on the same ``call_letters`` (LML#1449): the librarian files variants of one
+name on the same letters ("Alaska", "Alaska!": AL) and a different act on its
+own ("Mark Almond", Marc Almond's solo records: AL; "Mark-Almond", the 1970s
+band: MA). Articles are never folded there. The variants' rows come last.
 
 ``alternate_artist_name`` and ``cross_reference_names`` are not consulted. A
 cross-reference files a band's release under a member's name, which is not
@@ -80,11 +83,13 @@ async def artist_spellings(db: LibraryDB, artist: str) -> list[str]:
     name = normalize_for_comparison(artist).strip()
     if not name or len(name) > _MAX_NAME_LENGTH:
         return []
+    names = await db.artist_names_matching(
+        list(dict.fromkeys([artist, *(rung(name) for rung in _RUNGS)]))
+    )
+    # The typed spelling first, then a stable order: the DISTINCT scan has none.
     stored = {
         spelling: normalize_for_comparison(spelling).strip()
-        for spelling in await db.artist_names_matching(
-            list(dict.fromkeys([artist, *(rung(name) for rung in _RUNGS)]))
-        )
+        for spelling in sorted(names, key=lambda spelling: (spelling != artist, spelling))
     }
     for tolerant, rung in enumerate(_RUNGS):
         want = rung(name)
@@ -93,37 +98,49 @@ async def artist_spellings(db: LibraryDB, artist: str) -> list[str]:
             continue
         if tolerant and len({stored[spelling] for spelling in hits}) > 1:
             return []
-        if not tolerant:
-            hits += _punctuation_variants(stored, hits)
-        return hits
+        return hits + await _punctuation_variants(db, stored, hits)
     return []
 
 
-def _punctuation_variants(stored: dict[str, str], hits: list[str]) -> list[str]:
-    """The stored spellings that equal a rung-1 hit under punctuation folding (LML#1449).
-
-    One act filed as "Alaska" and "Alaska!" is one artist; the exact spelling
-    answered, and the variant must not drop out. Articles are not folded here.
-    """
-    folded = {fold_punctuation_for_comparison(stored[spelling]) for spelling in hits} - {""}
-    return [
-        spelling
-        for spelling, key in stored.items()
-        if spelling not in hits and fold_punctuation_for_comparison(key) in folded
+async def _punctuation_variants(
+    db: LibraryDB, stored: dict[str, str], hits: list[str]
+) -> list[str]:
+    """The stored spellings equal to a hit under punctuation folding and filed
+    on its call letters (LML#1449). Articles are not folded here."""
+    fold = {spelling: fold_punctuation_for_comparison(key) for spelling, key in stored.items()}
+    keys = {fold[spelling] for spelling in hits} - {""}
+    candidates = [
+        spelling for spelling in stored if spelling not in hits and fold[spelling] in keys
     ]
+    if not candidates:
+        return []
+    filed = await db.artist_call_letters([*hits, *candidates])
+
+    def shelf(spelling: str) -> tuple[str, frozenset[str]]:
+        return fold[spelling], frozenset(letters for name, letters in filed if name == spelling)
+
+    shelves = {shelf(spelling) for spelling in hits}
+    return [spelling for spelling in candidates if shelf(spelling) in shelves]
+
+
+def _own_rows_first(rows: list[LibraryItem], spellings: list[str]) -> list[LibraryItem]:
+    """``rows`` (id order) with the picked artist's rows ahead of its punctuation
+    variants', id order within each (LML#1449)."""
+    own = normalize_for_comparison(spellings[0]).strip() if spellings else ""
+    return sorted(rows, key=lambda row: normalize_for_comparison(row.artist or "").strip() != own)
 
 
 async def search_own(db: LibraryDB, query: str, spellings: list[str]) -> list[LibraryItem]:
-    """``LibraryDB.search_among`` rows grouped by ``spellings`` order, id order within each (LML#1449)."""
-    position = {spelling: i for i, spelling in enumerate(spellings)}
-    rows = await db.search_among(query, spellings)
-    return sorted(rows, key=lambda row: position.get(row.artist or "", len(position)))
+    """``LibraryDB.search_among`` rows, the picked artist's before its variants' (LML#1449)."""
+    return _own_rows_first(await db.search_among(query, spellings), spellings)
 
 
 async def rows_for_artist(db: LibraryDB, artist: str) -> list[LibraryItem]:
-    """Every library row by ``artist`` and by no one else, in id order.
+    """Every library row by ``artist`` and by no one else, in id order, then its
+    punctuation variants' rows in id order.
 
     Empty when the artist is not shelved, or when only a tolerant rung matches
     and it matches more than one artist. See the module docstring.
     """
-    return await db.rows_by_artist(await artist_spellings(db, artist))
+    spellings = await artist_spellings(db, artist)
+    return _own_rows_first(await db.rows_by_artist(spellings), spellings)

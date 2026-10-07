@@ -204,7 +204,8 @@ async def apply_shelf_fallback(
     # On ``main`` this path returned an empty 200 with no further I/O, so a
     # failure here must leave that response exactly as it was.
     try:
-        rows = _order_shelf_rows(await rows_for_artist(db, lib_artist), parsed.song)
+        shelf = await rows_for_artist(db, lib_artist)
+        rows = _order_shelf_rows(shelf, parsed.song)
         shelf_items = [
             LookupResultItem(library_item=row.to_catalog_item())
             for row in rows[:MAX_SEARCH_RESULTS]
@@ -219,7 +220,8 @@ async def apply_shelf_fallback(
     return (
         shelf_items,
         SEARCH_TYPE_FALLBACK,
-        album_not_found_message(parsed, rows[0].artist or lib_artist),
+        # The picked spelling's first row, not a song-led variant's (LML#1449).
+        album_not_found_message(parsed, shelf[0].artist or lib_artist),
         "library",
         len(shelf_items),
     )

@@ -69,7 +69,9 @@ CROWD = 60
 the 50-row ``db.search`` window the artist-keyed lanes used to read."""
 
 
-async def make_library_catalog(tmp_path, rows: list[tuple[str, ...]]) -> LibraryDB:
+async def make_library_catalog(
+    tmp_path, rows: list[tuple[str, ...]], call_letters: dict[str, str] | None = None
+) -> LibraryDB:
     """A connected ``LibraryDB`` over ``rows`` of ``(artist, title)``, ids from 1.
 
     A real ``library_fts`` index built with the repo's own DDL, for tests of
@@ -77,7 +79,8 @@ async def make_library_catalog(tmp_path, rows: list[tuple[str, ...]]) -> Library
     which a mocked ``LibraryDB`` cannot show (LML#1406, LML#1421). A row may
     carry a third element, its ``alternate_artist_name``; when one does, the
     table gains that column and the index covers it, as the production
-    ``library.db`` built by discogs-etl does.
+    ``library.db`` built by discogs-etl does. ``call_letters`` maps an artist
+    to the letters its rows are filed under; every other row is filed under "A".
     """
     alternates = any(len(row) > 2 for row in rows)
     db_file = tmp_path / "library.db"
@@ -93,10 +96,16 @@ async def make_library_catalog(tmp_path, rows: list[tuple[str, ...]]) -> Library
         else LIBRARY_FTS_CREATE_SQL
     )
     conn.executemany(
-        "INSERT INTO library VALUES (?, ?, ?, 'A', 1, 1, 'Rock', 'LP'"
+        "INSERT INTO library VALUES (?, ?, ?, ?, 1, 1, 'Rock', 'LP'"
         + (", ?)" if alternates else ")"),
         [
-            (i, row[1], row[0], *([row[2] if len(row) > 2 else None] if alternates else []))
+            (
+                i,
+                row[1],
+                row[0],
+                (call_letters or {}).get(row[0], "A"),
+                *([row[2] if len(row) > 2 else None] if alternates else []),
+            )
             for i, row in enumerate(rows, start=1)
         ],
     )
