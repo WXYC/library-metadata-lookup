@@ -147,8 +147,8 @@ def _is_self_titled_record(row: LibraryItem, folded_name: str) -> bool:
 
     Both sides use the album filter's fold, not ``shelf_fallback``'s
     diacritic-stripping one: a row this counts must survive ``album_rows``'s
-    title filter, so skipping step 2 never empties the album lane. A typed name whose accents
-    differ from the row's keeps step 2, as before LML#1412.
+    title filter, so skipping step 2 never empties the album lane. A typed name
+    whose accents differ from the row's keeps step 2, as before LML#1412.
     """
     return (
         bool(folded_name)
