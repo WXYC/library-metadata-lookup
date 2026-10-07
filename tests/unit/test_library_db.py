@@ -2540,20 +2540,23 @@ class TestArtistKeyedQueries:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("query", "ids", "expected_ids"),
+        ("query", "artists", "expected_ids"),
         [
-            pytest.param("Cat Power", [1, 2, 4], [2, 4], id="rows-the-search-matches"),
-            pytest.param("Cat Power", [4, 3], [3, 4], id="id-order"),
-            pytest.param("Cat Album 3", [2, 3, 4], [3], id="artist-and-title-columns"),
-            pytest.param("   ", [2, 3], [], id="blank-query-runs-no-query"),
-            pytest.param("Cat Power", [], [], id="no-ids"),
+            pytest.param(
+                "Cat Power", ["Cat Power", "Stereolab"], [2, 3], id="rows-the-search-matches"
+            ),
+            pytest.param("Cat", ["Power Cat Trio", "Cat Power"], [2, 3, 4], id="id-order"),
+            pytest.param("Cat Album 3", ["Cat Power"], [3], id="artist-and-title-columns"),
+            pytest.param("Cat Power", ["cat power"], [], id="spellings-are-literal"),
+            pytest.param("   ", ["Cat Power"], [], id="blank-query-runs-no-query"),
+            pytest.param("Cat Power", [], [], id="no-artists"),
         ],
     )
-    async def test_search_among(self, tmp_path, query, ids, expected_ids):
-        """``search``'s full-text match over ``ids`` only (LML#1421)."""
+    async def test_search_among(self, tmp_path, query, artists, expected_ids):
+        """``search``'s full-text match over rows filed under ``artists`` only (LML#1421)."""
         db = await self._indexed_db(tmp_path, self.ARTISTS)
         try:
-            rows = await db.search_among(query, ids)
+            rows = await db.search_among(query, artists)
         finally:
             await db.close()
 
@@ -2564,7 +2567,7 @@ class TestArtistKeyedQueries:
         """The 200th match comes back, where ``search`` stops at its limit."""
         db = await self._indexed_db(tmp_path, [f"Orchestra {i}" for i in range(200)])
         try:
-            rows = await db.search_among("orchestra", [200, 1])
+            rows = await db.search_among("orchestra", ["Orchestra 199", "Orchestra 0"])
         finally:
             await db.close()
 
@@ -2576,7 +2579,7 @@ class TestArtistKeyedQueries:
         [
             ("artist_names_matching", (["Stereolab"],)),
             ("rows_by_artist", (["Stereolab"],)),
-            ("search_among", ("Stereolab", [1])),
+            ("search_among", ("Stereolab", ["Stereolab"])),
         ],
     )
     async def test_requires_a_connection(self, tmp_path, method, args):

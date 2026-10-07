@@ -6,10 +6,11 @@ else. A ``db.search`` window cannot give them that: it is 50 rows of
 any-column full-text hits, and for a common-word name ("Love", "The Band",
 "Heart") other artists fill it before the artist's own rows appear.
 
-:func:`rows_for_artist` asks the catalog for the stored artist spellings that
-contain the name as a phrase (``LibraryDB.artist_names_matching``, artist
-column only, no window), picks the spellings that ARE the artist, and fetches
-exactly those rows. Picking runs rung by rung, first hit wins:
+:func:`artist_spellings` asks the catalog for the stored artist spellings
+that contain the name as a phrase (``LibraryDB.artist_names_matching``, artist
+column only, no window) and picks the spellings that ARE the artist;
+:func:`rows_for_artist` fetches exactly those rows. Picking runs rung by rung,
+first hit wins:
 
 1. equal under ``normalize_for_comparison`` (case, diacritics, whitespace);
 2. equal with a leading article stripped from both sides ("Clientele" for
@@ -64,11 +65,14 @@ _MAX_NAME_LENGTH = 120
 thread, and the request model does not cap the artist field."""
 
 
-async def rows_for_artist(db: LibraryDB, artist: str) -> list[LibraryItem]:
-    """Every library row by ``artist`` and by no one else, in id order.
+async def artist_spellings(db: LibraryDB, artist: str) -> list[str]:
+    """The stored ``library.artist`` spellings that ARE ``artist``: the rung pick.
 
     Empty when the artist is not shelved, or when only a tolerant rung matches
-    and it matches more than one artist. See the module docstring.
+    and it matches more than one artist. Reads artist names only, never rows,
+    so a caller that restricts its own query to these spellings
+    (``LibraryDB.search_among``) never materializes the shelf. See the module
+    docstring.
     """
     name = normalize_for_comparison(artist).strip()
     if not name or len(name) > _MAX_NAME_LENGTH:
@@ -86,5 +90,14 @@ async def rows_for_artist(db: LibraryDB, artist: str) -> list[LibraryItem]:
             continue
         if tolerant and len({stored[spelling] for spelling in hits}) > 1:
             return []
-        return await db.rows_by_artist(hits)
+        return hits
     return []
+
+
+async def rows_for_artist(db: LibraryDB, artist: str) -> list[LibraryItem]:
+    """Every library row by ``artist`` and by no one else, in id order.
+
+    Empty when the artist is not shelved, or when only a tolerant rung matches
+    and it matches more than one artist. See the module docstring.
+    """
+    return await db.rows_by_artist(await artist_spellings(db, artist))

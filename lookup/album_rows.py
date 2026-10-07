@@ -9,10 +9,11 @@ The lane used to read only :func:`album_search`: the first 50 hits of an
 artist+album full-text search, narrowed to rows whose artist starts with the
 typed name. For a common-word name other artists fill those 50 rows first, so
 God / "God" answered with God Rifle's record and Heads / "Heads" with Heads
-Up's (LML#1421). :func:`album_rows` asks the artist's own shelf first
-(``lookup/artist_shelf.py::rows_for_artist``) through the same full-text
-match with no window (``LibraryDB.search_among``), so it adds no row that an
-unlimited search would not have returned, and therefore no artwork lookup.
+Up's (LML#1421). :func:`album_rows` first runs the same full-text match with
+no window, restricted to rows filed under the artist's own stored spellings
+(``lookup/artist_shelf.py::artist_spellings``, via ``LibraryDB.search_among``),
+so it adds no row that an unlimited search would not have returned, and
+therefore no artwork lookup.
 When none of the artist's own rows passes the title filter, the window answers
 as before, so a typed "Sun Ra" still reaches "Sun Ra Arkestra", and an
 alternate or cross-referenced name still reaches its rows.
@@ -73,16 +74,16 @@ def filter_by_album_title(
 
 
 async def album_rows(
-    db: LibraryDB, lib_artist: str, album: str, shelf: list[LibraryItem]
+    db: LibraryDB, lib_artist: str, album: str, spellings: list[str]
 ) -> list[LibraryItem]:
-    """The rows the lane keeps for ``album``: the artist's own rows on ``shelf``
-    that the search matches and the title filter accepts, else the window's.
+    """The rows the lane keeps for ``album``: the artist's own rows that the
+    search matches and the title filter accepts, else the window's.
 
-    ``shelf`` is :func:`~lookup.artist_shelf.rows_for_artist` for ``lib_artist``,
-    read once per request by the caller. See the module docstring.
+    ``spellings`` is :func:`~lookup.artist_shelf.artist_spellings` for
+    ``lib_artist``, read once per request by the caller. See the module docstring.
     """
-    if shelf:
-        own = await db.search_among(f"{lib_artist} {album}", [row.id for row in shelf])
+    if spellings:
+        own = await db.search_among(f"{lib_artist} {album}", spellings)
         if kept := filter_by_album_title(own, album, lib_artist):
             return kept
     return filter_by_album_title(await album_search(db, lib_artist, album), album, lib_artist)

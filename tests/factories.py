@@ -40,7 +40,9 @@ def shelve(db, rows):
     ``artist_names_matching`` returns every stored spelling in ``rows``
     whatever the phrases (the real query is a containment test, so a superset
     is the honest stand-in); ``rows_by_artist`` returns the rows filed under
-    exactly the spellings asked for. Returns ``db``.
+    exactly the spellings asked for. ``search_among`` returns the same rows
+    whatever the query: a superset stand-in for its full-text match, which the
+    lane's title filter then narrows (LML#1421). Returns ``db``.
     """
 
     async def artist_names_matching(phrases):
@@ -49,8 +51,12 @@ def shelve(db, rows):
     async def rows_by_artist(artists):
         return [row for row in rows if row.artist in artists]
 
+    async def search_among(query, artists):
+        return await rows_by_artist(artists)
+
     db.artist_names_matching = AsyncMock(side_effect=artist_names_matching)
     db.rows_by_artist = AsyncMock(side_effect=rows_by_artist)
+    db.search_among = AsyncMock(side_effect=search_among)
     return db
 
 
