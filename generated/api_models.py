@@ -1139,6 +1139,33 @@ class UpdateRotationCardRequest(BaseModel):
     name: str | None = Field(...)
 
 
+class RotationWindowDays(BaseModel):
+    """
+    Per bin, how many days a record may sit in rotation before a client flags it as due for replacement. Keyed by the `RotationBin` values: OpenAPI 3.0 cannot key an object by a `$ref`'d enum (`propertyNames` is 3.1), so the keys are spelled out here and a spec test pins them equal to `RotationBin`'s enum. The read shape carries no upper bound, so the write ceiling (see `UpdateRotationWindowDays`) can be raised later without a breaking change; oasdiff treats raising a response maximum as breaking.
+
+    """
+
+    H: conint(ge=1)
+    M: conint(ge=1)
+    L: conint(ge=1)
+    S: conint(ge=1)
+
+
+class UpdateRotationWindowDays(BaseModel):
+    """
+    The `window_days` of `UpdateRotationThresholdsRequest`: the `RotationWindowDays` keys, each optional. Keyed by the `RotationBin` values for the same reason as `RotationWindowDays`; a key outside them is a 400.
+
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    H: conint(ge=1, le=365) | None = None
+    M: conint(ge=1, le=365) | None = None
+    L: conint(ge=1, le=365) | None = None
+    S: conint(ge=1, le=365) | None = None
+
+
 class RotationEntry(BaseModel):
     id: int
     album_id: int | None = Field(
@@ -5460,6 +5487,32 @@ class AlbumDetail(BaseModel):
         max_length=20,
     )
     reconciled_identity: ReconciledIdentity | None = None
+
+
+class RotationThresholds(BaseModel):
+    """
+    The station-wide rotation thresholds that music directors set: one record for the whole station, not per-user. Every value is a count of whole days. Read by `GET /library/rotation/thresholds` and changed by `PATCH /library/rotation/thresholds`.
+
+    """
+
+    window_days: RotationWindowDays
+    card_stale_days: conint(ge=1) = Field(
+        ...,
+        description="How many days a rotation card may go without a recorded change (see `last_changed_at` on `GET /library/rotation/cards`) before a client flags it as stale. One number across all bins.\n",
+    )
+
+
+class UpdateRotationThresholdsRequest(BaseModel):
+    """
+    Body of `PATCH /library/rotation/thresholds`. Partial: an omitted key leaves that value unchanged, at both levels, so `{"window_days": {"H": 30}}` changes only the Heavy window, and `{}` or `{"window_days": {}}` changes nothing and returns the current record. `null` is not a way to omit a key: an explicit `null`, at either level, is a 400, as is a day count that is not an integer in 1..365. Any other key is a 400 naming it. The 1..365 bound is request-side only and declared at publication, because oasdiff treats adding a request-side bound later as breaking.
+
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    window_days: UpdateRotationWindowDays | None = None
+    card_stale_days: conint(ge=1, le=365) | None = None
 
 
 class IntakeSlip(BaseModel):
