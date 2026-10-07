@@ -428,6 +428,11 @@ MODULE_BUDGETS: dict[str, int] = {
     # ``_rehydrate_resolved_release``, moved out of rowless.py so the import
     # direction (rowless -> album_level_match) stays acyclic. Smallest
     # multiple of 50 at or above 1.3x the 215-line measured size (279.5).
+    # LML#1443: `build_result_items` (+ nested `_identity_for`), moved verbatim
+    # out of lookup/orchestrator.py, which sat at 1849/1850, so the
+    # `matched_via_alias` tag (LML#1425) has a home that is not the spine.
+    # Smallest multiple of 50 at or above 1.3x the 70-line measured size (91).
+    "lookup/result_items.py": 100,
     "lookup/album_level_match.py": 300,
     "lookup/release_resolution.py": 550,
     # LML#1391/#1393: the unbound shelf fallback, the new Step 8 at the end of
