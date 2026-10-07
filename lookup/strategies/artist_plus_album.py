@@ -28,7 +28,7 @@ from core.search import (
 from library.db import LibraryDB
 from library.models import LibraryItem
 from lookup.album_rows import album_rows
-from lookup.artist_shelf import rows_for_artist
+from lookup.artist_shelf import artist_spellings
 from lookup.fallback_title_floors import _filter_results_by_album_match
 from lookup.matching import (
     _FETCH_LIMIT,
@@ -123,7 +123,7 @@ async def runs_album_resolution(parsed: ParsedRequest, db: LibraryDB | None) -> 
         return True
     typed_folded = fold_punctuation_for_comparison(typed.lower())
     if not is_self_titled_request_placeholder(typed):
-        rows = await album_rows(db, lib_artist, typed, await rows_for_artist(db, lib_artist))
+        rows = await album_rows(db, lib_artist, typed, await artist_spellings(db, lib_artist))
         return not any(_is_self_titled_record(r, typed_folded) for r in rows)
     rows = filter_results_by_artist(
         await db.search(query=lib_artist, limit=_FETCH_LIMIT), lib_artist
@@ -184,12 +184,10 @@ async def search_library_with_fallback(
         return [], bool(parsed.song)
 
     if lib_artist and albums:
-        shelf = await rows_for_artist(db, lib_artist)
-
-        async def search_one_album(album: str) -> list[LibraryItem]:
-            return await album_rows(db, lib_artist, album, shelf)
-
-        album_results = await asyncio.gather(*[search_one_album(a) for a in albums])
+        spellings = await artist_spellings(db, lib_artist)
+        album_results = await asyncio.gather(
+            *(album_rows(db, lib_artist, a, spellings) for a in albums)
+        )
 
         for results in album_results:
             for item in results:

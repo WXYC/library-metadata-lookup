@@ -1040,24 +1040,26 @@ class LibraryDB:
         )
         return [LibraryItem(**dict(row)) for row in await cursor.fetchall()]
 
-    async def search_among(self, query: str, ids: list[int]) -> list[LibraryItem]:
-        """Return the rows among ``ids`` that the FTS ``query`` matches, in id order.
+    async def search_among(self, query: str, artists: list[str]) -> list[LibraryItem]:
+        """Return the rows filed under ``artists`` that the FTS ``query`` matches, in id order.
 
-        The match :meth:`search` runs, with no ``LIMIT``: a caller that already
-        holds an artist's rows (:meth:`rows_by_artist`) asks which of them the
-        query reaches, however many other rows it also reaches (LML#1421). No
-        LIKE or fuzzy fallback; ``[]`` for a query with no terms or no ids.
+        The match :meth:`search` runs, with no ``LIMIT``, restricted to rows
+        whose ``artist`` is literally one of ``artists`` (the stored spellings
+        ``lookup.artist_shelf.artist_spellings`` picks): a caller asks which of
+        an artist's rows the query reaches, however many other rows it also
+        reaches (LML#1421), without reading the artist's whole shelf first. No
+        LIKE or fuzzy fallback; ``[]`` for a query with no terms or no artists.
         """
         if not self._conn:
             raise RuntimeError("Database not connected")
         match_query = _to_fts_match_query(query)
-        if not match_query or not ids:
+        if not match_query or not artists:
             return []
         cursor = await self._conn.execute(
             f"SELECT {self._select_columns('l')} FROM library l "
             "JOIN library_fts fts ON l.id = fts.rowid WHERE library_fts MATCH ? "
-            f"AND l.id IN ({', '.join('?' for _ in ids)}) ORDER BY l.id",
-            [match_query, *ids],
+            f"AND l.artist IN ({', '.join('?' for _ in artists)}) ORDER BY l.id",
+            [match_query, *artists],
         )
         return [LibraryItem(**dict(row)) for row in await cursor.fetchall()]
 

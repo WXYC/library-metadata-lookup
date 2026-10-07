@@ -8,7 +8,7 @@ show.
 
 import pytest
 
-from lookup.artist_shelf import rows_for_artist
+from lookup.artist_shelf import artist_spellings, rows_for_artist
 from lookup.matching import _FETCH_LIMIT
 from tests.factories import crowd_rows, make_library_catalog
 
@@ -196,3 +196,38 @@ class TestTolerantRungs:
             await db.close()
 
         assert [row.id for row in rows] == list(range(1, 61))
+
+
+class TestArtistSpellings:
+    """The rung pick alone, before any row is read (LML#1421 reads rows its own way)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("typed", "catalog", "expected"),
+        [
+            pytest.param(
+                "Stereolab",
+                [("Stereolab", "Dots and Loops"), ("STEREOLAB", "Emperor Tomato Ketchup")],
+                ["Stereolab", "STEREOLAB"],
+                id="every-casing-of-the-artist",
+            ),
+            pytest.param(
+                "Clientele", [("The Clientele", "Suburban Light")], ["The Clientele"], id="tolerant"
+            ),
+            pytest.param(
+                "Frames",
+                [("A Frames", "Black Forest"), ("The Frames", "Fitzcarraldo")],
+                [],
+                id="ambiguous-tolerant-rung",
+            ),
+            pytest.param("Sun Ra", [("Sun Ra Arkestra", "Lanquidity")], [], id="not-shelved"),
+        ],
+    )
+    async def test_artist_spellings(self, tmp_path, typed, catalog, expected):
+        db = await make_library_catalog(tmp_path, catalog)
+        try:
+            spellings = await artist_spellings(db, typed)
+        finally:
+            await db.close()
+
+        assert sorted(spellings) == sorted(expected)
