@@ -1,6 +1,6 @@
 """The artist+album lane's rows against a real SQLite catalog (LML#1421).
 
-A real ``library_fts`` index, as in ``tests/unit/test_artist_shelf.py``: the
+A real ``library_fts`` index (``tests/factories.py::make_library_catalog``): the
 defect lived in the gap between the 50 rows the full-text search returns and
 the rows the lane keeps, which a mocked ``LibraryDB`` cannot show.
 """
@@ -9,12 +9,12 @@ import pytest
 
 from lookup.strategies.artist_plus_album import search_library_with_fallback
 from services.parser import MessageType, ParsedRequest
-from tests.unit.test_artist_shelf import _catalog, _crowd
+from tests.factories import crowd_rows, make_library_catalog
 
 
 async def _lane(tmp_path, rows, artist, album):
     """``((artist, title) of the lane's rows, fallback flag)`` for one typed album, no song."""
-    db = await _catalog(tmp_path, rows)
+    db = await make_library_catalog(tmp_path, rows)
     parsed = ParsedRequest(
         artist=artist,
         album=album,
@@ -39,7 +39,7 @@ class TestOwnRowsBehindAFullSearchWindow:
         artist's own, so the 50-row window never reached them."""
         rows = [
             (f"{artist} Rifle", f"{artist} Rifle"),
-            *_crowd(artist),
+            *crowd_rows(artist),
             (artist, artist),
             (artist, "Second Album"),
         ]
