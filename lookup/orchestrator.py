@@ -82,6 +82,7 @@ from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.release_resolution import (
     ResolvedRelease,
 )
+from lookup.result_items import build_result_items
 from lookup.shelf_fallback import apply_shelf_fallback
 from lookup.spine_deadline import (
     SpineDeadline,
@@ -752,7 +753,7 @@ async def _step_library_miss_probe(
     # LML#1026: an index hit means the fold will supply in-library shelf rows
     # for this track — synthesizing a rowless id=0 "not in your library" item
     # here would both spend the live Discogs call the hit path is meant to
-    # avoid and outrank the shelf location as primary (_build_result_items
+    # avoid and outrank the shelf location as primary (build_result_items
     # ranks items_with_artwork first).
     if _task_resolved_with_renderable_locations(location_union_task):
         return
@@ -1141,59 +1142,6 @@ async def _step_resolve_result_identities(
     return identities_by_artist
 
 
-def _build_result_items(
-    state: LookupState,
-    identities_by_artist: dict[str, ReconciledIdentity],
-) -> list[LookupResultItem]:
-    """Build the response items (convert internal models to API contract models).
-
-    READS: ``items_with_artwork`` (takes precedence when non-empty — the
-    canonical rule statement is ``LookupState.result_count``),
-    ``library_results``, ``matched_via_by_id``.
-    WRITES: nothing.
-    """
-
-    def _identity_for(item: LibraryItem) -> ReconciledIdentity | None:
-        if not item.artist:
-            return None
-        return identities_by_artist.get(item.artist)
-
-    result_items = []
-    if state.items_with_artwork:
-        for item, artwork in state.items_with_artwork:
-            # Synthesized items (id=0, from Step 3a) have no library call-number
-            # components; build the "(external)" sentinel that Backend-Service
-            # already understands (same contract as the Step 7
-            # include_external_caches path — one construction site for both,
-            # lookup/external_search.py:build_external_catalog_item).
-            catalog_item = (
-                build_external_catalog_item(artist=item.artist, title=item.title)
-                if item.id == 0
-                else item.to_catalog_item()
-            )
-            result_items.append(
-                LookupResultItem(
-                    library_item=catalog_item,
-                    artwork=artwork.to_match_result() if artwork else None,
-                    reconciled_identity=_identity_for(item),
-                    # Synthesized items (id=0) carry no track-title-provenance hint;
-                    # do not look up key 0 in matched_via_by_id to prevent accidental
-                    # collision with any future strategy that might write to that key.
-                    matched_via=None if item.id == 0 else state.matched_via_by_id.get(item.id),
-                )
-            )
-    elif state.library_results:
-        for item in state.library_results:
-            result_items.append(
-                LookupResultItem(
-                    library_item=item.to_catalog_item(),
-                    reconciled_identity=_identity_for(item),
-                    matched_via=state.matched_via_by_id.get(item.id),
-                )
-            )
-    return result_items
-
-
 async def _step_external_cache_fallback(
     parsed: ParsedRequest,
     result_items: list[LookupResultItem],
@@ -1270,7 +1218,7 @@ async def perform_lookup(
     - Step 4b.   ``_step_enrich_metadata`` — metadata enrichment
     - (observability) ``_step_project_trace_attrs`` — Sentry trace projection
     - Step 6.    ``_step_resolve_result_identities`` — artist identity resolution
-    - (response) ``_build_result_items`` — API-model conversion
+    - (response) ``build_result_items`` — API-model conversion
     - Step 7.    ``_step_external_cache_fallback`` — external-cache fallback
     - (location fold) ``build_location_result_items`` + ``_reconcile_post_fold_signals``
       — fold the location-union's other shelf locations into ``results`` and
@@ -1479,7 +1427,7 @@ async def perform_lookup(
             location_union_task=location_union_task,
         )
 
-    result_items = _build_result_items(state, identities_by_artist)
+    result_items = build_result_items(state, identities_by_artist)
     external_source = await _step_external_cache_fallback(parsed, result_items, services)
 
     # Fold the location-union's other shelf locations into `results` (the
@@ -1786,7 +1734,7 @@ async def _build_degraded_response(
     Returns the library rows accumulated so far with **no** live-Discogs
     enrichment (artwork/streaming/identity resolution shed) and no context
     message. Identities are empty (identity resolution itself can shed), so
-    ``_build_result_items`` binds each row with ``reconciled_identity=None``.
+    ``build_result_items`` binds each row with ``reconciled_identity=None``.
     ``timeout`` is left as the search pipeline reported it. This degrades the
     hot path to fast, partial metadata instead of a 500.
 
@@ -1819,7 +1767,7 @@ async def _build_degraded_response(
         sentry_sdk.set_tag("lml.degraded_reason", degraded_reason.value)
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Failed to project degraded_reason onto Sentry transaction: %s", e)
-    result_items = _build_result_items(state, {})
+    result_items = build_result_items(state, {})
     folded_locations = await _await_location_union_bounded(location_union_task)
     result_items, folded_location_count, index_confirmed_existing = _fold_locations_into_results(
         result_items, folded_locations, state
