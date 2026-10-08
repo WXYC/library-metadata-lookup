@@ -29,7 +29,7 @@ from library.db import LibraryDB
 from library.models import LibraryItem
 from lookup.album_rows import album_rows
 from lookup.artist_shelf import artist_spellings
-from lookup.fallback_title_floors import _filter_results_by_album_match
+from lookup.fallback_rows import artist_only_rows, artist_song_rows
 from lookup.matching import (
     _FETCH_LIMIT,
     MAX_SEARCH_RESULTS,
@@ -173,7 +173,9 @@ async def search_library_with_fallback(
     Each album's rows come from :func:`~lookup.album_rows.album_rows`: the
     artist's own rows when they have the album, then its alternate-name rows,
     else the 50-row search window (LML#1421). The artist+song and artist-only
-    fallbacks still read the window (LML#1425).
+    fallbacks (``lookup/fallback_rows.py``) order their rows the same way
+    (LML#1445); for a shelved artist whose own rows miss the song's words, the
+    artist+song fallback answers only with own rows and credited rows.
 
     Returns:
         Tuple of (library_results, song_not_found_flag)
@@ -190,8 +192,9 @@ async def search_library_with_fallback(
                 return results[:MAX_SEARCH_RESULTS], False
         return [], bool(parsed.song)
 
+    spellings = await artist_spellings(db, lib_artist) if lib_artist else []
+
     if lib_artist and albums:
-        spellings = await artist_spellings(db, lib_artist)
         album_results = await asyncio.gather(
             *(album_rows(db, lib_artist, a, spellings) for a in albums)
         )
@@ -245,24 +248,14 @@ async def search_library_with_fallback(
         )
 
     if lib_artist and parsed.song:
-        query = f"{lib_artist} {parsed.song}"
-        results = await db.search(query=query, limit=_FETCH_LIMIT)
-        results = filter_results_by_artist(results, lib_artist)
-        results = _filter_results_by_album_match(results, parsed.album)
-
+        results = await artist_song_rows(db, lib_artist, parsed.song, parsed.album, spellings)
         if results:
-            song_lower = parsed.song.lower()
-            results.sort(
-                key=lambda r: song_lower in (r.title or "").lower(),
-                reverse=True,
-            )
             return results, True
 
-    if not all_results and lib_artist:
+    # A shelved artist's artist+song fallback has already read the artist-only rows.
+    if not all_results and lib_artist and not (parsed.song and spellings):
         logger.info(f"No results for albums {albums}, trying artist only: '{lib_artist}'")
-        results = await db.search(query=lib_artist, limit=_FETCH_LIMIT)
-        results = filter_results_by_artist(results, lib_artist)
-        results = _filter_results_by_album_match(results, parsed.album)
+        results = await artist_only_rows(db, lib_artist, parsed.album, spellings)
         if results:
             return results, True
 
