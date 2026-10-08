@@ -92,6 +92,33 @@ class TestUnresolvableSongReadsTheShelf:
         assert got == ([("Stereolab", "Emperor Tomato Ketchup")], True)
 
     @pytest.mark.asyncio
+    async def test_a_credited_title_as_the_song_leads(self, tmp_path):
+        """The song search reaches the row through its credit line; no own row
+        holds the song's words, so the credited row answers ahead of the shelf."""
+        credit = "Harold Budd, Elizabeth Fraser, Robin Guthrie, Simon Raymonde"
+        rows = [
+            ("Harold Budd", "The Pavilion of Dreams"),
+            ("Cocteau Twins", "The Moon and the Melodies", credit),
+        ]
+
+        got, _ = await _fallback(tmp_path, rows, "Harold Budd", song="The Moon and the Melodies")
+
+        assert got == [("Cocteau Twins", "The Moon and the Melodies")]
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_compilation_title_leads_for_various_artists(self, tmp_path):
+        """The window's LIKE fallback reaches the compilation-shelf row from a song
+        cut short; it answers, not the plain shelf's lowest-id row."""
+        rows = [
+            ("Various Artists", "Sugar Hill - The Great Rap Hits"),
+            ("Various Artists - Rock - A", "American Graffiti"),
+        ]
+
+        got, _ = await _fallback(tmp_path, rows, "Various Artists", song="America Graffiti")
+
+        assert got == [("Various Artists - Rock - A", "American Graffiti")]
+
+    @pytest.mark.asyncio
     async def test_artist_without_a_shelf_still_reads_the_window(self, tmp_path):
         rows = [("Junior Varsity KM", "You're Fabulous")]
 
@@ -146,6 +173,31 @@ class TestArtistOnlyFallback:
         assert got == [("Can", "Tago Mago")]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("song", [None, UNRESOLVABLE])
+    async def test_typed_album_no_own_row_clears_never_answers_with_a_prefix_row(
+        self, tmp_path, song
+    ):
+        """ABBA / "ABBA" with a Discogs miss: no ABBA title clears the album floor
+        and "Abba Gargando" does. The fallback answers with nothing rather than
+        another artist's record (LML#1425 decision 1); an empty response reaches
+        step 8, which lists the shelf without binding a release to it."""
+        rows = [("Abba Gargando", "Abba Gargando"), ("ABBA", "Arrival"), ("ABBA", "Waterloo")]
+
+        got, _ = await _fallback(
+            tmp_path, rows, "ABBA", album="ABBA", song=song, albums=["Zz Nonexistent Album"]
+        )
+
+        assert got == []
+
+    @pytest.mark.asyncio
+    async def test_typed_album_keeps_a_credited_row_that_clears_the_floor(self, tmp_path):
+        rows = [("ABBA", "Arrival"), ("Frida", "Shine", "ABBA & Frida")]
+
+        got, _ = await _fallback(tmp_path, rows, "ABBA", album="Shine", albums=["Zz Nonexistent"])
+
+        assert got == [("Frida", "Shine")]
+
+    @pytest.mark.asyncio
     async def test_own_read_stops_at_the_window_size_with_no_album(self, tmp_path):
         """Various Artists' plain shelf holds 3,113 rows; main's window returned 49."""
         rows = [("Stereolab", f"Record {i}") for i in range(_FETCH_LIMIT + 10)]
@@ -179,19 +231,20 @@ class TestArtistSongFallback:
     async def test_song_titled_after_a_record_leads_with_the_artists_row(self, tmp_path):
         """The catalog's collision: "Can-i-bus" tokenizes to "can", so Canibus'
         row and the crowd fill the "Can Can" window ahead of Can's self-titled
-        record, and main answered with Canibus alone."""
+        record, and main answered with Canibus alone. Which Can row leads is the
+        substring sort's call ("Cannibalism" holds "can"), unchanged from main."""
         rows = [
             ("Canibus", "Can-i-bus"),
             *crowd_rows("Can"),
             ("Can", "Ege Bamyasi"),
+            ("Can", "Cannibalism"),
             ("Can", "Can"),
         ]
 
         got, fallback = await _fallback(tmp_path, rows, "Can", song="Can")
 
         assert fallback is True
-        assert got[0] == ("Can", "Can")
-        assert ("Canibus", "Can-i-bus") not in got
+        assert got and {artist for artist, _ in got} == {"Can"}
 
     @pytest.mark.asyncio
     async def test_song_in_title_ranks_first_within_own_rows(self, tmp_path):
@@ -204,10 +257,28 @@ class TestArtistSongFallback:
         assert got == [("Can", "Sessions Tago Mago Live"), ("Can", "Tago Mago Sessions")]
 
     @pytest.mark.asyncio
+    async def test_a_credited_row_titled_with_the_song_leads_own_rows_that_are_not(self, tmp_path):
+        """Kath Bloom / "Kath Bloom": every own row matches through the artist
+        column, but the record titled with the song is filed under Loren Mazzacane."""
+        rows = [
+            ("Loren Mazzacane", "Kath Bloom", "Kath Bloom"),
+            ("Kath Bloom", "Pass through here"),
+            ("Kath Bloom", "Finally"),
+        ]
+
+        got, _ = await _fallback(tmp_path, rows, "Kath Bloom", song="Kath Bloom")
+
+        assert got[0] == ("Loren Mazzacane", "Kath Bloom")
+
+    @pytest.mark.asyncio
     async def test_various_artists_song_reaches_a_compilation_shelf(self, tmp_path):
-        """The shelves are read with the song alone: their names never hold the
-        song's words, so the artist + song query would miss them."""
-        rows = [("Various Artists", "Other"), ("Various Artists - Rock - S", "Sister Ray")]
+        """The shelves are read with the song alone, so a shelf row the crowded
+        window never reaches still answers."""
+        rows = [
+            *((f"Various Artists Tribute {i}", f"Sister Ray {i}") for i in range(60)),
+            ("Various Artists", "Other"),
+            ("Various Artists - Rock - S", "Sister Ray"),
+        ]
 
         got = await _fallback(tmp_path, rows, "Various Artists", song="Sister Ray")
 
