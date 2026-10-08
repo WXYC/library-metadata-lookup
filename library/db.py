@@ -1076,7 +1076,9 @@ class LibraryDB:
         )
         return {(row[0], row[1] or "") for row in await cursor.fetchall()}
 
-    async def search_among(self, query: str, artists: list[str]) -> list[LibraryItem]:
+    async def search_among(
+        self, query: str, artists: list[str], limit: int | None = None
+    ) -> list[LibraryItem]:
         """Return the rows filed under ``artists`` that the FTS ``query`` matches, in id order.
 
         The match :meth:`search` runs, with no ``LIMIT``, restricted to rows
@@ -1085,6 +1087,7 @@ class LibraryDB:
         an artist's rows the query reaches, however many other rows it also
         reaches (LML#1421), without reading the artist's whole shelf first. No
         LIKE or fuzzy fallback; ``[]`` for a query with no terms or no artists.
+        ``limit``, when given, keeps the first ``limit`` of those rows.
         """
         if not self._conn:
             raise RuntimeError("Database not connected")
@@ -1094,8 +1097,8 @@ class LibraryDB:
         cursor = await self._conn.execute(
             f"SELECT {self._select_columns('l')} FROM library l "
             "JOIN library_fts fts ON l.id = fts.rowid WHERE library_fts MATCH ? "
-            f"AND l.artist IN ({', '.join('?' for _ in artists)}) ORDER BY l.id",
-            [match_query, *artists],
+            f"AND l.artist IN ({', '.join('?' for _ in artists)}) ORDER BY l.id LIMIT ?",
+            [match_query, *artists, -1 if limit is None else limit],
         )
         return [LibraryItem(**dict(row)) for row in await cursor.fetchall()]
 

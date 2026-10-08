@@ -42,7 +42,7 @@ def shelve(db, rows):
     is the honest stand-in); ``rows_by_artist`` returns the rows filed under
     exactly the spellings asked for. ``search_among`` returns the same rows
     whatever the query: a superset stand-in for its full-text match, which the
-    lane's title filter then narrows (LML#1421). ``titles_by_artist`` returns
+    lane's title filter then narrows (LML#1421), cut to its ``limit``. ``titles_by_artist`` returns
     those rows' titles, and ``artist_call_letters`` their ``(artist,
     call_letters)`` (LML#1449). Returns ``db``.
     """
@@ -53,8 +53,8 @@ def shelve(db, rows):
     async def rows_by_artist(artists):
         return [row for row in rows if row.artist in artists]
 
-    async def search_among(query, artists):
-        return await rows_by_artist(artists)
+    async def search_among(query, artists, limit=None):
+        return (await rows_by_artist(artists))[:limit]
 
     db.artist_names_matching = AsyncMock(side_effect=artist_names_matching)
     db.rows_by_artist = AsyncMock(side_effect=rows_by_artist)

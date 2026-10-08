@@ -13,7 +13,7 @@ from collections.abc import Callable
 from library.db import LibraryDB
 from library.models import LibraryItem
 from lookup.alternate_credit import credits_artist
-from lookup.artist_shelf import search_own
+from lookup.artist_shelf import own_rows_first
 from lookup.compilation_shelves import shelf_rows
 
 
@@ -26,6 +26,8 @@ async def artist_rows(
     window: list[LibraryItem],
     lib_artist: str,
     spellings: list[str],
+    window_when_shelved: bool = True,
+    limit: int | None = None,
 ) -> list[LibraryItem]:
     """The rows for ``lib_artist``: own rows through ``keep``, else ``window``.
 
@@ -38,9 +40,15 @@ async def artist_rows(
     as drop (LML#1445's artist+song fallback puts song-in-title rows first
     within each tier this way). The credited rows that follow keep their order
     in ``window``, so a caller that wants them ordered sorts ``window`` first.
+
+    ``window_when_shelved=False`` returns ``[]`` instead of ``window`` when the
+    artist has a shelf and ``keep`` leaves no own row, so the caller can read the
+    shelf another way (LML#1445's artist+song fallback). ``limit`` bounds the own
+    read (``LibraryDB.search_among``) to its lowest ids; pass it only with a ``keep``
+    that drops nothing, or rows past the bound that it would keep are lost.
     """
     if spellings:
-        own = await search_own(db, query, spellings)
+        own = own_rows_first(await db.search_among(query, spellings, limit), spellings)
         own += await shelf_rows(db, shelf_query, spellings)
         if kept := keep(own):
             ids = {row.id for row in kept}
@@ -49,4 +57,6 @@ async def artist_rows(
                 for row in window
                 if row.id not in ids and credits_artist(row.alternate_artist_name, lib_artist)
             ]
+        if not window_when_shelved:
+            return []
     return window
