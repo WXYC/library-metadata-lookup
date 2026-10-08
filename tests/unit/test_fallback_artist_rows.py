@@ -43,9 +43,10 @@ MALI_MUSIC_CREDIT = "Afel Bocoum, Damon Albarn, Toumani Diabate and friends"
 
 
 class TestUnresolvableSongReadsTheShelf:
-    """A shelved artist whose own rows miss the song falls through to the
-    artist-only read; the artist+song window's LIKE/fuzzy rows never answer
-    (LML#1425: Afel Bocoum, and Junior Varsity -> Junior Varsity KM)."""
+    """A shelved artist whose own rows miss the song's words: of the artist+song
+    window's LIKE/fuzzy rows only its own answer, followed by the artist-only
+    read's credited rows, or the artist-only rows when there are none (LML#1425:
+    Afel Bocoum, and Junior Varsity -> Junior Varsity KM)."""
 
     @pytest.mark.asyncio
     async def test_afel_bocoum_lists_his_rows_then_the_tagged_credit(self, tmp_path):

@@ -1081,7 +1081,7 @@ class LibraryDB:
     ) -> list[LibraryItem]:
         """Return the rows filed under ``artists`` that the FTS ``query`` matches, in id order.
 
-        The match :meth:`search` runs, with no ``LIMIT``, restricted to rows
+        The match :meth:`search` runs, with no window, restricted to rows
         whose ``artist`` is literally one of ``artists`` (the stored spellings
         ``lookup.artist_shelf.artist_spellings`` picks): a caller asks which of
         an artist's rows the query reaches, however many other rows it also
