@@ -57,7 +57,7 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/artist_rows.py": 100,
     # LML#1445: the artist+song and artist-only fallbacks' rows, out of
     # `lookup/strategies/artist_plus_album.py` (294 of 300). Smallest multiple
-    # of 50 at or above 1.3x the 83-line measured size (107.9).
+    # of 50 at or above 1.3x the 90-line measured size (117).
     "lookup/fallback_rows.py": 150,
     # LML#1421 (#1425 decision 5): the alternate-name credit predicate the
     # album lane keeps alternate-name rows by, and LML#1444 will tag them by.

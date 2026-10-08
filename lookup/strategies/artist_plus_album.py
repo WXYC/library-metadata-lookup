@@ -252,7 +252,8 @@ async def search_library_with_fallback(
         if results:
             return results, True
 
-    if not all_results and lib_artist:
+    # A shelved artist's artist+song fallback has already read the artist-only rows.
+    if not all_results and lib_artist and not (parsed.song and spellings):
         logger.info(f"No results for albums {albums}, trying artist only: '{lib_artist}'")
         results = await artist_only_rows(db, lib_artist, parsed.album, spellings)
         if results:
