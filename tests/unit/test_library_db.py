@@ -2575,6 +2575,17 @@ class TestArtistKeyedQueries:
         assert [row.id for row in rows] == [1, 200]
 
     @pytest.mark.asyncio
+    async def test_search_among_limit_keeps_the_lowest_ids(self, tmp_path):
+        """LML#1445: the artist-only fallback bounds its own read to the window's size."""
+        db = await self._indexed_db(tmp_path, self.ARTISTS)
+        try:
+            rows = await db.search_among("Cat", ["Power Cat Trio", "Cat Power"], limit=2)
+        finally:
+            await db.close()
+
+        assert [row.id for row in rows] == [2, 3]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("artists", "expected"),
         [

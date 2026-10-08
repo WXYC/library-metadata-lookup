@@ -80,7 +80,7 @@ async def artist_spellings(db: LibraryDB, artist: str) -> list[str]:
     and it matches more than one act. Reads artist names, and the call letters of
     punctuation-sibling spellings (``LibraryDB.artist_call_letters``), never a
     ``LibraryItem``: a caller restricting its own query to these spellings
-    (``LibraryDB.search_among``) never materializes the shelf. See the module docstring.
+    (``LibraryDB.search_among``) reads only the rows its query matches. See the module docstring.
     """
     name = normalize_for_comparison(artist).strip()
     if not name or len(name) > _MAX_NAME_LENGTH:
@@ -128,15 +128,10 @@ async def _variants(db: LibraryDB, stored: dict[str, str], hits: list[str]) -> l
     return [spelling for spelling in candidates if shelf[spelling] in {shelf[h] for h in hits}]
 
 
-def _own_rows_first(rows: list[LibraryItem], spellings: list[str]) -> list[LibraryItem]:
+def own_rows_first(rows: list[LibraryItem], spellings: list[str]) -> list[LibraryItem]:
     """``rows`` (id order), the picked artist's ahead of its punctuation variants' (LML#1449)."""
     own = normalize_for_comparison(spellings[0]).strip() if spellings else ""
     return sorted(rows, key=lambda row: normalize_for_comparison(row.artist or "").strip() != own)
-
-
-async def search_own(db: LibraryDB, query: str, spellings: list[str]) -> list[LibraryItem]:
-    """``LibraryDB.search_among`` rows, the picked artist's before its variants' (LML#1449)."""
-    return _own_rows_first(await db.search_among(query, spellings), spellings)
 
 
 async def rows_for_artist(db: LibraryDB, artist: str) -> list[LibraryItem]:
@@ -147,4 +142,4 @@ async def rows_for_artist(db: LibraryDB, artist: str) -> list[LibraryItem]:
     and it matches more than one act. See the module docstring.
     """
     spellings = await artist_spellings(db, artist)
-    return _own_rows_first(await db.rows_by_artist(spellings), spellings)
+    return own_rows_first(await db.rows_by_artist(spellings), spellings)
