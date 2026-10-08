@@ -2041,17 +2041,17 @@ class ArtistRefileResult(ArtistCard):
     previous_code_artist_number: int = Field(
         ..., description="The artist number before this request."
     )
-    previous_code_letters: str | None = Field(
-        None,
-        description="Optional: a server that predates WXYC/Backend-Service#3035 omits it. The call letters before this request. Equals the card's `code_letters` when the letters did not change.\n",
+    previous_code_letters: str = Field(
+        ...,
+        description="The call letters before this request. Equals the card's `code_letters` when the letters did not change.\n",
     )
-    previous_genre_id: int | None = Field(
-        None,
-        description="Optional: a server that predates WXYC/Backend-Service#3035 omits it. The genre before this request. Equals the card's `genre_id` when the artist did not move. The card is the destination membership, so after a genre move its `genre_id` is `to_genre_id`.\n",
+    previous_genre_id: int = Field(
+        ...,
+        description="The genre before this request. Equals the card's `genre_id` when the artist did not move. The card is the destination membership, so after a genre move its `genre_id` is `to_genre_id`.\n",
     )
     releases_to_relabel: int = Field(
         ...,
-        description="How many releases are filed under the destination (artist, genre) membership, counted after the writes. Every one re-labels in the database at once, so this is the count of physical records whose shelf labels now need replacing. Also present when `changed` is `false`, where nothing re-labelled and the count is informational; the `previous_*` fields that are present then equal the card's values.\n",
+        description="How many releases are filed under the destination (artist, genre) membership, counted after the writes. Every one re-labels in the database at once, so this is the count of physical records whose shelf labels now need replacing. Also present when `changed` is `false`, where nothing re-labelled and the count is informational; the `previous_*` fields then equal the card's values.\n",
     )
 
 
