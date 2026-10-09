@@ -19,7 +19,7 @@ import pytest
 from core.exceptions import BreakerOpenError
 from core.search import SearchState
 from discogs.breaker import DiscogsBreakerOpenError
-from discogs.models import DiscogsSearchResponse
+from discogs.models import DiscogsSearchResponse, TrackReleasesResponse
 from entity.compilation_track_location import CompilationTrackLocationRow
 from generated.api_models import (
     DegradedReason,
@@ -31,6 +31,8 @@ from library.models import LibraryItem
 from lookup.location_union import ResolvedLocation
 from lookup.models import LookupRequest, LookupResponse
 from lookup.orchestrator import LookupState, perform_lookup
+from lookup.release_resolution import ResolvedRelease
+from lookup.rowless import ROWLESS_LIBRARY_ID, _make_rowless_item
 from lookup.spine_deadline import LIMIT_CALLER_BUDGET, SpineDeadline
 from tests.conftest import make_lml_telemetry
 from tests.factories import make_discogs_result, make_library_item
@@ -2060,6 +2062,83 @@ class TestPerformLookupLocationUnion:
             call.kwargs.get("artist_as_keyword")
             for call in mock_discogs_service.search_releases_by_track.await_args_list
         ), "the strategy's live comp-discovery pass must not fire on an index hit"
+
+    @pytest.mark.asyncio
+    async def test_a_folded_location_leads_an_a4_rowless_release_and_the_shelf(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#1456: A4 finds the song only on an unshelved release, so the
+        cascade keeps the artist's shelf behind it under ``song_not_found``.
+        A concurrently folded shelf location that carries the song is then
+        prepended (the Case B ordering), so the shelved record a DJ can pull
+        leads, ahead of the release and the unconfirmed shelf rows. Before
+        LML#1456 the same request read ``[release, location]``."""
+        shelf = [
+            LibraryItem(id=40863, title="I Say Nothing", artist="Voice of the Beehive"),
+            LibraryItem(id=40864, title="Let it Bee", artist="Voice of the Beehive"),
+            LibraryItem(id=40865, title="Honey Lingers", artist="Voice of the Beehive"),
+        ]
+        mock_library_db.search.return_value = shelf
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        mock_discogs_service.validate_track_on_release.return_value = False
+        mock_discogs_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="", artist="", releases=[], total=0, cached=False
+            )
+        )
+        rowless = _make_rowless_item(artist="Voice of the Beehive", title="Precious")
+        precious = ResolvedRelease(
+            release_id=1424169,
+            release_url="https://www.discogs.com/release/1424169",
+            is_compilation=True,
+            album_title="Precious",
+            confidence=0.8,
+            track_confirmed=True,
+        )
+        comp = LibraryItem(id=70001, title="Indie Comp", artist="Various Artists - Rock - I")
+        location = ResolvedLocation(
+            row=_location_row(
+                library_id=70001,
+                track_artist="voice of the beehive",
+                track_title="monsters and angels",
+            ),
+            shelf_item=comp,
+        )
+
+        with (
+            patch(
+                "lookup.validation.find_library_albums_with_cached_track",
+                new_callable=AsyncMock,
+                return_value=([rowless], {ROWLESS_LIBRARY_ID: precious}),
+            ),
+            patch(
+                "lookup.orchestrator.resolve_track_shelf_locations",
+                new_callable=AsyncMock,
+                return_value=[location],
+            ),
+        ):
+            response = await perform_lookup(
+                LookupRequest(
+                    artist="Voice of the Beehive",
+                    song="Monster And Angels",
+                    raw_message="Monster And Angels by Voice of the Beehive",
+                ),
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
+            )
+
+        assert [r.library_item.id for r in response.results] == [
+            70001,
+            ROWLESS_LIBRARY_ID,
+            40863,
+            40864,
+            40865,
+        ]
+        assert response.search_type == "compilation"
+        assert response.found_on_compilation is True
+        assert response.context_message == 'Found "Monster And Angels" by Voice of the Beehive on:'
 
     @pytest.mark.asyncio
     async def test_low_priority_caller_keeps_the_legacy_live_comp_pass(

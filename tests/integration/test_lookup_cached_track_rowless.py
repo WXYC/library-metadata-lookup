@@ -34,6 +34,7 @@ from discogs.models import (
     ReleaseMetadataResponse,
     TrackReleasesResponse,
 )
+from lookup.matching import MAX_SEARCH_RESULTS
 from lookup.models import LookupRequest
 from lookup.orchestrator import perform_lookup
 from lookup.rowless import ROWLESS_NO_ALBUM_CONFIDENCE
@@ -167,6 +168,34 @@ async def test_cached_track_surfaces_rowless_release_end_to_end(
     assert item.artwork.release_url == NONLIB_RELEASE_URL
     # No typed album -> A2 soft confidence on the A4 path too.
     assert item.artwork.confidence == ROWLESS_NO_ALBUM_CONFIDENCE
+
+
+@pytest.mark.asyncio
+async def test_the_artist_shelf_follows_the_rowless_release(library_db, enable_nonlibrary_release):
+    """The release carrying the song is not shelved, so request-o-matic strips it
+    (ROM#256). The artist's shelf must follow it, or the DJ is told the song is
+    not in the library with nothing listed (LML#1456). Prod, 2026-10-09: "Monster
+    and Angels" by Voice of the Beehive answered that way over three shelved
+    albums.
+
+    The shelf rows are asserted against the same request with no cache hit (the
+    rows the cascade returns when A4 finds nothing), not as fixed ids: which rows
+    the artist+song fallback reads is a separate contract (LML#1445).
+    """
+    without_hit = await _run(library_db, _service(with_cache_hit=False))
+    response = await _run(library_db, _service(with_cache_hit=True))
+
+    assert response.results[0].library_item.id == 0
+    assert response.results[0].artwork.release_id == NONLIB_RELEASE_ID
+    shelf_ids = [r.library_item.id for r in without_hit.results]
+    assert shelf_ids
+    assert [r.library_item.id for r in response.results[1:]] == shelf_ids[: MAX_SEARCH_RESULTS - 1]
+    assert {r.library_item.artist for r in response.results[1:]} == {ARTIST}
+    assert response.song_not_found is True
+    assert response.search_type == "fallback"
+    assert response.context_message == (
+        f'"{SONG}" is not on any album in the library, but here are some albums by {ARTIST}:'
+    )
 
 
 @pytest.mark.asyncio

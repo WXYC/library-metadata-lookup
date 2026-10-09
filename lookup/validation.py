@@ -441,8 +441,10 @@ async def apply_track_validation_cascade(
     (``_filter_results_by_song_as_album_title``); and last, A4's **row-less**
     carry-through, which asserts the library does not have the record and so
     ranks below any shelved row that answers the request (see the comment at
-    that branch for the title-divergence shape it gets wrong). Each promotes
-    over the previous tier's result only when it finds something.
+    that branch for the title-divergence shape it gets wrong). The row-less
+    release then leads the artist's unconfirmed shelf rows under
+    ``song_not_found`` (LML#1456). Each promotes over the previous tier's
+    result only when it finds something.
 
     On-a-compilation tier: validates the artist-fallback rows saved before
     ``TRACK_ON_COMPILATION`` replaced them, and prepends any confirmed matches
@@ -581,10 +583,17 @@ async def apply_track_validation_cascade(
                         release_overrides={shelf_row.id: resolved_release.release_id},
                     )
 
-            # A row-less release is the weakest thing this tier can return, so
-            # it yields to any shelved row that answers the request and keeps
-            # its seam entry for everything else.
-            return Step3bResult(promoted, False, {**discogs_titles, **promoted_titles})
+            # A row-less release yields to any shelved row that answers the
+            # request (the tiers above). When none does, it leads, and the
+            # artist's shelf rows the request would get without it follow,
+            # unconfirmed (LML#1456), as in the LML#1184 lane below.
+            # request-o-matic strips row-less rows (ROM#256); without the
+            # shelf it would list nothing by an artist the library holds.
+            titles = {**discogs_titles, **promoted_titles}
+            shelf = [r for r in library_results if r.id != ROWLESS_LIBRARY_ID]
+            if shelf:
+                return Step3bResult([*promoted, *shelf][:MAX_SEARCH_RESULTS], True, titles)
+            return Step3bResult(promoted, False, titles)
 
         return Step3bResult(library_results, song_not_found, discogs_titles)
 
