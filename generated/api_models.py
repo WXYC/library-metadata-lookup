@@ -1388,13 +1388,16 @@ class IntakeItemState(StrEnum):
 
 
 class Pass(BaseModel):
-    dj_name: str
+    dj_name: str = Field(
+        ...,
+        description="The passing DJ's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. Station-only: not for any public or anonymous surface, because it holds a legal name; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+    )
     passed_at: AwareDatetime
 
 
 class IntakeItem(BaseModel):
     """
-    One physical copy the station holds, logged by a music director and waiting for a review (WXYC/Backend-Service#2791). Its three DJ-name fields (`requested_dj_name`, `checked_out_by_name`, `passes[].dj_name`) are `auth_user.name`, the public-safe display value; no real name appears in it. `passes` and `draft_authors` are present only for callers holding `reviews: manage`; `draft_authors` is `reviews.author` free text and carries the weaker guarantee of `IntakeDeleteResponse.deleted_review_authors`; see its description.
+    One physical copy the station holds, logged by a music director and waiting for a review (WXYC/Backend-Service#2791). Its three DJ-name fields (`requested_dj_name`, `checked_out_by_name`, `passes[].dj_name`) hold the person's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. They are station-only: not for any public or anonymous surface, because they hold a legal name, and never for client telemetry (analytics properties, error breadcrumbs, logs). `passes` and `draft_authors` are present only for callers holding `reviews: manage`; `draft_authors` is `reviews.author` free text: a real name or account name for a DJ's own review, but whatever the music director typed for an on-behalf review. It carries the same station-only caveat as the three DJ-name fields; see `IntakeDeleteResponse.deleted_review_authors`.
 
     """
 
@@ -1419,13 +1422,19 @@ class IntakeItem(BaseModel):
         ...,
         description="The DJ a music director asked to review the item, set when it enters `requested`. Read it together with `state` and `effective_state`, not as proof of a live request: later transitions may leave it set (a checkout clears the request's fields, and accepting a review withdraws a pending request). `null` while `state: requested` means the requested DJ's account has since been deleted, the case that makes `effective_state` read `pool` despite `state` still saying `requested`.\n",
     )
-    requested_dj_name: str | None = Field(...)
+    requested_dj_name: str | None = Field(
+        ...,
+        description="The requested DJ's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. Station-only: not for any public or anonymous surface, because it holds a legal name; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+    )
     requested_at: AwareDatetime | None = Field(...)
     checked_out_by: str | None = Field(
         ...,
         description='Who holds the physical copy, set on checkout. It stays set when a review is accepted, so a `reviewed` item can still name the DJ who has the copy: deleting the accepted review of an item not yet filed returns it to `checked_out` with the same holder, or to `pool` when there is none. A `reviewed` item keeps its holder until the holder or a music director returns it (`POST /intake/{id}/release`) or the item is filed, which clears it. Read it together with `state`, not as proof of a live checkout. `null` while `checked_out_at` is set, in `checked_out` or `reviewed`, means the holder\'s account has since been deleted, shown to MDs as "holder removed"; an MD may release the item.\n',
     )
-    checked_out_by_name: str | None = Field(...)
+    checked_out_by_name: str | None = Field(
+        ...,
+        description="The holder's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. Station-only: not for any public or anonymous surface, because it holds a legal name; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+    )
     checked_out_at: AwareDatetime | None = Field(...)
     cited_album_id: int | None = Field(...)
     cited_submission_id: int | None = Field(...)
@@ -1455,7 +1464,7 @@ class IntakeItem(BaseModel):
     )
     draft_authors: list[str] | None = Field(
         None,
-        description="Present only for callers holding `reviews: manage`. The `author` of each unsubmitted draft attached to this item: names only, never content, so a music director can see whose unfinished work a delete would remove. These are `reviews.author` snapshots and carry the caveat on `IntakeDeleteResponse.deleted_review_authors`: station-only, never for client telemetry.\n",
+        description="Present only for callers holding `reviews: manage`. The `author` of each unsubmitted draft attached to this item: names only, never content, so a music director can see whose unfinished work a delete would remove. These are `reviews.author` snapshots and carry the caveat on `IntakeDeleteResponse.deleted_review_authors`: station-only, never for client telemetry, and not for any public or anonymous surface, because they hold a legal name.\n",
     )
 
 
@@ -1564,7 +1573,7 @@ class IntakeDeleteResponse(BaseModel):
 
     deleted_review_authors: list[str] = Field(
         ...,
-        description="`reviews.author` snapshots (WXYC/Backend-Service#2805), not `auth_user.name`. For an account-holding DJ's own review this is the same public-safe display value; for a handwritten or on-behalf review an MD typed by hand, it is free text and may be a real name. Unlike `IntakeItem`'s `*_name` fields, this is not guaranteed PII-free — it exists for the MD's own in-station confirmation of what was removed, never for display outside the station or for client telemetry (analytics properties, error breadcrumbs, logs). Includes the authors of unsubmitted drafts that went with the item, the same names `IntakeItem.draft_authors` showed before the delete.\n",
+        description="`reviews.author` snapshots (WXYC/Backend-Service#2805), not `auth_user.name`. For an account-holding DJ's own review this is the same real name (falling back to the account name when none is on file), a snapshot taken when written; for a handwritten or on-behalf review an MD typed by hand, it is free text and may be a real name. Like `IntakeItem`'s `*_name` fields, it is not guaranteed PII-free — it exists for the MD's own in-station confirmation of what was removed, not for any public or anonymous surface, because it holds a legal name, never for display outside the station or for client telemetry (analytics properties, error breadcrumbs, logs). Includes the authors of unsubmitted drafts that went with the item, the same names `IntakeItem.draft_authors` showed before the delete.\n",
     )
 
 
@@ -1593,6 +1602,22 @@ class ReviewCredit(StrEnum):
     none = "none"
 
 
+class Reviewer(BaseModel):
+    """
+    An account that can write reviews. For use inside the station only: `name` is a real name.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="The `auth_user.id`, the value to send as `dj_id` or `author_user_id`.",
+    )
+    name: str = Field(
+        ...,
+        description="The person's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, so the fallback can be the on-air name. It is never the `dj_name` field. Shown only inside the station; not for any public or anonymous surface, because it holds a legal name; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+    )
+
+
 class Review(BaseModel):
     """
     An in-app DJ album review, the station's printed slip plus publishing consent. Attached to an intake item or to a library release (at least one of `intake_item_id` and `album_id` is set). The review's own FCC line (`fcc`) is never published outside the station. In v1 the service stores consent (`publish_*`, `credit`) and publishes nothing.
@@ -1604,7 +1629,7 @@ class Review(BaseModel):
     intake_item_id: int | None = Field(...)
     author: constr(max_length=128) | None = Field(
         ...,
-        description="Null only on a row that predates the in-app model (the column has never been NOT NULL). For an account holder's own review, a snapshot of their display name, the public-safe value. For a handwritten or on-behalf review it is what the music director typed: free text that may be a real name, so it is not guaranteed PII-free. Shown only inside the station; never the published credit (`credit` decides that) and never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+        description="Null only on a row that predates the in-app model (the column has never been NOT NULL). For an account holder's own review, a snapshot of their real name as shown inside the station, taken when written, falling back to their account name (on-air handle, else username) when no real name is on file. For a handwritten or on-behalf review it is what the music director typed: free text that may be a real name, so it is not guaranteed PII-free. Shown only inside the station; not for any public or anonymous surface, because it holds a legal name; never the published credit (`credit` decides that) and never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
     )
     author_user_id: str | None = Field(
         ...,
@@ -1667,7 +1692,7 @@ class ReviewRevision(BaseModel):
     )
     edited_by: constr(max_length=128) | None = Field(
         ...,
-        description="Display-name snapshot taken at the time. Revision 1 names the review's author: it is a copy of `Review.author`, whoever pressed submit, so for a review a music director recorded on someone's behalf it is the name the music director typed. A later revision names whoever made that edit; for a music director's edit of someone else's review, the music director. Station-only, with the caveat on `Review.author`.\n",
+        description="Snapshot of the editor's real name (falling back to their account name when no real name is on file), taken at the time. Revision 1 names the review's author: it is a copy of `Review.author`, whoever pressed submit, so for a review a music director recorded on someone's behalf it is the name the music director typed. A later revision names whoever made that edit; for a music director's edit of someone else's review, the music director. Station-only, with the caveat on `Review.author`; not for any public or anonymous surface, because it holds a legal name.\n",
     )
     edited_by_user_id: str | None = Field(
         ...,
@@ -1723,7 +1748,7 @@ class FccNote(BaseModel):
     )
     reported_by: constr(max_length=128) = Field(
         ...,
-        description="Display-name snapshot of the reporter, the public-safe account display name. Shown inside the station only; never for client telemetry.\n",
+        description="Snapshot of the reporter's real name as shown inside the station, taken when the note was written, falling back to their account name (on-air handle, else username) when no real name is on file. Shown inside the station only; not for any public or anonymous surface, because it holds a legal name; never for client telemetry.\n",
     )
     reported_by_user_id: str | None = Field(
         ..., description="`null` once that account has been deleted."
@@ -1731,7 +1756,7 @@ class FccNote(BaseModel):
     reported_at: AwareDatetime
     confirmed_by: constr(max_length=128) | None = Field(
         ...,
-        description="Display-name snapshot of the music director who confirmed the note, taken at the time, like `reported_by`; `null` while `reported`. There is no account-id field for the confirmer.\n",
+        description="Snapshot of the confirming music director's real name as shown inside the station, taken when the note was confirmed, falling back to their account name (on-air handle, else username) when no real name is on file; `null` while `reported`. Shown inside the station only; not for any public or anonymous surface, because it holds a legal name; never for client telemetry. There is no account-id field for the confirmer.\n",
     )
     confirmed_at: AwareDatetime | None = Field(...)
     artist_name: constr(max_length=128) = Field(
@@ -1791,7 +1816,7 @@ class Medium(StrEnum):
 
 class NewReviewRequest(ReviewFields):
     """
-    Creates a draft, except an on-behalf or handwritten create that names an `intake_item_id` and does not send `accept: false`, which creates a submitted, accepted review (see `accept`). Send exactly one of `intake_item_id` and `album_id`. A caller with `reviews: manage` may also send `author`, `author_user_id` and `medium`, which makes it an on-behalf review: `author` is free text, `author_user_id` optionally links the reviewer's account, and the caller is recorded as the one who recorded it. When `author_user_id` is sent, that account is the review's author and is told by email that a review was recorded in their name (the email carries no review text). A `handwritten` review is recorded the same way. An on-behalf review starts with no publishing surface ticked and `credit` null, because the author never saw the consent question, so an on-behalf create that sends any `publish_*` as `true`, or a non-null `credit`, answers 400. `author` is required on an on-behalf create, because the service cannot snapshot a display name for someone who is not the caller: a missing or blank `author` answers 400, and so does an `author_user_id` that names no account. An on-behalf create may name an intake item in any state, including `filed` and `finalized`. Without these fields, the review is the caller's own and `typed`: the service sets `author` to a snapshot of the account's display name at creation, and sets the account fields from the caller, so a client never sends them. `author` is never the published credit; the `credit` choice decides that.
+    Creates a draft, except an on-behalf or handwritten create that names an `intake_item_id` and does not send `accept: false`, which creates a submitted, accepted review (see `accept`). Send exactly one of `intake_item_id` and `album_id`. A caller with `reviews: manage` may also send `author`, `author_user_id` and `medium`, which makes it an on-behalf review: `author` is free text, `author_user_id` optionally links the reviewer's account, and the caller is recorded as the one who recorded it. When `author_user_id` is sent, that account is the review's author and is told by email that a review was recorded in their name (the email carries no review text). A `handwritten` review is recorded the same way. An on-behalf review starts with no publishing surface ticked and `credit` null, because the author never saw the consent question, so an on-behalf create that sends any `publish_*` as `true`, or a non-null `credit`, answers 400. `author` is required on an on-behalf create, because the service cannot snapshot a name for someone who is not the caller: a missing or blank `author` answers 400, and so does an `author_user_id` that names no account. An on-behalf create may name an intake item in any state, including `filed` and `finalized`. Without these fields, the review is the caller's own and `typed`: the service sets `author` to a snapshot of the caller's real name at creation, falling back to their account name (on-air handle, else username) when no real name is on file, and sets the account fields from the caller, so a client never sends them. An on-behalf review keeps the text that was typed. `author` is never the published credit; the `credit` choice decides that.
 
     """
 
@@ -5529,7 +5554,7 @@ class IntakeSlip(BaseModel):
     review: str | None = Field(...)
     author: constr(max_length=128) | None = Field(
         ...,
-        description="The printed review's `Review.author`, with the same station-only caveat; never for client telemetry.",
+        description="The printed review's `Review.author`, snapshotted when written (a real name or account name for a DJ's own review, the music director's typed text for an on-behalf or handwritten one), with the same station-only caveat; not for any public or anonymous surface, because it holds a legal name; never for client telemetry.",
     )
     submitted_at: AwareDatetime | None = Field(...)
     recommended_tracks: str | None = Field(...)
