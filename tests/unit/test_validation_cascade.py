@@ -14,6 +14,7 @@ import pytest
 
 from config.settings import get_settings
 from entity.sources import PgSource
+from lookup.matching import MAX_SEARCH_RESULTS
 from lookup.release_resolution import ResolvedRelease
 from lookup.rowless import ROWLESS_LIBRARY_ID, _make_rowless_item
 from lookup.validation import (
@@ -312,6 +313,111 @@ class TestApplyTrackValidationCascade:
         assert result.song_not_found is False
 
 
+BEEHIVE = "Voice of the Beehive"
+BEEHIVE_SHELF = [
+    make_library_item(id=40863, artist=BEEHIVE, title="I Say Nothing"),
+    make_library_item(id=40864, artist=BEEHIVE, title="Let it Bee"),
+    make_library_item(id=40865, artist=BEEHIVE, title="Honey Lingers"),
+]
+PRECIOUS = ResolvedRelease(
+    release_id=1424169,
+    release_url="https://www.discogs.com/release/1424169",
+    is_compilation=True,
+    album_title="Precious",
+    confidence=0.8,
+    track_confirmed=True,
+)
+
+
+@pytest.mark.asyncio
+class TestA4RowlessReleaseKeepsTheShelf:
+    """A4 finds the song only on a release WXYC does not shelve: the release
+    leads, and the artist's shelf rows the cascade would otherwise have
+    returned follow it under ``song_not_found`` (LML#1456).
+
+    Prod, 2026-10-09: "Monster and Angels" by Voice of the Beehive. Per-row
+    validation confirmed nothing, A4 found the song on the compilation
+    *Precious*, and the response held *Precious* alone. request-o-matic strips
+    row-less rows (ROM#256), so the DJ was told the song was not in the
+    library, with three of the band's albums on the shelf. The LML#1184 lane
+    already keeps the shelf behind a row-less compilation hit; this is the same
+    shape for the A4 tier.
+    """
+
+    async def _run(self, library_results, real_results=None):
+        rowless = _make_rowless_item(artist="The Voice Of The Bee Hive", title="Precious")
+        if real_results is None:
+            real_results = [r for r in library_results if r.id != ROWLESS_LIBRARY_ID]
+        with (
+            patch(
+                "lookup.validation.filter_results_by_track_validation",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "lookup.validation.find_library_albums_with_cached_track",
+                new_callable=AsyncMock,
+                return_value=([rowless], {ROWLESS_LIBRARY_ID: PRECIOUS}),
+            ),
+        ):
+            result = await apply_track_validation_cascade(
+                real_results=real_results,
+                library_results=library_results,
+                found_on_compilation=False,
+                song_not_found=True,
+                discogs_titles={40865: "existing"},
+                artist_fallback_results=[],
+                song="Monster And Angels",
+                artist="The Voice Of The Bee Hive",
+                match_artist=BEEHIVE,
+                db=object(),
+                discogs_service=object(),
+                allow_release_resolution_fallback=True,
+            )
+        return rowless, result
+
+    async def test_the_shelf_follows_the_release(self):
+        rowless, result = await self._run(BEEHIVE_SHELF)
+
+        assert result.library_results == [rowless, *BEEHIVE_SHELF]
+        assert result.song_not_found is True
+        assert result.discogs_titles == {40865: "existing", ROWLESS_LIBRARY_ID: PRECIOUS}
+        assert result.found_on_compilation is None
+
+    async def test_a_full_shelf_is_capped_behind_the_release(self):
+        shelf = [
+            make_library_item(id=n, artist=BEEHIVE, title=f"Album {n}")
+            for n in range(1, MAX_SEARCH_RESULTS + 1)
+        ]
+
+        rowless, result = await self._run(shelf)
+
+        assert len(result.library_results) == MAX_SEARCH_RESULTS
+        assert result.library_results == [rowless, *shelf[: MAX_SEARCH_RESULTS - 1]]
+
+    async def test_with_no_shelf_the_release_stands_alone(self):
+        rowless, result = await self._run([])
+
+        assert result.library_results == [rowless]
+        assert result.song_not_found is False
+
+    async def test_the_ranked_rows_follow_not_the_widened_candidates(self):
+        """``real_results`` may be LML#808's widened, unranked candidate list;
+        the rows that follow are the ranked ones the request would get anyway."""
+        widened = [make_library_item(id=n, artist=BEEHIVE, title=f"Album {n}") for n in range(1, 9)]
+
+        rowless, result = await self._run(BEEHIVE_SHELF, real_results=widened)
+
+        assert result.library_results == [rowless, *BEEHIVE_SHELF]
+
+    async def test_a_rowless_row_already_present_is_not_appended(self):
+        degrade = _make_rowless_item(artist=BEEHIVE, title="Sex & Misery")
+
+        rowless, result = await self._run([degrade, *BEEHIVE_SHELF])
+
+        assert result.library_results == [rowless, *BEEHIVE_SHELF]
+
+
 # ---------------------------------------------------------------------------
 # The LML#850-override row-less reverse probe.
 #
@@ -368,7 +474,9 @@ BROADCAST_TENDER_BUTTONS_ITEM = make_library_item(
 )
 
 # The Hiding Places / High Places guard: a same-artist row that must NOT be
-# readmitted just because it shares the artist with a row-less High Places hit.
+# promoted to the answer just because it shares the artist with a row-less
+# High Places hit. It still rides behind the release as one of the artist's
+# albums, unconfirmed (LML#1456).
 HIDING_PLACES_ITEM = make_library_item(
     id=8001, artist="Hiding Places Artist", title="Hiding Places"
 )
@@ -519,18 +627,18 @@ class TestCascadeRowLessReverseProbe:
         assert result.library_results == [BROADCAST_ITEM]
         assert result.song_not_found is False
 
-    async def test_no_override_present_falls_through_to_rowless_as_before(self):
-        """Degrades to the pre-existing row-less behaviour when nothing is pinned
-        yet — the stopgap changes nothing for a row the override walk hasn't
-        reached."""
+    async def test_no_override_present_falls_through_to_rowless_ahead_of_the_shelf(self):
+        """Degrades to the row-less answer when nothing is pinned yet: the
+        release leads and the shelf row follows it unconfirmed (LML#1456), the
+        same as for a row the override walk hasn't reached."""
         result, mock_overrides = await self._run(
             real_results=[BROADCAST_ITEM],
             promoted_release_id=BROADCAST_RELEASE_ID,
             overrides={},
         )
         mock_overrides.assert_awaited_once()
-        assert result.library_results[0].id == ROWLESS_LIBRARY_ID
-        assert result.song_not_found is False
+        assert [r.id for r in result.library_results] == [ROWLESS_LIBRARY_ID, BROADCAST_ITEM.id]
+        assert result.song_not_found is True
 
     async def test_hiding_places_guard_rejects_a_same_artist_different_album(self):
         """Regression guard: a same-artist row whose OWN override points to a
@@ -541,8 +649,12 @@ class TestCascadeRowLessReverseProbe:
             overrides={8001: HIDING_PLACES_OWN_RELEASE_ID},
             song="High Places",
         )
-        assert result.library_results[0].id == ROWLESS_LIBRARY_ID
-        assert result.library_results[0].id != HIDING_PLACES_ITEM.id
+        assert [r.id for r in result.library_results] == [
+            ROWLESS_LIBRARY_ID,
+            HIDING_PLACES_ITEM.id,
+        ]
+        assert result.song_not_found is True
+        assert HIDING_PLACES_ITEM.id not in result.release_overrides
 
     async def test_clean_title_control_never_consults_overrides(self):
         """Control: a track that per-result validation confirms directly (the
@@ -623,7 +735,9 @@ class TestCascadeRowLessReverseProbe:
                 allow_release_resolution_fallback=True,
             )
 
-        assert result.library_results[0].id == ROWLESS_LIBRARY_ID
+        assert [r.id for r in result.library_results] == [ROWLESS_LIBRARY_ID, BROADCAST_ITEM.id]
+        assert result.song_not_found is True
+        assert result.release_overrides == {}
 
 
 @pytest.mark.asyncio
@@ -735,7 +849,8 @@ class TestProbeHonoursTheOverrideFlag:
                 pg=AsyncMock(spec=PgSource),
             )
         mock_overrides.assert_not_awaited()
-        assert result.library_results[0].id == ROWLESS_LIBRARY_ID
+        assert [r.id for r in result.library_results] == [ROWLESS_LIBRARY_ID, BROADCAST_ITEM.id]
+        assert result.song_not_found is True
         assert result.release_overrides == {}
 
 
