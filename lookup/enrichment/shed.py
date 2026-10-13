@@ -48,9 +48,16 @@ def shed_cost_content(
       this cannot happen on a shed: the Wikipedia cache is keyed on the
       shed step's own ``artist_id``. The term pins the rule for a future key.
 
-    Known over-approximation: an artist-step shed is still marked when the
-    LML#504 gate would have nulled the bio anyway (title matched, artist
-    identity did not verify). Telling those apart would mean re-deriving
+    Known over-approximation: an artist-step shed is marked whenever the
+    prefetch gate is true, even when ``item.enrich_one``'s bio gate would
+    have discarded the bio anyway. That covers both gates. Under the LML#504
+    split gate (``extended``), it covers a top-1 row whose title matched but
+    whose artist identity did not verify. Under the legacy non-extended gate
+    (``use_split_gate`` false), the bio is used only when
+    ``library_row_acceptable``, so it covers a top-1 row whose artist
+    verified but whose title did not: the fetch runs, its bio is discarded,
+    and the response is still marked degraded. The cost is an occasional
+    unnecessary re-ask. Telling those cases apart would mean re-deriving
     ``item.enrich_one``'s gate here.
     """
     return outcome.upstream_shed and should_prefetch_top1 and served_bio is None
