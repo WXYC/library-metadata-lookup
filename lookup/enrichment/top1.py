@@ -16,6 +16,7 @@ import logging
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import ArtistDetails, DiscogsSearchResult, ReleaseMetadataResponse
 from discogs.service import DiscogsService
+from lookup.enrichment.shed import Top1FetchOutcome, record_shed
 from lookup.wikipedia_url import PickedWikiUrl, pick_artist_wikipedia_url
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 async def fetch_top1_release_details(
     discogs_service: DiscogsService,
     top_artwork: DiscogsSearchResult | None,
+    outcome: Top1FetchOutcome | None = None,
 ) -> tuple[
     int | None,
     str | None,
@@ -36,6 +38,9 @@ async def fetch_top1_release_details(
     Returns the release + artist payloads alongside the legacy three
     scalars so the extended-field population can pluck additional
     fields without re-fetching.
+
+    ``outcome``, when given, is marked ``upstream_shed`` on a breaker shed so
+    the caller can tell a shed from a genuine absence (LML#1420).
     """
     # `release_id <= 0` short-circuits the LML#401 streaming-only
     # synthesis sentinel (see issue #518): the synthesized result
@@ -67,6 +72,7 @@ async def fetch_top1_release_details(
                 "Top-1 release fetch shed by saturation breaker for release_id=%s",
                 top_artwork.release_id,
             )
+            record_shed(outcome)
             return None, None, None, None, None
         if not release:
             return None, None, None, None, None
@@ -90,6 +96,7 @@ async def fetch_top1_release_details(
             # below, which (pre-existing, unchanged) still drops everything
             # on a non-shed failure. No negative is cached either way:
             # ``get_artist_details`` itself already guarantees that on a shed.
+            record_shed(outcome)
             return year, None, None, release, None
         if not details:
             return year, None, None, release, None
@@ -116,6 +123,13 @@ async def fetch_top1_release_details(
             wiki = None
         return year, bio, wiki, release, details
     except Exception:
+        # LML#1420 decision: NOT reported as a shed, so the response is not
+        # marked degraded. ``DiscogsService`` already turns Discogs HTTP
+        # failures into ``None`` before they get here, so this branch catches
+        # unexpected errors (a bug, a malformed payload). Calling that
+        # ``upstream_unavailable`` would mislabel it, and a deterministic
+        # failure flagged degraded would make every re-asking caller retry it
+        # forever. The ``logger.exception`` Sentry event is its signal.
         logger.exception(
             "Top-1 release/artist detail fetch failed for release_id=%s", top_artwork.release_id
         )

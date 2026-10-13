@@ -44,6 +44,7 @@ from lookup.artist_resolution import (
 # that patches against the submodule silently miss.
 from lookup.enrichment import background, item, top1, wikipedia_bio
 from lookup.enrichment.context import EnrichmentContext
+from lookup.enrichment.shed import Top1FetchOutcome, shed_cost_content
 from lookup.spine_deadline import SpineDeadline
 
 logger = logging.getLogger(__name__)
@@ -91,8 +92,11 @@ async def enrich_artwork_results(
     discogs_cache_pg: PgSource | None = None,
     found_on_compilation: bool = False,
     spine_deadline: SpineDeadline | None = None,
+    shed_report: Top1FetchOutcome | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
+
+    ``shed_report``: marked when a top-1 shed cost content (``enrichment.shed``).
 
     When library_db has a streaming_links table, uses direct URLs from the database.
     Falls back to search URLs when direct links are not available.
@@ -241,6 +245,7 @@ async def enrich_artwork_results(
     ) or _artist_pair_verified(request_artist_stripped, top1_item.alternate_artist_name)
     should_prefetch_top1 = top1_library_row_acceptable or top1_library_row_artist_verified
 
+    top1_outcome = Top1FetchOutcome()
     if should_prefetch_top1 or not _skip_prefetch_on_synthesis_enabled():
         (
             top1_year,
@@ -248,7 +253,7 @@ async def enrich_artwork_results(
             top1_wiki,
             top1_release,
             top1_details,
-        ) = await top1.fetch_top1_release_details(discogs_service, top1_artwork)
+        ) = await top1.fetch_top1_release_details(discogs_service, top1_artwork, top1_outcome)
     else:
         # Wholly-fuzzy-miss synthesis path: the top-1 item's title doesn't
         # match the request AND its artist doesn't verify, so the fetch's
@@ -357,6 +362,10 @@ async def enrich_artwork_results(
     enriched_top1_wiki = (
         top1_enriched_result.wikipedia_url if top1_enriched_result is not None else None
     )
+    if shed_report is not None:
+        shed_report.upstream_shed = shed_cost_content(
+            top1_outcome, should_prefetch_top1, served_bio=enriched_top1_bio
+        )
     # Return value (whether the bio actually reached the wire post-gate)
     # deliberately unused past round 6, pass 3, A3 -- it used to also gate
     # the Discogs ref-warm below (`top1_bio_surfaced`), which was the wrong

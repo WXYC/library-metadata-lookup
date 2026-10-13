@@ -59,6 +59,7 @@ from lookup.admission import evaluate_admission_shed
 from lookup.artwork import fetch_artwork_for_items
 from lookup.candidate_memo import TrackCandidateMemo
 from lookup.enrichment import enrich_artwork_results
+from lookup.enrichment.shed import Top1FetchOutcome
 from lookup.external_search import (
     build_external_catalog_item,
     search_external_fallback,
@@ -385,6 +386,14 @@ class LookupState:
     tail legs' ``_build_degraded_response``) instead of the pre-LML#1126
     hardcoded ``degraded=False`` — even when ``library_results`` ended up
     non-empty, since the shed strategy's own contribution is still missing."""
+
+    enrichment_shed: bool = False
+    """True when a Discogs saturation-breaker shed on the top-1 enrichment
+    fetch (step 4b) cost the response content (LML#1420). Read by the normal
+    response build, which ORs it into ``degraded`` exactly like
+    ``upstream_shed``. Kept separate from ``upstream_shed`` because that flag
+    also gates the step-8 shelf fallback and the miss-kind classifier, which
+    are about the SEARCH leg; a shed after a match was found changes neither."""
 
     @property
     def result_count(self) -> int:
@@ -1050,7 +1059,8 @@ async def _step_enrich_metadata(
 
     READS: ``items_with_artwork``, ``found_on_compilation``; plus
     ``services.extended`` and ``services.warm_cache``.
-    WRITES: ``items_with_artwork`` (rebound to the enriched pairs).
+    WRITES: ``items_with_artwork`` (rebound to the enriched pairs),
+    ``enrichment_shed``.
 
     Ordering invariant: runs strictly after Step 4 built ``items_with_artwork``
     — and after Step 3a, whose synthesized pair bypasses the artwork fetch and
@@ -1059,6 +1069,7 @@ async def _step_enrich_metadata(
     """
     with services.telemetry.track_step("metadata_enrichment"):
         if state.items_with_artwork:
+            shed_report = Top1FetchOutcome()
             state.items_with_artwork = await enrich_artwork_results(
                 state.items_with_artwork,
                 services.discogs_service,
@@ -1078,7 +1089,9 @@ async def _step_enrich_metadata(
                 discogs_cache_pg=services.discogs_cache_pg,
                 found_on_compilation=state.found_on_compilation,
                 spine_deadline=services.spine_deadline,
+                shed_report=shed_report,
             )
+            state.enrichment_shed = shed_report.upstream_shed
 
 
 def _step_project_trace_attrs(
@@ -1470,8 +1483,9 @@ async def perform_lookup(
     result_items, search_type, context, external_source, shelf_fallback_rows = shelf_result
 
     # LML#1126: a search-leg breaker shed must not read as a genuine no-match
-    # -- see ``LookupState.upstream_shed``'s docstring.
-    degraded = state.upstream_shed
+    # -- see ``LookupState.upstream_shed``'s docstring. LML#1420: nor may a
+    # top-1 enrichment shed read as "no Discogs profile" (``enrichment_shed``).
+    degraded = state.upstream_shed or state.enrichment_shed
     response = LookupResponse(
         results=result_items,
         search_type=search_type,

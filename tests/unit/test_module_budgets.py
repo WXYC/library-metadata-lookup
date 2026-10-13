@@ -145,6 +145,11 @@ MODULE_BUDGETS: dict[str, int] = {
     # coordinator is for.
     "lookup/enrichment/__init__.py": 400,
     "lookup/enrichment/background.py": 100,
+    # LML#1420: the top-1 breaker-shed report (out-parameter + the "did the
+    # shed cost content" rule), extracted straight to its own module because
+    # `__init__.py` and `top1.py` both sat near their ceilings. Smallest
+    # multiple of 50 at or above 1.3x the 56-line measured size (72.8).
+    "lookup/enrichment/shed.py": 100,
     # LML#1098: the inline Bandcamp live probe, extracted out of item.py to keep
     # that file under its ceiling (same posture streaming_status.py took for
     # LML#1053) — a self-contained concern with no dependency on enrich_one's
