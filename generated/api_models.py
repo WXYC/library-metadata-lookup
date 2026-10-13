@@ -1397,7 +1397,7 @@ class Pass(BaseModel):
 
 class IntakeItem(BaseModel):
     """
-    One physical copy the station holds, logged by a music director and waiting for a review (WXYC/Backend-Service#2791). Its three DJ-name fields (`requested_dj_name`, `checked_out_by_name`, `passes[].dj_name`) hold the person's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. They are station-only: not for any public or anonymous surface, because they hold a legal name, and never for client telemetry (analytics properties, error breadcrumbs, logs). `passes` and `draft_authors` are present only for callers holding `reviews: manage`; `draft_authors` is `reviews.author` free text: a real name or account name for a DJ's own review, but whatever the music director typed for an on-behalf review. It carries the same station-only caveat as the three DJ-name fields; see `IntakeDeleteResponse.deleted_review_authors`.
+    One record a music director logged and that is waiting for a review (WXYC/Backend-Service#2791): either a disc the station holds, or an album that arrived as files (`digital`), which a music director burns onto CD-R once its review is chosen. Its three DJ-name fields (`requested_dj_name`, `checked_out_by_name`, `passes[].dj_name`) hold the person's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. They are station-only: not for any public or anonymous surface, because they hold a legal name, and never for client telemetry (analytics properties, error breadcrumbs, logs). `passes` and `draft_authors` are present only for callers holding `reviews: manage`; `draft_authors` is `reviews.author` free text: a real name or account name for a DJ's own review, but whatever the music director typed for an on-behalf review. It carries the same station-only caveat as the three DJ-name fields; see `IntakeDeleteResponse.deleted_review_authors`.
 
     """
 
@@ -1407,6 +1407,10 @@ class IntakeItem(BaseModel):
     record_label: constr(max_length=128) | None = Field(...)
     label_id: int | None = Field(...)
     format_id: int
+    digital: bool = Field(
+        ...,
+        description="True when the album reached the station as files, not a disc. A music director burns it onto CD-R once a review is chosen for it, so `format_id` is the CD-R format from the moment it is logged. It stays true after filing; screens show the format as Digital until the record is filed.\n",
+    )
     discogs_release_id: int | None = Field(...)
     state: IntakeItemState
     effective_state: IntakeItemState = Field(
@@ -1415,7 +1419,7 @@ class IntakeItem(BaseModel):
     )
     overdue: bool = Field(
         ...,
-        description="True while the record's checkout is more than 14 days old (`checked_out_at`), in `checked_out` or `reviewed`; a reviewed record that has been returned has no checkout and is never overdue.\n",
+        description="True while the record's checkout is more than 14 days old (`checked_out_at`), in `checked_out` or `reviewed`; a reviewed record that has been returned has no checkout and is never overdue. A digital album's holder is cleared when its review is chosen, so its flag can only be set while it is still being reviewed.\n",
     )
     logged_at: AwareDatetime
     requested_dj_id: str | None = Field(
@@ -1429,7 +1433,7 @@ class IntakeItem(BaseModel):
     requested_at: AwareDatetime | None = Field(...)
     checked_out_by: str | None = Field(
         ...,
-        description='Who holds the physical copy, set on checkout. It stays set when a review is accepted, so a `reviewed` item can still name the DJ who has the copy: deleting the accepted review of an item not yet filed returns it to `checked_out` with the same holder, or to `pool` when there is none. A `reviewed` item keeps its holder until the holder or a music director returns it (`POST /intake/{id}/release`) or the item is filed, which clears it. Read it together with `state`, not as proof of a live checkout. `null` while `checked_out_at` is set, in `checked_out` or `reviewed`, means the holder\'s account has since been deleted, shown to MDs as "holder removed"; an MD may release the item.\n',
+        description='Who holds the record, set on checkout: the DJ who has the disc, or for a digital album the DJ who claimed it to review. It stays set when a review is accepted, so a `reviewed` item can still name the DJ who has the copy: deleting the accepted review of an item not yet filed returns it to `checked_out` with the same holder, or to `pool` when there is none. A `reviewed` item keeps its holder until the holder or a music director returns it (`POST /intake/{id}/release`) or the item is filed, which clears it. A digital album is the exception: when its review is chosen (`POST /intake/{id}/accept-review`) both `checked_out_by` and `checked_out_at` are cleared, because nothing was lent out. Read it together with `state`, not as proof of a live checkout. `null` while `checked_out_at` is set, in `checked_out` or `reviewed`, means the holder\'s account has since been deleted, shown to MDs as "holder removed"; an MD may release the item.\n',
     )
     checked_out_by_name: str | None = Field(
         ...,
@@ -1493,13 +1497,20 @@ class NewIntakeItemRequest(BaseModel):
     album_title: constr(max_length=128)
     record_label: constr(max_length=128) | None = None
     label_id: int | None = None
-    format_id: int
+    format_id: int | None = Field(
+        None,
+        description="Required unless `digital` is true. Must be omitted when `digital` is true, because the server then stores the CD-R format itself.\n",
+    )
+    digital: bool | None = Field(
+        None,
+        description="True when the album reached the station as files, not a disc. `format_id` must then be omitted. Defaults to false when omitted.\n",
+    )
     discogs_release_id: int | None = None
 
 
 class IntakeItemPatch(BaseModel):
     """
-    Any subset of the `NewIntakeItemRequest` fields, plus setting or clearing the citation. `cited_album_id` and `cited_submission_id` are mutually exclusive as non-null values (WXYC/Backend-Service#2797's table CHECK enforces this in storage): a patch may not carry both as non-null at once, but may set one while explicitly clearing the other (for example `{cited_album_id: null, cited_submission_id: 12}`) to switch citation kinds in a single request, rather than passing through an uncited state across two. Setting one citation clears the other, so the single-key form `{cited_submission_id: 12}` is the canonical switch every generated client can send (WXYC/Backend-Service#2797); Swift omits nil optionals and cannot send an explicit null. The schema-level `not` rule is documentation the pipeline does not enforce, and the generated `IntakeItemPatchNot` type in swift6 and kotlin is a generator artifact, not part of the wire contract. Setting `cited_album_id` to a different release, or clearing it, also clears an accepted review that was chosen from the cited release (`accepted_review_id`, `accepted_by` and `accepted_at` become null) and returns the item to `checked_out` if someone holds it, otherwise to `pool`. Citing a submission instead (`{cited_submission_id: 12}`, the switch above) clears `cited_album_id` and counts as clearing it here: an accepted review chosen from that release goes with it. An accepted review of the item itself is kept. Implemented by WXYC/Backend-Service#2860.
+    Any subset of the `NewIntakeItemRequest` fields except `digital`, plus setting or clearing the citation. `digital` can't be changed once an item is logged: an item logged as the wrong kind is deleted and logged again. A `format_id` is refused with a 400 on an item whose `digital` is true, because a digital album's format is CD-R until it is filed. `cited_album_id` and `cited_submission_id` are mutually exclusive as non-null values (WXYC/Backend-Service#2797's table CHECK enforces this in storage): a patch may not carry both as non-null at once, but may set one while explicitly clearing the other (for example `{cited_album_id: null, cited_submission_id: 12}`) to switch citation kinds in a single request, rather than passing through an uncited state across two. Setting one citation clears the other, so the single-key form `{cited_submission_id: 12}` is the canonical switch every generated client can send (WXYC/Backend-Service#2797); Swift omits nil optionals and cannot send an explicit null. The schema-level `not` rule is documentation the pipeline does not enforce, and the generated `IntakeItemPatchNot` type in swift6 and kotlin is a generator artifact, not part of the wire contract. Setting `cited_album_id` to a different release, or clearing it, also clears an accepted review that was chosen from the cited release (`accepted_review_id`, `accepted_by` and `accepted_at` become null) and returns the item to `checked_out` if someone holds it, otherwise to `pool`. Citing a submission instead (`{cited_submission_id: 12}`, the switch above) clears `cited_album_id` and counts as clearing it here: an accepted review chosen from that release goes with it. An accepted review of the item itself is kept. Implemented by WXYC/Backend-Service#2860.
 
     """
 
@@ -1604,7 +1615,7 @@ class ReviewCredit(StrEnum):
 
 class Reviewer(BaseModel):
     """
-    An account that can write reviews. For use inside the station only: `name` is a real name.
+    An account that can be asked to review. For use inside the station only: `name` is a real name.
 
     """
 
@@ -1661,11 +1672,11 @@ class Review(BaseModel):
     last_modified: AwareDatetime
     in_use: bool = Field(
         ...,
-        description="Computed. `true` when this review is the accepted review of an intake item, or is the review in the latest print-log entry of a copy or of a library release (`POST /library/{id}/print`). An author cannot delete a review that is in use (`ReviewConflictReason` `in_use`), but may still edit it.\n",
+        description="Computed. `true` when this review is the accepted review of an intake item, or is the review in the latest print-log entry of a copy or of a library release (`POST /library/{id}/print`); a print with no intake item counts only while its release does not have exactly one filed or finalized intake item. An author cannot delete a review that is in use (`ReviewConflictReason` `in_use`), but may still edit it.\n",
     )
     on_cover: bool = Field(
         ...,
-        description="Computed, and meaningful only in a list filtered by `album_id` (`GET /reviews?album_id=`): `true` when this review is on the cover of a copy of that release. That is, it is the accepted review of an intake item filed or finalized as that release, or the review in the latest print-log entry of such an item, or the review in the release's latest print-log entry that has no intake item. These are the reviews that list puts first. `false` in every other response: a single review, the write responses, and the unfiltered, `mine` and `intake_item_id` lists. It differs from `in_use`, which is true when the review is in use for any record: a review reached through `cited_album_id` is in use for the release it belongs to, and is on the cover here only once it has been chosen or printed for a copy of this release.\n",
+        description="Computed, and meaningful only in a list filtered by `album_id` (`GET /reviews?album_id=`): `true` when this review is on the cover of a copy of that release. That is, it is the accepted review of an intake item filed or finalized as that release, or the review in the latest print-log entry of such an item, or the review in the release's latest print-log entry that has no intake item while the release does not have exactly one filed or finalized intake item. These are the reviews that list puts first. `false` in every other response: a single review, the write responses, and the unfiltered, `mine` and `intake_item_id` lists. It differs from `in_use`, which is true when the review is in use for any record: a review reached through `cited_album_id` is in use for the release it belongs to, and is on the cover here only once it has been chosen or printed for a copy of this release. A print from `POST /library/{id}/print` on a release with exactly one filed or finalized intake item is that item's print, so it is never a second cover. A print with no intake item is left off the cover for as long as the release has exactly one filed or finalized intake item, and is back on it when the release has none or two or more. That is delivered by WXYC/Backend-Service#3075.\n",
     )
     printed_revision_id: int | None = Field(
         ...,
@@ -1848,7 +1859,7 @@ class ReviewPatch(ReviewFields):
 
 class ReviewConflictReason(StrEnum):
     """
-    Discriminator for the review 409s, pairing with `ReviewConflictError` the way `IntakeConflictReason` pairs with `IntakeConflictError`. `not_draft`: the review is already submitted (submitting twice). `subject_not_held`: a DJ's `POST /reviews` names an `intake_item_id` the caller does not currently hold (effective state `checked_out` or `reviewed`, with `checked_out_by` the caller), or the subject is neither an intake item nor a library release; an on-behalf create (`reviews: manage`) is exempt from the hold rule. `in_use`: an author deleting their own review while it is in use, meaning it is the accepted review of an intake item or the review in the latest print-log entry of a copy or of a library release. The author may still edit it. A caller with `reviews: manage` is never refused with `in_use`. `accepted_review`: a caller with `reviews: manage` deleting the accepted review of a `filed` or `finalized` intake item, whether or not the item carries a citation. Accept another review for the item first (`POST /intake/{id}/accept-review`). Deleting the accepted review of an item that is not yet filed is allowed: the item returns to `checked_out` if someone holds it, otherwise to `pool`.
+    Discriminator for the review 409s, pairing with `ReviewConflictError` the way `IntakeConflictReason` pairs with `IntakeConflictError`. `not_draft`: the review is already submitted (submitting twice). `subject_not_held`: a DJ's `POST /reviews` names an `intake_item_id` the caller does not currently hold (effective state `checked_out` or `reviewed`, with `checked_out_by` the caller), or the subject is neither an intake item nor a library release; an on-behalf create (`reviews: manage`) is exempt from the hold rule. `in_use`: an author deleting their own review while it is in use, meaning it is the accepted review of an intake item or the review in the latest print-log entry of a copy or of a library release (a print with no intake item counts only while its release does not have exactly one filed or finalized intake item). The author may still edit it. A caller with `reviews: manage` is never refused with `in_use`. `accepted_review`: a caller with `reviews: manage` deleting the accepted review of a `filed` or `finalized` intake item, whether or not the item carries a citation. Accept another review for the item first (`POST /intake/{id}/accept-review`). Deleting the accepted review of an item that is not yet filed is allowed: the item returns to `checked_out` if someone holds it, otherwise to `pool`.
 
     """
 
