@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -665,6 +665,7 @@ dependencies = [
     { name = "uvicorn" },
     { name = "wxyc-etl" },
     { name = "wxyc-fastapi", extra = ["posthog"] },
+    { name = "ytmusicapi" },
 ]
 
 [package.optional-dependencies]
@@ -678,9 +679,6 @@ dev = [
     { name = "pytest-httpx" },
     { name = "pytest-xdist" },
     { name = "ruff" },
-]
-drain = [
-    { name = "ytmusicapi" },
 ]
 
 [package.metadata]
@@ -709,8 +707,8 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.6" },
     { name = "uvicorn", specifier = ">=0.24.0" },
     { name = "wxyc-etl", specifier = ">=0.10.0,<0.11.0" },
-    { name = "wxyc-fastapi", extras = ["posthog"], specifier = ">=1.5.0,<2.0.0" },
-    { name = "ytmusicapi", marker = "extra == 'drain'", specifier = "==1.12.1" },
+    { name = "wxyc-fastapi", extras = ["posthog"], specifier = ">=1.6.0,<2.0.0" },
+    { name = "ytmusicapi", specifier = "==1.12.1" },
 ]
 provides-extras = ["dev", "drain"]
 
@@ -950,19 +948,17 @@ wheels = [
 
 [[package]]
 name = "posthog"
-version = "7.9.12"
+version = "7.73.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "backoff" },
     { name = "distro" },
-    { name = "python-dateutil" },
     { name = "requests" },
-    { name = "six" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1c/a7/2865487853061fbd62383492237b546d2d8f7c1846272350d2b9e14138cd/posthog-7.9.12.tar.gz", hash = "sha256:ebabf2eb2e1c1fbf22b0759df4644623fa43cc6c9dcbe9fd429b7937d14251ec", size = 176828, upload-time = "2026-03-12T09:01:15.184Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/98/55/0ac54e115de9bd2e972c2da341f99161b32ab8cf2cab66c87e16572cd346/posthog-7.73.1.tar.gz", hash = "sha256:af3a2faeb0bfccaebac65e5d8aa1568581c563b00ab2852b92b37d3b241d0ef6", size = 764785, upload-time = "2026-10-20T11:53:49.806Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/65/a9/7a803aed5a5649cf78ea7b31e90d0080181ba21f739243e1741a1e607f1f/posthog-7.9.12-py3-none-any.whl", hash = "sha256:7175bd1698a566bfea98a016c64e3456399f8046aeeca8f1d04ae5bf6c5a38d0", size = 202469, upload-time = "2026-03-12T09:01:13.38Z" },
+    { url = "https://files.pythonhosted.org/packages/50/a8/5cc1117b7c5c26f4a23e75ed8400ec6fe8ba95dc53788ddc079fa894016c/posthog-7.73.1-py3-none-any.whl", hash = "sha256:aca0e3bea228e50fbd245a3b07bef17413ec7a1cc83f464e0c79086f7adbbd23", size = 894496, upload-time = "2026-10-20T11:53:47.464Z" },
 ]
 
 [[package]]
@@ -1542,16 +1538,16 @@ wheels = [
 
 [[package]]
 name = "wxyc-fastapi"
-version = "1.5.0"
+version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "sentry-sdk", extra = ["fastapi"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/68/09/29e534081ca26b8b416af1aee30e56efb16409f6878106e07bb653d954b9/wxyc_fastapi-1.5.0.tar.gz", hash = "sha256:14bffc7c36a52eaef89b7908932440243373b4e32526eb18d3ac373507ee7f05", size = 27045, upload-time = "2026-08-10T17:30:13.246Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c2/2c/bc8987ce6bcaf3121d02fbe96b9cb65d3c1c8ac72419c19c2c0540584e05/wxyc_fastapi-1.6.0.tar.gz", hash = "sha256:132c9b7bbea25d0d5dd50baab74ef47ee911ea9edde7cba1773db9f6cfe95cb5", size = 34077, upload-time = "2026-10-20T03:40:56.091Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/36/cf/6dfd75bbbdf08c4df5bc680ef0ada378e647bfe5b4e96739634742579ce7/wxyc_fastapi-1.5.0-py3-none-any.whl", hash = "sha256:ac37c17febca205e7364440d32cae7fd8385603c2e08e8d0bc2015ab6b9f3341", size = 29819, upload-time = "2026-08-10T17:30:11.832Z" },
+    { url = "https://files.pythonhosted.org/packages/da/1d/252614a660ae2fa1f22b5370583982bfc6618009f65fab2e2860ba858dfd/wxyc_fastapi-1.6.0-py3-none-any.whl", hash = "sha256:5015605e28265099b598248f3a8bd8311c0dda522898dbe0daba42810eec5e3c", size = 38878, upload-time = "2026-10-20T03:40:54.758Z" },
 ]
 
 [package.optional-dependencies]

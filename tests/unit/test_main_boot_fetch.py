@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import boto3
 import pytest
@@ -154,6 +154,25 @@ class TestBootFetchHelper:
         assert store.calls == 3  # retried, not one-shot
         assert captured, "final failure must be Sentry-captured"
         assert not settings.resolved_library_db_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_also_reports_the_exception_to_posthog(self, tmp_path):
+        """The wxyc-fastapi shim is PostHog-only, so it rides beside the Sentry
+        capture during parity."""
+        from main import _boot_fetch_library_db
+
+        settings = _bucket_settings(tmp_path)
+        error = RuntimeError("connection reset")
+        store = _RaisingStore(error)
+
+        with (
+            pytest.MonkeyPatch.context() as mp,
+            patch("main.capture_posthog_exception") as mock_posthog,
+        ):
+            mp.setattr("sentry_sdk.capture_exception", lambda *a, **k: None)
+            await _boot_fetch_library_db(settings, store, attempts=3, base_delay=0)
+
+        mock_posthog.assert_called_once_with(error)
 
     @pytest.mark.asyncio
     async def test_missing_object_degrades_without_retry(self, tmp_path):

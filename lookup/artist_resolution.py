@@ -16,6 +16,7 @@ from typing import Any
 import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
+from wxyc_fastapi.observability import add_breadcrumb as add_posthog_breadcrumb
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from clients.streaming.matching import (
@@ -364,6 +365,9 @@ def _log_release_resolution_bind(
             level="info",
             data=payload,
         )
+        add_posthog_breadcrumb(
+            category="release_resolution_bind", message=str(payload), level="info", data=payload
+        )
     except Exception as e:
         logger.warning("Failed to add release_resolution_bind breadcrumb: %s", e)
 
@@ -516,6 +520,9 @@ def _log_artist_identity_split_gate(
             category="artist_identity_split_gate",
             level="info",
             data=payload,
+        )
+        add_posthog_breadcrumb(
+            category="artist_identity_split_gate", message=str(payload), level="info", data=payload
         )
     except Exception as e:
         logger.warning("Failed to add artist_identity_split_gate breadcrumb: %s", e)

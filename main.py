@@ -17,7 +17,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from wxyc_fastapi.observability import init_sentry, shutdown_posthog
+from wxyc_fastapi.observability import capture_exception as capture_posthog_exception
+from wxyc_fastapi.observability import init_error_tracking, init_sentry, shutdown_posthog
 
 from artists.router import router as artists_router
 from cache.router import router as cache_router
@@ -77,6 +78,29 @@ init_sentry(
     # thinning one span family out of a kept trace.
     before_send_transaction=drop_fast_pool_reset_spans,
 )
+
+
+def _error_tracking_daily_ceiling(environment: str) -> int:
+    """Per-process PostHog error budget per day: 50 in staging, 300 otherwise
+    (the wxyc-fastapi#43 contract)."""
+    return 50 if environment.strip().lower() in {"staging", "stage"} else 300
+
+
+def _init_error_tracking(app: FastAPI, settings: Settings) -> None:
+    """Wire PostHog error tracking beside ``init_sentry`` (LML#1470).
+
+    Parity window: Sentry keeps its signal until the Sentry-removal leaf. A no-op
+    while ``POSTHOG_ERRORS_API_KEY`` is unset. Passing ``app`` mounts the
+    request-id middleware, so this must run before the app starts.
+    """
+    init_error_tracking(
+        service="library-metadata-lookup",
+        environment=settings.environment,
+        daily_ceiling=_error_tracking_daily_ceiling(settings.environment),
+        release=settings.app_version,
+        app=app,
+    )
+
 
 log_file = None
 if settings.log_level != "DEBUG":
@@ -323,6 +347,7 @@ async def _fetch_library_db_with_retry(
                 "Boot-fetch of library.db failed after %d attempts; serving degraded", attempts
             )
             sentry_sdk.capture_exception(exc)
+            capture_posthog_exception(exc)
             return False
         # Success: land the bytes atomically off the event loop.
         await asyncio.to_thread(_atomic_write_bytes, dest, data)
@@ -617,6 +642,8 @@ app = FastAPI(
     version=settings.app_version,
     lifespan=lifespan,
 )
+
+_init_error_tracking(app, settings)
 
 app.add_middleware(
     CORSMiddleware,
