@@ -16,9 +16,10 @@ store tests use.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import stat
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import boto3
 import pytest
@@ -173,6 +174,43 @@ class TestBootFetchHelper:
             await _boot_fetch_library_db(settings, store, attempts=3, base_delay=0)
 
         mock_posthog.assert_called_once_with(error)
+
+    @pytest.mark.asyncio
+    async def test_final_failure_sends_one_posthog_event_from_the_log_handler(self, tmp_path):
+        """What PostHog receives, behind a real PosthogErrorsClient: exactly one
+        event, from the root-logger handler (``logger.exception``), not from the
+        ``capture_exception`` shim, which is a no-op once the handler has marked
+        the exception reported."""
+        from wxyc_fastapi.observability import PosthogErrorsClient, PosthogErrorsHandler
+
+        from main import _boot_fetch_library_db
+
+        inner = MagicMock()
+        client = PosthogErrorsClient(
+            inner, service="library-metadata-lookup", environment="test", daily_ceiling=1000
+        )
+        handler = PosthogErrorsHandler(client)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        try:
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr("sentry_sdk.capture_exception", lambda *a, **k: None)
+                await _boot_fetch_library_db(
+                    _bucket_settings(tmp_path),
+                    _RaisingStore(RuntimeError("connection reset")),
+                    attempts=2,
+                    base_delay=0,
+                )
+        finally:
+            root.removeHandler(handler)
+
+        inner.capture_exception.assert_called_once()
+        inner.capture.assert_not_called()
+        exc_info = inner.capture_exception.call_args.args[0]
+        assert exc_info[0] is RuntimeError
+        properties = inner.capture_exception.call_args.kwargs["properties"]
+        assert properties["logger"] == "main"
+        assert properties["service"] == "library-metadata-lookup"
 
     @pytest.mark.asyncio
     async def test_missing_object_degrades_without_retry(self, tmp_path):
@@ -350,3 +388,20 @@ class TestLifespanWiring:
             pass
 
         assert called is False
+
+    @pytest.mark.asyncio
+    async def test_shutdown_flushes_the_posthog_errors_client(self, tmp_path, monkeypatch):
+        """The lifespan shuts the errors client down beside the analytics client so
+        error events queued during shutdown are flushed deterministically."""
+        import main
+
+        monkeypatch.setattr(main, "settings", _bucket_settings(tmp_path))
+        monkeypatch.setattr(main, "get_object_store", AsyncMock(return_value=object()))
+        monkeypatch.setattr(main, "_boot_fetch_library_db", AsyncMock(return_value=True))
+        shutdown_errors = MagicMock()
+        monkeypatch.setattr(main, "shutdown_posthog_errors", shutdown_errors)
+
+        async with main.lifespan(main.app):
+            shutdown_errors.assert_not_called()
+
+        shutdown_errors.assert_called_once_with()

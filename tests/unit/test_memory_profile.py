@@ -17,8 +17,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+from wxyc_fastapi.observability import PosthogErrorsHandler
 
 from config.settings import Settings
 from core import memory_profile
@@ -647,17 +649,33 @@ class TestRssBound:
 
         assert sent == [(memory_profile.RSS_OVER_BOUND_MESSAGE, "warning")]
 
-    def test_the_report_logs_at_error_so_posthog_synthesizes_an_exception(self, caplog):
+    def test_the_report_logs_at_error_when_posthog_errors_is_active(self, caplog):
         """PostHog's logging handler turns an ERROR record with no exc_info into a
         message-only ``$exception`` (wxyc-fastapi's init_error_tracking); the
         record text carries ``rss_mb`` and ``bound_mb``, so it is the PostHog
         payload. A WARNING would never reach PostHog."""
-        with caplog.at_level(logging.WARNING, logger="core.memory_profile"):
-            memory_profile.report_rss_over_bound(650.0, 600)
+        handler = PosthogErrorsHandler(MagicMock())
+        root = logging.getLogger()
+        root.addHandler(handler)
+        try:
+            with caplog.at_level(logging.WARNING, logger="core.memory_profile"):
+                memory_profile.report_rss_over_bound(650.0, 600)
+        finally:
+            root.removeHandler(handler)
 
         records = [r for r in caplog.records if r.name == "core.memory_profile"]
         assert [r.levelno for r in records] == [logging.ERROR]
         assert records[0].exc_info is None
+        assert records[0].getMessage() == "memory_rss_over_bound rss_mb=650.0 bound_mb=600"
+
+    def test_the_report_stays_a_warning_when_posthog_errors_is_inactive(self, caplog):
+        """With POSTHOG_ERRORS_API_KEY unset no handler is installed, and an ERROR
+        record would make Sentry's logging integration send an extra event."""
+        with caplog.at_level(logging.WARNING, logger="core.memory_profile"):
+            memory_profile.report_rss_over_bound(650.0, 600)
+
+        records = [r for r in caplog.records if r.name == "core.memory_profile"]
+        assert [r.levelno for r in records] == [logging.WARNING]
         assert records[0].getMessage() == "memory_rss_over_bound rss_mb=650.0 bound_mb=600"
 
     @pytest.mark.asyncio
