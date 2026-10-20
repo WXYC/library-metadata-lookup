@@ -18,7 +18,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from wxyc_fastapi.observability import capture_exception as capture_posthog_exception
-from wxyc_fastapi.observability import init_error_tracking, init_sentry, shutdown_posthog
+from wxyc_fastapi.observability import (
+    init_error_tracking,
+    init_sentry,
+    shutdown_posthog,
+    shutdown_posthog_errors,
+)
 
 from artists.router import router as artists_router
 from cache.router import router as cache_router
@@ -628,6 +633,7 @@ async def lifespan(app: FastAPI):
     if api_key_cache_task is not None:
         await stop_api_key_cache(api_key_cache_task)
     shutdown_posthog()
+    shutdown_posthog_errors()
     await close_library_db()
     await close_discogs_service()
     await close_entity_store()

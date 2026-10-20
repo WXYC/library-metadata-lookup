@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import sentry_sdk
+from wxyc_fastapi.observability import PosthogErrorsHandler
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from config.settings import Settings
@@ -213,18 +214,31 @@ def diff_snapshots(current: Any, previous: Any | None, *, top_n: int) -> dict[st
     return {"growing": growing, "largest": [_summarize(s) for s in by_size[:top_n]]}
 
 
+def _posthog_errors_active() -> bool:
+    """True when wxyc-fastapi's PostHog errors handler is on the root logger.
+
+    wxyc-fastapi exposes no argument-free accessor for the errors client, so the
+    installed handler is the public signal that ERROR records reach PostHog.
+    """
+    return any(isinstance(h, PosthogErrorsHandler) for h in logging.getLogger().handlers)
+
+
 def report_rss_over_bound(rss_mb: float, bound_mb: int) -> None:
     """Announce one crossing of the RSS bound (LML#1400).
 
     A WARNING record alone is only a breadcrumb under this service's Sentry
     logging integration (``event_level=ERROR``), so the report also sends an
-    explicit message. The record is ERROR because PostHog's logging handler
-    (wxyc-fastapi ``init_error_tracking``) synthesizes a message-only
-    ``$exception`` from an ERROR record; its text carries ``rss_mb`` and
-    ``bound_mb`` (LML#1470). Not the running-max measurement helpers: those are broken
-    under sentry-sdk 2.x (LML#1390).
+    explicit message. The record is ERROR only while PostHog error tracking is
+    active, because PostHog's logging handler (wxyc-fastapi
+    ``init_error_tracking``) synthesizes a message-only ``$exception`` from an
+    ERROR record; its text carries ``rss_mb`` and ``bound_mb`` (LML#1470).
+    With the key unset the record stays WARNING: an ERROR record would make
+    Sentry's logging integration send a second event, changing behaviour.
+    Not the running-max measurement helpers: those are broken under sentry-sdk
+    2.x (LML#1390).
     """
-    logger.error("memory_rss_over_bound rss_mb=%s bound_mb=%s", rss_mb, bound_mb)
+    level = logging.ERROR if _posthog_errors_active() else logging.WARNING
+    logger.log(level, "memory_rss_over_bound rss_mb=%s bound_mb=%s", rss_mb, bound_mb)
     with sentry_sdk.new_scope() as scope:
         scope.set_context("memory", {"rss_mb": rss_mb, "bound_mb": bound_mb})
         sentry_sdk.capture_message(RSS_OVER_BOUND_MESSAGE, level="warning")

@@ -11,11 +11,13 @@ our claim structure and request shape.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import jwt as pyjwt
 import pytest
+from wxyc_fastapi.observability import PosthogErrorsClient, PosthogErrorsHandler
 
 from clients.streaming.apple_music import (
     _APPLE_MUSIC_MATCH_FLOOR,
@@ -1934,6 +1936,37 @@ class TestObservability:
             await client.search_song("Stereolab", "Aluminum Tunes")
 
         mock_posthog.assert_called_once_with(error)
+
+    @pytest.mark.asyncio
+    async def test_network_error_sends_one_posthog_event_from_the_log_handler(self, es256_keypair):
+        """What PostHog receives, behind a real PosthogErrorsClient: exactly one
+        event, from the root-logger handler (``logger.exception``); the
+        ``capture_exception`` shim is a no-op once the handler has marked the
+        exception reported."""
+        inner = MagicMock()
+        errors_client = PosthogErrorsClient(
+            inner, service="library-metadata-lookup", environment="test", daily_ceiling=1000
+        )
+        handler = PosthogErrorsHandler(errors_client)
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(side_effect=httpx.ConnectError("dns failure"))
+        client._http = mock_http
+
+        root = logging.getLogger()
+        root.addHandler(handler)
+        try:
+            with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
+                mock_sentry.start_span.return_value.__enter__.return_value = MagicMock()
+                await client.search_song("Stereolab", "Aluminum Tunes")
+        finally:
+            root.removeHandler(handler)
+
+        inner.capture_exception.assert_called_once()
+        inner.capture.assert_not_called()
+        assert inner.capture_exception.call_args.args[0][0] is httpx.ConnectError
+        properties = inner.capture_exception.call_args.kwargs["properties"]
+        assert properties["logger"] == "clients.streaming.apple_music"
 
 
 class TestExtractReleaseYear:
