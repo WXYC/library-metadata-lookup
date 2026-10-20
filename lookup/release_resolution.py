@@ -23,6 +23,7 @@ from typing import Any
 
 import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
+from wxyc_fastapi.observability import add_breadcrumb as add_posthog_breadcrumb
 
 from clients.streaming.matching import score_match
 from discogs.breaker import BreakerState, DiscogsBreakerOpenError
@@ -153,6 +154,9 @@ def _log_track_validation(
             category="track_validation",
             level="info",
             data=payload,
+        )
+        add_posthog_breadcrumb(
+            category="track_validation", message=str(payload), level="info", data=payload
         )
     except Exception as e:
         logger.warning("Failed to add track_validation breadcrumb: %s", e)

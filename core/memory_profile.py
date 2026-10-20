@@ -218,10 +218,13 @@ def report_rss_over_bound(rss_mb: float, bound_mb: int) -> None:
 
     A WARNING record alone is only a breadcrumb under this service's Sentry
     logging integration (``event_level=ERROR``), so the report also sends an
-    explicit message. Not the running-max measurement helpers: those are broken
+    explicit message. The record is ERROR because PostHog's logging handler
+    (wxyc-fastapi ``init_error_tracking``) synthesizes a message-only
+    ``$exception`` from an ERROR record; its text carries ``rss_mb`` and
+    ``bound_mb`` (LML#1470). Not the running-max measurement helpers: those are broken
     under sentry-sdk 2.x (LML#1390).
     """
-    logger.warning("memory_rss_over_bound rss_mb=%s bound_mb=%s", rss_mb, bound_mb)
+    logger.error("memory_rss_over_bound rss_mb=%s bound_mb=%s", rss_mb, bound_mb)
     with sentry_sdk.new_scope() as scope:
         scope.set_context("memory", {"rss_mb": rss_mb, "bound_mb": bound_mb})
         sentry_sdk.capture_message(RSS_OVER_BOUND_MESSAGE, level="warning")

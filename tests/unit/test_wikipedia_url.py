@@ -631,6 +631,25 @@ class TestShadowTelemetry:
         mock_sentry.add_breadcrumb.assert_called_once()
         assert mock_sentry.add_breadcrumb.call_args.kwargs["category"] == "wikipedia_slug_pick"
 
+    def test_posthog_breadcrumb_carries_the_category_and_the_payload(self, monkeypatch):
+        # The wxyc-fastapi shim is PostHog-only: it sits beside the Sentry
+        # breadcrumb during parity. It records `message` as a tag, so the
+        # payload rides there (the shim drops `data`).
+        monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
+        urls = ["https://en.wikipedia.org/wiki/Stereolab"]
+        with (
+            patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry,
+            patch("lookup.wikipedia_url.add_posthog_breadcrumb") as mock_posthog,
+        ):
+            mock_sentry.get_current_scope.return_value.transaction = MagicMock()
+            pick_artist_wikipedia_url(urls, "Stereolab")
+        mock_posthog.assert_called_once()
+        kwargs = mock_posthog.call_args.kwargs
+        assert kwargs["category"] == "wikipedia_slug_pick"
+        assert kwargs["data"] == mock_sentry.add_breadcrumb.call_args.kwargs["data"]
+        assert kwargs["message"] == str(kwargs["data"])
+        assert "'clears_floor': True" in kwargs["message"]
+
     def test_breadcrumb_error_is_independently_swallowed(self, monkeypatch):
         monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
         urls = ["https://en.wikipedia.org/wiki/Stereolab"]

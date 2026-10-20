@@ -47,6 +47,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import sentry_sdk
+from wxyc_fastapi.observability import add_breadcrumb as add_posthog_breadcrumb
 
 from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
 from core.env import resolve_bool_env
@@ -133,6 +134,9 @@ def _project_wikipedia_slug_pick(
         logger.warning("Failed to project wikipedia_slug_pick onto Sentry transaction: %s", e)
     try:
         sentry_sdk.add_breadcrumb(category="wikipedia_slug_pick", level="info", data=payload)
+        add_posthog_breadcrumb(
+            category="wikipedia_slug_pick", message=str(payload), level="info", data=payload
+        )
     except Exception as e:
         logger.warning("Failed to add wikipedia_slug_pick breadcrumb: %s", e)
     if random.random() < 0.01:

@@ -46,6 +46,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
 from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison
+from wxyc_fastapi.observability import capture_exception as capture_posthog_exception
 
 from clients.streaming.base import BaseStreamingClient
 from clients.streaming.matching import (
@@ -264,10 +265,11 @@ class AppleMusicClient(BaseStreamingClient):
                     data, last_status = await self._search_with_retry(
                         artist, term, types=types, result_key=result_key, span=span
                     )
-            except Exception:
+            except Exception as exc:
                 logger.exception("Apple Music search raised for %s - %s", artist, term)
                 span.set_data("apple_music.search.result", "error")
                 sentry_sdk.capture_exception()
+                capture_posthog_exception(exc)
                 return []
 
             # `result` is the chokepoint signal Sentry dashboards filter on.

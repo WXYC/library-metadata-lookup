@@ -5313,6 +5313,28 @@ class TestLogReleaseResolutionBind:
         assert mock_breadcrumb.call_args.kwargs["category"] == "release_resolution_bind"
         assert mock_breadcrumb.call_args.kwargs["data"]["release_id"] == 36907527
 
+    def test_posthog_breadcrumb_carries_the_category_and_the_payload(self):
+        from lookup.artist_resolution import _log_release_resolution_bind
+
+        with (
+            patch("lookup.artist_resolution.sentry_sdk.add_breadcrumb") as mock_sentry,
+            patch("lookup.artist_resolution.add_posthog_breadcrumb") as mock_posthog,
+        ):
+            _log_release_resolution_bind(
+                song="Message to Black Youth",
+                artist="A Guy Called Gerald",
+                album="When There Is No Sun",
+                bound=True,
+                release_id=36907527,
+            )
+
+        mock_posthog.assert_called_once()
+        kwargs = mock_posthog.call_args.kwargs
+        assert kwargs["category"] == "release_resolution_bind"
+        assert kwargs["data"] == mock_sentry.call_args.kwargs["data"]
+        assert kwargs["message"] == str(kwargs["data"])
+        assert "'release_id': 36907527" in kwargs["message"]
+
     def test_swallows_sentry_failure(self):
         from lookup.artist_resolution import _log_release_resolution_bind
 
@@ -5324,6 +5346,35 @@ class TestLogReleaseResolutionBind:
             _log_release_resolution_bind(
                 song="s", artist="a", album=None, bound=False, release_id=None
             )
+
+
+class TestArtistIdentitySplitGatePosthogBreadcrumb:
+    """The wxyc-fastapi breadcrumb shim is PostHog-only, so it sits beside the
+    Sentry breadcrumb during parity; the shim records `message` as a tag."""
+
+    def test_posthog_breadcrumb_carries_the_category_and_the_payload(self):
+        from lookup.artist_resolution import _log_artist_identity_split_gate
+
+        with (
+            patch("lookup.artist_resolution.sentry_sdk") as mock_sentry,
+            patch("lookup.artist_resolution.add_posthog_breadcrumb") as mock_posthog,
+        ):
+            _log_artist_identity_split_gate(
+                library_row_acceptable=False,
+                artist_identity_verified=True,
+                library_row_artist_verified=False,
+                release_side_artist_verified=True,
+                release_anchor_present=True,
+                use_split_gate=True,
+                sample_rate=0.0,
+            )
+
+        mock_posthog.assert_called_once()
+        kwargs = mock_posthog.call_args.kwargs
+        assert kwargs["category"] == "artist_identity_split_gate"
+        assert kwargs["data"] == mock_sentry.add_breadcrumb.call_args.kwargs["data"]
+        assert kwargs["message"] == str(kwargs["data"])
+        assert "'artist_identity_verified': True" in kwargs["message"]
 
 
 class TestSearchCompilationsCarriedTitleRank:

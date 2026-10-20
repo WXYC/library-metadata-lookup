@@ -1915,6 +1915,26 @@ class TestObservability:
 
         mock_sentry.capture_exception.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_network_error_also_reports_the_caught_exception_to_posthog(self, es256_keypair):
+        """The wxyc-fastapi shim is PostHog-only, so it sits beside the Sentry call
+        during parity and takes the caught exception explicitly (the bare Sentry
+        call reads the active one)."""
+        client = _client(es256_keypair)
+        error = httpx.ConnectError("dns failure")
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(side_effect=error)
+        client._http = mock_http
+
+        with (
+            patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry,
+            patch("clients.streaming.apple_music.capture_posthog_exception") as mock_posthog,
+        ):
+            mock_sentry.start_span.return_value.__enter__.return_value = MagicMock()
+            await client.search_song("Stereolab", "Aluminum Tunes")
+
+        mock_posthog.assert_called_once_with(error)
+
 
 class TestExtractReleaseYear:
     """The extractor must reject malformed/sentinel/non-ASCII inputs so 0,

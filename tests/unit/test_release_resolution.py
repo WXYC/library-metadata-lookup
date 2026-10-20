@@ -819,6 +819,27 @@ class TestLogTrackValidation:
         assert data["verdict"] is True
         assert data["latency_ms"] == 42.5
 
+    def test_posthog_breadcrumb_carries_the_category_and_the_payload(self):
+        with (
+            patch("lookup.release_resolution.sentry_sdk.add_breadcrumb") as mock_sentry,
+            patch("lookup.release_resolution.add_posthog_breadcrumb") as mock_posthog,
+        ):
+            _log_track_validation(
+                source="compilation_inline",
+                release_id=12345,
+                song="VI Scose Poise",
+                artist="Autechre",
+                verdict=True,
+                latency_ms=42.5,
+                sample_rate=0.0,
+            )
+        mock_posthog.assert_called_once()
+        kwargs = mock_posthog.call_args.kwargs
+        assert kwargs["category"] == "track_validation"
+        assert kwargs["data"] == mock_sentry.call_args.kwargs["data"]
+        assert kwargs["message"] == str(kwargs["data"])
+        assert "'verdict': True" in kwargs["message"]
+
     def test_samples_info_log_at_configured_rate(self):
         """When the random sample fires, an INFO log is emitted alongside the breadcrumb."""
         with (
