@@ -18,14 +18,8 @@ semaphore (``discogs_max_concurrent=5``) + ``AsyncLimiter``
 (``discogs_rate_limit=50/min``). The dispatcher inherits both for free
 through ``DiscogsService.get_release`` / ``DiscogsService.get_artist_details``.
 
-Sentry instrumentation:
-
-- ``http.server`` span at handler entry (defense-in-depth against
-  FastApiIntegration's automatic transaction not landing, per LML#371).
-- ``cache.refresh.batch`` span around the gather, carrying batch size and
-  outer-concurrency cap.
-- Per-item spans in ``cache.dispatch`` (``cache.refresh.identity`` /
-  ``.release`` / ``.artist``) — the dispatcher owns those.
+Sentry instrumentation: none beyond the ``lml.client_aborted`` tag that
+``run_bulk_gather`` sets on a client disconnect; tracing is off (BS#3393 D2).
 """
 
 from __future__ import annotations

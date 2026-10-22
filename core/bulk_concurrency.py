@@ -376,7 +376,6 @@ async def run_bulk_gather[R](
     watch_disconnect_fn: Callable[[Request], Coroutine[Any, Any, None]],
     on_abort: Callable[[], None],
     sentinel_task_name: str = "lml.bulk.disconnect_sentinel",
-    on_race_settled: Callable[[bool], None] | None = None,
 ) -> list[R]:
     """Race a bulk ``asyncio.gather`` against a client-disconnect sentinel (LML#1033).
 
@@ -422,9 +421,6 @@ async def run_bulk_gather[R](
         sentinel_task_name: Forwarded to ``asyncio.create_task`` so each
             route keeps its own distinguishable task name (mirrors the
             pre-extraction per-route names).
-        on_race_settled: Optional; called with the computed ``client_aborted``
-            boolean right after the race settles, for both outcomes. No
-            production route passes it today, so it stays opt-in.
 
     Returns:
         ``gather_future.result()`` — per-item results in input order
@@ -458,8 +454,6 @@ async def run_bulk_gather[R](
     # `asyncio.wait` wakeup, the work already finished, so proceed rather
     # than treat it as an abort.
     client_aborted = sentinel_task in done and not gather_future.done()
-    if on_race_settled is not None:
-        on_race_settled(client_aborted)
 
     if client_aborted:
         # Tag is global-scope (filterable across all routes as

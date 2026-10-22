@@ -36,7 +36,7 @@ from config.settings import get_settings
 from core.observability import capture_unsampled_counter
 from discogs.admission import admit_or_shed, retry_429
 from discogs.breaker import DiscogsBreakerOpenError
-from discogs.fallthrough import fallthrough, request_context
+from discogs.fallthrough import fallthrough
 from discogs.matching import (
     TracklistEntry,
     normalize_for_track_comparison,
@@ -283,10 +283,7 @@ async def acquire_discogs_permits(
 
     This ``try/finally`` guarantees exactly one release per acquire:
     cancellation mid-block or a raise inside it leaves no leaked permit and
-    never double-releases. As a result the ``lml.discogs.semaphore`` /
-    ``lml.discogs.rate_limiter`` spans fire once per attempt rather than once
-    per request -- a span-count schema change documented in the #569 PR (no
-    dashboard/alert aggregates on that count).
+    never double-releases.
 
     LML#927: a low-priority call holds the bulk reservation semaphore OUTER
     to the shared semaphore, acquired first so bulk can never occupy more
@@ -591,8 +588,7 @@ class DiscogsService:
         Returns a ``DiscogsApiCheckResult`` so ``/health`` can distinguish
         token-rotation drift (401/403), rate limits (429), upstream outages
         (5xx), and network failures from each other. The result is also
-        projected onto the active Sentry trace as the ``discogs_api.check``
-        tag so historic incidents are queryable in trace explorer.
+        set as the ``discogs_api.check`` Sentry tag.
         """
         # NetworkError covers DNS/refused/reset; TimeoutException covers
         # every connect/read/write/pool timeout. Both signal "couldn't reach
@@ -665,13 +661,6 @@ class DiscogsService:
         low_priority = is_discogs_low_priority()
         bulk_semaphore = get_bulk_discogs_semaphore() if low_priority else None
 
-        # LML#537: tag both wait spans with the seam's method + cache_state
-        # via ``apply_request_ctx_tags`` (a no-op when no context is active —
-        # the case for the small handful of legacy direct-call tests).
-        # Production callers enter via ``fallthrough()`` (dominant) or via
-        # the ``request_context()`` helper (the four API-only methods that
-        # bypass the seam and the four ``cache is None`` fallback branches).
-        #
         # LML#1040: the admission stack below composes three independently
         # tested pieces (``discogs/admission.py`` -- read their docstrings for
         # the full rationale this used to carry inline): ``admit_or_shed``
@@ -985,8 +974,7 @@ class DiscogsService:
             return TrackReleasesResponse(track=track, artist=artist, cached=False)
 
         if cache is None:
-            with request_context("search_releases_by_track"):
-                return await _api_fetch() or _empty_error_response()
+            return await _api_fetch() or _empty_error_response()
 
         # The negative-cache check fires regardless of ``artist_as_keyword``
         # because its key includes that dimension. The PG read is only safe
@@ -1069,11 +1057,8 @@ class DiscogsService:
         # Fresh per-result set means ``_process_search_result``'s album-dedup
         # branch never triggers across iterations.
         try:
-            with request_context("search_releases_by_album_title"):
-                async with timed_api():
-                    response = await self._request_with_retry(
-                        "GET", "/database/search", params=params
-                    )
+            async with timed_api():
+                response = await self._request_with_retry("GET", "/database/search", params=params)
             if response is not None:
                 get_cache_stats_recorder().record_api_call()
                 response.raise_for_status()
@@ -1143,9 +1128,8 @@ class DiscogsService:
         params: dict[str, Any] = {"type": "artist", "q": name, "per_page": 100}
 
         add_discogs_breadcrumb("search_artists", {"name": name})
-        with request_context("search_artists"):
-            async with timed_api():
-                response = await self._request_with_retry("GET", "/database/search", params=params)
+        async with timed_api():
+            response = await self._request_with_retry("GET", "/database/search", params=params)
 
         if response is None:
             return None
@@ -1235,9 +1219,8 @@ class DiscogsService:
         params: dict[str, Any] = {"type": "release", "artist": name, "per_page": limit}
 
         add_discogs_breadcrumb("search_release_ids_by_artist", {"name": name})
-        with request_context("search_release_ids_by_artist"):
-            async with timed_api():
-                response = await self._request_with_retry("GET", "/database/search", params=params)
+        async with timed_api():
+            response = await self._request_with_retry("GET", "/database/search", params=params)
 
         if response is None:
             return None
@@ -1558,8 +1541,7 @@ class DiscogsService:
         cache = self.cache_service
         value: ReleaseMetadataResponse | None
         if cache is None:
-            with request_context("get_release"):
-                value = await _api_fetch()
+            value = await _api_fetch()
         else:
             value = await fallthrough(
                 label="get_release",
@@ -1773,8 +1755,7 @@ class DiscogsService:
         cache = self.cache_service
         value: ArtistDetails | None
         if cache is None:
-            with request_context("get_artist_details"):
-                value = await _api_fetch()
+            value = await _api_fetch()
         else:
             value = await fallthrough(
                 label="get_artist_details",
@@ -1843,9 +1824,8 @@ class DiscogsService:
             Image URI string, or None if unavailable
         """
         try:
-            with request_context("get_label_image"):
-                async with timed_api():
-                    response = await self._request_with_retry("GET", f"/labels/{label_id}")
+            async with timed_api():
+                response = await self._request_with_retry("GET", f"/labels/{label_id}")
             if response is None:
                 return None
             get_cache_stats_recorder().record_api_call()
@@ -1869,9 +1849,8 @@ class DiscogsService:
             MasterRelease with title and year, or None on error
         """
         try:
-            with request_context("get_master"):
-                async with timed_api():
-                    response = await self._request_with_retry("GET", f"/masters/{master_id}")
+            async with timed_api():
+                response = await self._request_with_retry("GET", f"/masters/{master_id}")
             if response is None:
                 return None
             get_cache_stats_recorder().record_api_call()
@@ -2080,11 +2059,7 @@ class DiscogsService:
 
         cache = self.cache_service
         if cache is None or skip_pg:
-            # ``skip`` is the seam's existing cache-bypass state (LML#537
-            # taxonomy), so the #784 floor-reject retry is distinguishable
-            # from ``no_pg`` in the wait-time histograms.
-            with request_context("search", "skip" if skip_pg else "no_pg"):
-                result = await _api_fetch()
+            result = await _api_fetch()
         else:
             result = await fallthrough(
                 label="search",
