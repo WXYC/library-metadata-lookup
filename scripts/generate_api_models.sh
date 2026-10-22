@@ -248,7 +248,7 @@ pin_streaming_url_fields_to_str() {
 # the pin failing OPEN, so the post-condition cannot itself be another anchored
 # regex: it parses the output and inspects each pinned field's annotation.
 #
-# It asserts what the annotation IS (an allowlist: `str`, modulo None/Optional/
+# It asserts what the annotation IS (an allowlist: `str` or `constr`, modulo None/Optional/
 # Union/Annotated/Field wrappers), not what it is not. LML#1312 review: a
 # denylist for the literal token `AnyUrl` -- which is what wxyc-shared's
 # canonical copy does today -- fails open on one indirection this generator
@@ -258,9 +258,10 @@ pin_streaming_url_fields_to_str() {
 # annotation, and all five ship validating URLs at decode time anyway. That is
 # not hypothetical: this regen landed `class Url(RootModel[...])` for exactly
 # that reason, and AlbumMetadata's own docstring says these five fields "will be
-# migrated to use `$ref` in a future version". The allowlist also stops a
-# `constr(...)` narrowing, deliberately -- anything that is not plain `str`
-# decodes differently and wants a human, not a silent pass.
+# migrated to use `$ref` in a future version". Anything outside
+# `str`/`constr` decodes differently and wants a human, not a silent pass.
+# `constr` is allowed (LML#1476): upstream gave `bandcamp_url` a `maxLength` on
+# unrelated intake schemas, and a constrained string still decodes as `str`.
 #
 # It also asserts every pinned field was FOUND. `offenders`-only logic is
 # vacuous under a rename: upstream renames one of the five, the sed no-ops, the
@@ -297,6 +298,9 @@ with open(output_path, "r", encoding="utf-8") as f:
 
 # Wrappers that may surround the pinned type without changing what it decodes as.
 WRAPPERS = {"None", "Optional", "Union", "Annotated", "Field"}
+# Names that may carry the type itself: a constr(...) is still a plain str on
+# decode, it only adds a length/pattern check (LML#1476).
+PLAIN_STR_NAMES = {"str", "constr"}
 
 tree = ast.parse(source, filename=output_path)
 offenders = []
@@ -309,7 +313,7 @@ for node in ast.walk(tree):
             referenced = {
                 n.id for n in ast.walk(node.annotation) if isinstance(n, ast.Name)
             } - WRAPPERS
-            if referenced != {"str"}:
+            if not referenced or not referenced <= PLAIN_STR_NAMES:
                 offenders.append(f"{node.target.id} (line {node.lineno}): {annotation_src}")
 
 if offenders:
