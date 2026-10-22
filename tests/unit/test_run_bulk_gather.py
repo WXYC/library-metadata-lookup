@@ -38,25 +38,20 @@ class TestRunBulkGatherNormalCompletion:
             await asyncio.sleep(0)
             return f"resolved:{name}"
 
-        settled: list[bool] = []
-
         results = await run_bulk_gather(
             (_run_one(name) for name in _WXYC_ARTISTS),
             http_request=object(),
             watch_disconnect_fn=_never_disconnects,
             on_abort=lambda: pytest.fail("on_abort must not fire on normal completion"),
-            on_race_settled=settled.append,
         )
 
         assert results == [f"resolved:{name}" for name in _WXYC_ARTISTS]
-        assert settled == [False]
 
     @pytest.mark.asyncio
-    async def test_single_coroutine_iterable_works_and_on_race_settled_is_optional(self):
+    async def test_single_coroutine_iterable_works(self):
         """A single-element iterable (the `genres_bulk` shape, whose
         per-artist loop stays sequential inside its own coroutine) works the
-        same as an N-item generator -- and, since this call omits
-        `on_race_settled`, doubles as proof that the callback is optional.
+        same as an N-item generator.
         """
 
         async def _process_all() -> list[str]:
@@ -91,7 +86,6 @@ class TestRunBulkGatherClientAbort:
             await asyncio.sleep(0.01)
 
         abort_calls = 0
-        settled: list[bool] = []
 
         def _on_abort() -> None:
             nonlocal abort_calls
@@ -109,7 +103,6 @@ class TestRunBulkGatherClientAbort:
                         http_request=object(),
                         watch_disconnect_fn=_fast_disconnect,
                         on_abort=_on_abort,
-                        on_race_settled=settled.append,
                     ),
                     timeout=3.0,
                 )
@@ -117,7 +110,6 @@ class TestRunBulkGatherClientAbort:
         assert exc_info.value.status_code == 499
         assert exc_info.value.detail == "client disconnected"
         assert abort_calls == 1
-        assert settled == [True], f"expected on_race_settled(True) before the 499; got {settled}"
         assert captured_tags.get("lml.client_aborted") == "true", (
             f"Expected lml.client_aborted=true tag; got {captured_tags!r}"
         )
@@ -195,7 +187,6 @@ class TestRunBulkGatherTieBreak:
         async def _immediate_disconnect(_request: object) -> None:
             return None
 
-        settled: list[bool] = []
         abort_calls = 0
 
         def _on_abort() -> None:
@@ -207,9 +198,7 @@ class TestRunBulkGatherTieBreak:
             http_request=object(),
             watch_disconnect_fn=_immediate_disconnect,
             on_abort=_on_abort,
-            on_race_settled=settled.append,
         )
 
         assert results == _WXYC_ARTISTS
-        assert settled == [False], f"expected the tie to resolve non-aborted; got {settled}"
         assert abort_calls == 0

@@ -79,7 +79,7 @@ Implementation lives in `cache/`:
 - `cache/router.py` — the FastAPI handler, batch concurrency primitives shared with `lookup/router.py` via `core/bulk_concurrency.py`.
 - `entity/store.py:get_release_identity_provenance_bulk` — the bulk PG read returning `{identity_id: [(source, external_id), ...]}`.
 
-Sentry spans: `cache.refresh.batch` around the gather, `cache.refresh.identity` per identity, `cache.refresh.release` per source leg, `cache.refresh.artist` per walk target. Numeric attributes (`identity_id`, `external_id`) are set on the span at open, never via late binding.
+Tracing is off (BS#3393 D2), so this endpoint is not traced; a client disconnect sets the `lml.client_aborted` Sentry tag.
 
 ## Streaming Check Endpoint
 
