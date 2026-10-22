@@ -300,20 +300,20 @@ async def acquire_discogs_permits(
     discipline LML#953 established: nothing already holding the shared
     semaphore ever waits on this one, so no acquire cycle can form.
 
-    Explicit acquire/release (not ``async with semaphore:``) so the wait is
-    wrapped in a Sentry span. The 5-permit semaphore is the dominant source
-    of pre-request dark time on backfill cascades -- sampling the queue depth
-    right before the await gives the trace explorer a relative-load signal
-    per call. See WXYC/library-metadata-lookup#358.
+    Explicit acquire/release (not ``async with semaphore:``) so the queue
+    depth can be sampled right before each await and the two permits can be
+    released in a controlled order. The 5-permit semaphore is the dominant
+    source of pre-request dark time on backfill cascades. See
+    WXYC/library-metadata-lookup#358.
 
     Args:
         bulk_semaphore: The LML#927 bulk-lane reservation semaphore, or
             ``None`` for an interactive (non-low-priority) caller -- in
             which case only ``semaphore`` is touched.
         semaphore: The shared LML#358/#569 concurrency semaphore.
-        low_priority: Tags the ``lml.discogs.semaphore`` span/transaction
-            with ``lml.discogs.priority`` (``"bulk"`` or ``"interactive"``)
-            so wait-time p95/p99 can be sliced by traffic class.
+        low_priority: Tags the Sentry scope with ``lml.discogs.priority``
+            (``"bulk"`` or ``"interactive"``) so events can be sliced by
+            traffic class.
     """
     bulk_permit_held = False
     main_permit_held = False
@@ -329,10 +329,8 @@ async def acquire_discogs_permits(
 
         queue_depth = _approx_semaphore_queue_depth(semaphore)
         _project_semaphore_queue_depth(queue_depth)
-        # LML#927: tag this span with the traffic class so
-        # ``lml.discogs.semaphore`` p95/p99 wait can be sliced by class --
-        # the direct signal for verifying interactive is no longer
-        # head-of-line-blocked behind bulk.
+        # LML#927: tag the scope with the traffic class so events can be
+        # sliced by class.
         sentry_sdk.set_tag("lml.discogs.priority", "bulk" if low_priority else "interactive")
         await semaphore.acquire()
         main_permit_held = True

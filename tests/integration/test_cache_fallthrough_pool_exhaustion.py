@@ -38,8 +38,8 @@ These tests pin both halves of that contract:
 2. ``test_end_to_end_get_release_falls_back_on_exhausted_pool`` — wires
    ``DiscogsService`` against an exhausted pool with a mocked API path,
    confirms the fall-back response is returned, the cool-down is armed, the
-   next call skips the cache leg entirely, and the Sentry transaction carries
-   ``data.cache_fallback_fired``.
+   next call skips the cache leg entirely, and the ``cache_fallback_fired``
+   WARNING log is emitted.
 
 Why ``release`` table presence doesn't matter
 ---------------------------------------------
@@ -54,13 +54,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 from unittest.mock import MagicMock
 
 import asyncpg
 import pytest
 import pytest_asyncio
-import sentry_sdk
 
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.fallthrough import (
@@ -237,12 +237,12 @@ class TestEndToEndCoolDownOnExhaustedPool:
     2. The cool-down is armed after the first call.
     3. The next call within the cool-down window skips the cache leg
        entirely (verified via a spy on ``DiscogsCacheService.get_release``).
-    4. ``data.cache_fallback_fired`` is projected onto the active Sentry
-       transaction.
+    4. The ``cache_fallback_fired`` WARNING log carries the reason and
+       error class.
     """
 
     @pytest.mark.asyncio
-    async def test_end_to_end_get_release_falls_back_on_exhausted_pool(self, real_pool):
+    async def test_end_to_end_get_release_falls_back_on_exhausted_pool(self, real_pool, caplog):
         timed_pool = _TimeoutPoolWrapper(real_pool, timeout=_POOL_ACQUIRE_TIMEOUT_SECONDS)
         cache_service = DiscogsCacheService(timed_pool)
 
@@ -287,68 +287,69 @@ class TestEndToEndCoolDownOnExhaustedPool:
             # (``fallthrough()`` with the cache's ``get_release`` as
             # ``pg_read``) so the test reflects the real call shape without
             # punching through the decorator.
-            with sentry_sdk.start_transaction(name="test_end_to_end") as transaction:
+            caplog.set_level(logging.WARNING, logger="discogs.fallthrough")
 
-                async def call_seam(release_id: int) -> ReleaseMetadataResponse | None:
-                    payload = api_payloads[release_id]
+            async def call_seam(release_id: int) -> ReleaseMetadataResponse | None:
+                payload = api_payloads[release_id]
 
-                    async def api_fetch() -> ReleaseMetadataResponse:
-                        return payload
+                async def api_fetch() -> ReleaseMetadataResponse:
+                    return payload
 
-                    return await fallthrough(
-                        label="get_release",
-                        pg_read=lambda: cache_service.get_release(release_id),
-                        api_fetch=api_fetch,
-                        pg_write=None,  # write-back skipped for the test
-                        is_pg_hit=lambda v: v is not None and v.artwork_url is not None,
-                        breadcrumb_data={"release_id": release_id},
-                    )
-
-                # ----- Call 1: cache leg raises CacheUnavailableError, seam falls
-                # through to the API payload, cool-down is armed.
-                assert not _cool_down_active(), "Cool-down should be off at test start."
-                first_result = await call_seam(101)
-
-                # (1) API-fallback shape — same model the cache would have
-                # returned, but populated by the API leg (cached=False on
-                # an API result).
-                assert first_result is not None
-                assert first_result.release_id == 101
-                assert first_result.cached is False
-
-                # Cache leg was invoked exactly once for this call (the spy
-                # records the L2 attempt that ultimately raised).
-                assert cache_spy.call_count == 1
-
-                # (2) Cool-down is armed.
-                assert _cool_down_active(), (
-                    "Cool-down should be armed after the cache leg raised "
-                    "CacheUnavailableError under pool exhaustion."
+                return await fallthrough(
+                    label="get_release",
+                    pg_read=lambda: cache_service.get_release(release_id),
+                    api_fetch=api_fetch,
+                    pg_write=None,  # write-back skipped for the test
+                    is_pg_hit=lambda v: v is not None and v.artwork_url is not None,
+                    breadcrumb_data={"release_id": release_id},
                 )
 
-                # (4) Sentry transaction carries the cache-fallback payload.
-                transaction_data = transaction.to_json()["data"]
-                payload = transaction_data.get("cache_fallback_fired")
-                assert payload is not None, (
-                    "Expected `cache_fallback_fired` to be projected onto the "
-                    f"transaction. Got data keys: {list(transaction_data.keys())}"
-                )
-                assert payload["reason"] == "get_release"
-                assert payload["error_class"] == "CacheUnavailableError"
-                assert payload["cool_down_seconds"] == _COOL_DOWN_SECONDS
+            # ----- Call 1: cache leg raises CacheUnavailableError, seam falls
+            # through to the API payload, cool-down is armed.
+            assert not _cool_down_active(), "Cool-down should be off at test start."
+            first_result = await call_seam(101)
 
-                # ----- Call 2 (within cool-down window): cache leg must be
-                # bypassed entirely; seam goes straight to API.
-                second_result = await call_seam(102)
-                assert second_result is not None
-                assert second_result.release_id == 102
+            # (1) API-fallback shape — same model the cache would have
+            # returned, but populated by the API leg (cached=False on
+            # an API result).
+            assert first_result is not None
+            assert first_result.release_id == 101
+            assert first_result.cached is False
 
-                # (3) Cache leg was NOT invoked on the second call — the
-                # cool-down short-circuits ``pg_read``.
-                assert cache_spy.call_count == 1, (
-                    f"Expected cache leg to be skipped on second call; "
-                    f"spy was invoked {cache_spy.call_count} times total."
-                )
+            # Cache leg was invoked exactly once for this call (the spy
+            # records the L2 attempt that ultimately raised).
+            assert cache_spy.call_count == 1
+
+            # (2) Cool-down is armed.
+            assert _cool_down_active(), (
+                "Cool-down should be armed after the cache leg raised "
+                "CacheUnavailableError under pool exhaustion."
+            )
+
+            # (4) The cool-down logs ``cache_fallback_fired`` with the payload.
+            fired = [
+                r.getMessage()
+                for r in caplog.records
+                if r.levelno == logging.WARNING
+                and r.getMessage().startswith("cache_fallback_fired")
+            ]
+            assert len(fired) == 1, f"Expected one cache_fallback_fired WARNING; got {fired}"
+            assert "'reason': 'get_release'" in fired[0]
+            assert "'error_class': 'CacheUnavailableError'" in fired[0]
+            assert f"'cool_down_seconds': {_COOL_DOWN_SECONDS}" in fired[0]
+
+            # ----- Call 2 (within cool-down window): cache leg must be
+            # bypassed entirely; seam goes straight to API.
+            second_result = await call_seam(102)
+            assert second_result is not None
+            assert second_result.release_id == 102
+
+            # (3) Cache leg was NOT invoked on the second call — the
+            # cool-down short-circuits ``pg_read``.
+            assert cache_spy.call_count == 1, (
+                f"Expected cache leg to be skipped on second call; "
+                f"spy was invoked {cache_spy.call_count} times total."
+            )
         finally:
             release.set()
             await hog

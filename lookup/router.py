@@ -693,8 +693,7 @@ async def handle_lookup(
                 if queue_wait_ms > 0 and x_caller_budget_ms is not None and x_caller_budget_ms > 0:
                     x_caller_budget_ms = max(1, x_caller_budget_ms - int(queue_wait_ms))
                 # Constructed inside the permit so telemetry's total-duration
-                # series keeps meaning "lookup work", not "queue wait + work" —
-                # the wait is reported separately via the Sentry measurement.
+                # series keeps meaning "lookup work", not "queue wait + work".
                 telemetry = RequestTelemetry(
                     api_call_keys=["discogs"],
                     distinct_id=SERVICE_POSTHOG_DISTINCT_ID,

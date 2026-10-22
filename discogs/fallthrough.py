@@ -47,9 +47,8 @@ Bare ``Exception`` (programming errors), ``asyncio.TimeoutError``, and
 ``asyncio.CancelledError`` are *not* armed — they have their own semantics.
 The set is pinned by ``_ARMING_EXCEPTIONS`` and asserted by tests.
 
-The cool-down also projects ``data.cache_fallback_fired = {reason, error_class}``
-onto the active Sentry transaction (when one exists), matching the pattern
-used by ``_log_album_title_fallback`` in ``lookup/orchestrator.py``.
+Arming the cool-down logs ``cache_fallback_fired`` at WARNING with
+``{reason, error_class, cool_down_seconds}``.
 """
 
 from __future__ import annotations
