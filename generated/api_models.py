@@ -57,23 +57,6 @@ class ShowAlreadyOpenErrorCode(StrEnum):
     show_already_open = "show_already_open"
 
 
-class ShowAlreadyOpenShow(BaseModel):
-    """
-    Identity of the open show the caller collided with. A strict subset of `OpenShow`, whose rows `GET /flowsheet/open-shows` returns — same fields, same nullability, same BS#1371 resolution chain for `dj_name`.
-
-    """
-
-    id: int = Field(
-        ...,
-        description="`shows.id` of the open show. This is the value a follow-up `intent: takeover` must send as `expected_show_id`.\n",
-    )
-    dj_name: str | None = Field(
-        None,
-        description='The show OWNER\'s public handle, resolved through the same PII-safe chain as `OpenShow.dj_name` (BS#1371): per-show override -> the DJ\'s chosen handle -> the legacy tubafrenzy handle -> `null` when unresolvable.\n\n**Null is the common case, not the edge.** Essentially the whole open-show backlog this handshake exists to unstick reaches nothing through that chain (2,813 of production\'s 2,814 open shows carried a NULL `primary_dj_id` as of 2026-08-21), so a prompt that interpolates it unguarded renders "null is on air". Fall back to generic phrasing.\n\nFor an abandoned show this names the DJ who LEFT. A client showing "who is on air right now" should prefer `GET /flowsheet/djs-on-air`, whose active-membership answer is the one that disagrees with this field precisely when it matters.\n',
-    )
-    start_time: AwareDatetime
-
-
 class PaginationParams(BaseModel):
     page: conint(ge=1) | None = None
     limit: conint(ge=1, le=100) | None = None
@@ -182,30 +165,6 @@ class FlowsheetEntryBase(BaseModel):
     )
 
 
-class FlowsheetRangeShow(BaseModel):
-    """
-    Show metadata for one show overlapping a `GET /flowsheet/range` window. A deliberately public-safe projection of the `shows` row: it carries the DJ's public handle but no user id and no real-name column. Distinct from `Show`, which exposes `primary_dj_id` and is used on authenticated surfaces.
-    """
-
-    id: int = Field(
-        ...,
-        description="Matches `entries[].show_id` for every entry belonging to this show.",
-    )
-    show_name: str | None = Field(
-        None, description="Specialty-show name, or `null` for a regular show."
-    )
-    dj_name: str | None = Field(
-        None,
-        description="The DJ's public on-air handle, never the DJ's legal name. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371): per-show override -> the DJ's chosen handle (`user.djName`) -> the legacy tubafrenzy handle (`shows.legacy_dj_name`, tubafrenzy's `DJ_HANDLE`) -> `null`.",
-    )
-    specialty_id: int | None = None
-    start_time: AwareDatetime = Field(..., description="When the DJ signed on (ISO 8601).")
-    end_time: AwareDatetime | None = Field(
-        None,
-        description='When the DJ signed off (ISO 8601), or `null`. Null has **two** causes and they are not distinguishable from this field alone: the show is genuinely on the air, or its `show_end` delivery was dropped and the column stayed null permanently (nothing re-closes it on a schedule). Do not render a null `end_time` as "on air now"; compare `start_time` against the present, or read the `show_end` marker row in `entries`, which is the second independent signal.',
-    )
-
-
 class FlowsheetSongEntry(FlowsheetEntryBase):
     """
     Song entry in the flowsheet. Not `$ref`'d by any operation in this document — every v1 read path composes `FlowsheetEntryResponse` instead — but published as a generated type, so it is kept accurate.
@@ -305,18 +264,8 @@ class FlowsheetCreateMessage(BaseModel):
     )
 
 
-class FlowsheetUpdateRequest(BaseModel):
-    track_title: str | None = None
-    track_position: str | None = Field(
-        None,
-        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Set when re-picking a track via the flowsheet picker; cleared (omitted) when a DJ edits the entry to a free-text track_title. String-typed to match Discogs\'s `release_track.position`.\n',
-    )
-    artist_name: str | None = None
-    album_title: str | None = None
-    record_label: str | None = None
-    label_id: int | None = None
-    request_flag: bool | None = None
-    segue: bool | None = None
+class EntryType1(StrEnum):
+    spotlight = "spotlight"
 
 
 class FlowsheetQueryParams(BaseModel):
@@ -402,7 +351,7 @@ class PlaylistSearchResponse(BaseModel):
 
 class FlowsheetEntryType(StrEnum):
     """
-    Discriminator for V2 flowsheet entry types
+    Discriminator for V2 flowsheet entry types. The set grows without a coordinated release. A client that meets an unrecognized `entry_type` must not fail the page. It renders the row's server-composed `message` when its surface shows marker rows, or else skips the row.
     """
 
     track = "track"
@@ -413,6 +362,7 @@ class FlowsheetEntryType(StrEnum):
     talkset = "talkset"
     breakpoint = "breakpoint"
     message = "message"
+    spotlight = "spotlight"
 
 
 class FlowsheetV2Base(BaseModel):
@@ -429,11 +379,11 @@ class FlowsheetV2Base(BaseModel):
     add_time: AwareDatetime
 
 
-class EntryType1(StrEnum):
+class EntryType2(StrEnum):
     track = "track"
 
 
-class EntryType2(StrEnum):
+class EntryType3(StrEnum):
     show_start = "show_start"
 
 
@@ -450,7 +400,7 @@ class FlowsheetV2ShowStartEntry(FlowsheetV2Base):
     timestamp: AwareDatetime
 
 
-class EntryType3(StrEnum):
+class EntryType4(StrEnum):
     show_end = "show_end"
 
 
@@ -467,7 +417,7 @@ class FlowsheetV2ShowEndEntry(FlowsheetV2Base):
     timestamp: AwareDatetime
 
 
-class EntryType4(StrEnum):
+class EntryType5(StrEnum):
     dj_join = "dj_join"
 
 
@@ -483,7 +433,7 @@ class FlowsheetV2DJJoinEntry(FlowsheetV2Base):
     )
 
 
-class EntryType5(StrEnum):
+class EntryType6(StrEnum):
     dj_leave = "dj_leave"
 
 
@@ -499,7 +449,7 @@ class FlowsheetV2DJLeaveEntry(FlowsheetV2Base):
     )
 
 
-class EntryType6(StrEnum):
+class EntryType7(StrEnum):
     talkset = "talkset"
 
 
@@ -512,7 +462,7 @@ class FlowsheetV2TalksetEntry(FlowsheetV2Base):
     message: str
 
 
-class EntryType7(StrEnum):
+class EntryType8(StrEnum):
     breakpoint = "breakpoint"
 
 
@@ -529,7 +479,7 @@ class FlowsheetV2BreakpointEntry(FlowsheetV2Base):
     message: str | None = None
 
 
-class EntryType8(StrEnum):
+class EntryType9(StrEnum):
     message = "message"
 
 
@@ -542,22 +492,26 @@ class FlowsheetV2MessageEntry(FlowsheetV2Base):
     message: str
 
 
-class OnAirInfo(BaseModel):
+class EntryType10(StrEnum):
+    spotlight = "spotlight"
+
+
+class Source(StrEnum):
     """
-    Minimal, name-only on-air DJ shape for the `on_air` field. Deliberately separate from `OnAirDJ`, which additionally carries an `id` (a nullable `auth_user.id` string) that the `on_air` banner has no use for.
+    Which rule produced `mode`: `dj` the show's own choice (`request_mode` on `PATCH /flowsheet/shows/{id}`), `program` the specialty program's `default_request_mode`, `spotlight` the person in the spotlight (a band or a reader hides the button by default), `default` none of those applied.
     """
 
-    dj_name: str = Field(
-        ...,
-        description="The DJ's public on-air handle, never the DJ's legal name. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371), except when unresolvable this substitutes the station name (\"WXYC\") rather than `null` — it's the enclosing `on_air` field that goes `null`, not this one.",
-    )
+    dj = "dj"
+    program = "program"
+    spotlight = "spotlight"
+    default = "default"
 
 
 class OnAirDJ(BaseModel):
     """
     One DJ in a DJ list — the `auth_user.id` and the PII-safe on-air handle, both nullable.
 
-    The single shape for all three list sites: `/flowsheet/djs-on-air`, `/flowsheet/shows/recent`'s `djs` and `/flowsheet/playlist`'s `show_djs`. Every one of them resolves the handle through the same `resolveDjDisplayName`, so none can constrain `dj_name` more tightly than the others — the premise a per-site fork would rest on. A second declaration of one shape is how the two come to disagree; declare the site, not the shape.
+    The shape for two list sites: `/flowsheet/djs-on-air` and `/flowsheet/shows/recent`'s `djs`. `/flowsheet/playlist`'s `show_djs` uses `ShowPlaylistDJ`, which adds a membership flag these two do not emit. Every site resolves the handle through the same `resolveDjDisplayName`, so none can constrain `dj_name` more tightly than the others.
     """
 
     id: str | None = Field(
@@ -567,6 +521,24 @@ class OnAirDJ(BaseModel):
     dj_name: str | None = Field(
         ...,
         description="The DJ's public on-air handle, never the DJ's legal name. For a DJ with a Backend-Service account, the DJ's chosen handle (`user.djName`); for a legacy/tubafrenzy-mirrored show with no account, the full PII-safe chain (BS#1371) down to `shows.legacy_dj_name`.\n\n`null` when that chain resolves to nothing. The account arm keeps the DJ's row and nulls the name — `resolveDjDisplayName` discards a blank handle and the literal \"Anonymous\" (BS#1286) — so every operation serving this schema can return it. Present-but-null, never omitted: `dj_name` stays required.\n\nA null `dj_name` and a null `id` never co-occur. The legacy arm is the only source of a null `id`, and it emits an entry only when it has a name to put in it.",
+    )
+
+
+class ShowPlaylistDJ(BaseModel):
+    """
+    One DJ in `GET /flowsheet/playlist`'s `show_djs`: `OnAirDJ`'s `id` and `dj_name` (same types and nullability) plus `active`.
+    """
+
+    id: str | None = Field(
+        ...,
+        description="The DJ's `auth_user.id`, or `null` for a legacy show DJ with no account.",
+    )
+    dj_name: str | None = Field(
+        ..., description="The DJ's public on-air handle; see `OnAirDJ.dj_name`."
+    )
+    active: bool = Field(
+        ...,
+        description="`true` when the DJ's `show_djs` membership row is active, `false` when the DJ left the show.",
     )
 
 
@@ -1375,7 +1347,7 @@ class LibraryFilingConflictError(BaseModel):
 
 class IntakeItemState(StrEnum):
     """
-    Where an intake item sits in its lifecycle: logged into `pool`, held in the office for a named DJ as `requested` (the DJ it was requested of has not yet accepted), held by its holder as `checked_out`, `reviewed` once a music director has accepted a review for it (submitting a review does not move it), `filed` into the catalog, and `finalized` once shelved. `effective_state` on `IntakeItem` reads a stale `requested` as `pool` (WXYC/Backend-Service#2796): a `requested` row is stale once its `requested_at` is more than 7 days old, or once the DJ it was requested of has had their account deleted (`requested_dj_id` turns `null`). `state` itself does not change when a request goes stale — a read never writes — so `state: requested` can outlive the 7-day window on a row no one has touched since; only `effective_state` reflects the lapse.
+    Where an intake item sits in its lifecycle: added to `pool`, held in the office for a named DJ as `requested` (the DJ it was requested of has not yet accepted), held by its holder as `checked_out`, `reviewed` once a music director has accepted a review for it (submitting a review does not move it), `filed` into the catalog, and `finalized` once shelved. An item in effective state `pool` with a submitted review is not on the review shelf: it waits for a music director to choose or delete that review (`submitted_review_count` above 0 with `accepted_review_id` null), and clients that draw the review shelf leave it out. `POST /intake/{id}/checkout` refuses such an item. Delivered by WXYC/Backend-Service#3387. `effective_state` on `IntakeItem` reads a stale `requested` as `pool` (WXYC/Backend-Service#2796): a `requested` row is stale once its `requested_at` is more than 7 days old, or once the DJ it was requested of has had their account deleted (`requested_dj_id` turns `null`). `state` itself does not change when a request goes stale — a read never writes — so `state: requested` can outlive the 7-day window on a row no one has touched since; only `effective_state` reflects the lapse.
 
     """
 
@@ -1393,11 +1365,15 @@ class Pass(BaseModel):
         description="The passing DJ's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. Station-only: not for any public or anonymous surface, because it holds a legal name; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
     )
     passed_at: AwareDatetime
+    dj_id: str | None = Field(
+        None,
+        description="The passing account's `auth_user.id`, so a client can match a pass to an account without comparing names. Optional: a server that predates it omits it. Station-only: not for any public or anonymous surface; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+    )
 
 
 class IntakeItem(BaseModel):
     """
-    One record a music director logged and that is waiting for a review (WXYC/Backend-Service#2791): either a disc the station holds, or an album that arrived as files (`digital`), which a music director burns onto CD-R once its review is chosen. Its three DJ-name fields (`requested_dj_name`, `checked_out_by_name`, `passes[].dj_name`) hold the person's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. They are station-only: not for any public or anonymous surface, because they hold a legal name, and never for client telemetry (analytics properties, error breadcrumbs, logs). `passes` and `draft_authors` are present only for callers holding `reviews: manage`; `draft_authors` is `reviews.author` free text: a real name or account name for a DJ's own review, but whatever the music director typed for an on-behalf review. It carries the same station-only caveat as the three DJ-name fields; see `IntakeDeleteResponse.deleted_review_authors`.
+    One record a music director added and that is waiting for a review (WXYC/Backend-Service#2791): either a disc the station holds, or an album that arrived as files (`digital`), which a music director burns onto CD-R once its review is chosen. Its four name fields (`requested_dj_name`, `requested_by_name`, `checked_out_by_name`, `passes[].dj_name`) hold the person's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. They are station-only: not for any public or anonymous surface, because they hold a legal name, and never for client telemetry (analytics properties, error breadcrumbs, logs). `passes` and `draft_authors` are present only for callers holding `reviews: manage`; `draft_authors` is `reviews.author` free text: a real name or account name for a DJ's own review, but whatever the music director typed for an on-behalf review. It carries the same station-only caveat as the four name fields; see `IntakeDeleteResponse.deleted_review_authors`.
 
     """
 
@@ -1409,9 +1385,21 @@ class IntakeItem(BaseModel):
     format_id: int
     digital: bool = Field(
         ...,
-        description="True when the album reached the station as files, not a disc. A music director burns it onto CD-R once a review is chosen for it, so `format_id` is the CD-R format from the moment it is logged. It stays true after filing; screens show the format as Digital until the record is filed.\n",
+        description="True when the album reached the station as files, not a disc. A music director burns it onto CD-R once a review is chosen for it, so `format_id` is the CD-R format from the moment it is added. It stays true after filing; screens show the format as Digital until the record is filed.\n",
     )
     discogs_release_id: int | None = Field(...)
+    spotify_url: str | None = Field(
+        None,
+        description="A link to the record on Spotify, or null when none is known. A preview for choosing and hearing a record, not the station's review copy: certification counts only a recorded listen of the station's file. Filled by a lookup after adding and refreshed by one after a rename, never entered by a music director: no request carries it. A rename's own response can still carry the old record's link, as the lookup runs without being waited for. A server that predates the field leaves it out, so treat a missing key like `null`.\n",
+    )
+    apple_music_url: str | None = Field(
+        None,
+        description="A link to the record on Apple Music, or null when none is known. A preview for choosing and hearing a record, not the station's review copy: certification counts only a recorded listen of the station's file. Filled by a lookup after adding and refreshed by one after a rename, never entered by a music director: no request carries it. A rename's own response can still carry the old record's link, as the lookup runs without being waited for. A server that predates the field leaves it out, so treat a missing key like `null`.\n",
+    )
+    bandcamp_url: str | None = Field(
+        None,
+        description="A link to the record on Bandcamp, or null when none is known. A preview for choosing and hearing a record, not the station's review copy: certification counts only a recorded listen of the station's file. Entered by a music director when adding or editing the record, or filled by a lookup after adding and refreshed by one after a rename; a found link never replaces one a music director entered. A rename's own response can still carry the old record's link, as the lookup runs without being waited for. A server that predates the field leaves it out, so treat a missing key like `null`. There is no Discogs URL field: clients build it from `discogs_release_id`.\n",
+    )
     state: IntakeItemState
     effective_state: IntakeItemState = Field(
         ...,
@@ -1429,6 +1417,14 @@ class IntakeItem(BaseModel):
     requested_dj_name: str | None = Field(
         ...,
         description="The requested DJ's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. Station-only: not for any public or anonymous surface, because it holds a legal name; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+    )
+    requested_by: str | None = Field(
+        None,
+        description="The asking music director's account id, shaped like `checked_out_by`, set together with `requested_dj_id` when the item enters `requested`. Only an item whose `state` is `requested` carries it: withdrawing the request, the requested DJ accepting or passing it, a checkout, accepting a review for the item and filing each clear it along with the request's other fields, so an item in any other state reads `null`. A read never writes, so a stale `requested` item, whose `effective_state` reads `pool`, keeps it set. Read it together with `state` and `effective_state`, not as proof of a live request. `null` while `state: requested` means the request was made before the server recorded the asker, or the asker's account has since been deleted; show a generic line, not an error, in either case. A server that predates the field leaves it out, so treat a missing key like `null`.\n",
+    )
+    requested_by_name: str | None = Field(
+        None,
+        description="The asker's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, current at read time. `null` whenever `requested_by` is `null`. Station-only: not for any public or anonymous surface, because it holds a legal name; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
     )
     requested_at: AwareDatetime | None = Field(...)
     checked_out_by: str | None = Field(
@@ -1506,11 +1502,15 @@ class NewIntakeItemRequest(BaseModel):
         description="True when the album reached the station as files, not a disc. `format_id` must then be omitted. Defaults to false when omitted.\n",
     )
     discogs_release_id: int | None = None
+    bandcamp_url: constr(max_length=512) | None = Field(
+        None,
+        description="A link to the record on Bandcamp, a preview for choosing and hearing it and not the station's review copy. Surrounding whitespace is trimmed. A blank or whitespace-only string means no link, the same as `null`. Any other value must be an `https` URL on `bandcamp.com` or a subdomain of it, or the request is a 400. Any link sent counts as entered by a music director, and a lookup never replaces it, so send `bandcamp_url` only when a music director entered or changed it, not to send back the value a read returned.\n",
+    )
 
 
 class IntakeItemPatch(BaseModel):
     """
-    Any subset of the `NewIntakeItemRequest` fields except `digital`, plus setting or clearing the citation. `digital` can't be changed once an item is logged: an item logged as the wrong kind is deleted and logged again. A `format_id` is refused with a 400 on an item whose `digital` is true, because a digital album's format is CD-R until it is filed. `cited_album_id` and `cited_submission_id` are mutually exclusive as non-null values (WXYC/Backend-Service#2797's table CHECK enforces this in storage): a patch may not carry both as non-null at once, but may set one while explicitly clearing the other (for example `{cited_album_id: null, cited_submission_id: 12}`) to switch citation kinds in a single request, rather than passing through an uncited state across two. Setting one citation clears the other, so the single-key form `{cited_submission_id: 12}` is the canonical switch every generated client can send (WXYC/Backend-Service#2797); Swift omits nil optionals and cannot send an explicit null. The schema-level `not` rule is documentation the pipeline does not enforce, and the generated `IntakeItemPatchNot` type in swift6 and kotlin is a generator artifact, not part of the wire contract. Setting `cited_album_id` to a different release, or clearing it, also clears an accepted review that was chosen from the cited release (`accepted_review_id`, `accepted_by` and `accepted_at` become null) and returns the item to `checked_out` if someone holds it, otherwise to `pool`. Citing a submission instead (`{cited_submission_id: 12}`, the switch above) clears `cited_album_id` and counts as clearing it here: an accepted review chosen from that release goes with it. An accepted review of the item itself is kept. Implemented by WXYC/Backend-Service#2860.
+    Any subset of the `NewIntakeItemRequest` fields except `digital`, plus setting or clearing the citation. `digital` can't be changed once an item is logged: an item logged as the wrong kind is deleted and logged again. A `format_id` is refused with a 400 on an item whose `digital` is true, because a digital album's format is CD-R until it is filed. `cited_album_id` and `cited_submission_id` are mutually exclusive as non-null values (WXYC/Backend-Service#2797's table CHECK enforces this in storage): a patch may not carry both as non-null at once, but may set one while explicitly clearing the other (for example `{cited_album_id: null, cited_submission_id: 12}`) to switch citation kinds in a single request, rather than passing through an uncited state across two. Setting one citation clears the other, so the single-key form `{cited_submission_id: 12}` is the canonical switch every generated client can send (WXYC/Backend-Service#2797); Swift omits nil optionals and cannot send an explicit null. The schema-level `not` rule is documentation the pipeline does not enforce, and the generated `IntakeItemPatchNot` type in swift6 and kotlin is a generator artifact, not part of the wire contract. Setting `cited_album_id` to a different release, or clearing it, also clears an accepted review that was chosen from the cited release (`accepted_review_id`, `accepted_by` and `accepted_at` become null) and returns the item to `checked_out` if someone holds it, otherwise to `pool`. Citing a submission instead (`{cited_submission_id: 12}`, the switch above) clears `cited_album_id` and counts as clearing it here: an accepted review chosen from that release goes with it. An accepted review of the item itself is kept. Implemented by WXYC/Backend-Service#2860. Setting either citation to a non-null value also withdraws a pending request in the same update: a `requested` item returns to `pool`, and `requested_dj_id`, `requested_by` and `requested_at` become null. A `checked_out` item keeps its holder. Clearing a citation touches no request. No email is sent for the withdrawn request. Implemented by WXYC/Backend-Service#3383.
 
     """
 
@@ -1520,6 +1520,10 @@ class IntakeItemPatch(BaseModel):
     label_id: int | None = None
     format_id: int | None = None
     discogs_release_id: int | None = None
+    bandcamp_url: constr(max_length=512) | None = Field(
+        None,
+        description="A link to the record on Bandcamp, a preview for choosing and hearing it and not the station's review copy. Surrounding whitespace is trimmed. A blank or whitespace-only string means no link, the same as `null`. Any other value must be an `https` URL on `bandcamp.com` or a subdomain of it, or the request is a 400. A PATCH with `null` or a blank string clears it. Swift omits nil optionals and cannot send an explicit `null`, so it sends an empty string. Any link sent counts as entered by a music director, and a lookup never replaces it, so send `bandcamp_url` only when a music director entered or changed it, not to send back the value a read returned.\n",
+    )
     cited_album_id: int | None = None
     cited_submission_id: int | None = None
 
@@ -1576,6 +1580,25 @@ class IntakeConflictError(BaseModel):
     reason: IntakeConflictReason
 
 
+class IntakeRequestRefusedCode(StrEnum):
+    """
+    Discriminator for the coded `POST /intake/{id}/request` 400. Named rather than inline, pairing with `IntakeRequestRefusedError` the way `ShowAlreadyOpenErrorCode` pairs with `ShowAlreadyOpenError`.
+
+    """
+
+    asked_dj_cannot_see_feature = "asked_dj_cannot_see_feature"
+
+
+class IntakeRequestRefusedError(BaseModel):
+    """
+    The coded `POST /intake/{id}/request` 400 body, shape-compatible with `ApiErrorResponse`. Sent only for an account that can be asked (one that holds `reviews: write` and is not a service account), when the account cannot see reviews now under the access rule that `GET /feature-access` reports as `can_see` (at `off`, every such account; at `staff`, one below music director that does not hold `reviews_beta`; at `everyone`, one without DJ access); no request is recorded. Any other `dj_id` that fails validation gets the plain `ApiErrorResponse` with no code.
+
+    """
+
+    message: str
+    code: IntakeRequestRefusedCode
+
+
 class IntakeDeleteResponse(BaseModel):
     """
     Names the review authors whose reviews went with the item, so the music director's confirmation can say whose work was removed.
@@ -1605,7 +1628,7 @@ class ReviewStatus(StrEnum):
 
 class ReviewCredit(StrEnum):
     """
-    How the author asked to be credited if the review is ever published.
+    How the author asked to be credited if the review is ever published, except that on a review created by the one-time Backend-Service job that copies form-archive submissions, `none` is the station's decision and not an author's request.
     """
 
     dj_name = "dj_name"
@@ -1627,6 +1650,18 @@ class Reviewer(BaseModel):
         ...,
         description="The person's real name as shown inside the station, falling back to their account name (on-air handle, else username) when no real name is on file, so the fallback can be the on-air name. It is never the `dj_name` field. Shown only inside the station; not for any public or anonymous surface, because it holds a legal name; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
     )
+    on_air_name: str | None = Field(
+        None,
+        description='The account\'s on-air name as the public playlist shows it (`auth_user.dj_name`, except that a literal "Anonymous" counts as none); `null` when there is none. Optional: a server that predates it omits it. Station-only: not for any public surface, because this is an activity fact about a person; never for client telemetry (analytics properties, error breadcrumbs, logs).\n',
+    )
+    records_out: conint(ge=0) | None = Field(
+        None,
+        description="How many unfiled records the account has checked out or taken now. Optional: a server that predates it omits it. Station-only: not for any public surface, because this is an activity fact about a person; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+    )
+    last_submitted_at: AwareDatetime | None = Field(
+        None,
+        description="When the account last submitted a review; `null` if never. Optional: a server that predates it omits it. Station-only: not for any public surface, because this is an activity fact about a person; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+    )
 
 
 class Review(BaseModel):
@@ -1640,7 +1675,7 @@ class Review(BaseModel):
     intake_item_id: int | None = Field(...)
     author: constr(max_length=128) | None = Field(
         ...,
-        description="Null only on a row that predates the in-app model (the column has never been NOT NULL). For an account holder's own review, a snapshot of their real name as shown inside the station, taken when written, falling back to their account name (on-air handle, else username) when no real name is on file. For a handwritten or on-behalf review it is what the music director typed: free text that may be a real name, so it is not guaranteed PII-free. Shown only inside the station; not for any public or anonymous surface, because it holds a legal name; never the published credit (`credit` decides that) and never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
+        description="Null on a row that predates the in-app model (the column has never been NOT NULL), and on a review created by the one-time Backend-Service job that copies form-archive submissions (see `AlbumReview`) when the form's reviewer answer was blank. For a review that job created, it is the form's reviewer answer as typed, trimmed, which may carry a date or other text. For an account holder's own review, a snapshot of their real name as shown inside the station, taken when written, falling back to their account name (on-air handle, else username) when no real name is on file. For a handwritten or on-behalf review it is what the music director typed: free text that may be a real name, so it is not guaranteed PII-free. Shown only inside the station; not for any public or anonymous surface, because it holds a legal name; never the published credit (`credit` decides that) and never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
     )
     author_user_id: str | None = Field(
         ...,
@@ -1665,7 +1700,7 @@ class Review(BaseModel):
     publish_instagram: bool
     credit: ReviewCredit | None = Field(
         ...,
-        description="`null` means no choice has been made yet (an on-behalf review starts this way); `none` means the author chose no name.",
+        description="`null` means no choice has been made yet (an on-behalf review starts this way); `none` means the author chose no name. The one-time Backend-Service job that copies form-archive submissions sets `none` on every review it creates, as a station decision and not as any author's choice. Such a review has no author account, so no account can change its `credit` or `publish_*`, which keep the values the job set.",
     )
     add_date: date_aliased
     submitted_at: AwareDatetime | None = Field(...)
@@ -1827,7 +1862,7 @@ class Medium(StrEnum):
 
 class NewReviewRequest(ReviewFields):
     """
-    Creates a draft, except an on-behalf or handwritten create that names an `intake_item_id` and does not send `accept: false`, which creates a submitted, accepted review (see `accept`). Send exactly one of `intake_item_id` and `album_id`. A caller with `reviews: manage` may also send `author`, `author_user_id` and `medium`, which makes it an on-behalf review: `author` is free text, `author_user_id` optionally links the reviewer's account, and the caller is recorded as the one who recorded it. When `author_user_id` is sent, that account is the review's author and is told by email that a review was recorded in their name (the email carries no review text). A `handwritten` review is recorded the same way. An on-behalf review starts with no publishing surface ticked and `credit` null, because the author never saw the consent question, so an on-behalf create that sends any `publish_*` as `true`, or a non-null `credit`, answers 400. `author` is required on an on-behalf create, because the service cannot snapshot a name for someone who is not the caller: a missing or blank `author` answers 400, and so does an `author_user_id` that names no account. An on-behalf create may name an intake item in any state, including `filed` and `finalized`. Without these fields, the review is the caller's own and `typed`: the service sets `author` to a snapshot of the caller's real name at creation, falling back to their account name (on-air handle, else username) when no real name is on file, and sets the account fields from the caller, so a client never sends them. An on-behalf review keeps the text that was typed. `author` is never the published credit; the `credit` choice decides that.
+    Creates a draft, except an on-behalf or handwritten create that names an `intake_item_id` and does not send `accept: false`, which creates a submitted, accepted review (see `accept`). Send exactly one of `intake_item_id` and `album_id`. A caller with `reviews: manage` may also send `author`, `author_user_id`, `medium` and `copied_from_submission_id`, which makes it an on-behalf review: `author` is free text, `author_user_id` optionally links the reviewer's account, and the caller is recorded as the one who recorded it. When `author_user_id` is sent, that account is the review's author and is told by email that a review was recorded in their name (the email carries no review text). A `handwritten` review is recorded the same way. An on-behalf review starts with no publishing surface ticked and `credit` null, because the author never saw the consent question, so an on-behalf create that sends any `publish_*` as `true`, or a non-null `credit`, answers 400. `author` is required on an on-behalf create, because the service cannot snapshot a name for someone who is not the caller: a missing or blank `author` answers 400, and so does an `author_user_id` that names no account. An on-behalf create may name an intake item in any state, including `filed` and `finalized`. Without these fields, the review is the caller's own and `typed`: the service sets `author` to a snapshot of the caller's real name at creation, falling back to their account name (on-air handle, else username) when no real name is on file, and sets the account fields from the caller, so a client never sends them. An on-behalf review keeps the text that was typed. `author` is never the published credit; the `credit` choice decides that.
 
     """
 
@@ -1848,6 +1883,10 @@ class NewReviewRequest(ReviewFields):
     accept: bool | None = Field(
         None,
         description="Only a caller with `reviews: manage` may send this, and it only has meaning on an on-behalf or handwritten create whose subject is an `intake_item_id`. When `true` or left out on such a create, the review is created already `submitted` (revision 1 is written) and is accepted for the item in the same step, exactly as `POST /intake/{id}/accept-review` would: there is no draft and no separate submit. Because the review is submitted at once, a `typed` review with a `null` `review` is a 400 at create. `false` creates a draft that is not accepted, like any other create. Sent with an `album_id` subject, with either value, it is a 400.\n",
+    )
+    copied_from_submission_id: int | None = Field(
+        None,
+        description="Only a caller with `reviews: manage` may send this, and only with an `intake_item_id` subject (a 400 with `album_id`). The `id` of the form review (`AlbumReview`, from `GET /album-reviews`) whose text this review was copied from. Sending it makes the create an on-behalf create, so `author` is required. An id naming no form review is a 400. It is kept with the review and never returned. How it affects `GET /album-reviews` is set out in Backend-Service ADR 0011.\n",
     )
 
 
@@ -2618,6 +2657,273 @@ class AddScheduleShiftRequest(BaseModel):
     specialty_id: int | None = None
 
 
+class SpotlightRole(StrEnum):
+    """
+    Closed set. Clients must render an unrecognized value with a neutral label rather than fail, so a role can be added without a coordinated release. Generated enum decoders reject unknown values, so clients decode this field as a string and map it themselves.
+    """
+
+    performer = "performer"
+    dj = "dj"
+    reader = "reader"
+    guest = "guest"
+    host = "host"
+
+
+class RequestLineMode(StrEnum):
+    """
+    What the listener request button is for. `requests`: today's flow, where the message is parsed, searched and posted, and a message the parser judges not to be a request keeps its label; listeners see "Request" (DJs see "Requests"). `feedback`: every message is posted as feedback with no parse and no library search; listeners see "Message" (DJs see "Messages only"). `closed`: messages are refused and nothing is posted; listeners see no button (DJs see "Closed"). Closed set. Clients must treat an unrecognized value as `requests`. Generated enum decoders reject unknown values, so clients decode this field as a string and map it themselves, so a mode can be added without a coordinated release.
+    """
+
+    requests = "requests"
+    feedback = "feedback"
+    closed = "closed"
+
+
+class SpecialtyShowArtwork(BaseModel):
+    square_url: AnyUrl = Field(..., description="1024x1024 sRGB, immutable")
+    master_url: AnyUrl | None = Field(None, description="3000x3000")
+    wide_url: AnyUrl | None = Field(None, description="3:1 banner")
+
+
+class Cadence(StrEnum):
+    weekly = "weekly"
+    some_weeks = "some_weeks"
+    last_of_month = "last_of_month"
+
+
+class SpecialtyShowSlot(BaseModel):
+    day: conint(ge=0, le=6) = Field(..., description="0 = Monday, matching Schedule.day")
+    start_time: constr(pattern=r"^([01]\d|2[0-3]):[0-5]\d$") = Field(
+        ..., description="America/New_York wall clock, `HH:MM`"
+    )
+    duration_minutes: conint(ge=1, le=720)
+    cadence: Cadence
+
+
+class SpecialtyShowRef(BaseModel):
+    """
+    The catalog fields a now-playing surface needs. Embedded; no extra request.
+    """
+
+    id: int
+    slug: constr(pattern=r"^[a-z0-9]+(-[a-z0-9]+)*$")
+    name: str
+    short_name: str
+    tagline: str | None = Field(None, description="One line for the show card")
+    logs_playcuts: bool = Field(
+        ...,
+        description="Whether this program normally logs tracks. When `false`, DJ clients stop prompting for songs and history can say the show has no tracklist.",
+    )
+    default_spotlight_role: SpotlightRole | None = Field(
+        None,
+        description="What to call the person in the spotlight, when the show has one.",
+    )
+    artwork: SpecialtyShowArtwork | None = None
+    accent_color: constr(pattern=r"^#[0-9A-Fa-f]{6}$") | None = Field(
+        None,
+        description="One color serves light and dark mode. The catalog refuses a color unless white text on it reaches 4.5:1 contrast and the color reaches 3:1 against the app's darkest surface.",
+    )
+
+
+class SpecialtyShow(SpecialtyShowRef):
+    description: str | None = None
+    slots: list[SpecialtyShowSlot]
+    active: bool
+    default_request_mode: RequestLineMode | None = Field(
+        None,
+        description="The request line mode a show of this program starts with. `null` means `requests`.",
+    )
+
+
+class SpecialtyShowManaged(SpecialtyShow):
+    """
+    The catalog editor's view of a program: `SpecialtyShow` plus who created, last edited and retired it. Served only to callers who may manage the catalog; the public `SpecialtyShow` carries none of this.
+    """
+
+    created_by: str | None = Field(
+        None, description="Public DJ handle of whoever created the program."
+    )
+    updated_by: str | None = Field(None, description="Public DJ handle of whoever last edited it.")
+    retired_by: str | None = Field(
+        None, description="Public DJ handle of whoever retired it. Null while active."
+    )
+    retired_at: AwareDatetime | None = Field(
+        None, description="When it was retired. Null while active."
+    )
+    future_poster_count: conint(ge=0) | None = Field(
+        None,
+        description="Posters waiting for a broadcast date that has not yet passed, for the list and the retire dialog. Absent when the server does not supply it; read `GET /specialty-posters` instead.",
+    )
+
+
+class SpecialtyShowCreateRequest(BaseModel):
+    slug: constr(pattern=r"^[a-z0-9]+(-[a-z0-9]+)*$", max_length=64) = Field(
+        ...,
+        description="The stable public id. Never reused, even by a retired program.",
+    )
+    name: constr(max_length=64)
+    short_name: constr(max_length=32)
+    tagline: constr(max_length=120) | None = None
+    description: str | None = None
+    slots: list[SpecialtyShowSlot]
+    logs_playcuts: bool | None = None
+    default_spotlight_role: SpotlightRole | None = None
+    default_request_mode: RequestLineMode | None = None
+    accent_color: constr(pattern=r"^#[0-9A-Fa-f]{6}$") | None = Field(
+        None,
+        description="Refused with 400 `accent_too_light` or `accent_too_dark` unless white text on it reaches 4.5:1 and it reaches 3:1 against the app's darkest surface.",
+    )
+
+
+class SpecialtyShowUpdateRequest(BaseModel):
+    """
+    Any `SpecialtyShowCreateRequest` field, plus `active`. Omitted fields are unchanged; `slots`, when sent, replaces the whole schedule.
+    """
+
+    slug: constr(pattern=r"^[a-z0-9]+(-[a-z0-9]+)*$", max_length=64) | None = Field(
+        None,
+        description="Changes only while nothing uses the slug; otherwise 409 `slug_in_use`.",
+    )
+    name: constr(max_length=64) | None = None
+    short_name: constr(max_length=32) | None = None
+    tagline: constr(max_length=120) | None = None
+    description: str | None = None
+    slots: list[SpecialtyShowSlot] | None = None
+    logs_playcuts: bool | None = None
+    default_spotlight_role: SpotlightRole | None = None
+    default_request_mode: RequestLineMode | None = None
+    accent_color: constr(pattern=r"^#[0-9A-Fa-f]{6}$") | None = Field(
+        None, description="The same refusal as on create."
+    )
+    active: bool | None = Field(
+        None, description="`false` retires the program; `true` brings it back."
+    )
+
+
+class Rendition1(BaseModel):
+    width: int
+    height: int
+    url: AnyUrl
+
+
+class ShowPoster(BaseModel):
+    """
+    An airing's poster, normalized by the server. Public, with no uploader. Both URLs are immutable.
+    """
+
+    id: int
+    aspect_ratio: float = Field(
+        ...,
+        description="Width divided by height, 0.667 to 1.0, so a client can lay out before the image loads.",
+    )
+    renditions: list[Rendition1] = Field(
+        ...,
+        description="The poster at its own aspect ratio, never cropped or padded, one entry per width, ascending. Today 600 and 1200 px wide, never upscaled, so the largest entry may be narrower than 1200.",
+    )
+
+
+class Status1(StrEnum):
+    uploading = "uploading"
+    published = "published"
+    replaced = "replaced"
+    removed = "removed"
+    purged = "purged"
+    failed = "failed"
+
+
+class PosterFailureCode(StrEnum):
+    """
+    Why a poster upload was refused. `bad_aspect` includes a story-format 9:16 image.
+    """
+
+    not_uploaded = "not_uploaded"
+    unsupported_type = "unsupported_type"
+    too_large = "too_large"
+    too_small = "too_small"
+    bad_aspect = "bad_aspect"
+    animated = "animated"
+    decode_failed = "decode_failed"
+
+
+class PosterCompletionFailure(ApiErrorResponse):
+    """
+    The 422 body of `POST /specialty-posters/{id}/complete`.
+    """
+
+    failure_code: PosterFailureCode
+
+
+class ContentType(StrEnum):
+    image_jpeg = "image/jpeg"
+    image_png = "image/png"
+    image_webp = "image/webp"
+
+
+class PosterFileDeclaration(BaseModel):
+    content_type: ContentType
+    byte_length: conint(ge=1, le=10485760)
+
+
+class PosterUploadRequest(BaseModel):
+    specialty_id: int
+    broadcast_date: date_aliased
+    title: constr(max_length=128) | None = None
+    poster: PosterFileDeclaration
+
+
+class PresignedUpload(BaseModel):
+    """
+    The presigned PUT a client uploads an image to. Shared by `PosterUploadResponse` and `LogoUploadResponse`.
+    """
+
+    url: AnyUrl = Field(..., description="Presigned PUT. Never logged.")
+    headers: dict[str, str] = Field(
+        ...,
+        description="The Content-Type to send exactly. Content-Length is not included because a browser sets it itself; the server checks the size with HEAD on complete.",
+    )
+    expires_at: AwareDatetime
+
+
+class ContentType1(StrEnum):
+    image_png = "image/png"
+    image_jpeg = "image/jpeg"
+
+
+class LogoFileDeclaration(BaseModel):
+    content_type: ContentType1
+    byte_length: conint(ge=1, le=10485760)
+
+
+class LogoUploadResponse(BaseModel):
+    """
+    The presigned PUT for a program logo. It carries the upload object only; the program is unchanged until `POST /specialty-shows/{id}/logo/complete` succeeds.
+    """
+
+    upload: PresignedUpload
+
+
+class LogoFailureCode(StrEnum):
+    """
+    Why a logo upload was refused. The poster codes with `not_square` in place of `bad_aspect`; only `POST /specialty-shows/{id}/logo/complete` returns `not_square`, and `PosterFailureCode` never does.
+    """
+
+    not_uploaded = "not_uploaded"
+    unsupported_type = "unsupported_type"
+    too_large = "too_large"
+    too_small = "too_small"
+    not_square = "not_square"
+    animated = "animated"
+    decode_failed = "decode_failed"
+
+
+class LogoCompletionFailure(ApiErrorResponse):
+    """
+    The 422 body of `POST /specialty-shows/{id}/logo/complete`.
+    """
+
+    failure_code: LogoFailureCode
+
+
 class Schedule(BaseModel):
     id: int | None = Field(None, description="Primary key")
     day: conint(ge=0, le=6) | None = Field(
@@ -2920,7 +3226,14 @@ class AlbumReview(BaseModel):
     """
     One archived DJ album review, sourced from the WXYC album-review
     Google Form (collected since March 2021) and synced nightly by
-    Backend-Service's album-reviews ETL.
+    Backend-Service's album-reviews ETL until the form closes, when
+    the sync ends.
+
+    Once the form has closed, a one-time Backend-Service job copies
+    submissions that are linked to a library release into the in-app
+    Review model; unlinked submissions stay archive-only. Which linked
+    submissions it skips is set out in Backend-Service ADR 0011
+    (https://github.com/WXYC/Backend-Service/blob/main/docs/adr/0011-album-review-submissions-separate-archive.md).
 
     Distinct from the in-app `Review` model (`/reviews`: many per
     release, each attached to an intake item or a library release):
@@ -3967,7 +4280,7 @@ class ReleaseIdentityResolveResponse(BaseModel):
 
 class ArtistSearchAliasSource(StrEnum):
     """
-    Origin of an artist search alias variant. Opaque to BS storage (just a tag); used by future read-path ranking and audit. Open enum — new sources can be added by LML without a wire-format break.
+    Origin of an artist search alias variant. Consumers act on it: catalog search reports it in `matched_via_alias`, and the Backend-Service concerts resolver uses it to decide which rows may resolve a headliner. Open enum: new sources can be added, so a client must tolerate a value it does not know. Sources fall into two classes. A synonym source is another name for the same artist: `discogs_name_variation` and `discogs_alias`. A relational source names a different person or group that is related to the artist, and a consumer that needs a true synonym (for example, matching a concert headliner to an artist) must skip it. `discogs_member` is relational: a Discogs band member. `wxyc_library_credit` is relational: one name taken from a comma-joined WXYC alternate artist name, such as a member or collaborator credited on a release filed under this artist's card. It is a member or collaborator credit, not a spelling variant (Backend-Service#3554). `wxyc_library_alt` is the raw WXYC alternate artist name, stored as one value. It is usually a spelling variant, but sometimes it is a member or collaborator credit: Backend-Service's shadow ingest stores the whole value, and LML's alternate-credit hint (LML#1444) labels a row that a credit brought in with this source. A consumer that needs strict synonyms cannot fully trust `wxyc_library_alt` today. Catalog search matches every source.
 
     """
 
@@ -3975,11 +4288,12 @@ class ArtistSearchAliasSource(StrEnum):
     discogs_alias = "discogs_alias"
     discogs_member = "discogs_member"
     wxyc_library_alt = "wxyc_library_alt"
+    wxyc_library_credit = "wxyc_library_credit"
 
 
 class ArtistSearchAliasMethod(StrEnum):
     """
-    Semantic classification of how this variant relates to the subject artist. Distinct from source — multiple sources can emit the same method.
+    Semantic classification of how this variant relates to the subject artist. Distinct from source — multiple sources can emit the same method. `wxyc_library_credit` rows use `alt_curated`, like `wxyc_library_alt` rows, because both come from the station's curated alternate artist name.
 
     """
 
@@ -4012,7 +4326,7 @@ class ArtistSearchAliasVariant(BaseModel):
     method: ArtistSearchAliasMethod
     confidence: confloat(ge=0.0, le=1.0) = Field(
         ...,
-        description="Per-source default confidence (e.g. 0.95 for discogs_name_variation, 0.85 for discogs_alias / wxyc_library_alt, 0.70 for discogs_member). v1 search ignores this; stored for v2 ranking calibration.\n",
+        description="Per-source default confidence (e.g. 0.95 for discogs_name_variation, 0.85 for discogs_alias / wxyc_library_alt, 0.70 for discogs_member / wxyc_library_credit). v1 search ignores this; stored for v2 ranking calibration.\n",
     )
 
 
@@ -4504,7 +4818,7 @@ class TrackMatchHint(BaseModel):
 
 class ArtistMatchHint(BaseModel):
     """
-    Populated on library search result items when an artist-alias match from the BS-local `artist_search_alias` cache drove the inclusion of this release into the results (artist-search-alias plan PR 5). Sibling to TrackMatchHint — track hints carry title + position + artist_credit which have no meaning for alias matches; alias hints carry the variant string that scored and its source tag for UX rendering and audit.
+    Populated on search result items when an artist alias drove the inclusion of this release into the results: Backend-Service catalog search reads its `artist_search_alias` cache (artist-search-alias plan PR 5), and LML's `POST /api/v1/lookup` labels a row that an alternate artist credit brought in (LML#1444). Sibling to TrackMatchHint — track hints carry title + position + artist_credit which have no meaning for alias matches; alias hints carry the variant string that scored and its source tag for UX rendering and audit.
 
     """
 
@@ -4551,7 +4865,7 @@ class LibrarySearchItem(BaseModel):
     )
     matched_via_alias: list[ArtistMatchHint] | None = Field(
         None,
-        description="Sibling to `matched_via`. Reserved for the day LML composes artist-alias hits itself; not produced in v1 of the artist-search-alias plan (BS-local cache only). Optional and backward-compatible.\n",
+        description="Sibling to `matched_via`. Carries an artist-alias hint when one brought the row in. LML fills the same field on `LookupResultItem` (`POST /api/v1/lookup`) since LML#1444; no path returns this schema today. Optional and backward-compatible.\n",
     )
 
 
@@ -4596,6 +4910,30 @@ class StreamingCheckResponse(BaseModel):
         None,
         description="Names of services whose check raised an exception (transient network/rate-limit/\nscraping failure). Empty when every dispatched check completed without raising.\nWhen non-empty, callers should consider the listed services unchecked and may\nschedule a selective retry. Independent of `on_streaming`: a service can both\nmatch (populating `sources.<service>`) and other services can error.\n",
     )
+
+
+class FeatureAudience(StrEnum):
+    """
+    Who a gated feature is open to, globally: nobody (`off`), music directors and above, and testers holding the feature's capability (`staff`), or every account with DJ access (`everyone`).
+
+    """
+
+    off = "off"
+    staff = "staff"
+    everyone = "everyone"
+
+
+class FeatureAccessEntry(BaseModel):
+    audience: FeatureAudience
+    can_see: bool = Field(..., description="Whether the calling account can see the feature now.")
+
+
+class FeatureAccessResponse(BaseModel):
+    """
+    One property per gated feature; a later feature is an additive property.
+    """
+
+    reviews: FeatureAccessEntry
 
 
 class AppConfig(BaseModel):
@@ -4913,7 +5251,7 @@ class Type7(StrEnum):
     ack = "ack"
 
 
-class Status1(StrEnum):
+class Status2(StrEnum):
     ok = "ok"
     error = "error"
     unknown_command = "unknown_command"
@@ -4922,7 +5260,7 @@ class Status1(StrEnum):
 class AutoDJAck(BaseModel):
     type: Literal["ack"]
     id: str = Field(..., description="The id from the command being acknowledged")
-    status: Status1
+    status: Status2
     error: str | None = Field(None, description="Error message (only when status is error)")
     result: dict[str, Any] | None = Field(
         None,
@@ -5053,13 +5391,29 @@ class AutoDJDeactivateResponse(BaseModel):
     deactivatedAt: AwareDatetime
 
 
-class ShowAlreadyOpenErrorDetails(BaseModel):
+class ShowAlreadyOpenShow(BaseModel):
     """
-    Wrapper matching `ApiErrorResponse`'s `details` position, so the 409 body stays shape-compatible with every other error on the service even though it is typed. Named for the same reason as the code enum above: inline, it generates as a top-level `Details` class.
+    Identity of the open show the caller collided with. Carries `OpenShow`'s identity fields, with the same nullability and the same BS#1371 resolution chain for `dj_name`, plus the embedded `specialty`, which `OpenShow` (the rows `GET /flowsheet/open-shows` returns) does not have.
 
     """
 
-    show: ShowAlreadyOpenShow | None = None
+    id: int = Field(
+        ...,
+        description="`shows.id` of the open show. This is the value a follow-up `intent: takeover` must send as `expected_show_id`.\n",
+    )
+    dj_name: str | None = Field(
+        None,
+        description='The show OWNER\'s public handle, resolved through the same PII-safe chain as `OpenShow.dj_name` (BS#1371): per-show override -> the DJ\'s chosen handle -> the legacy tubafrenzy handle -> `null` when unresolvable.\n\n**Null is the common case, not the edge.** Essentially the whole open-show backlog this handshake exists to unstick reaches nothing through that chain (2,813 of production\'s 2,814 open shows carried a NULL `primary_dj_id` as of 2026-08-21), so a prompt that interpolates it unguarded renders "null is on air". Fall back to generic phrasing.\n\nFor an abandoned show this names the DJ who LEFT. A client showing "who is on air right now" should prefer `GET /flowsheet/djs-on-air`, whose active-membership answer is the one that disagrees with this field precisely when it matters.\n',
+    )
+    start_time: AwareDatetime
+    show_name: str | None = Field(
+        None,
+        description="This airing's free-text title, such as a Thursday Night Feature topic; not the program name. The program name comes from `specialty`. `null` when it has none. Optional so a server that predates it stays valid.",
+    )
+    specialty: SpecialtyShowRef | None = Field(
+        None,
+        description="The specialty program the open show was signed on as, so a Go Live handoff prompt can name it. `null` for an ordinary show. Optional so a server that predates it stays valid.",
+    )
 
 
 class FlowsheetEntryFields(BaseModel):
@@ -5140,6 +5494,68 @@ class FlowsheetEntryResponse(FlowsheetEntryBase, FlowsheetEntryFields):
     """
     Flowsheet entry as returned by the API with all possible fields
     """
+
+
+class FlowsheetRangeShow(BaseModel):
+    """
+    Show metadata for one show referenced by a flowsheet response: the rows of `GET /flowsheet/range` and of `FlowsheetV2PaginatedResponse.shows`. A deliberately public-safe projection of the `shows` row: it carries the DJ's public handle but no user id and no real-name column. Distinct from `Show`, which exposes `primary_dj_id` and is used on authenticated surfaces.
+    """
+
+    id: int = Field(
+        ...,
+        description="Matches `entries[].show_id` for every entry belonging to this show.",
+    )
+    show_name: str | None = Field(
+        None,
+        description="This airing's free-text title, such as a Thursday Night Feature topic; not the program name. The program name comes from `specialty`.",
+    )
+    dj_name: str | None = Field(
+        None,
+        description="The DJ's public on-air handle, never the DJ's legal name. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371): per-show override -> the DJ's chosen handle (`user.djName`) -> the legacy tubafrenzy handle (`shows.legacy_dj_name`, tubafrenzy's `DJ_HANDLE`) -> `null`.",
+    )
+    specialty_id: int | None = None
+    specialty: SpecialtyShowRef | None = Field(
+        None,
+        description="The catalog entry for `specialty_id`, embedded so a now-playing surface needs no second request. `null` for a regular show.",
+    )
+    poster: ShowPoster | None = Field(
+        None,
+        description="This airing's poster, or `null` when it has none; fall back to the program's artwork, then to the text tile. Optional so a server that predates it stays valid.",
+    )
+    start_time: AwareDatetime = Field(..., description="When the DJ signed on (ISO 8601).")
+    end_time: AwareDatetime | None = Field(
+        None,
+        description='When the DJ signed off (ISO 8601), or `null`. Null has **two** causes and they are not distinguishable from this field alone: the show is genuinely on the air, or its `show_end` delivery was dropped and the column stayed null permanently (nothing re-closes it on a schedule). Do not render a null `end_time` as "on air now"; compare `start_time` against the present, or read the `show_end` marker row in `entries`, which is the second independent signal.',
+    )
+
+
+class FlowsheetCreateSpotlight(BaseModel):
+    """
+    Adds a spotlight row to any open show, specialty or freeform. Rejected with 400 for an unknown `spotlight_role`, an empty or over-128 `spotlight_name`, or any track field present.
+    """
+
+    entry_type: EntryType1
+    spotlight_role: SpotlightRole
+    spotlight_name: constr(min_length=1, max_length=128)
+
+
+class FlowsheetUpdateRequest(BaseModel):
+    spotlight_role: SpotlightRole | None = None
+    spotlight_name: constr(min_length=1, max_length=128) | None = Field(
+        None,
+        description="`spotlight_role` and `spotlight_name` each correct a spotlight row in place, alone or together, such as a misspelled band. They apply to spotlight rows only; on a track row they get a 400. `entry_type` is not client-writable.",
+    )
+    track_title: str | None = None
+    track_position: str | None = Field(
+        None,
+        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Set when re-picking a track via the flowsheet picker; cleared (omitted) when a DJ edits the entry to a free-text track_title. String-typed to match Discogs\'s `release_track.position`.\n',
+    )
+    artist_name: str | None = None
+    album_title: str | None = None
+    record_label: str | None = None
+    label_id: int | None = None
+    request_flag: bool | None = None
+    segue: bool | None = None
 
 
 class FlowsheetV2TrackEntry(FlowsheetV2Base):
@@ -5227,6 +5643,17 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
     )
 
 
+class FlowsheetV2SpotlightEntry(FlowsheetV2Base):
+    """
+    V2 spotlight entry: from this row on, the named person or group is the focus of the show. The current spotlight is the newest spotlight row in the open show; it lasts until the next one or the end of the show. A DJ hands the focus back with a `host` row. There is no "end spotlight" type.
+    """
+
+    entry_type: Literal["spotlight"]
+    spotlight_role: SpotlightRole
+    spotlight_name: str
+    message: str = Field(..., description="Server-composed fallback label")
+
+
 class FlowsheetV2Entry(
     RootModel[
         FlowsheetV2TrackEntry
@@ -5237,6 +5664,7 @@ class FlowsheetV2Entry(
         | FlowsheetV2TalksetEntry
         | FlowsheetV2BreakpointEntry
         | FlowsheetV2MessageEntry
+        | FlowsheetV2SpotlightEntry
     ]
 ):
     root: (
@@ -5248,26 +5676,58 @@ class FlowsheetV2Entry(
         | FlowsheetV2TalksetEntry
         | FlowsheetV2BreakpointEntry
         | FlowsheetV2MessageEntry
+        | FlowsheetV2SpotlightEntry
     ) = Field(
         ...,
-        description="One row of the V2 flowsheet projection — the discriminated union every `projectEntriesV2` caller emits.\n\nDeclared once and referenced from all four of its sites (`FlowsheetV2PaginatedResponse.entries`, `ShowPlaylist.entries`, `FlowsheetRangeResponse.entries`, and the array branches of `GET /flowsheet`) rather than inlined per site. It was previously pasted into two of them, which is how the copies come to disagree: nothing makes an inlined `oneOf` track a variant added to its twin. Add a variant here and to `entry_type`'s mapping, never to a call site.",
+        description="One row of the V2 flowsheet projection — the discriminated union every `projectEntriesV2` caller emits.\n\nDeclared once and referenced from all four of its sites (`FlowsheetV2PaginatedResponse.entries`, `ShowPlaylist.entries`, `FlowsheetRangeResponse.entries`, and the array branches of `GET /flowsheet`) rather than inlined per site. It was previously pasted into two of them, which is how the copies come to disagree: nothing makes an inlined `oneOf` track a variant added to its twin. Add a variant here and to `entry_type`'s mapping, never to a call site.\n\nThe set of `entry_type` values grows without a coordinated release. A client that meets an unrecognized `entry_type` must not fail the page. It renders the row's server-composed `message` when its surface shows marker rows, or else skips the row.",
         discriminator="entry_type",
     )
 
 
-class FlowsheetV2PaginatedResponse(BaseModel):
+class RequestLine(BaseModel):
     """
-    The response of the default (paginated) branch of `GET /flowsheet` — the branch a request carrying neither `shows_limit` nor `start_id`/`end_id` selects, and the one the iOS app polls. The other two branches of that endpoint answer with a bare `FlowsheetV2Entry` array and no envelope; see the path for which query selects which.
+    What the listener request button does right now, computed once on the server so every client agrees. Apps obey `mode` and nothing else; `source` lets the DJ site explain itself ("Closed while a band is on"). Absent from an older server. When nobody is on the air `on_air` is `null` and there is no answer here: apps keep today's behaviour.
     """
 
-    entries: list[FlowsheetV2Entry]
-    page: int
-    limit: int
-    total: int = Field(..., description="Total number of entries")
-    totalPages: int = Field(..., description="Total number of pages")
-    on_air: OnAirInfo | None = Field(
+    mode: RequestLineMode
+    source: Source = Field(
+        ...,
+        description="Which rule produced `mode`: `dj` the show's own choice (`request_mode` on `PATCH /flowsheet/shows/{id}`), `program` the specialty program's `default_request_mode`, `spotlight` the person in the spotlight (a band or a reader hides the button by default), `default` none of those applied.",
+    )
+
+
+class OnAirInfo(BaseModel):
+    """
+    On-air banner shape for the `on_air` field: the DJ's public handle plus the live show's identity (`show_id`, `show_name`, `specialty`). Deliberately separate from `OnAirDJ`, which additionally carries an `id` (a nullable `auth_user.id` string) that the `on_air` banner has no use for.
+    """
+
+    dj_name: str = Field(
+        ...,
+        description="The DJ's public on-air handle, never the DJ's legal name. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371), except when unresolvable this substitutes the station name (\"WXYC\") rather than `null` — it's the enclosing `on_air` field that goes `null`, not this one.",
+    )
+    show_id: int | None = Field(
         None,
-        description='The DJ currently on air, when known. An object with `dj_name` means a named DJ is live; JSON `null` means the station is confirmed on automation ("Auto DJ"); the field being absent entirely means the server does not report on-air status (older backends / non-default query branches) and clients should treat it as unknown rather than asserting automation. Not in `required` so absence stays distinct from an explicit `null`.\n\nCodegen note: this three-way distinction (object / null / absent) survives openapi-typescript (`on_air?: OnAirInfo | null`), but a *synthesized* decoder in Swift (Codable `decodeIfPresent`), Kotlin (kotlinx default value), or Python (pydantic `| None = None`) collapses JSON `null` and an absent key into the same value. A consumer that needs the third state must decode by key presence (e.g. Swift\'s `container.contains` + `decodeNil`), as the iOS app does — do not rely on a generated model to tell `null` from absent.',
+        description="`shows.id` of the live show, so a client can tell which show a flowsheet entry belongs to (an entry's own `show_id` names the same key).",
+    )
+    show_name: str | None = Field(
+        None,
+        description="This airing's free-text title, such as a Thursday Night Feature topic; not the program name. The program name comes from `specialty`. `null` when the show has none.",
+    )
+    specialty: SpecialtyShowRef | None = Field(
+        None,
+        description="The specialty program, set only when a DJ signed on as that show or tagged it afterwards. Never inferred from the time slot. `null` for an ordinary show. The tag can be set, changed or cleared mid-show through `PATCH /flowsheet/shows/{id}`, so the value can change for the same `show_id`; re-read it on every poll.",
+    )
+    poster: ShowPoster | None = Field(
+        None,
+        description="This airing's poster, or `null` when it has none; fall back to the program's artwork, then to the text tile. Optional so a server that predates it stays valid.",
+    )
+    spotlight: FlowsheetV2SpotlightEntry | None = Field(
+        None,
+        description="The current spotlight: the newest spotlight row in the open show, computed by the server so a client never searches a window of entries for it. `null` or absent when the show has none.",
+    )
+    request_line: RequestLine | None = Field(
+        None,
+        description='What the listener request button does right now, computed once on the server so every client agrees. Apps obey `mode` and nothing else; `source` lets the DJ site explain itself ("Closed while a band is on"). Absent from an older server. When nobody is on the air `on_air` is `null` and there is no answer here: apps keep today\'s behaviour.',
     )
 
 
@@ -5283,6 +5743,14 @@ class ShowPlaylist(BaseModel):
         description="`shows.id` — the same value passed as `show_id`, and the value to pass back for a neighbour. The row is spread, so the key is `id`, not `show_id`.",
     )
     specialty_id: int | None = Field(...)
+    specialty: SpecialtyShowRef | None = Field(
+        None,
+        description="The catalog entry for `specialty_id`, embedded. `null` for a regular show. `specialty_show_name` stays for compatibility.",
+    )
+    poster: ShowPoster | None = Field(
+        None,
+        description="This airing's poster, or `null` when it has none; fall back to the program's artwork, then to the text tile. Optional so a server that predates it stays valid.",
+    )
     show_name: str | None = Field(...)
     start_time: AwareDatetime
     end_time: AwareDatetime | None = Field(
@@ -5298,7 +5766,7 @@ class ShowPlaylist(BaseModel):
         ...,
         description="The resolved specialty-show name, or the empty string when the show is not a specialty show. Empty string, never null.",
     )
-    show_djs: list[OnAirDJ]
+    show_djs: list[ShowPlaylistDJ]
     previous_show_id: int | None = Field(
         ...,
         description="The show that aired immediately before this one, or null on the oldest show in the archive.\n\nOrdered by `(start_time, id)`, not by `id`: ids were airtime-ordered while tubafrenzy assigned them, but the import left 32 of ~72,900 shows carrying a lower id than a show that aired earlier. Null is the end of the archive and nothing else — never `0`, the sentinel the legacy JSP linked to and then failed to resolve.",
@@ -5731,6 +6199,40 @@ class RestoreBatchResponse(BaseModel):
     entities: list[RestoredEntity]
 
 
+class SpecialtyPoster(BaseModel):
+    """
+    The DJ site's management view of one poster. A story-format 9:16 image is refused with `failure_code` `bad_aspect`.
+    """
+
+    id: int
+    specialty_id: int
+    broadcast_date: date_aliased = Field(
+        ..., description="America/New_York broadcast day, starting 06:00."
+    )
+    title: constr(max_length=128) | None = None
+    status: Status1
+    status_changed_by: str | None = Field(
+        None,
+        description="Public DJ handle of whoever replaced, removed, restored or purged it.",
+    )
+    status_changed_at: AwareDatetime | None = None
+    replaced_by_poster_id: int | None = None
+    restorable_until: AwareDatetime | None = Field(
+        None,
+        description="When the held renditions expire. Null unless replaced or removed.",
+    )
+    show_id: int | None = Field(None, description="The airing it is bound to, if any.")
+    poster: ShowPoster | None = Field(None, description="Null until published.")
+    uploaded_by: str | None = Field(None, description="The uploader's public DJ handle.")
+    failure_code: PosterFailureCode | None = None
+    created_at: AwareDatetime
+
+
+class PosterUploadResponse(BaseModel):
+    poster: SpecialtyPoster
+    upload: PresignedUpload
+
+
 class DiscogsMatchResult(BaseModel):
     """
     A processed Discogs search result with artwork and enriched metadata. Distinct from the raw Discogs API search response, which this contract deliberately does not model -- no WXYC endpoint proxies Discogs unmodified. Streaming URL fields match the StreamingLinks schema and will be migrated to use $ref in a future version.
@@ -5833,7 +6335,7 @@ class LookupResultItem(BaseModel):
     )
     matched_via_alias: list[ArtistMatchHint] | None = Field(
         None,
-        description="Sibling to `matched_via`. Reserved for the day LML composes artist-alias hits itself; not produced in v1 of the artist-search-alias plan (BS-local cache only). Optional and backward-compatible.\n",
+        description="Sibling to `matched_via`. LML fills it since LML#1444 when a row is in the results because its alternate artist name credits the requested artist: one hint, with the stored credit line as `matched_variant` and `wxyc_library_alt` as `source`. LML does not emit `wxyc_library_credit`. Optional and backward-compatible.\n",
     )
 
 
@@ -5929,15 +6431,13 @@ class LiveFsEvent(RootModel[LiveFsUpdateEvent | LiveFsRefetchEvent | LiveFsInser
     )
 
 
-class ShowAlreadyOpenError(BaseModel):
+class ShowAlreadyOpenErrorDetails(BaseModel):
     """
-    The `POST /flowsheet/join` 409 body. Purpose-built rather than a `$ref` to the shared `ApiErrorResponse`, following `AuthErrorResponse` and the `DeviceAuth*Error` family: `ApiErrorResponse.details` is `additionalProperties: true`, which reaches consumers as an untyped bag (`JSONValue` in Swift, `Record<string, unknown>` in TS), and `details.show.id` is not an incidental diagnostic here — a client is REQUIRED to read it and echo it back as `expected_show_id` to complete the takeover handshake. Typing it is what makes that a compare-and-set rather than four hand-written key-path digs.
+    Wrapper matching `ApiErrorResponse`'s `details` position, so the 409 body stays shape-compatible with every other error on the service even though it is typed. Named for the same reason as the code enum above: inline, it generates as a top-level `Details` class.
 
     """
 
-    message: str
-    code: ShowAlreadyOpenErrorCode | None = None
-    details: ShowAlreadyOpenErrorDetails | None = None
+    show: ShowAlreadyOpenShow | None = None
 
 
 class FlowsheetRangeResponse(BaseModel):
@@ -5960,3 +6460,34 @@ class LibraryQueryResponse(BaseModel):
     total: int
     page: int
     totalPages: int
+
+
+class FlowsheetV2PaginatedResponse(BaseModel):
+    """
+    The response of the default (paginated) branch of `GET /flowsheet` — the branch a request carrying neither `shows_limit` nor `start_id`/`end_id` selects, and the one the iOS app polls. The other two branches of that endpoint answer with a bare `FlowsheetV2Entry` array and no envelope; see the path for which query selects which.
+    """
+
+    entries: list[FlowsheetV2Entry]
+    page: int
+    limit: int
+    total: int = Field(..., description="Total number of entries")
+    totalPages: int = Field(..., description="Total number of pages")
+    on_air: OnAirInfo | None = Field(
+        None,
+        description='The DJ currently on air, when known. An object with `dj_name` means a named DJ is live; JSON `null` means the station is confirmed on automation ("Auto DJ"); the field being absent entirely means the server does not report on-air status (older backends / non-default query branches) and clients should treat it as unknown rather than asserting automation. Not in `required` so absence stays distinct from an explicit `null`.\n\nCodegen note: this three-way distinction (object / null / absent) survives openapi-typescript (`on_air?: OnAirInfo | null`), but a *synthesized* decoder in Swift (Codable `decodeIfPresent`), Kotlin (kotlinx default value), or Python (pydantic `| None = None`) collapses JSON `null` and an absent key into the same value. A consumer that needs the third state must decode by key presence (e.g. Swift\'s `container.contains` + `decodeNil`), as the iOS app does — do not rely on a generated model to tell `null` from absent.',
+    )
+    shows: list[FlowsheetRangeShow] | None = Field(
+        None,
+        description='The shows behind `entries`, so a client can group rows under a per-show header: every show referenced by an entry\'s `show_id`, plus the open show if there is one, each once. It reuses the `GET /flowsheet/range` show shape (`FlowsheetRangeShow`, including the embedded `specialty` program) on purpose, so one decoder serves both endpoints. Order is unspecified; key it by `id`. Carries public DJ handles only, never a legal name. Not in `required`: an older server that omits it stays valid, and a client treats absence as "no headers".',
+    )
+
+
+class ShowAlreadyOpenError(BaseModel):
+    """
+    The `POST /flowsheet/join` 409 body. Purpose-built rather than a `$ref` to the shared `ApiErrorResponse`, following `AuthErrorResponse` and the `DeviceAuth*Error` family: `ApiErrorResponse.details` is `additionalProperties: true`, which reaches consumers as an untyped bag (`JSONValue` in Swift, `Record<string, unknown>` in TS), and `details.show.id` is not an incidental diagnostic here — a client is REQUIRED to read it and echo it back as `expected_show_id` to complete the takeover handshake. Typing it is what makes that a compare-and-set rather than four hand-written key-path digs.
+
+    """
+
+    message: str
+    code: ShowAlreadyOpenErrorCode | None = None
+    details: ShowAlreadyOpenErrorDetails | None = None
