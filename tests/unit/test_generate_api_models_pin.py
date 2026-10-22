@@ -368,3 +368,60 @@ def test_a_renamed_field_fails_loudly_instead_of_pinning_fewer(tmp_path):
     assert result.returncode != 0
     assert "were not found" in result.stderr
     assert dropped in result.stderr
+
+
+_CONSTR_SHAPE = """\
+from typing import Optional
+
+from pydantic import AnyUrl, BaseModel, HttpUrl, constr
+
+
+class IntakeItem(BaseModel):
+    bandcamp_url: {annotation}
+
+
+class StreamingLinks(BaseModel):
+{pinned}
+"""
+
+
+def _install_bandcamp_annotation_stub(tmp_path: Path, annotation: str) -> None:
+    """Stub the generator so one ``bandcamp_url`` carries ``annotation`` verbatim.
+
+    The other four pinned fields come out as the usual ``AnyUrl | None`` and are
+    rewritten to ``str`` by the sed, so the verdict rests on ``annotation`` alone.
+    """
+    pinned = "\n".join(f"    {f}: AnyUrl | None = None" for f in PINNED_FIELDS)
+    _install_stub_toolchain(tmp_path, annotated=False)
+    (tmp_path / "bin" / "generated_source.py.txt").write_text(
+        _CONSTR_SHAPE.format(annotation=annotation, pinned=pinned)
+    )
+
+
+@pytest.mark.parametrize(
+    ("annotation", "accepted"),
+    [
+        # LML#1476: wxyc-shared#687 gave bandcamp_url `maxLength: 512` on the intake
+        # schemas, so the generator emits constr(...). A constrained string still
+        # decodes as str, so the verifier accepts it.
+        ("constr(max_length=512) | None = None", True),
+        ("Optional[constr(max_length=512)] = None", True),
+        # Anything that is not str/constr still fails, with the same error. The
+        # sed anchors on `field: AnyUrl`, so these shapes survive it unpinned.
+        ("Optional[AnyUrl] = None", False),
+        ("constr(max_length=512) | AnyUrl = None", False),
+        ("HttpUrl | None = None", False),
+    ],
+)
+def test_constr_is_accepted_as_plain_str_and_nothing_else_is(tmp_path, annotation, accepted):
+    _install_bandcamp_annotation_stub(tmp_path, annotation)
+    script = _set_up_repo(tmp_path)
+
+    result = _run(tmp_path, script)
+
+    if accepted:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert "#428 pin did not apply" in result.stderr
+        assert "bandcamp_url" in result.stderr
