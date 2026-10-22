@@ -647,8 +647,6 @@ class TestFindBestMatch:
     def test_returns_per_axis_scores(self):
         """find_best_match surfaces the winning candidate's artist/title scores.
 
-        LML#592: callers emit these to Sentry to measure how often a match
-        clears the floor with a marginal artist score against a high title.
         Uses the Wand/Wanda short-name collision (artist 88.89, title 100).
         """
         from clients.streaming.matching import find_best_match, score_match
@@ -1201,33 +1199,6 @@ class TestFindBestMatchSparseRowGuard:
         assert mock_logger.warning.call_count == 2  # both caught, neither fatal
 
 
-class TestFindBestSourceMatchEmits:
-    """LML#592: the album chokepoint's required ``service`` contract."""
-
-    _WAND = [{"artist": "Wanda", "album": "DOGA", "url": "http://w"}]
-
-    def test_service_is_required(self):
-        """``service`` must be a required keyword arg, never silently defaulted.
-
-        A defaulted ``service="unknown"`` once let an adapter's album matches
-        (Apple's) drop into an unattributable telemetry bucket instead of
-        failing loudly — telemetry is best-effort and would have swallowed the
-        mistake at runtime (LML#592). Pin the required contract so re-adding a
-        default is caught here, not in production data.
-        """
-        from clients.streaming.matching import find_best_source_match
-
-        with pytest.raises(TypeError):
-            find_best_source_match(
-                self._WAND,
-                "Wand",
-                "DOGA",
-                artist_fn=lambda r: r["artist"],
-                title_fn=lambda r: r["album"],
-                url_fn=lambda r: r["url"],
-            )  # no service= → TypeError
-
-
 class TestAcceptanceFloorUnchanged:
     """LML#592 is instrument-only: the 80/80 floor is NOT tightened in this PR.
 
@@ -1258,7 +1229,6 @@ class TestAcceptanceFloorUnchanged:
             artist_fn=lambda r: r["artist"],
             title_fn=lambda r: r["album"],
             url_fn=lambda r: r["url"],
-            service="deezer",
         )
         assert match is not None
         assert match.url == "http://w"

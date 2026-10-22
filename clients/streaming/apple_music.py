@@ -406,7 +406,6 @@ class AppleMusicClient(BaseStreamingClient):
             artist_fn=_extract_artist_name,
             title_fn=_extract_name,
             url_fn=_extract_url,
-            service="apple_music",
         )
 
     async def find_track_metadata(
@@ -446,10 +445,10 @@ class AppleMusicClient(BaseStreamingClient):
         # ``or None``: a whitespace-only album normalizes to "" — no
         # scoreable constraint, so treat it as album-less rather than
         # running a guaranteed-miss constrained pass whose winner would
-        # be mislabeled ``track_album_fallback`` in LML#592 telemetry.
+        # be wrongly treated as an album-fallback match.
         norm_album = (normalize_for_comparison(album) or None) if album else None
 
-        best, _ = _select_best_track_candidate(
+        best = _select_best_track_candidate(
             results,
             norm_artist=norm_artist,
             norm_song=norm_song,
@@ -482,7 +481,7 @@ class AppleMusicClient(BaseStreamingClient):
         # URL — the issue's "URL beats null" call, accepted knowingly.
         album_fallback = False
         if best is None and norm_album is not None:
-            best, _ = _select_best_track_candidate(
+            best = _select_best_track_candidate(
                 results,
                 norm_artist=norm_artist,
                 norm_song=norm_song,
@@ -534,7 +533,7 @@ def _select_best_track_candidate(
     norm_album: str | None,
     raw_song: str,
     raw_album: str | None,
-) -> tuple[dict | None, tuple[float, float]]:
+) -> dict | None:
     """One scoring pass over a ``search_song`` response.
 
     Applies the 80/80(/80) ``token_set_ratio`` floor per axis plus the
@@ -551,19 +550,12 @@ def _select_best_track_candidate(
     un-normalized request album (``None`` when the album axis is dropped) —
     the LML#719/#721 guards do their own normalization internally.
 
-    Returns ``(best, (artist_score, track_score))`` — the chosen record
-    (or ``None`` when nothing clears) plus its per-axis scores, stashed
-    in lockstep with the candidate so they describe whichever record
-    ``best_with_artwork or best_overall`` actually selected, not the
-    higher-fuzz record that artwork preference may have passed over
-    (LML#592).
+    Returns the chosen record, or ``None`` when nothing clears.
     """
     best_overall: dict | None = None
     best_overall_score = 0.0
-    best_overall_axes: tuple[float, float] = (0.0, 0.0)
     best_with_artwork: dict | None = None
     best_with_artwork_score = 0.0
-    best_with_artwork_axes: tuple[float, float] = (0.0, 0.0)
     # Highest combined score among candidates the LML#1139 V/A guard struck.
     # Feeds the no-promotion rule after the loop.
     struck_best_score = 0.0
@@ -663,11 +655,9 @@ def _select_best_track_candidate(
         if combined > best_overall_score:
             best_overall_score = combined
             best_overall = item
-            best_overall_axes = (artist_score, track_score)
         if (attrs.get("artwork") or {}).get("url") and combined > best_with_artwork_score:
             best_with_artwork_score = combined
             best_with_artwork = item
-            best_with_artwork_axes = (artist_score, track_score)
 
     # LML#1139 no-promotion rule. A strike is allowed to REMOVE a candidate,
     # never to promote one that could not have won without it. If the best
@@ -683,11 +673,9 @@ def _select_best_track_candidate(
     # file's standing trade is that dropping enrichment beats shipping a wrong
     # link.
     if struck_best_score >= best_overall_score:
-        return None, (0.0, 0.0)
+        return None
 
-    best = best_with_artwork or best_overall
-    axes = best_with_artwork_axes if best is best_with_artwork else best_overall_axes
-    return best, axes
+    return best_with_artwork or best_overall
 
 
 def _extract_artist_name(item: dict) -> str:

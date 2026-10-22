@@ -424,9 +424,8 @@ class TestPostHogTelemetry:
 
     @pytest.mark.asyncio
     async def test_error_exit_emits_nothing(self, make_app, mock_entity_store, mock_posthog_client):
-        """Error exits deliberately emit no event — the Sentry span's
-        status pins carry error observability; a 503 must not inflate the
-        completed-event baseline any alert is calibrated on."""
+        """Error exits deliberately emit no event — a 503 must not inflate
+        the completed-event baseline any alert is calibrated on."""
         from asyncpg.exceptions import PostgresError
 
         mock_entity_store.bulk_resolve_library_names = AsyncMock(

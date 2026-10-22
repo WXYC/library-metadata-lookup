@@ -723,8 +723,8 @@ def find_best_match(
                 "confidence": combined,
                 "matched_artist": result_artist,
                 "matched_title": result_title,
-                # Per-axis scores so callers can emit match telemetry (LML#592):
-                # the artist axis is the discriminator on shared-title collisions.
+                # Per-axis scores for the winning candidate: the artist axis is
+                # the discriminator on shared-title collisions.
                 "artist_score": artist_score,
                 "title_score": title_score,
             }
@@ -869,7 +869,6 @@ def find_best_source_match(
     artist_fn: Callable[[dict], str],
     title_fn: Callable[[dict], str],
     url_fn: Callable[[dict], str],
-    service: str,
 ) -> SourceMatch | None:
     """Run ``find_best_match`` and wrap the verdict as a ``SourceMatch``.
 
@@ -880,15 +879,6 @@ def find_best_source_match(
     the ``best is None / SourceMatch(url=..., confidence=...)`` boilerplate
     here. ``id_fn`` deliberately omitted — ``SourceMatch`` doesn't carry an
     id, so the extra extractor was dead weight in adapter bodies.
-
-    ``service`` labels the LML#592 match telemetry emitted for the winning
-    candidate (album surface) with the originating streaming service
-    ("apple_music", "spotify", ...). It is **required** rather than defaulted:
-    a silent ``"unknown"`` default once let an adapter (Apple) drop its album
-    matches into an unattributable telemetry bucket instead of failing loudly,
-    and because telemetry is best-effort the mistake would have been swallowed
-    at runtime. Requiring the label turns a forgotten ``service=`` into a
-    call-time ``TypeError`` caught by the first test, not silent data rot.
     """
     best = find_best_match(
         results,

@@ -265,7 +265,7 @@ def _sanitize_name(name: str) -> str:
 
 @dataclass
 class ResolveStats:
-    """Per-request aggregates for the route's Sentry span + PostHog event.
+    """Per-request aggregates for the route's PostHog event.
 
     Verdict counters count response POSITIONS (duplicates share their
     group's verdict), so they sum to ``names``. ``deduped`` counts unique
@@ -288,8 +288,8 @@ class ResolveStats:
     any HTTP left the building, though a mid-flight open may have spent
     attempts first — the service-level cache-stats counters carry the
     exact per-request HTTP tally. The service-qualified name is
-    deliberate: every field lands verbatim as a span key and PostHog
-    property, and a bare ``api_calls`` would shadow the framework's
+    deliberate: every field lands verbatim as a PostHog property, and a
+    bare ``api_calls`` would shadow the framework's
     per-service map that rides on every ``*_completed`` event.
     """
 
