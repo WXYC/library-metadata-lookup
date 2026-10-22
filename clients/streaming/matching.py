@@ -7,7 +7,6 @@ import re
 from collections.abc import Callable, Iterable
 from typing import Any
 
-import sentry_sdk
 from rapidfuzz import fuzz
 from wxyc_etl.text import is_compilation_artist, strip_discogs_disambiguation
 from wxyc_etl.text import to_match_form as normalize_for_comparison  # noqa: F401
@@ -612,111 +611,6 @@ def va_artist_axis_is_uninformative(query_artist: str, candidate_artist: str) ->
     )
 
 
-# LML#592 telemetry bands. The 80/80 floor admits organic short-name artist
-# collisions on a shared album title ("Wand" vs "Wanda" scores 88.89 against
-# an identical title at 100). These bands classify the *signature* of such a
-# clear — a marginal artist score against a high title — so we can measure how
-# often it happens in production BEFORE deciding whether to tighten the floor.
-# Raw scores are emitted alongside the boolean, so the bands can be re-tuned in
-# Sentry queries without a code change. NOT acceptance thresholds: nothing here
-# rejects a match. The artist axis is the discriminator; titles collide cheaply.
-MARGINAL_ARTIST_CEILING: float = 90.0  # artist in [floor, ceiling) is "marginal"
-HIGH_TITLE_FLOOR: float = 95.0  # title >= this is "high" — the collision tell
-
-
-def record_match_telemetry(
-    *,
-    artist_score: float,
-    title_score: float,
-    service: str,
-    surface: str,
-    query_artist: str | None = None,
-    matched_artist: str | None = None,
-    query_title: str | None = None,
-    matched_title: str | None = None,
-) -> None:
-    """Emit a winning match's per-axis fuzzy scores to Sentry (LML#592).
-
-    Opens a lightweight ``matcher.match`` span carrying the raw artist/title
-    scores plus a derived ``marginal_artist_clear`` flag (artist in
-    ``[SCORE_MATCH_ACCEPTANCE_FLOOR, MARGINAL_ARTIST_CEILING)`` while title is
-    ``>= HIGH_TITLE_FLOOR``). Called once per resolved match, so the count of
-    these spans is the denominator and the flagged subset is the numerator of
-    the marginal-clear rate.
-
-    For the marginal subset *only*, the request-vs-matched ``artist``/``title``
-    strings are attached too. The flag and scores answer "how often does a
-    marginal clear happen"; the strings answer "was a given marginal clear
-    actually wrong" — which the scores can't, since an organic false match
-    (``Wand`` -> ``Wanda``) and a legitimate one (``Wand`` -> ``WAND`` with a
-    casing/punctuation diff) can both land at ~88. The strings let a production
-    sample be hand-labeled for the false-positive rate that gates the eventual
-    floor tightening (Part 2). Marginal-only because that set is rare by
-    construction and the only sample worth labeling — the common path stays
-    scores-only, so names don't ride the whole match stream.
-
-    Telemetry must never break a lookup: any failure is swallowed with a warning
-    (mirrors ``_project_cache_stats_to_transaction`` in ``lookup/router.py``).
-
-    Args:
-        artist_score: Fuzzy score of the request artist vs the matched artist.
-        title_score: Fuzzy score of the request title vs the matched title.
-        service: Streaming service that produced the match ("apple_music", ...).
-        surface: Match surface — "album", "track", "track_album_less", or
-            "track_album_fallback". "track" means the album-CONSTRAINED pass
-            supplied the winner; "track_album_less" that the request carried no
-            scoreable album at all (LML#1139 — previously conflated with
-            "track", which made the album-less population unmeasurable);
-            "track_album_fallback" that the LML#782 album-less re-score did.
-        query_artist: Request artist string (labeling; marginal clears only).
-        matched_artist: Matched-candidate artist string (labeling).
-        query_title: Request title string (labeling).
-        matched_title: Matched-candidate title string (labeling).
-
-    Unlike ``service`` (a *required* kwarg, so a forgotten label fails loudly
-    instead of rotting telemetry — see ``find_best_source_match``), the four
-    label strings are optional: they're emitted only on the marginal subset, so
-    requiring them on every call would over-couple non-marginal callers. The
-    same silent-null risk is instead guarded at use: a marginal clear that
-    arrives without them logs a warning (telemetry is best-effort, so this can
-    warn but never raise).
-    """
-    try:
-        marginal = (
-            SCORE_MATCH_ACCEPTANCE_FLOOR <= artist_score < MARGINAL_ARTIST_CEILING
-            and title_score >= HIGH_TITLE_FLOOR
-        )
-        with sentry_sdk.start_span(op="matcher.match", name=f"{service}:{surface}") as span:
-            span.set_data("matcher.service", service)
-            span.set_data("matcher.surface", surface)
-            span.set_data("matcher.artist_score", artist_score)
-            span.set_data("matcher.title_score", title_score)
-            span.set_data("matcher.marginal_artist_clear", marginal)
-            if marginal:
-                if None in (query_artist, matched_artist, query_title, matched_title):
-                    # The labels are what make the marginal sample usable; a
-                    # marginal clear that reaches here without them is the
-                    # silent-unattributable-telemetry mode that the required
-                    # ``service=`` kwarg was added to reject (see
-                    # ``find_best_source_match``). The labels stay optional
-                    # because they're conditional (marginal-only) — requiring
-                    # them on every call would over-couple non-marginal callers
-                    # — so the gap is guarded here with a warning rather than at
-                    # the signature. Best-effort telemetry must never raise.
-                    logger.warning(
-                        "matcher.match marginal clear emitted without label strings "
-                        "(service=%s surface=%s); sample will be unlabelable",
-                        service,
-                        surface,
-                    )
-                span.set_data("matcher.query_artist", query_artist)
-                span.set_data("matcher.matched_artist", matched_artist)
-                span.set_data("matcher.query_title", query_title)
-                span.set_data("matcher.matched_title", matched_title)
-    except Exception as e:  # defensive; telemetry is best-effort, never fatal
-        logger.warning("Failed to emit matcher telemetry: %s", e)
-
-
 # Adapter extractors pull fields out of raw upstream rows either by subscripting
 # (Spotify's ``x["artists"][0]["name"]``, Deezer's ``x["artist"]["name"]``) or by
 # attribute access (the orchestrator's ``lambda r: r.artist`` over a
@@ -1006,14 +900,4 @@ def find_best_source_match(
     )
     if best is None:
         return None
-    record_match_telemetry(
-        artist_score=best["artist_score"],
-        title_score=best["title_score"],
-        service=service,
-        surface="album",
-        query_artist=query_artist,
-        matched_artist=best["matched_artist"],
-        query_title=query_title,
-        matched_title=best["matched_title"],
-    )
     return SourceMatch(url=best["url"], confidence=best["confidence"])

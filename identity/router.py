@@ -17,7 +17,6 @@ import asyncio
 import logging
 from collections import Counter
 
-import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from core.bulk_body import (
@@ -588,105 +587,75 @@ async def bulk_resolve_libraries(
                     status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
                 ) from None
 
-    # Explicit `http.server` span (LML#430). Defense-in-depth against the
-    # FastApiIntegration's automatic transaction not landing for this endpoint
-    # — `op:http.server span.description:*bulk-resolve-libraries*` queries in
-    # the trace explorer will surface bulk-resolve traffic even when the
-    # automatic instrumentation misses. Mirrors PR #417's pattern for
-    # `/api/v1/lookup/bulk`.
-    with sentry_sdk.start_span(
-        op="http.server",
-        name="POST /api/v1/identity/bulk-resolve-libraries",
-    ) as http_span:
-        http_span.set_data("http.method", "POST")
-        http_span.set_data("http.target", "/api/v1/identity/bulk-resolve-libraries")
-        http_span.set_data("lml.bulk_resolve.inputs", inputs_count)
-        http_span.set_data("lml.bulk_resolve.max_concurrent", max_concurrent)
+    def _on_abort() -> None:
+        # 499 = Nginx "client closed request" — nobody reads the body, but
+        # it pins the log for triage.
+        logger.warning("bulk resolve aborted by client: inputs=%d", inputs_count)
 
-        def _on_abort() -> None:
-            # 499 = Nginx "client closed request" — nobody reads the body, but
-            # it pins the span/log for triage.
-            http_span.set_data("http.status_code", 499)
-            logger.warning("bulk resolve aborted by client: inputs=%d", inputs_count)
-
-        # Race the gather against a client-disconnect sentinel (LML#700,
-        # hoisted into core.bulk_concurrency.run_bulk_gather by LML#1033).
-        # uvicorn does not propagate a client socket close into the handler,
-        # so a plain `await asyncio.gather(...)` would run the in-flight
-        # per-input tasks — and the discogs-cache pool permits they hold
-        # (bounded by `max_concurrent`) — to completion against a client that
-        # is already gone; the sentinel lets a disconnect cancel the
-        # outstanding gather promptly instead. `gather` preserves input order
-        # (results[i] <-> inputs[i]) regardless of completion order,
-        # satisfying the api.yaml ordering contract.
-        #
-        # Spawning the sentinel must happen *after* `await http_request.json()`
-        # above has fully consumed the request body — `watch_disconnect` awaits
-        # `request.receive()`, which would otherwise swallow the `http.request`
-        # body messages the JSON parser needs.
-        try:
-            results = await run_bulk_gather(
-                (
-                    _resolve_one(r, is_compilation=c)
-                    for r, c in zip(request.inputs, input_is_compilation, strict=True)
-                ),
-                http_request=http_request,
-                watch_disconnect_fn=watch_disconnect,
-                on_abort=_on_abort,
-                sentinel_task_name="lml.bulk_resolve.disconnect_sentinel",
-            )
-        except asyncio.CancelledError:
-            # Server-driven cancellation surfaced through the gather (shutdown /
-            # outer timeout), or a child observed a cancel — distinct from the
-            # client-disconnect branch above, which the sentinel handles. Pin 499
-            # and re-raise per the asyncio cancellation contract; the client is
-            # gone so there is nobody to read a 499 response.
-            http_span.set_data("http.status_code", 499)
-            logger.warning("bulk resolve aborted (cancelled): inputs=%d", inputs_count)
-            raise
-        except HTTPException as exc:
-            # Fail-closed 503 (or any explicit status) from a per-input failure
-            # -- or the 499 `run_bulk_gather` itself raises on abort, whose
-            # `on_abort` callback above already pinned the span/log, so this
-            # `set_data` call is a harmless no-op re-write to the same value.
-            # Pin the status on the span before re-raising so the trace carries
-            # the real outcome rather than an unset code.
-            http_span.set_data("http.status_code", exc.status_code)
-            raise
-
-        # Exit signal pairs with the entry log so operators can confirm
-        # response delivery and read off the per-kind verdict breakdown
-        # without correlating to a Sentry trace. The kind enum values
-        # (`single_artist`, `compilation`, `unresolved`) come from
-        # `BulkResolveResultKind` and are what the LML#355 audit needed when
-        # it had to fall back to local-cache simulation.
-        kinds = Counter(r.kind.value for r in results)
-        logger.info(
-            "bulk resolve complete: inputs=%d single_artist=%d compilation=%d unresolved=%d"
-            " include_tracks=%s single_artist_tracks_asked=%d single_artist_tracks_pinned=%d",
-            inputs_count,
-            kinds.get("single_artist", 0),
-            kinds.get("compilation", 0),
-            kinds.get("unresolved", 0),
-            include_tracks,
-            single_artist_track_candidates,
-            len(single_artist_pins),
+    # Race the gather against a client-disconnect sentinel (LML#700,
+    # hoisted into core.bulk_concurrency.run_bulk_gather by LML#1033).
+    # uvicorn does not propagate a client socket close into the handler,
+    # so a plain `await asyncio.gather(...)` would run the in-flight
+    # per-input tasks — and the discogs-cache pool permits they hold
+    # (bounded by `max_concurrent`) — to completion against a client that
+    # is already gone; the sentinel lets a disconnect cancel the
+    # outstanding gather promptly instead. `gather` preserves input order
+    # (results[i] <-> inputs[i]) regardless of completion order,
+    # satisfying the api.yaml ordering contract.
+    #
+    # Spawning the sentinel must happen *after* `await http_request.json()`
+    # above has fully consumed the request body — `watch_disconnect` awaits
+    # `request.receive()`, which would otherwise swallow the `http.request`
+    # body messages the JSON parser needs.
+    try:
+        results = await run_bulk_gather(
+            (
+                _resolve_one(r, is_compilation=c)
+                for r, c in zip(request.inputs, input_is_compilation, strict=True)
+            ),
+            http_request=http_request,
+            watch_disconnect_fn=watch_disconnect,
+            on_abort=_on_abort,
+            sentinel_task_name="lml.bulk_resolve.disconnect_sentinel",
         )
-        http_span.set_data("lml.bulk_resolve.single_artist", kinds.get("single_artist", 0))
-        http_span.set_data("lml.bulk_resolve.compilation", kinds.get("compilation", 0))
-        http_span.set_data("lml.bulk_resolve.unresolved", kinds.get("unresolved", 0))
-        http_span.set_data("lml.bulk_resolve.include_tracks", include_tracks)
-        # LML#1138's coverage counter: asked = distinct non-V/A legacy ids
-        # eligible for derivation this batch; pinned = how many an override
-        # pin resolved (== how many emit tracks_attempted=true). The spread
-        # IS the v1 coverage gap (the un-pinned + MB tail the issue's
-        # decision record documents) -- observable per request here rather
-        # than inferred from consumer re-ask rates.
-        http_span.set_data(
-            "lml.bulk_resolve.single_artist_tracks_asked", single_artist_track_candidates
-        )
-        http_span.set_data("lml.bulk_resolve.single_artist_tracks_pinned", len(single_artist_pins))
-        http_span.set_data("http.status_code", 200)
+    except asyncio.CancelledError:
+        # Server-driven cancellation surfaced through the gather (shutdown /
+        # outer timeout), or a child observed a cancel — distinct from the
+        # client-disconnect branch above, which the sentinel handles. Re-raise
+        # per the asyncio cancellation contract; the client is
+        # gone so there is nobody to read a 499 response.
+        logger.warning("bulk resolve aborted (cancelled): inputs=%d", inputs_count)
+        raise
+    except HTTPException:
+        # Fail-closed 503 (or any explicit status) from a per-input failure
+        # -- or the 499 `run_bulk_gather` itself raises on abort, whose
+        # `on_abort` callback above already logged.
+        raise
+
+    # Exit signal pairs with the entry log so operators can confirm
+    # response delivery and read off the per-kind verdict breakdown
+    # without correlating to a trace. The kind enum values
+    # (`single_artist`, `compilation`, `unresolved`) come from
+    # `BulkResolveResultKind` and are what the LML#355 audit needed when
+    # it had to fall back to local-cache simulation.
+    kinds = Counter(r.kind.value for r in results)
+    logger.info(
+        "bulk resolve complete: inputs=%d single_artist=%d compilation=%d unresolved=%d"
+        " include_tracks=%s single_artist_tracks_asked=%d single_artist_tracks_pinned=%d",
+        inputs_count,
+        kinds.get("single_artist", 0),
+        kinds.get("compilation", 0),
+        kinds.get("unresolved", 0),
+        include_tracks,
+        single_artist_track_candidates,
+        len(single_artist_pins),
+    )
+    # LML#1138's coverage counter: asked = distinct non-V/A legacy ids
+    # eligible for derivation this batch; pinned = how many an override
+    # pin resolved (== how many emit tracks_attempted=true). The spread
+    # IS the v1 coverage gap (the un-pinned + MB tail the issue's
+    # decision record documents) -- observable per request here rather
+    # than inferred from consumer re-ask rates.
 
     return BulkResolveLibrariesResponse(
         results=results,
@@ -729,15 +698,8 @@ async def resolve_release_identity(
     run via ``validate_and_canonicalize_external_id`` before any DB write, so
     no poisoned rows can be created.
 
-    Observability: emits entry/exit INFO logs and wraps the store call in an
-    explicit ``http.server`` span. Same posture as ``bulk_resolve_libraries``
-    above — the FastApiIntegration's automatic transaction is not reliable for
-    ``/api/v1/`` handlers (LML#355 audit), and the explicit span keeps trace-
-    explorer queries like ``op:http.server span.description:*identity/resolve*``
-    accurate when the auto-instrumentation gaps out. The entry log fires
-    before the span opens so a hang inside the store call still leaves a log
-    trace; the exit log fires after the span closes so its timestamp reflects
-    span completion.
+    Observability: emits entry/exit INFO logs. The entry log fires before the
+    store call so a hang inside it still leaves a log trace.
     """
     store = require_entity_store(entity_store)
 
@@ -751,29 +713,17 @@ async def resolve_release_identity(
     source_value = request.source.value
     logger.info("release-identity resolve start: source=%s", source_value)
 
-    with sentry_sdk.start_span(
-        op="http.server",
-        name="POST /api/v1/identity/resolve",
-    ) as http_span:
-        http_span.set_data("http.method", "POST")
-        http_span.set_data("http.target", "/api/v1/identity/resolve")
-        http_span.set_data("lml.identity_resolve.source", source_value)
-
-        try:
-            identity_id, minted = await store.mint_or_get_release_identity(
-                source=source_value, external_id=canonical_external_id
-            )
-        except TRANSIENT_PG_ERRORS:
-            logger.exception(
-                "release-identity resolve failed for source=%r external_id=%r",
-                source_value,
-                canonical_external_id,
-            )
-            http_span.set_data("http.status_code", 503)
-            raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
-
-        http_span.set_data("lml.identity_resolve.minted", minted)
-        http_span.set_data("http.status_code", 200)
+    try:
+        identity_id, minted = await store.mint_or_get_release_identity(
+            source=source_value, external_id=canonical_external_id
+        )
+    except TRANSIENT_PG_ERRORS:
+        logger.exception(
+            "release-identity resolve failed for source=%r external_id=%r",
+            source_value,
+            canonical_external_id,
+        )
+        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
 
     logger.info(
         "release-identity resolve complete: source=%s minted=%s identity_id=%d",

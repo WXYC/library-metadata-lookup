@@ -364,8 +364,8 @@ class TestBulkResolveLibrariesEndpoint:
 class TestBulkResolveObservability:
     """Entry/exit instrumentation pins (LML#430, sibling of #371 / PR #417).
 
-    The bulk-resolve-libraries route emits no `http.server` Sentry spans and no
-    log lines visible to Sentry — the [#355](https://github.com/WXYC/library-metadata-lookup/issues/355)
+    The bulk-resolve-libraries route emitted no log lines carrying the entry/exit
+    signal — the [#355](https://github.com/WXYC/library-metadata-lookup/issues/355)
     audit's prescribed Sentry pivot couldn't run because of this gap. The same
     root cause as #371 applies: FastAPI integration's automatic transaction
     commits on response completion, so a handler that hangs past the caller's
@@ -377,9 +377,8 @@ class TestBulkResolveObservability:
        the per-input PG loop, so a handler that hangs in the loop still
        produces this signal.
     2. An ``INFO`` log at handler exit carrying the per-kind verdict counts.
-    3. An explicit Sentry ``http.server`` span tied to the bulk-resolve route.
-    4. A ``http.status_code=499`` pin on the span when the client aborts
-       mid-loop (CancelledError caught and re-raised).
+    3. A warn log when the client aborts mid-loop (CancelledError caught and
+       re-raised).
 
     The matching production change is in
     ``identity/router.py:bulk_resolve_libraries``.
@@ -478,78 +477,58 @@ class TestBulkResolveObservability:
         assert "unresolved" in exit_msg, exit_msg
 
     @pytest.mark.asyncio
-    async def test_499_set_on_span_when_client_aborts_mid_loop(
+    async def test_warn_log_when_client_aborts_mid_loop(
         self, app_client, mock_entity_store, caplog
     ):
-        """Mid-loop CancelledError → http.status_code=499 on span + warn log.
+        """Mid-loop CancelledError → warn log + re-raise.
 
         The sequential per-input loop has no gather/sentinel structure (unlike
         PR #417's `/lookup/bulk` shape), so the only signal of a client abort
         is the `asyncio.CancelledError` raised at the next `await` point.
-        Without an explicit catch the span closes with no ``http.status_code``
-        set, and the audit-style query
-        ``op:http.server http.status_code:499`` returns nothing.
-
-        The handler must catch ``CancelledError``, pin 499 on the span, emit
-        a warn log so Railway carries a record, and re-raise so the asyncio
-        cancellation contract is honored.
+        The handler must catch ``CancelledError``, emit a warn log so Railway
+        carries a record, and re-raise so the asyncio cancellation contract is
+        honored.
         """
         import asyncio
         import logging
-        from unittest.mock import MagicMock
 
         async def cancel_mid_lookup(name: str):
             raise asyncio.CancelledError()
 
         mock_entity_store.resolve_library_name.side_effect = cancel_mid_lookup
 
-        # Capture the span so we can assert set_data calls after the request
-        # raises out of the test client.
-        span_mock = MagicMock()
-        span_cm = MagicMock()
-        span_cm.__enter__ = MagicMock(return_value=span_mock)
-        span_cm.__exit__ = MagicMock(return_value=False)
-
-        with patch("identity.router.sentry_sdk.start_span", return_value=span_cm):
-            with caplog.at_level(logging.WARNING, logger="identity.router"):
-                async with AsyncClient(
-                    transport=ASGITransport(app=app_client), base_url="http://test"
-                ) as ac:
-                    # CancelledError propagating out of the handler surfaces to
-                    # the test client as a connection-level exception. We don't
-                    # care which exact class — only that the span was tagged
-                    # 499 and the warn log fired before the re-raise. Use a
-                    # bare try/except (rather than pytest.raises(BaseException),
-                    # which trips B017) so any exception class — including
-                    # CancelledError, which subclasses BaseException not
-                    # Exception — is captured.
-                    raised: BaseException | None = None
-                    try:
-                        await ac.post(
-                            "/api/v1/identity/bulk-resolve-libraries",
-                            json={
-                                "inputs": [
-                                    {
-                                        "library_id": 1,
-                                        "artist_name": "Juana Molina",
-                                        "album_title": "DOGA",
-                                    }
-                                ]
-                            },
-                        )
-                    except BaseException as e:
-                        raised = e
-                    assert raised is not None, (
-                        "Expected CancelledError (or wrapped client-abort exception) "
-                        "to propagate out of the test client; nothing raised."
+        with caplog.at_level(logging.WARNING, logger="identity.router"):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                # CancelledError propagating out of the handler surfaces to
+                # the test client as a connection-level exception. We don't
+                # care which exact class — only that the warn log fired before the
+                # re-raise. Use a
+                # bare try/except (rather than pytest.raises(BaseException),
+                # which trips B017) so any exception class — including
+                # CancelledError, which subclasses BaseException not
+                # Exception — is captured.
+                raised: BaseException | None = None
+                try:
+                    await ac.post(
+                        "/api/v1/identity/bulk-resolve-libraries",
+                        json={
+                            "inputs": [
+                                {
+                                    "library_id": 1,
+                                    "artist_name": "Juana Molina",
+                                    "album_title": "DOGA",
+                                }
+                            ]
+                        },
                     )
-
-        status_data_calls = [
-            c for c in span_mock.set_data.call_args_list if c.args[0] == "http.status_code"
-        ]
-        assert any(c.args[1] == 499 for c in status_data_calls), (
-            f"Expected http.status_code=499 on span; saw: {status_data_calls}"
-        )
+                except BaseException as e:
+                    raised = e
+                assert raised is not None, (
+                    "Expected CancelledError (or wrapped client-abort exception) "
+                    "to propagate out of the test client; nothing raised."
+                )
 
         abort_logs = [
             r
@@ -562,22 +541,8 @@ class TestBulkResolveObservability:
         )
 
     @pytest.mark.asyncio
-    async def test_503_pinned_on_span_when_per_input_lookup_fails(
-        self, app_client, mock_entity_store
-    ):
-        """A per-input PG failure pins ``http.status_code=503`` on the span.
-
-        The #278 gather refactor moved the span-status pin: the old serial loop
-        set 503 on the span inside each per-input ``except`` block, whereas the
-        gather path raises ``HTTPException`` out of the child coroutine (which
-        runs *before* the span is opened, so it can't touch the span) and pins
-        the status in the handler's outer ``except HTTPException`` instead. This
-        characterizes that relocation so a future edit that drops the outer
-        catch can't silently close the span with no status on the 503 path —
-        the audit-style ``op:http.server http.status_code:503`` query depends
-        on it.
-        """
-        from unittest.mock import MagicMock
+    async def test_503_when_per_input_lookup_fails(self, app_client, mock_entity_store):
+        """A per-input PG failure surfaces as a 503 from the handler."""
 
         async def maybe_fail(name: str):
             if name == "Boom":
@@ -586,74 +551,20 @@ class TestBulkResolveObservability:
 
         mock_entity_store.resolve_library_name.side_effect = maybe_fail
 
-        span_mock = MagicMock()
-        span_cm = MagicMock()
-        span_cm.__enter__ = MagicMock(return_value=span_mock)
-        span_cm.__exit__ = MagicMock(return_value=False)
-
-        with patch("identity.router.sentry_sdk.start_span", return_value=span_cm):
-            async with AsyncClient(
-                transport=ASGITransport(app=app_client), base_url="http://test"
-            ) as ac:
-                resp = await ac.post(
-                    "/api/v1/identity/bulk-resolve-libraries",
-                    json={
-                        "inputs": [
-                            {"library_id": 1, "artist_name": "Fine One", "album_title": "x"},
-                            {"library_id": 2, "artist_name": "Boom", "album_title": "x"},
-                        ]
-                    },
-                )
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/identity/bulk-resolve-libraries",
+                json={
+                    "inputs": [
+                        {"library_id": 1, "artist_name": "Fine One", "album_title": "x"},
+                        {"library_id": 2, "artist_name": "Boom", "album_title": "x"},
+                    ]
+                },
+            )
 
         assert resp.status_code == 503
-        status_calls = [
-            c for c in span_mock.set_data.call_args_list if c.args[0] == "http.status_code"
-        ]
-        assert any(c.args[1] == 503 for c in status_calls), (
-            f"Expected http.status_code=503 pinned on the span; saw: {status_calls}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_http_server_span_emitted(self, app_client, mock_entity_store):
-        """An explicit Sentry `http.server` span wraps the handler.
-
-        Defensive against the FastApiIntegration's automatic transaction not
-        landing for this endpoint (the gap LML#355's audit hit). With the
-        wrap, a query for `op:http.server span.description:*bulk-resolve-libraries*`
-        in the trace explorer always surfaces traffic.
-        """
-        captured_spans: list[dict] = []
-        original_start_span = sentry_sdk.start_span
-
-        def capture_start_span(*args, **kwargs):
-            captured_spans.append({"args": args, "kwargs": kwargs})
-            return original_start_span(*args, **kwargs)
-
-        mock_entity_store.resolve_library_name.return_value = None
-
-        with patch("identity.router.sentry_sdk.start_span", side_effect=capture_start_span):
-            async with AsyncClient(
-                transport=ASGITransport(app=app_client), base_url="http://test"
-            ) as ac:
-                resp = await ac.post(
-                    "/api/v1/identity/bulk-resolve-libraries",
-                    json={
-                        "inputs": [
-                            {"library_id": 1, "artist_name": "Juana Molina", "album_title": "DOGA"}
-                        ]
-                    },
-                )
-
-        assert resp.status_code == 200
-        http_server_spans = [s for s in captured_spans if s["kwargs"].get("op") == "http.server"]
-        assert http_server_spans, (
-            "Expected at least one Sentry span with op='http.server'; got ops: "
-            f"{[s['kwargs'].get('op') for s in captured_spans]}"
-        )
-        span_name = http_server_spans[0]["kwargs"].get("name", "")
-        assert "bulk-resolve-libraries" in span_name, (
-            f"Expected http.server span name to include 'bulk-resolve-libraries'; got {span_name!r}"
-        )
 
 
 class TestBulkResolveConcurrency:
@@ -1008,7 +919,7 @@ class TestBulkResolveConcurrency:
 
         with (
             patch("identity.router.watch_disconnect", fake_sentinel),
-            patch("identity.router.sentry_sdk.set_tag", side_effect=capture_tag),
+            patch("sentry_sdk.set_tag", side_effect=capture_tag),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app_client), base_url="http://test"
