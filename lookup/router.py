@@ -231,26 +231,18 @@ def _get_lookup_semaphore() -> asyncio.Semaphore:
     return _lookup_semaphore
 
 
-def _project_inflight_capped(wait_ms: float) -> None:
-    """Project cap engagement onto Sentry for a request that queued.
+def _project_inflight_capped() -> None:
+    """Tag a request that queued on the in-flight cap onto Sentry.
 
-    Two channels, following the LML#683 lesson (recorded on
-    ``_project_cache_stats_to_transaction`` below): ``set_data`` alone reads
-    back as "Unknown attribute" in the spans dataset, so it can't back a
-    query or an alert. Therefore:
-
-    * ``sentry_sdk.set_tag("lml.lookup.inflight_capped", "true")`` — the
-      filterable engagement flag (mirrors ``lml.client_aborted``). Set only
-      on requests that found the cap saturated, so uncontended traffic stays
-      untagged.
-    * ``set_measurement("lml.lookup.inflight_wait_ms", ...)`` — the
-      quantitative series (p95 queue wait) that decides whether the default
-      cap (``min(8, LML_DISCOGS_POOL_MAX_SIZE)``) is tuned right.
+    One channel: ``sentry_sdk.set_tag("lml.lookup.inflight_capped", "true")``
+    — the filterable engagement flag (mirrors ``lml.client_aborted``). Set
+    only on requests that found the cap saturated, so uncontended traffic
+    stays untagged. The cap's default is ``min(8, LML_DISCOGS_POOL_MAX_SIZE)``.
 
     Observability must not break the request path; failures log and continue.
     """
-    with observability_guard("project inflight_capped onto Sentry transaction", logger):
-        project_capped("lml.lookup.inflight_capped", "lml.lookup.inflight_wait_ms", wait_ms)
+    with observability_guard("tag inflight_capped onto Sentry scope", logger):
+        project_capped("lml.lookup.inflight_capped")
 
 
 # LML#681 flag-tag keys. Recorded once per cache_stats context at the router
@@ -351,7 +343,7 @@ def _record_lml_flag_tags() -> None:
     flag per-request from inside the orchestrator would sum to the batch size.
 
     Observability must not break the request path, so any recorder/SDK exception
-    is swallowed (matches ``_project_cache_stats_to_transaction``). ``record`` is
+    is swallowed. ``record`` is
     a no-op when ``init_cache_stats`` wasn't called for the context.
     """
     with observability_guard("record LML flag tags into cache_stats", logger):
@@ -441,53 +433,6 @@ def init_lookup_observability(
     record_caller_reason_tag(caller_reason)
     if skip_cache:
         set_skip_cache(True)
-
-
-# Canonical full path for the bulk endpoint. Referenced by the explicit
-# `http.server` span (name + `http.target` data field) so the two stay in
-# lockstep; the FastAPI route decorator below uses the relative `/lookup/bulk`
-# form because the router prefix `/api/v1` is applied at mount time.
-_BULK_LOOKUP_ROUTE = "/api/v1/lookup/bulk"
-
-
-def _project_cache_stats_to_transaction(stats: dict | None) -> None:
-    """Attach numeric cache_stats fields to the current Sentry transaction.
-
-    Each field is attached two ways, because the two serve different consumers:
-
-    - ``set_data`` — a ``lml.cache.<key>`` span-data attribute, visible when you
-      open a single trace in Sentry's trace explorer (per-request drill-down,
-      alongside latency/status).
-    - ``set_measurement`` — a ``lml.cache.<key>`` transaction *measurement*. Span
-      ``data`` set via ``set_data`` is opaque to the spans/metrics datasets (it
-      reads back as "Unknown attribute"), so it cannot back a metric alert.
-      Measurements are aggregatable (avg/percentile/threshold) and are what the
-      LML#683 row-less-flag degradation alerts query (e.g. the Discogs call-rate
-      guard on ``lml.cache.api_calls``). **It is a SAMPLE, not a census**:
-      ``traces_sample_rate`` is an operator knob (LML#1174) -- read ``Settings``,
-      not a number here. Averages survive sampling, counts do not; see #683.
-
-    No-op when there is no active transaction (Sentry not initialized, or call
-    happening outside a request span).
-
-    Non-numeric values (strings, None) are skipped — the cache_stats schema
-    is all-numeric today, but keep the projection defensive in case that
-    ever drifts.
-
-    Observability must not break the request path: any exception raised by
-    the Sentry SDK or by an unexpected stats shape is caught and logged at
-    WARNING. The request keeps going.
-    """
-    if not stats:
-        return
-    with observability_guard("project cache_stats onto Sentry transaction", logger):
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is None:
-            return
-        for key, value in stats.items():
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                transaction.set_data(f"lml.cache.{key}", value)
-                transaction.set_measurement(f"lml.cache.{key}", value)
 
 
 def _emit_server_timing_header(
@@ -734,7 +679,7 @@ async def handle_lookup(
                 queue_wait_ms = bulk_wait_ms
                 if capped_on_arrival:
                     interactive_wait_ms = (time.perf_counter() - wait_start) * 1000.0
-                    _project_inflight_capped(interactive_wait_ms)
+                    _project_inflight_capped()
                     queue_wait_ms += interactive_wait_ms
                 # Debit the TOTAL queue wait (bulk-global + interactive) from the
                 # caller's budget so the A8 / LML#345 contract ("LML returns
@@ -783,16 +728,9 @@ async def handle_lookup(
 
         # Attach cache stats. wxyc-shared#86 has shipped the typed CacheStats
         # Pydantic model, so the response field is no longer dict-shaped —
-        # convert before assignment. Keep the raw dict around for the Sentry
-        # projection (which iterates via `.items()`).
+        # convert before assignment.
         stats = get_cache_stats()
         response.cache_stats = CacheStats(**stats) if stats else None
-
-        # Project cache_stats onto the active Sentry transaction so it joins
-        # against the trace in Sentry's trace explorer (alongside latency,
-        # status, etc.). No-op when there is no active transaction (no
-        # SENTRY_DSN configured, or running outside a request span).
-        _project_cache_stats_to_transaction(stats)
 
         # Surface the per-stage telemetry as a Server-Timing header (BS#881).
         # The derived `discogs` leg is `pg_time_ms + api_time_ms`; guard the
@@ -1075,64 +1013,63 @@ async def handle_bulk_lookup(
                 emit_step_events=False,
             )
             try:
-                with sentry_sdk.start_span(op="lml.bulk.item", name=f"item {index}"):
-                    lookup_response = await perform_lookup(
-                        request=item,
-                        db=db,
-                        discogs_service=discogs_service,
-                        telemetry=telemetry,
-                        entity_store=entity_store,
-                        discogs_cache=discogs_cache,
-                        mb_pg=mb_pg,
-                        apple_music=apple_music,
-                        # Unconditional, unlike Bandcamp below: Spotify is a
-                        # cache-first post-process leg with no per-item live
-                        # probe on this path, so injecting it costs nothing when
-                        # lml_bulk_spotify_streaming_warm is off (the bulk
-                        # suppression keeps it cache-read-only) and is the
-                        # precondition for the LML#1052 rowless warm when it is
-                        # on — the flag alone can't wire an absent client.
-                        spotify=spotify,
-                        # Bandcamp on the bulk path is gated by the dedicated
-                        # lml_bulk_bandcamp_streaming_warm flag (default off; the
-                        # sibling of #1052's Spotify flag, built first as #1087).
-                        # With the flag OFF this is None — exactly the LML#573
-                        # PR-3 posture: its client is rate-limited to
-                        # 1 req/s, so a per-item live album probe would serialize
-                        # the 35k-album drain into hours of requests against
-                        # Bandcamp (and starve the shared singleton for the live
-                        # /lookup path), so the post-process skips the Bandcamp
-                        # leg and the search-URL fallback applies. With the flag
-                        # ON, the injected client flows through so a cold miss
-                        # schedules the bounded background warm (the post-process
-                        # exempts Bandcamp from the bulk suppression), resolving
-                        # the DIRECT album URL into the cache for subsequent
-                        # lookups. Enable only after the BS#642 drain completes.
-                        # LML#1098 adds the live-probe flag as a second reason to
-                        # inject the client: the inline probe (enrich_one) resolves a
-                        # DIRECT album URL in-response, distinct from the #1087 warm's
-                        # off-path next-time fill. Either flag wires the client through.
-                        bandcamp=(
-                            bandcamp
-                            if (
-                                settings.lml_bulk_bandcamp_streaming_warm
-                                or settings.lml_bandcamp_live_probe
-                            )
-                            else None
-                        ),
-                        # LML#1103: unconditional, unlike Bandcamp above. YTM has
-                        # no bulk-warm exemption flag, so the client's only effect
-                        # here is cache READ-FILL; pinning it to None would forfeit
-                        # that for no load saved.
-                        youtube_music=youtube_music,
-                        discogs_cache_pg=discogs_cache_pg,
-                        caller_budget_ms=x_caller_budget_ms,
-                        # Caller-controlled since LML#920 (default False, the
-                        # LML#671 bulk kill switch): the enrichment worker
-                        # (Backend-Service#1815) opts in via the query flag to
-                        # restore the resolution `/lookup` gets by default.
-                        allow_release_resolution_fallback=allow_release_resolution_fallback,
-                    )
+                lookup_response = await perform_lookup(
+                    request=item,
+                    db=db,
+                    discogs_service=discogs_service,
+                    telemetry=telemetry,
+                    entity_store=entity_store,
+                    discogs_cache=discogs_cache,
+                    mb_pg=mb_pg,
+                    apple_music=apple_music,
+                    # Unconditional, unlike Bandcamp below: Spotify is a
+                    # cache-first post-process leg with no per-item live
+                    # probe on this path, so injecting it costs nothing when
+                    # lml_bulk_spotify_streaming_warm is off (the bulk
+                    # suppression keeps it cache-read-only) and is the
+                    # precondition for the LML#1052 rowless warm when it is
+                    # on — the flag alone can't wire an absent client.
+                    spotify=spotify,
+                    # Bandcamp on the bulk path is gated by the dedicated
+                    # lml_bulk_bandcamp_streaming_warm flag (default off; the
+                    # sibling of #1052's Spotify flag, built first as #1087).
+                    # With the flag OFF this is None — exactly the LML#573
+                    # PR-3 posture: its client is rate-limited to
+                    # 1 req/s, so a per-item live album probe would serialize
+                    # the 35k-album drain into hours of requests against
+                    # Bandcamp (and starve the shared singleton for the live
+                    # /lookup path), so the post-process skips the Bandcamp
+                    # leg and the search-URL fallback applies. With the flag
+                    # ON, the injected client flows through so a cold miss
+                    # schedules the bounded background warm (the post-process
+                    # exempts Bandcamp from the bulk suppression), resolving
+                    # the DIRECT album URL into the cache for subsequent
+                    # lookups. Enable only after the BS#642 drain completes.
+                    # LML#1098 adds the live-probe flag as a second reason to
+                    # inject the client: the inline probe (enrich_one) resolves a
+                    # DIRECT album URL in-response, distinct from the #1087 warm's
+                    # off-path next-time fill. Either flag wires the client through.
+                    bandcamp=(
+                        bandcamp
+                        if (
+                            settings.lml_bulk_bandcamp_streaming_warm
+                            or settings.lml_bandcamp_live_probe
+                        )
+                        else None
+                    ),
+                    # LML#1103: unconditional, unlike Bandcamp above. YTM has
+                    # no bulk-warm exemption flag, so the client's only effect
+                    # here is cache READ-FILL; pinning it to None would forfeit
+                    # that for no load saved.
+                    youtube_music=youtube_music,
+                    discogs_cache_pg=discogs_cache_pg,
+                    caller_budget_ms=x_caller_budget_ms,
+                    # Caller-controlled since LML#920 (default False, the
+                    # LML#671 bulk kill switch): the enrichment worker
+                    # (Backend-Service#1815) opts in via the query flag to
+                    # restore the resolution `/lookup` gets by default.
+                    allow_release_resolution_fallback=allow_release_resolution_fallback,
+                )
             except Exception as e:
                 # Per-item isolation: one failure must not poison siblings.
                 # The error class is surfaced for caller-side classification,
@@ -1153,92 +1090,68 @@ async def handle_bulk_lookup(
                 lookup=lookup_response,
             )
 
-    # Explicit `http.server` span (LML#371). Defense-in-depth against the
-    # FastApiIntegration's automatic transaction not landing for this endpoint
-    # — that's the gap that left 22:21-22:34 on 2026-05-24 with 0 spans for 26
-    # in-flight bulk requests despite the handler running. With this wrap, any
-    # Sentry trace explorer query for `op:http.server span.description:*lookup/bulk*`
-    # will surface bulk-route traffic.
-    with sentry_sdk.start_span(op="http.server", name=f"POST {_BULK_LOOKUP_ROUTE}") as http_span:
-        http_span.set_data("http.method", "POST")
-        http_span.set_data("http.target", _BULK_LOOKUP_ROUTE)
-        http_span.set_data("lml.bulk.size", len(request.items))
-        http_span.set_data("lml.bulk.max_concurrent", max_concurrent)
-
-        with sentry_sdk.start_span(op="lml.bulk.batch", name=f"{len(request.items)} items") as span:
-            span.set_data("lml.bulk.size", len(request.items))
-            span.set_data("lml.bulk.max_concurrent", max_concurrent)
-
-            def _on_abort() -> None:
-                # Exit log fires for the abort branch too — operators see the
-                # batch size + abort reason without digging into Sentry.
-                logger.warning(
-                    "bulk lookup aborted by client: size=%d max_concurrent=%d",
-                    len(request.items),
-                    max_concurrent,
-                )
-                # 499 = Nginx "client closed request". Skip PostHog: partial
-                # counts would skew batch-completion analytics.
-                http_span.set_data("http.status_code", 499)
-
-            # Race the gather against a client-disconnect sentinel (LML#1033:
-            # core.bulk_concurrency.run_bulk_gather). If the client departs
-            # first, the gather is cancelled so Discogs semaphore permits free
-            # for the next caller; without this, queue depth grows
-            # monotonically across batches.
-            #
-            # Spawning the sentinel must happen *after* `parse_bulk_body`
-            # above has fully consumed the request body — `watch_disconnect`
-            # awaits `request.receive()`, which would otherwise swallow
-            # `http.request` body messages the body parser needs.
-            results = await run_bulk_gather(
-                (_run_one(i, item) for i, item in enumerate(request.items)),
-                http_request=http_request,
-                watch_disconnect_fn=watch_disconnect,
-                on_abort=_on_abort,
-                sentinel_task_name="lml.bulk.disconnect_sentinel",
-                # Span data carries the bulk-specific context; the Sentry tag
-                # `run_bulk_gather` sets on abort is global-scope. Key-name
-                # asymmetry intentional.
-                on_race_settled=lambda aborted: span.set_data("lml.bulk.client_aborted", aborted),
-            )
-
-        _project_cache_stats_to_transaction(get_cache_stats())
-
-        counts = Counter(r.status for r in results)
-
-        if posthog_client:
-            batch_telemetry.send_to_posthog(
-                posthog_client,
-                {
-                    "batch_size": len(request.items),
-                    "match_count": counts["match"],
-                    "no_match_count": counts["no_match"],
-                    "error_count": counts["error"],
-                    "max_concurrent": max_concurrent,
-                    "endpoint_family": ENDPOINT_FAMILY_LOOKUP_BULK,
-                    # Deploy attribution only (LML#1233): this payload is
-                    # batch-level and has no `response` to derive `miss_kind`
-                    # from. Bulk already carries `no_match_count`, and the
-                    # Layer 2 alert scopes to `endpoint_family = 'lookup'`.
-                    "commit_sha": COMMIT_SHA,
-                    "low_priority": True,
-                    "environment": get_settings().environment,  # LML#1170
-                    **({"caller_reason": x_caller_reason} if x_caller_reason is not None else {}),
-                },
-            )
-
-        # Exit signal pairs with the entry log so operators can confirm
-        # response delivery and read off the status breakdown without
-        # correlating to a Sentry trace.
-        logger.info(
-            "bulk lookup complete: size=%d match=%d no_match=%d error=%d",
+    def _on_abort() -> None:
+        # Exit log fires for the abort branch too — operators see the
+        # batch size + abort reason without digging into Sentry.
+        logger.warning(
+            "bulk lookup aborted by client: size=%d max_concurrent=%d",
             len(request.items),
-            counts["match"],
-            counts["no_match"],
-            counts["error"],
+            max_concurrent,
         )
-        http_span.set_data("http.status_code", 200)
+        # 499 = Nginx "client closed request". Skip PostHog: partial
+        # counts would skew batch-completion analytics.
+
+    # Race the gather against a client-disconnect sentinel (LML#1033:
+    # core.bulk_concurrency.run_bulk_gather). If the client departs
+    # first, the gather is cancelled so Discogs semaphore permits free
+    # for the next caller; without this, queue depth grows
+    # monotonically across batches.
+    #
+    # Spawning the sentinel must happen *after* `parse_bulk_body`
+    # above has fully consumed the request body — `watch_disconnect`
+    # awaits `request.receive()`, which would otherwise swallow
+    # `http.request` body messages the body parser needs.
+    results = await run_bulk_gather(
+        (_run_one(i, item) for i, item in enumerate(request.items)),
+        http_request=http_request,
+        watch_disconnect_fn=watch_disconnect,
+        on_abort=_on_abort,
+        sentinel_task_name="lml.bulk.disconnect_sentinel",
+    )
+
+    counts = Counter(r.status for r in results)
+
+    if posthog_client:
+        batch_telemetry.send_to_posthog(
+            posthog_client,
+            {
+                "batch_size": len(request.items),
+                "match_count": counts["match"],
+                "no_match_count": counts["no_match"],
+                "error_count": counts["error"],
+                "max_concurrent": max_concurrent,
+                "endpoint_family": ENDPOINT_FAMILY_LOOKUP_BULK,
+                # Deploy attribution only (LML#1233): this payload is
+                # batch-level and has no `response` to derive `miss_kind`
+                # from. Bulk already carries `no_match_count`, and the
+                # Layer 2 alert scopes to `endpoint_family = 'lookup'`.
+                "commit_sha": COMMIT_SHA,
+                "low_priority": True,
+                "environment": get_settings().environment,  # LML#1170
+                **({"caller_reason": x_caller_reason} if x_caller_reason is not None else {}),
+            },
+        )
+
+    # Exit signal pairs with the entry log so operators can confirm
+    # response delivery and read off the status breakdown without
+    # correlating to a Sentry trace.
+    logger.info(
+        "bulk lookup complete: size=%d match=%d no_match=%d error=%d",
+        len(request.items),
+        counts["match"],
+        counts["no_match"],
+        counts["error"],
+    )
 
     # Batch-level Server-Timing (BS#881): one `total` for the whole request,
     # no per-item step timings or derived `discogs` leg — per-item stages aren't

@@ -23,8 +23,6 @@ import time
 from collections.abc import Awaitable
 from dataclasses import dataclass
 
-import sentry_sdk
-
 from core.search import (
     resolve_effective_search_budget_ms,
     resolve_search_hard_timeout_ms,
@@ -217,32 +215,3 @@ async def run_within_spine_deadline[T](
         raise SpineDeadlineExceededError(
             limit=limit, elapsed_ms=deadline.elapsed_ms(), step=step
         ) from exc
-
-
-def project_spine_deadline_telemetry(exc: SpineDeadlineExceededError) -> None:
-    """Project a spine-deadline trip onto the active Sentry transaction.
-
-    Sets the **same** keys the in-pipeline step-3 paths already set
-    (``hard_cap_fired`` for the LML#370 hard cap, ``search_budget_exceeded`` for
-    the #345/#403 caller-budget cutoff) so existing Sentry filters keep working,
-    plus a step marker (``hard_cap_step`` / ``search_budget_step``) so a
-    step-2-originated cap hit is distinguishable from a step-3 one (LML#865 AC#4).
-
-    No-op when there is no active transaction; any SDK error is swallowed so
-    observability cannot break /lookup.
-    """
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is None:
-            return
-        elapsed_ms = round(exc.elapsed_ms, 2)
-        if exc.limit == LIMIT_HARD_CAP:
-            transaction.set_data("hard_cap_fired", True)
-            transaction.set_data("hard_cap_elapsed_ms", elapsed_ms)
-            transaction.set_data("hard_cap_step", exc.step)
-        else:
-            transaction.set_data("search_budget_exceeded", True)
-            transaction.set_data("search_budget_elapsed_ms", elapsed_ms)
-            transaction.set_data("search_budget_step", exc.step)
-    except Exception as e:  # pragma: no cover - defensive
-        logger.warning("Failed to project spine deadline telemetry onto Sentry transaction: %s", e)

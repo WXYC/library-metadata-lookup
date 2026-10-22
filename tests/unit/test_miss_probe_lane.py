@@ -36,16 +36,3 @@ def test_lane_is_chosen_from_the_rows_in_hand(song, album, rows, search_type, la
     )
 
     assert miss_probe_lane(parsed, rows, search_type) is lane
-
-
-@pytest.mark.parametrize(
-    ("lane", "matched", "outcome"),
-    [
-        (MissProbeLane.LIBRARY_MISS, True, "library_miss_discogs_match"),
-        (MissProbeLane.LIBRARY_MISS, False, "library_miss_no_discogs_match"),
-        (MissProbeLane.SERVE_BLOCKED, True, "serve_blocked_fallback_discogs_match"),
-        (MissProbeLane.SERVE_BLOCKED, False, "serve_blocked_fallback_no_discogs_match"),
-    ],
-)
-def test_outcome_values_are_the_four_the_trace_slices_key_on(lane, matched, outcome):
-    assert lane.outcome(matched=matched) == outcome

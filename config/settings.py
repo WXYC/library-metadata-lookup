@@ -170,64 +170,6 @@ class Settings(BaseSettings):
 
     # Sentry Configuration
     sentry_dsn: str | None = Field(None, description="Sentry DSN for error tracking")
-    sentry_traces_sample_rate: float = Field(
-        default=1.0,
-        description=(
-            "Fraction of requests Sentry traces (head-based, per-trace sampling -- "
-            "it does not thin spans within a kept trace). Default 1.0 preserves "
-            "today's full-rate tracing; lookup/router.py's cache-hit-rate "
-            "measurement series (see the comment near track_step) relies on that "
-            "default, so lowering it is an operator trade-off, not this ticket's "
-            "job (LML#1174). Mirrors Backend-Service's resolveTracesSampleRate "
-            "(apps/backend/sentry-config.ts) so the two services parse "
-            "SENTRY_TRACES_SAMPLE_RATE identically. Unparseable or out-of-range "
-            "(<0 or >1) values fall back to the default via the field_validator "
-            "below rather than raising at boot -- an env-var typo must never crash "
-            "the process. See WXYC/library-metadata-lookup#1174."
-        ),
-    )
-
-    @field_validator("sentry_traces_sample_rate", mode="before")
-    @classmethod
-    def _validate_traces_sample_rate(cls, v: object) -> object:
-        """Fall back to the 1.0 default on any parse or range failure (LML#1174).
-
-        Runs in ``mode="before"`` so it sees the raw env-var string ahead of
-        pydantic's own float coercion, which would otherwise raise on a
-        non-numeric value before this validator ever ran.
-
-        **The fallback announces itself (LML#1306).** It used to be silent, and
-        a telemetry misconfiguration has no symptom except span volume -- which
-        is the very signal you are trying to control -- so "the value was
-        rejected" and "you configured full-rate deliberately" looked identical.
-        That cost an hour of misdiagnosis on 2026-09-09, chasing a typo that
-        did not exist. ``25`` (an operator meaning 25%) is the canonical shape:
-        out of range, silently full-rate.
-
-        The warning fires before ``setup_logging`` runs -- ``main.py`` builds
-        settings at import, several lines ahead of it -- so it is emitted at
-        WARNING deliberately: Python's handler of last resort writes WARNING and
-        above to stderr even with no handler configured, which is what puts it
-        in the Railway log. An INFO line here would be swallowed.
-        """
-        try:
-            parsed = float(v)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            logger.warning(
-                "SENTRY_TRACES_SAMPLE_RATE=%r is not a number; falling back to 1.0 "
-                "(full-rate tracing). Set a fraction between 0 and 1, e.g. 0.25.",
-                v,
-            )
-            return 1.0
-        if not (0.0 <= parsed <= 1.0):
-            logger.warning(
-                "SENTRY_TRACES_SAMPLE_RATE=%r is outside [0, 1]; falling back to 1.0 "
-                "(full-rate tracing). It is a fraction, not a percentage -- "
-                "write 0.25, not 25.",
-                v,
-            )
-            return 1.0
-        return parsed
 
     # Discogs Cache Database Configuration
     database_url_discogs: str | None = Field(
@@ -504,8 +446,7 @@ class Settings(BaseSettings):
             "When True, swap inbound artist names for the canonical Discogs form "
             "when trigram similarity >= CANONICAL_ARTIST_SIMILARITY_FLOOR before "
             "search_releases_by_track probes. When False, the resolver still runs "
-            "in shadow mode (logs candidate + score on every lookup; emits "
-            "set_data('resolver_pre_pass', ...) on the active Sentry transaction) "
+            "in shadow mode (logs candidate + score on every lookup) "
             "but does not swap. Set True in Railway after the calibration sweep "
             "confirms the chosen floor's FP-rate is <= 0.5%. "
             "See WXYC/library-metadata-lookup#318."

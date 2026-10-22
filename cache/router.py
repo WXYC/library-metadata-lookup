@@ -35,7 +35,6 @@ import logging
 from collections import Counter
 from typing import TYPE_CHECKING
 
-import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from cache.dispatch import refresh_identity
@@ -92,8 +91,6 @@ _REFRESH_INPUT_CAP = 50
 # diverges, splitting into ``LML_REFRESH_MAX_CONCURRENT`` with a fallback to
 # ``LML_BULK_MAX_CONCURRENT`` is mechanical.
 _REFRESH_DEFAULT_CONCURRENCY = 10
-
-_REFRESH_ROUTE = "/api/v1/cache/refresh-for-identities"
 
 _DISCOGS_SERVICE_UNAVAILABLE_DETAIL = service_unavailable_detail(
     "Discogs service",
@@ -221,48 +218,29 @@ async def handle_refresh_for_identities(
                     message=type(e).__name__,
                 )
 
-    with sentry_sdk.start_span(op="http.server", name=f"POST {_REFRESH_ROUTE}") as http_span:
-        http_span.set_data("http.method", "POST")
-        http_span.set_data("http.target", _REFRESH_ROUTE)
-        http_span.set_data("lml.cache.size", len(identity_ids))
-        http_span.set_data("lml.cache.max_concurrent", max_concurrent)
+    def _on_abort() -> None:
+        logger.warning(
+            "cache refresh aborted by client: size=%d max_concurrent=%d",
+            len(identity_ids),
+            max_concurrent,
+        )
 
-        with sentry_sdk.start_span(
-            op="cache.refresh.batch", name=f"{len(identity_ids)} ids"
-        ) as span:
-            span.set_data("lml.cache.size", len(identity_ids))
-            span.set_data("lml.cache.max_concurrent", max_concurrent)
+    # Race the gather against a client-disconnect sentinel (LML#1033:
+    # core.bulk_concurrency.run_bulk_gather). Mirrors `/lookup/bulk`'s
+    # shape (lookup/router.py). Spawning the sentinel must happen
+    # *after* `parse_bulk_body` above has fully consumed the request
+    # body — `watch_disconnect` awaits `request.receive()`, which
+    # would otherwise swallow `http.request` body messages the body
+    # parser needs.
+    results = await run_bulk_gather(
+        (_run_one(identity_id) for identity_id in identity_ids),
+        http_request=http_request,
+        watch_disconnect_fn=watch_disconnect,
+        on_abort=_on_abort,
+        sentinel_task_name="lml.cache.disconnect_sentinel",
+    )
 
-            def _on_abort() -> None:
-                logger.warning(
-                    "cache refresh aborted by client: size=%d max_concurrent=%d",
-                    len(identity_ids),
-                    max_concurrent,
-                )
-                http_span.set_data("http.status_code", 499)
-
-            # Race the gather against a client-disconnect sentinel (LML#1033:
-            # core.bulk_concurrency.run_bulk_gather). Mirrors `/lookup/bulk`'s
-            # shape (lookup/router.py). Spawning the sentinel must happen
-            # *after* `parse_bulk_body` above has fully consumed the request
-            # body — `watch_disconnect` awaits `request.receive()`, which
-            # would otherwise swallow `http.request` body messages the body
-            # parser needs.
-            results = await run_bulk_gather(
-                (_run_one(identity_id) for identity_id in identity_ids),
-                http_request=http_request,
-                watch_disconnect_fn=watch_disconnect,
-                on_abort=_on_abort,
-                sentinel_task_name="lml.cache.disconnect_sentinel",
-                on_race_settled=lambda aborted: span.set_data("lml.cache.client_aborted", aborted),
-            )
-
-        counts = Counter(r.status for r in results)
-        http_span.set_data("lml.cache.warmed", counts.get("warmed", 0))
-        http_span.set_data("lml.cache.not_found", counts.get("not_found", 0))
-        http_span.set_data("lml.cache.not_implemented", counts.get("not_implemented", 0))
-        http_span.set_data("lml.cache.error", counts.get("error", 0))
-        http_span.set_data("http.status_code", 200)
+    counts = Counter(r.status for r in results)
 
     logger.info(
         "cache refresh complete: size=%d warmed=%d not_found=%d not_implemented=%d error=%d",

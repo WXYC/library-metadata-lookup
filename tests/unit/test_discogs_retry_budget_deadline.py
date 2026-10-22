@@ -72,7 +72,7 @@ async def test_retry_gives_up_when_next_delay_would_exceed_the_deadline(fake_lim
         patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.asyncio.sleep", new=sleep_spy),
-        patch("discogs.service.time.monotonic", return_value=1000.0),
+        patch("time.monotonic", return_value=1000.0),
     ):
         token = set_retry_budget_deadline(1002.0)  # 2s of budget remaining
         try:
@@ -113,7 +113,7 @@ async def test_retry_gives_up_when_the_deadline_has_already_passed(fake_limiter)
         patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.asyncio.sleep", new=sleep_spy),
-        patch("discogs.service.time.monotonic", return_value=1000.0),
+        patch("time.monotonic", return_value=1000.0),
     ):
         token = set_retry_budget_deadline(990.0)  # deadline was 10s ago
         try:
@@ -145,7 +145,7 @@ async def test_retry_proceeds_when_the_deadline_can_absorb_the_delay(fake_limite
         patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.asyncio.sleep", new=sleep_spy),
-        patch("discogs.service.time.monotonic", return_value=1000.0),
+        patch("time.monotonic", return_value=1000.0),
     ):
         token = set_retry_budget_deadline(1060.0)  # 60s of budget remaining
         try:

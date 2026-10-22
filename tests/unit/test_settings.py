@@ -1,6 +1,5 @@
 """Unit tests for config/settings.py."""
 
-import logging
 from pathlib import Path
 
 import pytest
@@ -193,101 +192,6 @@ class TestDiscogsRateBucketTimeoutBounds:
 
     def test_accepts_small_positive(self):
         assert Settings(discogs_rate_bucket_timeout_s=0.01).discogs_rate_bucket_timeout_s == 0.01
-
-
-class TestSentryTracesSampleRate:
-    """LML#1174: SENTRY_TRACES_SAMPLE_RATE is the runtime override for Sentry's
-    per-trace sampling. Default must stay 1.0 (lookup/router.py's measurement
-    series relies on full-rate tracing); an unparseable or out-of-range value
-    must fall back to 1.0 rather than raise at boot, mirroring Backend-Service's
-    ``resolveTracesSampleRate``."""
-
-    def test_defaults_to_one(self):
-        assert Settings().sentry_traces_sample_rate == 1.0
-
-    def test_unset_env_defaults_to_one(self, monkeypatch):
-        monkeypatch.delenv("SENTRY_TRACES_SAMPLE_RATE", raising=False)
-        assert Settings().sentry_traces_sample_rate == 1.0
-
-    def test_reads_valid_env(self, monkeypatch):
-        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")
-        assert Settings().sentry_traces_sample_rate == 0.1
-
-    def test_reads_boundary_zero(self, monkeypatch):
-        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "0")
-        assert Settings().sentry_traces_sample_rate == 0.0
-
-    def test_reads_boundary_one(self, monkeypatch):
-        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "1")
-        assert Settings().sentry_traces_sample_rate == 1.0
-
-    def test_above_range_falls_back_to_default(self, monkeypatch):
-        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "1.5")
-        assert Settings().sentry_traces_sample_rate == 1.0
-
-    def test_below_range_falls_back_to_default(self, monkeypatch):
-        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "-0.1")
-        assert Settings().sentry_traces_sample_rate == 1.0
-
-    def test_non_numeric_falls_back_to_default(self, monkeypatch):
-        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "not-a-number")
-        assert Settings().sentry_traces_sample_rate == 1.0
-
-    def test_empty_string_falls_back_to_default(self, monkeypatch):
-        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "")
-        assert Settings().sentry_traces_sample_rate == 1.0
-
-
-class TestSentryTracesSampleRateIsLoud:
-    """The fallback must say so. LML#1306.
-
-    On 2026-09-09 the operator set this var in Railway, the service redeployed,
-    and the effective rate was indistinguishable from unset for an hour of
-    investigation -- because the fallback above is silent and nothing anywhere
-    states the rate actually in force. A telemetry misconfiguration has no
-    symptom except span volume, which is exactly the signal you are trying to
-    read; so "it fell back" and "you configured it that way" look identical.
-
-    This is the fourth silent fail-safe in that one incident (the two fail-open
-    branches in ``_is_fast_pool_reset`` and this). The rule they share:
-    **a fail-safe that is silent turns a misconfiguration into a
-    indistinguishable-from-correct state.** Degrading safely is right; doing it
-    without a word is not.
-    """
-
-    @pytest.mark.parametrize(
-        "raw",
-        ["not-a-number", "", "1.5", "-0.1", "25"],
-        ids=["non-numeric", "empty", "above-range", "below-range", "percent-not-fraction"],
-    )
-    def test_fallback_logs_a_warning_naming_the_rejected_value(self, monkeypatch, caplog, raw):
-        """``25`` is in the list deliberately: an operator meaning 25% writes it,
-        it is out of range, and today it silently becomes full-rate tracing --
-        the exact shape of the 2026-09-09 misdiagnosis.
-        """
-        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", raw)
-
-        with caplog.at_level(logging.WARNING, logger="config.settings"):
-            assert Settings().sentry_traces_sample_rate == 1.0
-
-        assert caplog.records, f"falling back on {raw!r} logged nothing"
-        message = caplog.records[0].getMessage()
-        assert "SENTRY_TRACES_SAMPLE_RATE" in message
-        assert repr(raw) in message or raw in message, (
-            "the warning must name the rejected value -- an operator cannot fix "
-            "a typo the log does not quote"
-        )
-        assert "1.0" in message, "the warning must state what is now in force"
-
-    @pytest.mark.parametrize("raw", ["0.25", "0", "1"])
-    def test_valid_values_log_nothing(self, monkeypatch, caplog, raw):
-        """No crying wolf: a correct config must be silent at WARNING."""
-        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", raw)
-
-        with caplog.at_level(logging.WARNING, logger="config.settings"):
-            Settings()
-
-        assert not caplog.records
 
 
 class TestGetSettings:

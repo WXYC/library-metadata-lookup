@@ -603,217 +603,79 @@ class TestHandleLookup:
         mock_init.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_cache_stats_projected_onto_sentry_transaction(self, app_client):
-        """The numeric cache_stats fields are attached to the active Sentry transaction
-        as `lml.cache.*` data, so they appear in trace explorer alongside latency.
-        """
-        response = LookupResponse(results=[], search_type="direct")
-        stats = {
-            "memory_hits": 2,
-            "pg_hits": 5,
-            "pg_misses": 1,
-            "api_calls": 3,
-            "pg_time_ms": 12.5,
-            "api_time_ms": 480.7,
-        }
-        mock_transaction = Mock()
-        mock_transaction.set_data = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
+    async def test_lookup_completed_carries_cache_stats(self, mock_db, mock_discogs, mock_settings):
+        """The PostHog `lookup_completed` event carries the per-request
+        cache_stats dict as its `cache` property, independent of any Sentry
+        projection (the Sentry transaction projection is gone with tracing)."""
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
 
-        with (
-            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
-            patch("lookup.router.get_cache_stats", return_value=stats),
-            patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
-        ):
-            mock_lookup.return_value = response
-            async with AsyncClient(
-                transport=ASGITransport(app=app_client), base_url="http://test"
-            ) as client:
-                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
-
-        assert resp.status_code == 200
-        # Six numeric fields → six set_data calls
-        actual_calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert actual_calls == {
-            "lml.cache.memory_hits": 2,
-            "lml.cache.pg_hits": 5,
-            "lml.cache.pg_misses": 1,
-            "lml.cache.api_calls": 3,
-            "lml.cache.pg_time_ms": 12.5,
-            "lml.cache.api_time_ms": 480.7,
-        }
-
-    @pytest.mark.asyncio
-    async def test_cache_stats_projection_no_op_without_active_transaction(self, app_client):
-        """When there is no active Sentry transaction, projection is a no-op (no crash)."""
-        response = LookupResponse(results=[], search_type="direct")
-        mock_scope = Mock()
-        mock_scope.transaction = None  # no active transaction
-
-        with (
-            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
-            patch("lookup.router.get_cache_stats", return_value=_full_cache_stats()),
-            patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
-        ):
-            mock_lookup.return_value = response
-            async with AsyncClient(
-                transport=ASGITransport(app=app_client), base_url="http://test"
-            ) as client:
-                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
-
-        assert resp.status_code == 200
-
-    def test_projection_skips_non_numeric_values(self):
-        """Direct unit test of `_project_cache_stats_to_transaction`'s defensive
-        behavior. The router-level typed CacheStats now guarantees all-numeric
-        fields, but the projection helper keeps the isinstance check as belt-
-        and-suspenders for any future caller that doesn't go through the router.
-        """
-        from lookup.router import _project_cache_stats_to_transaction
-
-        stats = {"api_calls": 2, "weird_string": "nope", "weird_none": None}
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
-        with patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope):
-            _project_cache_stats_to_transaction(stats)
-
-        actual_calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert actual_calls == {"lml.cache.api_calls": 2}
-
-    def test_projection_emits_measurements_for_alerting(self):
-        """Each numeric cache_stats field is also recorded as a Sentry transaction
-        *measurement* (`lml.cache.<key>`), not only span `data` (LML#683).
-
-        `set_data` attaches the value as opaque span data — visible inside a single
-        trace, but not aggregatable in the spans/metrics datasets ("Unknown
-        attribute"), so it cannot back a metric alert. `set_measurement` promotes
-        the same value to a transaction measurement that the alert engine can
-        average/threshold (the row-less-flag degradation alerts in #683). Non-numeric
-        values are skipped here too, mirroring the `set_data` projection.
-        """
-        from lookup.router import _project_cache_stats_to_transaction
-
-        stats = {"api_calls": 2, "pg_time_ms": 12.5, "weird_string": "nope", "weird_none": None}
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
-        with patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope):
-            _project_cache_stats_to_transaction(stats)
-
-        measured = {c.args[0]: c.args[1] for c in mock_transaction.set_measurement.call_args_list}
-        assert measured == {"lml.cache.api_calls": 2, "lml.cache.pg_time_ms": 12.5}
-
-    @pytest.mark.asyncio
-    async def test_cache_stats_projection_called_with_raw_get_cache_stats_return(self, app_client):
-        """The projection helper must be invoked with the exact dict returned by
-        get_cache_stats(), not with response.cache_stats. response.cache_stats is
-        now a typed CacheStats Pydantic model (wxyc-shared#86), whose `.items()`
-        method does not exist; the projection iterates via `.items()` so passing
-        the model would AttributeError. Reading from the raw return value of
-        get_cache_stats() keeps the projection working regardless.
-        """
-        stats = _full_cache_stats()
+        mock_posthog = Mock()
+        mock_posthog.capture = Mock()
+        mock_posthog.flush = Mock()
         response = LookupResponse(results=[], search_type="direct")
 
-        with (
-            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
-            patch("lookup.router.get_cache_stats", return_value=stats),
-            patch("lookup.router._project_cache_stats_to_transaction") as mock_project,
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: mock_posthog,
+                get_settings: mock_settings,
+            },
         ):
-            mock_lookup.return_value = response
-            async with AsyncClient(
-                transport=ASGITransport(app=app_client), base_url="http://test"
-            ) as client:
-                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+            with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+                mock_lookup.return_value = response
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
 
         assert resp.status_code == 200
-        # Identity check: must be the exact dict from get_cache_stats(), not a
-        # copy that might have been routed through response.cache_stats.
-        mock_project.assert_called_once()
-        passed_arg = mock_project.call_args.args[0]
-        assert passed_arg is stats, (
-            "_project_cache_stats_to_transaction must be called with the raw dict "
-            "returned by get_cache_stats(), not with response.cache_stats (which is "
-            "now a typed CacheStats Pydantic model)."
-        )
+        calls = [
+            c
+            for c in mock_posthog.capture.call_args_list
+            if c.kwargs["event"] == "lookup_completed"
+        ]
+        assert len(calls) == 1
+        cache = calls[0].kwargs["properties"]["cache"]
+        assert {"memory_hits", "pg_hits", "pg_misses", "api_calls"} <= set(cache)
 
-    @pytest.mark.asyncio
-    async def test_cache_stats_projection_failure_does_not_break_request(self, app_client):
-        """If the Sentry projection raises, the request must still succeed.
-        Observability mustn't break the request path.
-        """
-        response = LookupResponse(results=[], search_type="direct")
-        mock_transaction = Mock()
-        mock_transaction.set_data = Mock(side_effect=RuntimeError("boom"))
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
+    def test_extra_keys_are_seeded_at_zero(self):
+        """Regression (LML#567): the LML-specific cache_stats extra keys must be
+        seeded at 0 even when never recorded, so the PostHog `cache` payload
+        shape is stable across requests.
 
-        with (
-            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
-            patch("lookup.router.get_cache_stats", return_value=_full_cache_stats()),
-            patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
-        ):
-            mock_lookup.return_value = response
-            async with AsyncClient(
-                transport=ASGITransport(app=app_client), base_url="http://test"
-            ) as client:
-                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
-
-        assert resp.status_code == 200
-
-    def test_extra_keys_seeded_and_projected_onto_transaction(self):
-        """Regression (LML#567): the LML-specific cache_stats extra keys must land
-        as `lml.cache.*` data on the Sentry transaction even when never recorded
-        (value 0).
-
-        Exercises the REAL seeding path — `init_cache_stats(extra_keys=...)`
-        followed by `get_cache_stats()` — rather than a hand-built dict, so the
+        Exercises the REAL seeding path -- `init_cache_stats(extra_keys=...)`
+        followed by `get_cache_stats()` -- rather than a hand-built dict, so the
         assertion fails if either LML drops one of these keys from
         `_LML_CACHE_STATS_EXTRA_KEYS` or the upstream `wxyc_fastapi` seeding
         contract regresses. The original bug was the upstream half: the extras
         were not seeded with 0, so they appeared only in payloads from the first
-        request that recorded them, and a representative (non-follower) request
-        showed no `lml.cache.memory_cache_inflight_join` at all.
+        request that recorded them.
         """
         from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
 
-        from lookup.router import (
-            _LML_CACHE_STATS_EXTRA_KEYS,
-            _project_cache_stats_to_transaction,
-        )
+        from lookup.router import _LML_CACHE_STATS_EXTRA_KEYS
 
         init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
         stats = get_cache_stats()
 
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-        with patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope):
-            _project_cache_stats_to_transaction(stats)
-
-        projected = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
         for key in (
             "memory_cache_inflight_join",
             "memory_cache_inflight_retry_after_cancel",
             "memory_cache_write_failed",
         ):
-            assert f"lml.cache.{key}" in projected, (
-                f"{key!r} must be seeded by init_cache_stats(extra_keys=...) and "
-                "projected onto the transaction even at zero (LML#567)."
+            assert stats[key] == 0, (
+                f"{key!r} must be seeded by init_cache_stats(extra_keys=...) at zero (LML#567)."
             )
-            assert projected[f"lml.cache.{key}"] == 0
 
-    def test_recorded_extra_key_value_flows_to_transaction(self):
+    def test_recorded_extra_key_value_flows_to_cache_stats(self):
         """A recorded extra-key count must flow through the real recorder →
-        get_cache_stats → projection path (LML#567).
-
-        Pins the "even when the dedup fires" half of the report: once a
-        follower-join is actually recorded, its count has to surface as
-        `lml.cache.memory_cache_inflight_join`, not just the seeded zero.
+        get_cache_stats path (LML#567): once a follower-join is actually
+        recorded, its count has to surface as `memory_cache_inflight_join`, not
+        just the seeded zero.
         """
         from wxyc_fastapi.observability import (
             get_cache_stats,
@@ -821,25 +683,14 @@ class TestHandleLookup:
             init_cache_stats,
         )
 
-        from lookup.router import (
-            _LML_CACHE_STATS_EXTRA_KEYS,
-            _project_cache_stats_to_transaction,
-        )
+        from lookup.router import _LML_CACHE_STATS_EXTRA_KEYS
 
         init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
         recorder = get_cache_stats_recorder()
         recorder.record("memory_cache_inflight_join")
         recorder.record("memory_cache_inflight_join")
-        stats = get_cache_stats()
 
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-        with patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope):
-            _project_cache_stats_to_transaction(stats)
-
-        projected = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert projected["lml.cache.memory_cache_inflight_join"] == 2
+        assert get_cache_stats()["memory_cache_inflight_join"] == 2
 
     def test_streaming_warm_depth_shed_key_is_seeded(self):
         """LML#1108 review finding 4: ``streaming_warm_depth_shed`` (LML#1108's

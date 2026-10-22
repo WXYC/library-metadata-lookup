@@ -12,7 +12,6 @@ import asyncio
 import logging
 import random
 import time
-import weakref
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from typing import Protocol
@@ -34,8 +33,6 @@ logger = logging.getLogger(__name__)
 _FAIL_OPEN_EVENT = "discogs_rate_gate_fail_open"
 _QUEUE_WAIT_EVENT = "discogs_rate_gate_queue_wait"
 _POSTHOG_EVENT_PREFIX = "discogs_rate_gate"
-_QUEUE_WAIT_MEASUREMENT = "lml.discogs.rate_gate_queue_wait_ms"
-_QUEUE_SLEEP_MEASUREMENT = "lml.discogs.rate_gate_queue_sleeps"
 
 # Upper bound on a SINGLE queue-for-a-token sleep in the rate gate. At the
 # default 50/min this never binds (retry_after ≈ 1.2s); it only clamps a
@@ -62,7 +59,6 @@ _breakers: dict[asyncio.AbstractEventLoop, DiscogsCircuitBreaker] = {}
 # LML#841 shared rate gate, stored per event loop (same scope). Composes the
 # per-loop local ``AsyncLimiter`` with the shared PG token bucket.
 _rate_gates: dict[asyncio.AbstractEventLoop, "DiscogsRateGate"] = {}
-_queue_wait_max_by_transaction: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 # LML#927: request-scoped low-priority flag, mirroring
 # ``discogs.memory_cache._skip_cache_var`` / ``lookup.streaming_url_postprocess.
@@ -364,7 +360,7 @@ def _capture_queue_wait(*, wait_ms: float, queue_sleeps: int) -> None:
     double-floods. A queue wait is not a failure — it is the no-overshoot
     invariant working — so it uses a separate event from ``_FAIL_OPEN_EVENT``.
     PostHog gives a sampling-independent tail distribution; Sentry carries the
-    per-transaction max alongside traces for drill-down. Strictly best-effort:
+    ``lml.discogs.rate_gate_queued`` tag. Strictly best-effort:
     observability must never turn healthy saturation into a request failure.
     """
     capture_unsampled_counter(
@@ -375,19 +371,6 @@ def _capture_queue_wait(*, wait_ms: float, queue_sleeps: int) -> None:
 
     try:
         sentry_sdk.set_tag("lml.discogs.rate_gate_queued", "true")
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is None:
-            return
-        if wait_ms <= _queue_wait_max_by_transaction.get(transaction, 0.0):
-            return
-        # Retain the transaction's WORST (max-wait_ms) queue. queue_sleeps rides
-        # that same selection — it is the sleep count of the worst queue, NOT an
-        # independently-maxed series — so the pair always describes one queue.
-        _queue_wait_max_by_transaction[transaction] = wait_ms
-        transaction.set_measurement(_QUEUE_WAIT_MEASUREMENT, wait_ms)
-        transaction.set_data(_QUEUE_WAIT_MEASUREMENT, wait_ms)
-        transaction.set_measurement(_QUEUE_SLEEP_MEASUREMENT, queue_sleeps)
-        transaction.set_data(_QUEUE_SLEEP_MEASUREMENT, queue_sleeps)
     except Exception:
         logger.warning("Failed to project %s measurement", _QUEUE_WAIT_EVENT, exc_info=True)
 
@@ -454,17 +437,10 @@ def get_discogs_rate_gate() -> "DiscogsRateGate":
 
 def reset_rate_limiting() -> None:
     """Reset rate limiting state for testing."""
-    global \
-        _rate_limiters, \
-        _semaphores, \
-        _bulk_semaphores, \
-        _breakers, \
-        _rate_gates, \
-        _queue_wait_max_by_transaction
+    global _rate_limiters, _semaphores, _bulk_semaphores, _breakers, _rate_gates
     _rate_limiters.clear()
     _semaphores.clear()
     _bulk_semaphores.clear()
     _breakers.clear()
     _rate_gates.clear()
-    _queue_wait_max_by_transaction.clear()
     logger.debug("Reset rate limiting state")

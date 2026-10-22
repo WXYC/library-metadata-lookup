@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, ClassVar, Protocol
 
-import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 from wxyc_fastapi.observability import get_cache_stats_recorder
@@ -239,13 +238,9 @@ def _log_album_title_fallback(
     Mirrors the ``_log_resolver_pre_pass`` shape. The fallback's firing
     population grew significantly when the gate changed from ``not raw_releases``
     to ``not results`` (see WXYC/library-metadata-lookup#322 review), so each
-    fire is recorded both as an INFO log line and as a Sentry transaction
-    ``data.album_title_fallback`` attribute. Sentry can answer "what
-    percentage of /lookup calls trigger this fallback, and what's the
-    surface rate?" without re-pulling Railway logs.
-
-    No-op when there's no active Sentry transaction. Any SDK error is
-    swallowed so observability never breaks /lookup.
+    fire is recorded as an INFO log line (a WARNING when ``error`` is set),
+    so "what percentage of /lookup calls trigger this fallback?" is
+    answerable from the logs.
     """
     payload: dict[str, Any] = {
         "album": album,
@@ -257,12 +252,6 @@ def _log_album_title_fallback(
         logger.warning("album_title_fallback %s", payload)
     else:
         logger.info("album_title_fallback %s", payload)
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("album_title_fallback", payload)
-    except Exception as e:
-        logger.warning("Failed to project album_title_fallback onto Sentry transaction: %s", e)
 
 
 async def _fetch_release_artist_variations(

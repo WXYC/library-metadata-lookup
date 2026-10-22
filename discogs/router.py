@@ -62,12 +62,11 @@ _require_discogs_service = require_service(get_discogs_service, _DISCOGS_SERVICE
 
 
 def _refresh_l1(cached_func: Callable, *args, **kwargs) -> None:
-    """Evict an L1 entry on a refresh request and tag the Sentry trace.
+    """Evict an L1 entry on a refresh request and tag the Sentry scope.
 
     Only tags when eviction actually removed something — a no-op probe
     (refresh on an already-cold key) doesn't count. The Sentry tag
-    ``lml.cache.refresh_evicted`` and transaction data
-    ``lml.cache.memory_evictions_refresh`` give operators a filterable signal
+    ``lml.cache.refresh_evicted`` gives operators a filterable signal
     that a refresh-driven miss caused any downstream L2/L3 traversal — distinct
     from a natural TTL expiry, which leaves no marker. LML#498.
     """
@@ -75,11 +74,8 @@ def _refresh_l1(cached_func: Callable, *args, **kwargs) -> None:
         return
     try:
         sentry_sdk.set_tag("lml.cache.refresh_evicted", "true")
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("lml.cache.memory_evictions_refresh", 1)
     except Exception as e:
-        logger.warning("Failed to tag refresh eviction on Sentry transaction: %s", e)
+        logger.warning("Failed to tag refresh eviction on Sentry scope: %s", e)
 
 
 @router.get(

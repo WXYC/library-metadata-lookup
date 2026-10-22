@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Literal
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -193,13 +193,6 @@ class TestPermitAccounting:
 
 
 class TestTelemetry:
-    @staticmethod
-    def _sentry_mocks():
-        transaction = Mock()
-        scope = Mock()
-        scope.transaction = transaction
-        return transaction, scope
-
     @pytest.mark.asyncio
     async def test_priority_tag_set_to_bulk_when_low_priority(self, fake_limiter):
         main_sem = asyncio.Semaphore(5)
@@ -245,9 +238,9 @@ class TestTelemetry:
         assert priority_tags[0].args[1] == "interactive"
 
     @pytest.mark.asyncio
-    async def test_capped_bulk_acquire_emits_wait_measurement_and_cache_stat(self, fake_limiter):
-        """A bulk call that arrives to a saturated sub-semaphore emits the
-        ``lml.discogs.bulk_semaphore_wait_ms`` measurement and increments the
+    async def test_capped_bulk_acquire_sets_tag_and_cache_stat(self, fake_limiter):
+        """A bulk call that arrives to a saturated sub-semaphore sets the
+        ``lml.discogs.bulk_semaphore_capped`` tag and increments the
         ``discogs_bulk_reserved_capped`` cache-stats counter (mirrors
         ``lml.bulk.global_capped`` at the entry gate)."""
         from wxyc_fastapi.observability import get_cache_stats_recorder, init_cache_stats
@@ -261,8 +254,6 @@ class TestTelemetry:
         service = _make_service(client)
         set_discogs_low_priority(True)
 
-        transaction, scope = self._sentry_mocks()
-
         async def _occupy_bulk():
             async with bulk_sem:
                 await asyncio.sleep(0.05)
@@ -274,19 +265,15 @@ class TestTelemetry:
             patch("discogs.service.get_semaphore", return_value=main_sem),
             patch("discogs.service.get_bulk_discogs_semaphore", return_value=bulk_sem),
             patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
-            patch("discogs.service.sentry_sdk.get_current_scope", return_value=scope),
+            patch("discogs.service.sentry_sdk.set_tag") as set_tag,
         ):
             await service._request_with_retry("GET", "/releases/1")
 
         await occupier
 
-        wait_measurements = [
-            c
-            for c in transaction.set_measurement.call_args_list
-            if c.args[0] == "lml.discogs.bulk_semaphore_wait_ms"
+        assert ("lml.discogs.bulk_semaphore_capped", "true") in [
+            c.args for c in set_tag.call_args_list
         ]
-        assert len(wait_measurements) == 1
-        assert wait_measurements[0].args[1] > 0
 
         stats = get_cache_stats_recorder()
         assert stats is not None
@@ -295,7 +282,7 @@ class TestTelemetry:
         assert _cache_stats_var.get()["discogs_bulk_reserved_capped"] == 1
 
     @pytest.mark.asyncio
-    async def test_uncontended_bulk_acquire_emits_no_wait_measurement(self, fake_limiter):
+    async def test_uncontended_bulk_acquire_sets_no_capped_tag(self, fake_limiter):
         main_sem = asyncio.Semaphore(5)
         bulk_sem = asyncio.Semaphore(2)
 
@@ -304,50 +291,17 @@ class TestTelemetry:
         service = _make_service(client)
         set_discogs_low_priority(True)
 
-        transaction, scope = self._sentry_mocks()
-
         with (
             patch("discogs.service.get_semaphore", return_value=main_sem),
             patch("discogs.service.get_bulk_discogs_semaphore", return_value=bulk_sem),
             patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
-            patch("discogs.service.sentry_sdk.get_current_scope", return_value=scope),
+            patch("discogs.service.sentry_sdk.set_tag") as set_tag,
         ):
             await service._request_with_retry("GET", "/releases/1")
 
-        wait_measurements = [
-            c
-            for c in transaction.set_measurement.call_args_list
-            if c.args[0] == "lml.discogs.bulk_semaphore_wait_ms"
-        ]
-        assert len(wait_measurements) == 0
-
-    @pytest.mark.asyncio
-    async def test_bulk_queue_depth_measurement_emitted_when_low_priority(self, fake_limiter):
-        main_sem = asyncio.Semaphore(5)
-        bulk_sem = asyncio.Semaphore(2)
-
-        client = MagicMock()
-        client.request = AsyncMock(return_value=_response(200))
-        service = _make_service(client)
-        set_discogs_low_priority(True)
-
-        transaction, scope = self._sentry_mocks()
-
-        with (
-            patch("discogs.service.get_semaphore", return_value=main_sem),
-            patch("discogs.service.get_bulk_discogs_semaphore", return_value=bulk_sem),
-            patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
-            patch("discogs.service.sentry_sdk.get_current_scope", return_value=scope),
-        ):
-            await service._request_with_retry("GET", "/releases/1")
-
-        queue_depth_measurements = [
-            c
-            for c in transaction.set_measurement.call_args_list
-            if c.args[0] == "lml.discogs.bulk_semaphore_queue_depth"
-        ]
-        assert len(queue_depth_measurements) == 1
-        assert queue_depth_measurements[0].args[1] == 0
+        assert not any(
+            c.args[0].startswith("lml.discogs.bulk_semaphore") for c in set_tag.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_no_bulk_telemetry_emitted_when_interactive(self, fake_limiter):
@@ -359,17 +313,14 @@ class TestTelemetry:
         service = _make_service(client)
         set_discogs_low_priority(False)
 
-        transaction, scope = self._sentry_mocks()
-
         with (
             patch("discogs.service.get_semaphore", return_value=main_sem),
             patch("discogs.service.get_bulk_discogs_semaphore", return_value=bulk_sem),
             patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
-            patch("discogs.service.sentry_sdk.get_current_scope", return_value=scope),
+            patch("discogs.service.sentry_sdk.set_tag") as set_tag,
         ):
             await service._request_with_retry("GET", "/releases/1")
 
         assert not any(
-            c.args[0].startswith("lml.discogs.bulk_semaphore")
-            for c in transaction.set_measurement.call_args_list
+            c.args[0].startswith("lml.discogs.bulk_semaphore") for c in set_tag.call_args_list
         )

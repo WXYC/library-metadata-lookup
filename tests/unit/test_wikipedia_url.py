@@ -12,7 +12,7 @@ pair that fires regardless of the flag.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -538,16 +538,13 @@ class TestWikipediaSlugMatchEnabled:
 
 
 class TestShadowTelemetry:
-    def test_fires_set_data_even_when_flag_is_off(self, monkeypatch):
+    def test_fires_even_when_flag_is_off(self, monkeypatch):
         monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
         urls = ["https://en.wikipedia.org/wiki/Stereolab"]
-        mock_transaction = MagicMock()
         with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
-            mock_sentry.get_current_scope.return_value.transaction = mock_transaction
             pick_artist_wikipedia_url(urls, "Stereolab")
-        mock_transaction.set_data.assert_called_once()
-        key, payload = mock_transaction.set_data.call_args.args
-        assert key == "wikipedia_slug_pick"
+        mock_sentry.add_breadcrumb.assert_called_once()
+        payload = mock_sentry.add_breadcrumb.call_args.kwargs["data"]
         assert payload["heuristic_pick"] == "https://en.wikipedia.org/wiki/Stereolab"
         assert payload["slug_pick"] == "https://en.wikipedia.org/wiki/Stereolab"
         assert payload["agreement"] is True
@@ -558,30 +555,12 @@ class TestShadowTelemetry:
             "https://en.wikipedia.org/wiki/Tim_Gane",
             "https://en.wikipedia.org/wiki/Stereolab",
         ]
-        mock_transaction = MagicMock()
         with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
-            mock_sentry.get_current_scope.return_value.transaction = mock_transaction
             pick_artist_wikipedia_url(urls, "Stereolab")
-        _key, payload = mock_transaction.set_data.call_args.args
+        payload = mock_sentry.add_breadcrumb.call_args.kwargs["data"]
         assert payload["heuristic_pick"] == "https://en.wikipedia.org/wiki/Tim_Gane"
         assert payload["slug_pick"] == "https://en.wikipedia.org/wiki/Stereolab"
         assert payload["agreement"] is False
-
-    def test_no_active_transaction_is_a_no_op(self, monkeypatch):
-        monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
-        urls = ["https://en.wikipedia.org/wiki/Stereolab"]
-        with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
-            mock_sentry.get_current_scope.return_value.transaction = None
-            # Must not raise.
-            pick_artist_wikipedia_url(urls, "Stereolab")
-
-    def test_sentry_error_is_swallowed(self, monkeypatch):
-        monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
-        urls = ["https://en.wikipedia.org/wiki/Stereolab"]
-        with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
-            mock_sentry.get_current_scope.side_effect = RuntimeError("boom")
-            # Must not raise — telemetry is best-effort.
-            pick_artist_wikipedia_url(urls, "Stereolab")
 
     def test_no_wikipedia_url_at_all_does_not_fire_telemetry(self, monkeypatch):
         # LML#1192 review (A4): a non-event (nothing to compare -- no
@@ -589,44 +568,35 @@ class TestShadowTelemetry:
         # disagreement; it would flood the divergence counter with
         # meaningless entries.
         monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
-        mock_transaction = MagicMock()
         with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
-            mock_sentry.get_current_scope.return_value.transaction = mock_transaction
             result = pick_artist_wikipedia_url(["https://example.com/not-wikipedia"], "Stereolab")
         assert result is None
-        mock_transaction.set_data.assert_not_called()
         mock_sentry.add_breadcrumb.assert_not_called()
 
     def test_payload_carries_slug_score_and_clears_floor(self, monkeypatch):
         monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
         urls = ["https://en.wikipedia.org/wiki/Stereolab"]
-        mock_transaction = MagicMock()
         with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
-            mock_sentry.get_current_scope.return_value.transaction = mock_transaction
             pick_artist_wikipedia_url(urls, "Stereolab")
-        _key, payload = mock_transaction.set_data.call_args.args
+        payload = mock_sentry.add_breadcrumb.call_args.kwargs["data"]
         assert payload["slug_score"] == pytest.approx(100.0)
         assert payload["clears_floor"] is True
 
     def test_below_floor_payload_reports_clears_floor_false(self, monkeypatch):
         monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
         urls = ["https://en.wikipedia.org/wiki/Completely_Unrelated_Page"]
-        mock_transaction = MagicMock()
         with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
-            mock_sentry.get_current_scope.return_value.transaction = mock_transaction
             pick_artist_wikipedia_url(urls, "Stereolab")
-        _key, payload = mock_transaction.set_data.call_args.args
+        payload = mock_sentry.add_breadcrumb.call_args.kwargs["data"]
         assert payload["clears_floor"] is False
 
     def test_fires_a_breadcrumb_so_bulk_items_do_not_clobber_each_other(self, monkeypatch):
-        # LML#1192 review (A4): set_data with a fixed key is last-writer-wins
-        # across multiple items sharing one /lookup/bulk transaction --
-        # add_breadcrumb accumulates instead, mirroring
+        # LML#1192 review (A4): add_breadcrumb accumulates across multiple
+        # items sharing one /lookup/bulk request, mirroring
         # lookup.artist_resolution._log_artist_identity_split_gate.
         monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
         urls = ["https://en.wikipedia.org/wiki/Stereolab"]
         with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
-            mock_sentry.get_current_scope.return_value.transaction = MagicMock()
             pick_artist_wikipedia_url(urls, "Stereolab")
         mock_sentry.add_breadcrumb.assert_called_once()
         assert mock_sentry.add_breadcrumb.call_args.kwargs["category"] == "wikipedia_slug_pick"
@@ -641,7 +611,6 @@ class TestShadowTelemetry:
             patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry,
             patch("lookup.wikipedia_url.add_posthog_breadcrumb") as mock_posthog,
         ):
-            mock_sentry.get_current_scope.return_value.transaction = MagicMock()
             pick_artist_wikipedia_url(urls, "Stereolab")
         mock_posthog.assert_called_once()
         kwargs = mock_posthog.call_args.kwargs
@@ -654,11 +623,9 @@ class TestShadowTelemetry:
         monkeypatch.delenv(WIKIPEDIA_SLUG_MATCH_ENV_VAR, raising=False)
         urls = ["https://en.wikipedia.org/wiki/Stereolab"]
         with patch("lookup.wikipedia_url.sentry_sdk") as mock_sentry:
-            mock_sentry.get_current_scope.return_value.transaction = MagicMock()
             mock_sentry.add_breadcrumb.side_effect = RuntimeError("boom")
-            # Must not raise, and must not prevent set_data from still firing.
+            # Must not raise — telemetry is best-effort.
             pick_artist_wikipedia_url(urls, "Stereolab")
-        mock_sentry.get_current_scope.return_value.transaction.set_data.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

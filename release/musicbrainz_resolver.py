@@ -27,35 +27,11 @@ import asyncio
 import logging
 from typing import Any
 
-import sentry_sdk
-
 from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from entity.sources import PgSourceProtocol
 from generated.api_models import DiscogsTrackItem
 
 logger = logging.getLogger(__name__)
-
-
-def _project_resolver_attrs(*, requested_album: str | None, returned_album: str | None) -> None:
-    """Project requested-vs-returned album titles onto the active Sentry trace.
-
-    LML#506 sizing: the resolver runs ``LIMIT 1`` with a lenient 0.70
-    trigram floor, so on Deluxe-vs-Original sibling shapes it can return a
-    non-requested album whose tracklist still partially overlaps. The
-    downstream song-sanity check catches one cohort (bonus-only-track
-    Deluxe leaks); this attribute exposes the population needed to size
-    whether the resolver-side Option 2 follow-up (top-K candidates
-    filtered by song-presence) is worth shipping.
-
-    Silent on Sentry SDK errors; observability never breaks the resolver.
-    """
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("lookup.mb_resolver.requested_album", requested_album)
-            transaction.set_data("lookup.mb_resolver.returned_album", returned_album)
-    except Exception as e:
-        logger.warning("Failed to project mb_resolver attrs onto Sentry transaction: %s", e)
 
 
 # Hard ceiling on the PG round trip. The rescue fires inside
@@ -159,7 +135,6 @@ async def resolve_tracklist_via_musicbrainz(
             artist,
             album,
         )
-        _project_resolver_attrs(requested_album=album, returned_album=None)
         return None
     except Exception as e:
         logger.warning(
@@ -168,26 +143,14 @@ async def resolve_tracklist_via_musicbrainz(
             album,
             e,
         )
-        _project_resolver_attrs(requested_album=album, returned_album=None)
         return None
 
     if not rows:
-        _project_resolver_attrs(requested_album=album, returned_album=None)
         return None
 
     first = rows[0]
     album_score = float(first.get("album_score") or 0.0)
     artist_score = float(first.get("artist_score") or 0.0)
-    # Capture before the floor check so the trace explorer sees both rejected
-    # and accepted candidates — operator can quantify the "trigram floor
-    # cleared but downstream sanity check dropped it" cohort by joining this
-    # attribute with ``lookup.mb_rescue.song_sanity_rejected``. Pass ``None``
-    # through unmodified when the row has no title (column NULL or absent)
-    # so the trace can distinguish "no candidate" (returned_album=None) from
-    # "candidate with empty title" (returned_album="") — three states from
-    # two values are easier to query than three-from-one with overloaded "".
-    returned_album_title = first.get("release_title")
-    _project_resolver_attrs(requested_album=album, returned_album=returned_album_title)
     # False-positive tracklists are worse than no tracklist — the DJ types the
     # correct tracks in 10s either way, but a wrong tracklist gets unknowingly
     # committed to the flowsheet.

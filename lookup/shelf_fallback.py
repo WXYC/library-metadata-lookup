@@ -48,8 +48,6 @@ cache-confirmed ordering tier is not implemented) is in
 
 import logging
 
-import sentry_sdk
-
 from core.search import SEARCH_TYPE_FALLBACK
 from library.db import LibraryDB
 from library.models import LibraryItem
@@ -96,26 +94,6 @@ def _order_shelf_rows(rows: list[LibraryItem], song: str | None) -> list[Library
     leading = [row for row in rows if row.id in leading_ids]
     trailing = [row for row in rows if row.id not in leading_ids]
     return leading + trailing
-
-
-def _mark_shelf_fallback_outcome(row_count: int, key: str = "lookup.shelf_fallback_rows") -> None:
-    """Project a lane's own, separate Sentry trace attr (one key per lane).
-
-    Deliberately NOT ``lookup.outcome`` -- that key is the pre-existing
-    ``library_miss_outcome`` projection (``_step_project_trace_attrs``), and
-    overwriting it here would make this lane indistinguishable from whatever
-    step 3a already recorded, violating the "existing trace attrs stay
-    unchanged" half of the telemetry-invisibility contract
-    (``docs/architecture.md``, "Shelf fallback (step 8): design notes"). A
-    fresh key name, only ever set when this lane actually fires, is additive
-    by construction. Observability must not break the request path.
-    """
-    try:
-        scope = sentry_sdk.get_current_scope()
-        if scope.transaction is not None:
-            scope.transaction.set_data(key, row_count)
-    except Exception:
-        pass
 
 
 async def _self_titled_companions(
@@ -198,7 +176,6 @@ async def apply_shelf_fallback(
             return unchanged
         if not companions:
             return unchanged
-        _mark_shelf_fallback_outcome(len(companions), "lookup.self_titled_companion_rows")
         return ([*result_items, *companions], search_type, context_message, external_source, 0)
 
     # On ``main`` this path returned an empty 200 with no further I/O, so a
@@ -219,7 +196,6 @@ async def apply_shelf_fallback(
     # The first listed row filed as the picked artist, not a song-led variant's (LML#1449).
     own = normalize_for_comparison(shelf[0].artist or "").strip()
     named = next(r.artist for r in rows if normalize_for_comparison(r.artist or "").strip() == own)
-    _mark_shelf_fallback_outcome(len(shelf_items))
     return (
         shelf_items,
         SEARCH_TYPE_FALLBACK,

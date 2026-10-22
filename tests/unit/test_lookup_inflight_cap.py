@@ -21,7 +21,7 @@ load-shedding; callers see latency, not errors. A request that arrives to a
 saturated cap deducts its measured queue wait from ``X-Caller-Budget-Ms``
 (floored at 1 — a non-positive header value falls back to the env default,
 which would ironically UNBOUND the budget) and projects a filterable Sentry
-tag plus a wait-duration measurement.
+tag.
 
 The bulk path keeps its own per-batch semaphore (``LML_BULK_MAX_CONCURRENT``)
 — different gate shape (outer per-request vs. inner per-item), so the knobs
@@ -453,18 +453,12 @@ class TestCallerBudgetDeduction:
 
 class TestInFlightCapObservability:
     @pytest.mark.asyncio
-    async def test_capped_wait_sets_filterable_tag_and_wait_measurement(
-        self, app_client, monkeypatch
-    ):
-        """A queued request tags + measures; the tag is the post-deploy signal.
+    async def test_capped_wait_sets_filterable_tag(self, app_client, monkeypatch):
+        """A queued request tags; the tag is the post-deploy signal.
 
         ``sentry_sdk.set_tag`` (not ``set_data``) is load-bearing: per the
-        LML#683 lesson documented on ``_project_cache_stats_to_transaction``,
-        ``set_data`` span attributes read back as "Unknown attribute" in the
-        spans dataset — unqueryable. The tag mirrors ``lml.client_aborted``;
-        the wait-ms measurement is the quantitative series that decides
-        whether the default cap (``min(8, LML_DISCOGS_POOL_MAX_SIZE)``) is
-        tuned right.
+        LML#683 lesson, a filterable tag is the queryable signal. The tag
+        mirrors ``lml.client_aborted``.
         """
         monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "1")
 
@@ -478,14 +472,10 @@ class TestInFlightCapObservability:
                 await gate.wait()
             return _empty_response()
 
-        transaction = Mock()
-        scope = Mock()
-        scope.transaction = transaction
         set_tag = Mock()
 
         with (
             patch("lookup.router.perform_lookup", new_callable=AsyncMock, side_effect=gated_lookup),
-            patch.object(router_mod.sentry_sdk, "get_current_scope", return_value=scope),
             patch.object(router_mod.sentry_sdk, "set_tag", set_tag),
         ):
             async with AsyncClient(
@@ -512,21 +502,11 @@ class TestInFlightCapObservability:
             c for c in set_tag.call_args_list if c.args == ("lml.lookup.inflight_capped", "true")
         ]
         assert len(capped_tags) == 1
-        wait_measurements = [
-            c
-            for c in transaction.set_measurement.call_args_list
-            if c.args[0] == "lml.lookup.inflight_wait_ms"
-        ]
-        assert len(wait_measurements) == 1
-        assert wait_measurements[0].args[1] > 0
 
     @pytest.mark.asyncio
-    async def test_uncontended_request_sets_no_tag_or_measurement(self, app_client, monkeypatch):
+    async def test_uncontended_request_sets_no_tag(self, app_client, monkeypatch):
         monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "8")
 
-        transaction = Mock()
-        scope = Mock()
-        scope.transaction = transaction
         set_tag = Mock()
 
         with (
@@ -535,7 +515,6 @@ class TestInFlightCapObservability:
                 new_callable=AsyncMock,
                 return_value=_empty_response(),
             ),
-            patch.object(router_mod.sentry_sdk, "get_current_scope", return_value=scope),
             patch.object(router_mod.sentry_sdk, "set_tag", set_tag),
         ):
             async with AsyncClient(
@@ -545,17 +524,12 @@ class TestInFlightCapObservability:
 
         assert resp.status_code == 200
         assert not any(c.args[0] == "lml.lookup.inflight_capped" for c in set_tag.call_args_list)
-        assert not any(
-            c.args[0] == "lml.lookup.inflight_wait_ms"
-            for c in transaction.set_measurement.call_args_list
-        )
 
 
 class TestQueueWaitServerTimingLeg:
     """The ``queue_wait`` Server-Timing leg (LML#907 fine-grained-timing
     follow-up) must render on EVERY response — 0 on the uncontended path, the
-    actual measured wait on a capped one — mirroring the Sentry
-    ``lml.lookup.inflight_wait_ms`` measurement above but surfaced in-band on
+    actual measured wait on a capped one — surfaced in-band on
     the response itself. Reuses the cap=1 gating pattern from
     ``TestCallerBudgetDeduction``.
     """

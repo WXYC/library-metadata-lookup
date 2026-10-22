@@ -88,7 +88,6 @@ from lookup.shelf_fallback import apply_shelf_fallback
 from lookup.spine_deadline import (
     SpineDeadline,
     SpineDeadlineExceededError,
-    project_spine_deadline_telemetry,
     run_within_spine_deadline,
 )
 from lookup.strategies import build_strategies
@@ -321,13 +320,6 @@ class LookupState:
     disagree, because consumers gate on this field alone (Backend-Service's
     ``isTrustedLmlTrackContextMatch``). Read by the trace projection and the
     response build."""
-
-    library_miss_outcome: str | None = None
-    """LML#583 outcome marker for the Sentry trace projection (``lookup.outcome``).
-    Written by the library-miss probe (step 3a): one hit and one miss value per
-    lane, kept distinct because existing slices key on the classic pair meaning
-    "the library returned NOTHING". The four values and their lanes are listed on
-    ``lookup/strategies/miss_probe_lane.py``."""
 
     serve_blocked_probe_pair: tuple[LibraryItem, DiscogsSearchResult] | None = None
     """LML#1319: the step-3a probe hit parked on the serve-blocked songless
@@ -724,8 +716,7 @@ async def _step_library_miss_probe(
 
     READS: ``library_results``, ``search_type`` (the serve-aware emptiness
     gate, LML#1319).
-    WRITES: ``items_with_artwork``, ``song_not_found``, ``library_miss_outcome``,
-    ``serve_blocked_probe_pair``.
+    WRITES: ``items_with_artwork``, ``song_not_found``, ``serve_blocked_probe_pair``.
 
     Ordering invariant (enforced here and at step 4's emptiness guard): on a
     classic library-miss hit this step writes ``items_with_artwork`` directly
@@ -807,15 +798,7 @@ async def _step_library_miss_probe(
                 state.serve_blocked_probe_pair = miss_match
             else:
                 state.items_with_artwork = [miss_match]
-            state.library_miss_outcome = lane.outcome(matched=True)
             services.telemetry.record_api_call("discogs")
-        elif services.discogs_service is not None:
-            # Discogs was available and searched but found no confident match.
-            # The serve-blocked arm gets its own value: the classic pair means
-            # "the library returned nothing", and on this lane it DID answer —
-            # reusing it would silently change the population behind every
-            # existing `lookup.outcome` slice and runbook (LML#1319 review).
-            state.library_miss_outcome = lane.outcome(matched=False)
 
 
 async def _step_validate_tracks(
@@ -1094,39 +1077,6 @@ async def _step_enrich_metadata(
             state.enrichment_shed = shed_report.upstream_shed
 
 
-def _step_project_trace_attrs(
-    state: LookupState,
-    services: LookupServices,
-) -> None:
-    """Project request flags and result-quality signals onto the Sentry transaction.
-
-    Runs between steps 4b and 5; not a numbered pipeline step (observability
-    only — it must never affect the response).
-
-    READS: ``result_count`` (via ``items_with_artwork``/``library_results``),
-    ``search_type``, ``library_miss_outcome``; plus ``services.extended`` and
-    ``services.warm_cache``.
-    WRITES: nothing.
-    """
-    # Project the request-side flags and result-quality signals onto the
-    # active Sentry transaction so the trace can be filtered by request mode
-    # (lml.lookup.extended, lml.lookup.warm_cache) and by match outcome
-    # (lookup.results_count, lookup.match_type — LML#158). Mirrors the
-    # cache_stats projection pattern (LML#213).
-    try:
-        scope = sentry_sdk.get_current_scope()
-        if scope.transaction is not None:
-            scope.transaction.set_data("lml.lookup.extended", services.extended)
-            scope.transaction.set_data("lml.lookup.warm_cache", services.warm_cache)
-            scope.transaction.set_data("lookup.results_count", state.result_count)
-            scope.transaction.set_data("lookup.match_type", state.search_type)
-            if state.library_miss_outcome is not None:
-                scope.transaction.set_data("lookup.outcome", state.library_miss_outcome)
-    except Exception:
-        # Observability must not break the request path.
-        pass
-
-
 async def _step_resolve_result_identities(
     state: LookupState,
     services: LookupServices,
@@ -1229,7 +1179,6 @@ async def perform_lookup(
     - Step 3c.   ``_step_populate_streaming_status`` — per-row streaming flags
     - Step 4.    ``_step_fetch_artwork`` — artwork fetch
     - Step 4b.   ``_step_enrich_metadata`` — metadata enrichment
-    - (observability) ``_step_project_trace_attrs`` — Sentry trace projection
     - Step 6.    ``_step_resolve_result_identities`` — artist identity resolution
     - (response) ``build_result_items`` — API-model conversion
     - Step 7.    ``_step_external_cache_fallback`` — external-cache fallback
@@ -1276,7 +1225,6 @@ async def perform_lookup(
             request, state, services
         )
     except SpineDeadlineExceededError as exc:
-        project_spine_deadline_telemetry(exc)
         logger.info(
             "Spine deadline exceeded during %s (%s) after %.1fms; returning empty timed-out "
             "response for %r",
@@ -1404,8 +1352,6 @@ async def perform_lookup(
             location_union_task=location_union_task,
         )
 
-    _step_project_trace_attrs(state, services)
-
     # LML#930: identity resolution is the last live-Discogs/EntityStore tail leg —
     # shed it too if the caller deadline is exhausted by now (the returned
     # degraded response binds each row with reconciled_identity=None, exactly as
@@ -1469,10 +1415,6 @@ async def perform_lookup(
         index_confirmed_existing=index_confirmed_existing,
         external_source=external_source,
     )
-    # Trace attrs cover the PRE-fallback rows: Step 8 must stay invisible to
-    # them (docs/architecture.md, "Shelf fallback (step 8): design notes").
-    _project_post_fold_trace_attrs(result_items, search_type)
-
     # Step 8 (LML#1391/#1393): additive, unbound shelf fallback. The `skip`
     # terms are documented in `lookup/shelf_fallback.py`.
     skip = state.timed_out or state.upstream_shed or is_discogs_low_priority()
@@ -1717,27 +1659,6 @@ def _reconcile_post_fold_signals(
     )
 
 
-def _project_post_fold_trace_attrs(result_items: list[LookupResultItem], search_type: str) -> None:
-    """Re-project ``lookup.results_count``/``lookup.match_type`` after the
-    location-union fold, overwriting whatever ``_step_project_trace_attrs``
-    projected pre-fold.
-
-    That call reads ``state.result_count``, which derives from
-    ``state.items_with_artwork``/``state.library_results`` — the folded
-    locations never enter ``LookupState``, so its projection is stale exactly
-    when this matters. Observability must not break the request path; the
-    failure mode mirrors ``_step_project_trace_attrs``.
-    """
-    try:
-        scope = sentry_sdk.get_current_scope()
-        if scope.transaction is not None:
-            scope.transaction.set_data("lookup.results_count", len(result_items))
-            scope.transaction.set_data("lookup.match_type", search_type)
-    except Exception:
-        # Observability must not break the request path.
-        pass
-
-
 async def _build_degraded_response(
     state: LookupState,
     parsed: ParsedRequest,
@@ -1782,7 +1703,7 @@ async def _build_degraded_response(
     try:
         sentry_sdk.set_tag("lml.degraded_reason", degraded_reason.value)
     except Exception as e:  # pragma: no cover - defensive
-        logger.warning("Failed to project degraded_reason onto Sentry transaction: %s", e)
+        logger.warning("Failed to project degraded_reason onto Sentry scope: %s", e)
     result_items = build_result_items(state, {}, artist=library_artist_for(parsed))
     folded_locations = await _await_location_union_bounded(location_union_task)
     result_items, folded_location_count, index_confirmed_existing = _fold_locations_into_results(

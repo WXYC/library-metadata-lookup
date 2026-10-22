@@ -34,14 +34,7 @@ Dedup is process-global, keyed ``(service, to_match_form(artist),
 to_match_form(album))``. Background concurrency is bounded by
 ``LML_STREAMING_WARM_CONCURRENCY`` (separate from the bio warm's bound).
 
-Sentry (hot-path only): ``streaming_url.persistent_lookup.fired.<service>`` plus
-``streaming_url.persistent_lookup.<outcome>.<service>`` where ``<outcome>`` is
-``cache_hit`` / ``cache_miss_recent`` / ``cache_error_recent`` /
-``cache_miss_enqueued`` / ``cache_miss_unwarmed``. ``cache_error_recent``
-(LML#1115) covers a fresh error row's enqueue/suppress/shed sub-cases
-uniformly — the couldn't-ask signal itself is what matters. The background
-task never writes to the active scope (the request scope has closed by then)
-— it logs its ``live_*`` outcome.
+The background task logs its ``live_*`` outcome.
 
 PG, the streaming clients, the entity store, and the cache layer are mocked. The
 cache-layer behavior itself is covered in
@@ -261,14 +254,6 @@ def _assert_minted(entity_store: MagicMock, case: dict, service: str) -> None:
         entity_store.mint_or_get_release_identity.assert_not_called()
 
 
-def _sentry_scope():
-    transaction = Mock()
-    transaction.set_data = Mock()
-    scope = Mock()
-    scope.transaction = transaction
-    return scope, transaction
-
-
 def _patch_cache_peek(url, has_fresh_decision=None, is_error=False):
     """Patch the hot-path cache peek, returning ``(url, has_fresh_decision, is_error)``.
 
@@ -448,12 +433,10 @@ class TestCacheHit:
         case = _CASES[service]
         update = _blank_update()
         entity_store = _entity_store()
-        scope, transaction = _sentry_scope()
 
         with (
             _patch_cache_peek(case["resolved_url"]),
             _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             await _run(update, settings=_settings(service), entity_store=entity_store)
 
@@ -461,9 +444,6 @@ class TestCacheHit:
         resolve.assert_not_called()
         entity_store.mint_or_get_release_identity.assert_not_called()
         assert not warm_mod._background_tasks
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get(f"streaming_url.persistent_lookup.fired.{service}") is True
-        assert calls.get(f"streaming_url.persistent_lookup.cache_hit.{service}") is True
 
 
 # ---------------------------------------------------------------------------
@@ -477,12 +457,10 @@ class TestKnownRecentMiss:
     async def test_recent_miss_does_not_enqueue_a_no_op_warm(self, service):
         case = _CASES[service]
         update = _blank_update()
-        scope, transaction = _sentry_scope()
 
         with (
             _patch_cache_peek(None, has_fresh_decision=True),
             _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             await _run(update, settings=_settings(service))
 
@@ -490,8 +468,6 @@ class TestKnownRecentMiss:
         resolve.assert_not_called()
         assert not warm_mod._background_tasks
         assert not warm_mod._streaming_warm_in_flight
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_recent.{service}") is True
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +475,7 @@ class TestKnownRecentMiss:
 # a genuine known miss above -- it DOES enqueue a bounded, deduplicated warm
 # (re-asking after a transient outage is the point), gated by the SAME bulk
 # suppression a genuine miss uses, and always reports the single
-# ``cache_error_recent`` Sentry outcome regardless of which of
+# unresolved outcome regardless of which of
 # enqueued/suppressed/shed it lands in.
 # ---------------------------------------------------------------------------
 
@@ -522,7 +498,6 @@ class TestFreshErrorRowMiss:
         # passes when the warm actually threads the zeroed override through.
         case = _CASES[service]
         update = _blank_update()
-        scope, transaction = _sentry_scope()
         row_last_checked_at = datetime.now(UTC) - timedelta(seconds=5)
 
         async def fake_fetchone(
@@ -547,7 +522,6 @@ class TestFreshErrorRowMiss:
 
         with (
             _patch_cache_peek(None, has_fresh_decision=True, is_error=True),
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             result = await _run(
                 update,
@@ -568,24 +542,16 @@ class TestFreshErrorRowMiss:
         assert update[case["url_field"]] is None
         assert not warm_mod._background_tasks
         assert not warm_mod._streaming_warm_in_flight
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
-        # LML#1121 FIX 7: the enqueue sub-outcome is tagged ALONGSIDE
-        # cache_error_recent now, not masked by it.
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_enqueued.{service}") is True
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_recent.{service}") is None
         assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
 
     async def test_fresh_error_row_stays_unwarmed_when_bulk_suppressed(self, service):
         case = _CASES[service]
         update = _blank_update()
-        scope, transaction = _sentry_scope()
         set_suppress_streaming_warm(True)
 
         with (
             _patch_cache_peek(None, has_fresh_decision=True, is_error=True),
             _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             result = await _run(update, settings=_settings(service))
 
@@ -595,12 +561,6 @@ class TestFreshErrorRowMiss:
         resolve.assert_not_called()
         assert not warm_mod._background_tasks
         assert not warm_mod._streaming_warm_in_flight
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
-        # LML#1121 FIX 7: cache_miss_unwarmed is the depth-shed/suppression
-        # signal docs/env-vars.md documents; it must fire ALONGSIDE
-        # cache_error_recent for a suppressed error row, not be masked by it.
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
         assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
 
     async def test_fresh_error_row_is_still_subject_to_the_depth_bound(self, service):
@@ -615,23 +575,14 @@ class TestFreshErrorRowMiss:
             warm_mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
 
         update = _blank_update()
-        scope, transaction = _sentry_scope()
         with (
             _patch_cache_peek(None, has_fresh_decision=True, is_error=True),
             _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             result = await _run(update, settings=_settings(service))
 
         assert not warm_mod._background_tasks
         resolve.assert_not_awaited()
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
-        # LML#1121 FIX 7: cache_miss_shed is docs/env-vars.md's designated
-        # depth-shed signal; it must not go silent for an error-triggered
-        # shed -- exactly the dominant-service-under-outage case where
-        # shedding peaks and the signal matters most.
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_shed.{service}") is True
         assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
 
 
@@ -1004,13 +955,11 @@ class TestBulkSuppression:
     async def test_genuine_miss_does_not_enqueue_when_suppressed(self):
         service = "apple_music_album"
         update = _blank_update()
-        scope, transaction = _sentry_scope()
         set_suppress_streaming_warm(True)
 
         with (
             _patch_cache_peek(None),
             _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             await _run(update, settings=_settings(service))
 
@@ -1018,8 +967,6 @@ class TestBulkSuppression:
         resolve.assert_not_called()
         assert not warm_mod._background_tasks
         assert not warm_mod._streaming_warm_in_flight
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
 
     async def test_cache_hit_still_fills_when_suppressed(self):
         # Suppression disables the warm, NOT the synchronous cache read-fill.
@@ -1072,13 +1019,11 @@ class TestBulkRowlessWarmExemption:
         # schedules the warm anyway — projecting cache_miss_enqueued (not
         # cache_miss_unwarmed).
         update = _blank_update()
-        scope, transaction = _sentry_scope()
         set_suppress_streaming_warm(True)
 
         with (
             _patch_cache_peek(None),
             _patch_resolver(return_value=ResolveOutcome(url=None, source="live_miss")),
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             result = await _run(
                 update, settings=_settings(service, **{flag_kwarg: True}), is_rowless=True
@@ -1088,10 +1033,6 @@ class TestBulkRowlessWarmExemption:
 
         assert not warm_mod._background_tasks
         assert not warm_mod._streaming_warm_in_flight
-        # Sentry keys use the storage key (``spotify_album``), not the catalog key.
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_enqueued.{service}") is True
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is None
         # The warm is off the response path: the triggering pass still returns
         # no URL for this service (#1052's AC — do not assert otherwise).
         assert update[_CASES[service]["url_field"]] is None
@@ -1106,21 +1047,17 @@ class TestBulkRowlessWarmExemption:
         # bulk suppression exists to prevent. Suppressed => cache_miss_unwarmed,
         # no warm.
         update = _blank_update()
-        scope, transaction = _sentry_scope()
         set_suppress_streaming_warm(True)
 
         with (
             _patch_cache_peek(None),
             _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             await _run(update, settings=_settings(service, **{flag_kwarg: True}), is_rowless=False)
 
         resolve.assert_not_called()
         assert not warm_mod._background_tasks
         assert not warm_mod._streaming_warm_in_flight
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
 
     async def test_flag_off_stays_suppressed_and_inert(self, service, flag_kwarg):
         # The client is present in ``clients`` and the per-service persist flag is
@@ -1128,21 +1065,17 @@ class TestBulkRowlessWarmExemption:
         # the suppression still applies: no live probe, no background warm —
         # exactly today's bulk behavior. The flag dominates the rowless signal.
         update = _blank_update()
-        scope, transaction = _sentry_scope()
         set_suppress_streaming_warm(True)
 
         with (
             _patch_cache_peek(None),
             _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             await _run(update, settings=_settings(service, **{flag_kwarg: False}), is_rowless=True)
 
         resolve.assert_not_called()
         assert not warm_mod._background_tasks
         assert not warm_mod._streaming_warm_in_flight
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
 
     async def test_master_kill_switch_restores_suppression(self, service, flag_kwarg):
         # AND-gate term 1 (``lml_persist_streaming_urls``): the master kill switch
@@ -1235,13 +1168,11 @@ class TestBulkRowlessWarmExemptionIsPerService:
         # #1087's Bandcamp behavior and vice versa. Apple is never exempt at all
         # (it has its own synchronous probe on the enrichment path).
         update = _blank_update()
-        scope, transaction = _sentry_scope()
         set_suppress_streaming_warm(True)
 
         with (
             _patch_cache_peek(None),
             _patch_resolver() as resolve,
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
             await _run(
                 update, settings=_settings(service, **{other_flag_kwarg: True}), is_rowless=True
@@ -1250,14 +1181,11 @@ class TestBulkRowlessWarmExemptionIsPerService:
         resolve.assert_not_called()
         assert not warm_mod._background_tasks
         assert not warm_mod._streaming_warm_in_flight
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
 
 
 # ---------------------------------------------------------------------------
 # LML#1053: the per-service resolution-status return value. The hot-path
-# disposition already computed for the Sentry projection (cache_hit /
-# cache_miss_recent / cache_miss_enqueued / cache_miss_unwarmed / peek error)
+# disposition (cache hit / recent miss / enqueued / unwarmed / peek error)
 # maps onto the StreamingResolutionStatus vocabulary consumed by
 # ``lookup/enrichment/item.py`` to build ``DiscogsSearchResult.streaming_status``.
 # Keyed by ``cfg.client_attr`` (``apple_music`` / ``spotify`` / ``bandcamp``) —
@@ -1465,65 +1393,6 @@ class TestDedup:
 
 
 # ---------------------------------------------------------------------------
-# Sentry: the hot path tags the active transaction; the background task does not.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-class TestSentryProjection:
-    async def test_miss_projects_enqueued_and_background_never_touches_active_scope(self):
-        service = "apple_music_album"
-        case = _CASES[service]
-        update = _blank_update()
-        scope, transaction = _sentry_scope()
-
-        with (
-            _patch_cache_peek(None),
-            _patch_resolver(
-                return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
-            ),
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
-        ):
-            await _run(update, settings=_settings(service))
-            await _drain_background_tasks()
-
-        keys = {c.args[0] for c in transaction.set_data.call_args_list}
-        assert f"streaming_url.persistent_lookup.fired.{service}" in keys
-        assert f"streaming_url.persistent_lookup.cache_miss_enqueued.{service}" in keys
-        # The background ``live_resolved`` outcome must NOT land on the active
-        # transaction — the request scope has closed; a tag here would
-        # mis-attribute to the next request (mirrors _warm_bio_cache).
-        assert not any(".live_resolved." in k for k in keys)
-        assert not any(".cache_hit." in k for k in keys)
-
-    async def test_no_active_transaction_does_not_crash(self):
-        update = _blank_update()
-        scope = Mock()
-        scope.transaction = None
-        with (
-            _patch_cache_peek(_CASES["apple_music_album"]["resolved_url"]),
-            _patch_resolver(),
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
-        ):
-            await _run(update, settings=_settings("apple_music_album"))
-        assert update["apple_music_url"] == _CASES["apple_music_album"]["resolved_url"]
-
-    async def test_set_data_failure_does_not_break_request(self):
-        update = _blank_update()
-        transaction = Mock()
-        transaction.set_data = Mock(side_effect=RuntimeError("boom"))
-        scope = Mock()
-        scope.transaction = transaction
-        with (
-            _patch_cache_peek(_CASES["apple_music_album"]["resolved_url"]),
-            _patch_resolver(),
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
-        ):
-            await _run(update, settings=_settings("apple_music_album"))
-        assert update["apple_music_url"] == _CASES["apple_music_album"]["resolved_url"]
-
-
-# ---------------------------------------------------------------------------
 # Background-warm concurrency bound (LML_STREAMING_WARM_CONCURRENCY).
 # ---------------------------------------------------------------------------
 
@@ -1623,29 +1492,24 @@ class TestWarmQueueDepthBound:
         # still "unresolved", exactly like a healthy enqueue would report.
         assert statuses["apple_music"] == StreamingResolutionStatus.unresolved
 
-    async def test_shed_projects_distinct_sentry_outcome_and_counts_via_cache_stats(self):
+    async def test_shed_counts_via_cache_stats(self):
         bound = warm_mod._streaming_warm_queue_depth_bound()
         for i in range(bound):
             warm_mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
 
         service = "apple_music_album"
         update = _blank_update()
-        scope, transaction = _sentry_scope()
         recorder = Mock()
 
         with (
             _patch_cache_peek(None),
             _patch_resolver(),
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
             patch.object(
                 streaming_warm_admission, "get_cache_stats_recorder", return_value=recorder
             ),
         ):
             await _run(update, settings=_settings(service))
 
-        keys = {c.args[0] for c in transaction.set_data.call_args_list}
-        assert f"streaming_url.persistent_lookup.cache_miss_shed.{service}" in keys
-        assert f"streaming_url.persistent_lookup.cache_miss_enqueued.{service}" not in keys
         recorder.record.assert_called_once_with(mod.STREAMING_WARM_DEPTH_SHED_STAT_KEY)
 
     async def test_dedup_hit_is_not_shed_by_the_depth_bound(self):

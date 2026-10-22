@@ -105,14 +105,10 @@ def _project_wikipedia_slug_pick(
     """Shadow telemetry, fires regardless of the enable flag (LML#513).
 
     Mirrors ``lookup.artist_resolution._log_artist_identity_split_gate``:
-    ``set_data`` on the active Sentry transaction (single-item view) AND
-    ``add_breadcrumb`` (accumulating view — LML#1192 review, A4: a fixed
-    ``set_data`` key is last-writer-wins across the multiple items sharing
-    one ``/lookup/bulk`` transaction, which would silently drop every item's
-    projection but the last; the breadcrumb list accumulates instead), plus
-    a 1% sampled INFO log line. Best-effort — each SDK call is independently
-    swallowed so telemetry can never break enrichment, and one surface's
-    failure can't suppress another's.
+    ``add_breadcrumb`` (accumulating view) plus a 1% sampled INFO log line.
+    Best-effort — each SDK call is independently swallowed so telemetry can
+    never break enrichment, and one surface's failure can't suppress
+    another's.
 
     Callers must skip this entirely for the no-URL-at-all case (there is
     nothing to compare — see the call site) rather than pass ``None``/``None``
@@ -126,12 +122,6 @@ def _project_wikipedia_slug_pick(
         "clears_floor": clears_floor,
         "agreement": agreement,
     }
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("wikipedia_slug_pick", payload)
-    except Exception as e:
-        logger.warning("Failed to project wikipedia_slug_pick onto Sentry transaction: %s", e)
     try:
         sentry_sdk.add_breadcrumb(category="wikipedia_slug_pick", level="info", data=payload)
         add_posthog_breadcrumb(

@@ -279,15 +279,6 @@ class TestCompanionRow:
         with pytest.raises(asyncio.CancelledError):
             await _apply(_parsed(), db, [_bound(MOON_PIX)])
 
-    @pytest.mark.asyncio
-    async def test_sentry_attr_is_separate_from_the_shelf_lane(self):
-        with patch("lookup.shelf_fallback.sentry_sdk") as sentry:
-            await _apply(_parsed(), _db([MOON_PIX, SELF_TITLED]), [_bound(MOON_PIX)])
-
-        sentry.get_current_scope.return_value.transaction.set_data.assert_called_once_with(
-            "lookup.self_titled_companion_rows", 1
-        )
-
 
 class TestCompanionOverARealIndex:
     """LML#1418. The lane used to look for the row in the first 50 hits of an

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -99,29 +98,18 @@ def _get_streaming_check_semaphore() -> asyncio.Semaphore:
     return _streaming_check_semaphore
 
 
-def _project_inflight_capped(wait_ms: float) -> None:
-    """Project cap engagement onto Sentry for a request that queued.
+def _project_inflight_capped() -> None:
+    """Tag a request that queued on the in-flight cap onto Sentry.
 
-    Two channels, mirroring `lookup.router._project_inflight_capped` (the
-    LML#683 lesson: `set_data` alone reads back as "Unknown attribute" in the
-    spans dataset, so it can't back a query or an alert):
-
-    * `sentry_sdk.set_tag("lml.streaming_check.inflight_capped", "true")` --
-      the filterable engagement flag, set only on requests that found the cap
-      saturated.
-    * `set_measurement("lml.streaming_check.inflight_wait_ms", ...)` -- the
-      quantitative series (p95 queue wait) that decides whether the default
-      cap is tuned right.
+    One channel, mirroring `lookup.router._project_inflight_capped`:
+    `sentry_sdk.set_tag("lml.streaming_check.inflight_capped", "true")` -- the
+    filterable engagement flag, set only on requests that found the cap
+    saturated.
 
     Observability must not break the request path; failures log and continue.
     """
-    with observability_guard("project inflight_capped onto Sentry transaction", logger):
-        project_capped(
-            "lml.streaming_check.inflight_capped",
-            "lml.streaming_check.inflight_wait_ms",
-            wait_ms,
-            also_set_data=False,
-        )
+    with observability_guard("tag inflight_capped onto Sentry scope", logger):
+        project_capped("lml.streaming_check.inflight_capped")
 
 
 def _summary_properties(
@@ -250,11 +238,10 @@ async def handle_streaming_check(
     # `acquire()` uses to decide whether to park.
     semaphore = _get_streaming_check_semaphore()
     capped_on_arrival = semaphore.locked()
-    wait_start = time.perf_counter()
 
     async with semaphore:
         if capped_on_arrival:
-            _project_inflight_capped((time.perf_counter() - wait_start) * 1000.0)
+            _project_inflight_capped()
 
         try:
             with telemetry.track_step("availability"):

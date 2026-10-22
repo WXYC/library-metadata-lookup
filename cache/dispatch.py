@@ -11,19 +11,6 @@ itself does not gate concurrency — Discogs work goes through
 ``discogs/ratelimit.py``'s per-event-loop semaphore + rate limiter
 (inherited for free via ``DiscogsService.get_release`` /
 ``DiscogsService.get_artist_details``).
-
-Sentry spans:
-
-- ``cache.refresh.identity`` — one span per identity_id, attributes set at
-  span open.
-- ``cache.refresh.release`` — one span per (identity_id, source) release leg.
-- ``cache.refresh.artist`` — one span per (identity_id, source, artist_id)
-  walk target.
-
-Attribute naming mirrors BS#1081's convention: numeric attributes
-(``identity_id``, ``external_id`` when integer-shaped) go on
-``span.set_data`` immediately after open, never via late binding through a
-helper. String attributes follow the same shape for symmetry.
 """
 
 from __future__ import annotations
@@ -31,8 +18,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import TYPE_CHECKING
-
-import sentry_sdk
 
 from cache.models import (
     ArtistRefreshOutcome,
@@ -191,57 +176,51 @@ async def _refresh_discogs_artist(
     discogs_service: DiscogsService, artist_id: int
 ) -> ArtistRefreshOutcome:
     """Run the Discogs artist leg for a single walk target."""
-    with sentry_sdk.start_span(op="cache.refresh.artist", name=f"discogs:{artist_id}") as span:
-        span.set_data("lml.cache.source", "discogs")
-        span.set_data("lml.cache.external_id", artist_id)
-        try:
-            await discogs_service.get_artist_details(artist_id)
-        except asyncio.CancelledError:
-            raise
-        except BreakerOpenError as exc:
-            # LML#1118 FIX 2: widened from ``DiscogsBreakerOpenError`` to the
-            # shared ``BreakerOpenError`` base -- same reason as the release
-            # leg above (``_refresh_discogs_release``): the generic ``except
-            # Exception`` below already tags ``message=type(exc).__name__``,
-            # so this arm's own ``type(exc).__name__`` tag produces
-            # byte-identical output for a Discogs shed while closing the gap
-            # for every other shed reachable today or later.
-            # LML#1049: ``get_artist_details`` now re-raises a saturation-breaker
-            # shed (mirroring ``get_release``'s LML#755 FIX-1, propagated to this
-            # walk-to-artist leg the same way ``_refresh_discogs_release`` above
-            # already handles the release leg — LML#814). Without this dedicated
-            # arm the shed would fall into the generic ``except Exception`` below
-            # and log at ERROR via ``logger.exception``, reproducing the #755
-            # Sentry flood (the Sentry LoggingIntegration promotes each such
-            # record to a discrete event) on this cron-driven fan-out.
-            #
-            # A shed is expected degrade: log at DEBUG and record the retriable
-            # ``error`` outcome, tagged with the breaker exception name so a
-            # dashboard can tell it apart from a hard leg failure — same shape as
-            # the release leg. Nothing negative is persisted: ``get_artist_details``
-            # re-raised before any tombstone/write-back (LML#1049 FIX 1), and this
-            # dispatcher only reports outcomes, it does not cache.
-            logger.debug(
-                "cache refresh: discogs artist leg shed by saturation breaker "
-                "artist_id=%d; recording retriable error (cache-only)",
-                artist_id,
-            )
-            span.set_data("lml.cache.outcome", "error")
-            return ArtistRefreshOutcome(
-                external_id=str(artist_id),
-                outcome="error",
-                message=type(exc).__name__,
-            )
-        except Exception as exc:
-            logger.exception("cache refresh: discogs artist leg failed artist_id=%d", artist_id)
-            span.set_data("lml.cache.outcome", "error")
-            return ArtistRefreshOutcome(
-                external_id=str(artist_id),
-                outcome="error",
-                message=type(exc).__name__,
-            )
-        span.set_data("lml.cache.outcome", "success")
-        return ArtistRefreshOutcome(external_id=str(artist_id), outcome="success")
+    try:
+        await discogs_service.get_artist_details(artist_id)
+    except asyncio.CancelledError:
+        raise
+    except BreakerOpenError as exc:
+        # LML#1118 FIX 2: widened from ``DiscogsBreakerOpenError`` to the
+        # shared ``BreakerOpenError`` base -- same reason as the release
+        # leg above (``_refresh_discogs_release``): the generic ``except
+        # Exception`` below already tags ``message=type(exc).__name__``,
+        # so this arm's own ``type(exc).__name__`` tag produces
+        # byte-identical output for a Discogs shed while closing the gap
+        # for every other shed reachable today or later.
+        # LML#1049: ``get_artist_details`` now re-raises a saturation-breaker
+        # shed (mirroring ``get_release``'s LML#755 FIX-1, propagated to this
+        # walk-to-artist leg the same way ``_refresh_discogs_release`` above
+        # already handles the release leg — LML#814). Without this dedicated
+        # arm the shed would fall into the generic ``except Exception`` below
+        # and log at ERROR via ``logger.exception``, reproducing the #755
+        # Sentry flood (the Sentry LoggingIntegration promotes each such
+        # record to a discrete event) on this cron-driven fan-out.
+        #
+        # A shed is expected degrade: log at DEBUG and record the retriable
+        # ``error`` outcome, tagged with the breaker exception name so a
+        # dashboard can tell it apart from a hard leg failure — same shape as
+        # the release leg. Nothing negative is persisted: ``get_artist_details``
+        # re-raised before any tombstone/write-back (LML#1049 FIX 1), and this
+        # dispatcher only reports outcomes, it does not cache.
+        logger.debug(
+            "cache refresh: discogs artist leg shed by saturation breaker "
+            "artist_id=%d; recording retriable error (cache-only)",
+            artist_id,
+        )
+        return ArtistRefreshOutcome(
+            external_id=str(artist_id),
+            outcome="error",
+            message=type(exc).__name__,
+        )
+    except Exception as exc:
+        logger.exception("cache refresh: discogs artist leg failed artist_id=%d", artist_id)
+        return ArtistRefreshOutcome(
+            external_id=str(artist_id),
+            outcome="error",
+            message=type(exc).__name__,
+        )
+    return ArtistRefreshOutcome(external_id=str(artist_id), outcome="success")
 
 
 # Sources for which the release leg has no PG-backed cache today. Returning
@@ -279,48 +258,41 @@ async def _dispatch_source(
     bandcamp_client: BandcampClient | None = None,
 ) -> SourceRefreshOutcome:
     """Run the release leg for one source and walk its artists if any."""
-    with sentry_sdk.start_span(op="cache.refresh.release", name=f"{source}:{external_id}") as span:
-        span.set_data("lml.cache.identity_id", identity_id)
-        span.set_data("lml.cache.source", source)
-        span.set_data("lml.cache.external_id", external_id)
 
-        if source == "discogs_release":
-            release, outcome = await _refresh_discogs_release(discogs_service, external_id)
-            span.set_data("lml.cache.release_outcome", outcome.release_outcome)
-            # Walk artists only if the release leg succeeded AND yielded a
-            # non-None record. Tombstones (success with release=None) walk
-            # nothing — empty artists list.
-            if outcome.release_outcome == "success" and release is not None:
-                artist_ids = extract_discogs_artist_ids(release)
-                # Sequential walks within a single release — the per-replica
-                # Discogs semaphore + rate limiter cap is in `discogs/ratelimit`
-                # and applies through `get_artist_details`. Parallelizing here
-                # would queue against the same gates and gain nothing.
-                outcome.artists = [
-                    await _refresh_discogs_artist(discogs_service, artist_id)
-                    for artist_id in artist_ids
-                ]
-            return outcome
+    if source == "discogs_release":
+        release, outcome = await _refresh_discogs_release(discogs_service, external_id)
+        # Walk artists only if the release leg succeeded AND yielded a
+        # non-None record. Tombstones (success with release=None) walk
+        # nothing — empty artists list.
+        if outcome.release_outcome == "success" and release is not None:
+            artist_ids = extract_discogs_artist_ids(release)
+            # Sequential walks within a single release — the per-replica
+            # Discogs semaphore + rate limiter cap is in `discogs/ratelimit`
+            # and applies through `get_artist_details`. Parallelizing here
+            # would queue against the same gates and gain nothing.
+            outcome.artists = [
+                await _refresh_discogs_artist(discogs_service, artist_id)
+                for artist_id in artist_ids
+            ]
+        return outcome
 
-        if source in _NOT_IMPLEMENTED_SOURCES:
-            outcome = SourceRefreshOutcome(release_outcome="not_implemented")
-            span.set_data("lml.cache.release_outcome", "not_implemented")
-            return outcome
+    if source in _NOT_IMPLEMENTED_SOURCES:
+        outcome = SourceRefreshOutcome(release_outcome="not_implemented")
+        return outcome
 
-        # Future-proofing: an unknown source key from the store should be
-        # logged so a schema/dispatcher drift surfaces at the leg level
-        # rather than corrupting the per-id rollup. Treat as not_implemented
-        # (most conservative — no API call, no false-success signal).
-        logger.warning(
-            "cache refresh: unknown source=%r for identity_id=%d; treating as not_implemented",
-            source,
-            identity_id,
-        )
-        span.set_data("lml.cache.release_outcome", "not_implemented")
-        return SourceRefreshOutcome(
-            release_outcome="not_implemented",
-            message=f"unknown source: {source!r}",
-        )
+    # Future-proofing: an unknown source key from the store should be
+    # logged so a schema/dispatcher drift surfaces at the leg level
+    # rather than corrupting the per-id rollup. Treat as not_implemented
+    # (most conservative — no API call, no false-success signal).
+    logger.warning(
+        "cache refresh: unknown source=%r for identity_id=%d; treating as not_implemented",
+        source,
+        identity_id,
+    )
+    return SourceRefreshOutcome(
+        release_outcome="not_implemented",
+        message=f"unknown source: {source!r}",
+    )
 
 
 async def refresh_identity(
@@ -369,25 +341,21 @@ async def refresh_identity(
         when there is no entity.release_identity row at all and is NOT a
         possible value here.
     """
-    with sentry_sdk.start_span(op="cache.refresh.identity", name=str(identity_id)) as span:
-        span.set_data("lml.cache.identity_id", identity_id)
-        span.set_data("lml.cache.source_count", len(source_pairs))
 
-        sources: dict[str, SourceRefreshOutcome] = {}
-        for source, external_id in source_pairs:
-            sources[source] = await _dispatch_source(
-                discogs_service,
-                identity_id,
-                source,
-                external_id,
-                mb_pg=mb_pg,
-                spotify_client=spotify_client,
-                apple_music_client=apple_music_client,
-                bandcamp_client=bandcamp_client,
-            )
+    sources: dict[str, SourceRefreshOutcome] = {}
+    for source, external_id in source_pairs:
+        sources[source] = await _dispatch_source(
+            discogs_service,
+            identity_id,
+            source,
+            external_id,
+            mb_pg=mb_pg,
+            spotify_client=spotify_client,
+            apple_music_client=apple_music_client,
+            bandcamp_client=bandcamp_client,
+        )
 
-        status = compute_per_id_status(sources)
-        span.set_data("lml.cache.status", status)
+    status = compute_per_id_status(sources)
 
     return CacheRefreshResultItem(
         identity_id=identity_id,

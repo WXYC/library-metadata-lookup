@@ -83,15 +83,13 @@ def is_shed_enforced() -> bool:
     return resolve_bool_env(ADMISSION_SHED_ENFORCE_ENV_VAR, default=False)
 
 
-def project_admission_shed_telemetry(*, enforced: bool, lag_ms: float) -> None:
+def project_admission_shed_telemetry(*, enforced: bool) -> None:
     """Project a would-shed admission decision onto Sentry + cache_stats (LML#930).
 
     Called only when :func:`should_shed_low_priority_tail` returned True
-    (shadow or enforce). Two-channel shape (#683 — ``set_data`` alone is
-    unqueryable in the spans/metrics datasets): tags
+    (shadow or enforce). Two channels: tags
     ``lml.admission.would_shed`` / ``lml.admission.enforced`` (would-shed
-    rate, sliced by shadow-vs-actually-shed), measurement
-    ``lml.admission.loop_lag_ms`` (flood magnitude at the decision), and the
+    rate, sliced by shadow-vs-actually-shed) and the
     cache-stats counter :data:`ADMISSION_WOULD_SHED_STAT_KEY` (alertable
     baseline series, seeded 0).
 
@@ -102,11 +100,8 @@ def project_admission_shed_telemetry(*, enforced: bool, lag_ms: float) -> None:
     try:
         sentry_sdk.set_tag("lml.admission.would_shed", "true")
         sentry_sdk.set_tag("lml.admission.enforced", "true" if enforced else "false")
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_measurement("lml.admission.loop_lag_ms", round(lag_ms, 2))
     except Exception as e:
-        logger.warning("Failed to project admission-shed telemetry onto Sentry transaction: %s", e)
+        logger.warning("Failed to project admission-shed telemetry onto Sentry scope: %s", e)
     try:
         get_cache_stats_recorder().record(ADMISSION_WOULD_SHED_STAT_KEY, 1)
     except Exception as e:
@@ -138,7 +133,7 @@ def evaluate_admission_shed(*, low_priority: bool, lag_ms: float | None) -> Degr
     # runtime contract.
     assert lag_ms is not None
     enforced = is_shed_enforced()
-    project_admission_shed_telemetry(enforced=enforced, lag_ms=lag_ms)
+    project_admission_shed_telemetry(enforced=enforced)
     logger.debug(
         "Admission shed predicate held (loop lag %.1fms > %dms threshold); enforced=%s",
         lag_ms,

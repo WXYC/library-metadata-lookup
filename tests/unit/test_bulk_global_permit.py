@@ -10,7 +10,7 @@ test module.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -107,35 +107,23 @@ class TestBulkGlobalPermitSizing:
 class TestGlobalPermitTelemetry:
     """Capped acquires must be queryable in Sentry (the LML#683 lesson).
 
-    Mirrors the #714 `lml.lookup.inflight_capped` / `inflight_wait_ms` pair:
-    a filterable tag for "this request queued on the global budget" plus a
-    quantitative wait measurement for tuning the knob. ``set_data`` alone is
-    unqueryable in the spans dataset.
+    Mirrors the #714 `lml.lookup.inflight_capped` tag: a filterable tag for
+    "this request queued on the global budget".
     """
 
-    @staticmethod
-    def _sentry_mocks():
-        from unittest.mock import Mock
-
-        transaction = Mock()
-        scope = Mock()
-        scope.transaction = transaction
-        return transaction, scope, Mock()
-
     @pytest.mark.asyncio
-    async def test_capped_acquire_sets_tag_and_wait_measurement(self, monkeypatch):
+    async def test_capped_acquire_sets_tag(self, monkeypatch):
         monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "1")
 
         from core import bulk_concurrency as bc
 
-        transaction, scope, set_tag = self._sentry_mocks()
+        set_tag = Mock()
 
         async def _second_holder(release: asyncio.Event):
             async with bc.acquire_bulk_global_permit():
                 release.set()
 
         with (
-            patch.object(bc.sentry_sdk, "get_current_scope", return_value=scope),
             patch.object(bc.sentry_sdk, "set_tag", set_tag),
         ):
             release = asyncio.Event()
@@ -167,34 +155,20 @@ class TestGlobalPermitTelemetry:
             c for c in set_tag.call_args_list if c.args == ("lml.bulk.global_capped", "true")
         ]
         assert len(capped_tags) == 1
-        wait_measurements = [
-            c
-            for c in transaction.set_measurement.call_args_list
-            if c.args[0] == "lml.bulk.global_wait_ms"
-        ]
-        assert len(wait_measurements) == 1
-        assert wait_measurements[0].args[1] > 0
 
     @pytest.mark.asyncio
-    async def test_uncontended_acquire_sets_no_tag_or_measurement(self, monkeypatch):
+    async def test_uncontended_acquire_sets_no_tag(self, monkeypatch):
         monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "4")
 
         from core import bulk_concurrency as bc
 
-        transaction, scope, set_tag = self._sentry_mocks()
+        set_tag = Mock()
 
-        with (
-            patch.object(bc.sentry_sdk, "get_current_scope", return_value=scope),
-            patch.object(bc.sentry_sdk, "set_tag", set_tag),
-        ):
+        with patch.object(bc.sentry_sdk, "set_tag", set_tag):
             async with bc.acquire_bulk_global_permit():
                 pass
 
         assert not any(c.args[0] == "lml.bulk.global_capped" for c in set_tag.call_args_list)
-        assert not any(
-            c.args[0] == "lml.bulk.global_wait_ms"
-            for c in transaction.set_measurement.call_args_list
-        )
 
 
 class TestCrossEndpointBudgetSharing:

@@ -11,7 +11,7 @@ the admission-control AC test live in ``tests/unit/test_orchestrator.py``.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
@@ -89,45 +89,25 @@ class TestIsShedEnforced:
 
 
 class TestProjectAdmissionShedTelemetry:
-    def test_sets_tags_and_measurement_on_would_shed(self):
-        txn = MagicMock()
-        with (
-            patch("lookup.admission.sentry_sdk.set_tag") as set_tag,
-            patch(
-                "lookup.admission.sentry_sdk.get_current_scope",
-                return_value=MagicMock(transaction=txn),
-            ),
-        ):
-            project_admission_shed_telemetry(enforced=True, lag_ms=734.5)
+    def test_sets_tags_on_would_shed(self):
+        with patch("lookup.admission.sentry_sdk.set_tag") as set_tag:
+            project_admission_shed_telemetry(enforced=True)
 
         tags = {c.args[0]: c.args[1] for c in set_tag.call_args_list}
         assert tags["lml.admission.would_shed"] == "true"
         assert tags["lml.admission.enforced"] == "true"
-        txn.set_measurement.assert_called_once_with("lml.admission.loop_lag_ms", 734.5)
 
     def test_enforced_false_tags_correctly(self):
-        with (
-            patch("lookup.admission.sentry_sdk.set_tag") as set_tag,
-            patch(
-                "lookup.admission.sentry_sdk.get_current_scope",
-                return_value=MagicMock(transaction=None),
-            ),
-        ):
-            project_admission_shed_telemetry(enforced=False, lag_ms=600.0)
+        with patch("lookup.admission.sentry_sdk.set_tag") as set_tag:
+            project_admission_shed_telemetry(enforced=False)
 
         tags = {c.args[0]: c.args[1] for c in set_tag.call_args_list}
         assert tags["lml.admission.enforced"] == "false"
 
     def test_bumps_would_shed_cache_stats_counter(self):
         init_cache_stats(extra_keys=(ADMISSION_WOULD_SHED_STAT_KEY,))
-        with (
-            patch("lookup.admission.sentry_sdk.set_tag"),
-            patch(
-                "lookup.admission.sentry_sdk.get_current_scope",
-                return_value=MagicMock(transaction=None),
-            ),
-        ):
-            project_admission_shed_telemetry(enforced=False, lag_ms=600.0)
+        with patch("lookup.admission.sentry_sdk.set_tag"):
+            project_admission_shed_telemetry(enforced=False)
 
         assert get_cache_stats()[ADMISSION_WOULD_SHED_STAT_KEY] == 1
 
@@ -137,7 +117,7 @@ class TestProjectAdmissionShedTelemetry:
         counter from recording."""
         init_cache_stats(extra_keys=(ADMISSION_WOULD_SHED_STAT_KEY,))
         with patch("lookup.admission.sentry_sdk.set_tag", side_effect=RuntimeError("boom")):
-            project_admission_shed_telemetry(enforced=False, lag_ms=600.0)  # must not raise
+            project_admission_shed_telemetry(enforced=False)  # must not raise
 
         assert get_cache_stats()[ADMISSION_WOULD_SHED_STAT_KEY] == 1
 
@@ -147,15 +127,11 @@ class TestProjectAdmissionShedTelemetry:
         with (
             patch("lookup.admission.sentry_sdk.set_tag") as set_tag,
             patch(
-                "lookup.admission.sentry_sdk.get_current_scope",
-                return_value=MagicMock(transaction=None),
-            ),
-            patch(
                 "lookup.admission.get_cache_stats_recorder",
                 side_effect=RuntimeError("recorder boom"),
             ),
         ):
-            project_admission_shed_telemetry(enforced=True, lag_ms=600.0)  # must not raise
+            project_admission_shed_telemetry(enforced=True)  # must not raise
 
         assert ("lml.admission.would_shed", "true") in [c.args for c in set_tag.call_args_list]
 
@@ -176,7 +152,7 @@ class TestEvaluateAdmissionShed:
             result = evaluate_admission_shed(low_priority=True, lag_ms=900.0)
 
         assert result == DegradedReason.cache_only
-        project.assert_called_once_with(enforced=True, lag_ms=900.0)
+        project.assert_called_once_with(enforced=True)
 
     def test_would_shed_and_shadow_returns_none_and_tags_enforced_false(self, monkeypatch):
         monkeypatch.delenv(ADMISSION_SHED_ENFORCE_ENV_VAR, raising=False)
@@ -184,7 +160,7 @@ class TestEvaluateAdmissionShed:
             result = evaluate_admission_shed(low_priority=True, lag_ms=900.0)
 
         assert result is None
-        project.assert_called_once_with(enforced=False, lag_ms=900.0)
+        project.assert_called_once_with(enforced=False)
 
     @pytest.mark.parametrize(
         "low_priority,lag_ms",
