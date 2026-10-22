@@ -577,28 +577,6 @@ class TestFindAlbumMatch:
         assert match is not None
         assert match.url.endswith("/456")
 
-    @pytest.mark.asyncio
-    async def test_emits_apple_music_service_for_album_winner(self, es256_keypair):
-        """LML#592: the album surface must label its telemetry with
-        service="apple_music", like the track surface does. ``find_album_match``
-        routes through the shared ``find_best_source_match`` chokepoint, whose
-        ``service`` kwarg defaults to "unknown" — Apple must pass its own label
-        so its album matches aren't misattributed to the "unknown" bucket in the
-        per-service marginal-clear breakdown. Patches the matching-module seam
-        because the album emit fires from inside ``find_best_source_match``, not
-        from the apple_music-level import the track path uses.
-        """
-        client = _client(es256_keypair)
-        client.search_album = AsyncMock(return_value=[_make_album_data()])
-
-        with patch("clients.streaming.matching.record_match_telemetry") as rec:
-            match = await client.find_album_match("Stereolab", "Aluminum Tunes")
-
-        assert match is not None
-        rec.assert_called_once()
-        assert rec.call_args.kwargs["service"] == "apple_music"
-        assert rec.call_args.kwargs["surface"] == "album"
-
 
 def _make_song_data_full(
     name: str = "Hebebeb (Zrag)",
@@ -1389,50 +1367,6 @@ class TestFindTrackMetadataVaArtistAxis:
         assert match is not None
         assert match.url == "https://music.apple.com/us/song/duke-of-earl/222"
 
-    @pytest.mark.asyncio
-    async def test_album_less_va_win_emits_track_album_less_surface(self, es256_keypair):
-        """LML#1139 telemetry split: an album-less request that WINS records
-        ``track_album_less``, not ``track``. Before the split the two were
-        conflated, which is why the album-less V/A population could not be sized
-        in the 30d sample that motivated this guard."""
-        client = _client(es256_keypair)
-        real_artist = _make_song_data(
-            name="la paradoja",
-            artist_name="Juana Molina",
-            album_name="DOGA",
-            url="https://music.apple.com/us/song/la-paradoja/321",
-        )
-        mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_songs_response([real_artist]))
-        client._http = mock_http
-
-        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
-            match = await client.find_track_metadata("Juana Molina", "la paradoja", album=None)
-
-        assert match is not None
-        assert rec.call_args.kwargs["surface"] == "track_album_less"
-
-    @pytest.mark.asyncio
-    async def test_album_constrained_win_still_emits_plain_track_surface(self, es256_keypair):
-        """The complement: a constrained win keeps ``track``, which now means
-        strictly "the album-constrained pass supplied the winner"."""
-        client = _client(es256_keypair)
-        real_artist = _make_song_data(
-            name="la paradoja",
-            artist_name="Juana Molina",
-            album_name="DOGA",
-            url="https://music.apple.com/us/song/la-paradoja/321",
-        )
-        mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_songs_response([real_artist]))
-        client._http = mock_http
-
-        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
-            match = await client.find_track_metadata("Juana Molina", "la paradoja", album="DOGA")
-
-        assert match is not None
-        assert rec.call_args.kwargs["surface"] == "track"
-
 
 class TestFindTrackMetadataAlbumSubsetInflation:
     """LML#721: the album axis inside ``find_track_metadata`` shares the same
@@ -1527,148 +1461,6 @@ class TestFindTrackMetadataAlbumSubsetInflation:
         assert match is not None
         assert match.url == "https://music.apple.com/us/song/glosoli/902"
         assert match.album_verified is False
-
-
-class TestFindTrackMetadataEmits:
-    """LML#592: the Apple track probe (``token_set_ratio``) emits match
-    telemetry for the winner under ``surface="track"``.
-
-    This path inlines its own floor and never calls the shared predicate, so
-    it must be instrumented separately. ``record_match_telemetry`` itself is
-    unit-tested in test_streaming_matching.py; here we pin the WIRING — that
-    the track path calls it once, with surface/service set and the *chosen*
-    winner's per-axis scores.
-    """
-
-    @pytest.mark.asyncio
-    async def test_emits_marginal_clear_for_track_winner(self, es256_keypair):
-        client = _client(es256_keypair)
-        # Request artist "Wand" / song "la paradoja" / album "DOGA"; Apple
-        # returns "Wanda" — token_set_ratio("wand","wanda") == 88.89 (marginal).
-        # The song title matches exactly (track axis 100) while album_name
-        # "DOGAS" is a deliberate near-miss to "DOGA" (88.89 — clears the 80
-        # floor but stays below the 95 high-title band). Keeping the track and
-        # album scores distinct pins that the emitted title_score is the *track*
-        # axis: a regression that emitted album_score instead would drop to
-        # 88.89 and fail the >= 95 assertion below.
-        mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(
-            return_value=_songs_response(
-                [_make_song_data(name="la paradoja", artist_name="Wanda", album_name="DOGAS")]
-            )
-        )
-        client._http = mock_http
-
-        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
-            match = await client.find_track_metadata("Wand", "la paradoja", album="DOGA")
-
-        assert match is not None  # still clears — this PR instruments, it does not reject
-        rec.assert_called_once()
-        kwargs = rec.call_args.kwargs
-        assert kwargs["surface"] == "track"
-        assert kwargs["service"] == "apple_music"
-        assert 80.0 <= kwargs["artist_score"] < 90.0  # marginal artist axis
-        assert kwargs["title_score"] >= 95.0  # high title axis (the track, not the album)
-        # LML#592 labeling: request value + chosen-winner's value, so this
-        # marginal track clear can be hand-labeled. Matched strings come from
-        # the chosen record's attributes, query strings from the request args.
-        assert kwargs["query_artist"] == "Wand"
-        assert kwargs["matched_artist"] == "Wanda"
-        assert kwargs["query_title"] == "la paradoja"
-        assert kwargs["matched_title"] == "la paradoja"
-
-    @pytest.mark.asyncio
-    async def test_whitespace_album_emits_album_less_track_surface(self, es256_keypair):
-        """A whitespace-only album normalizes to ``""`` — no scoreable
-        constraint. It must take the album-less path directly (one scoring
-        pass), not run a guaranteed-miss constrained pass and mislabel the
-        winner ``"track_album_fallback"`` — that would inflate the LML#592
-        fallback-rate dashboard with requests that were never album-constrained
-        to begin with.
-
-        LML#1139 sharpened the label this asserts: album-less wins now record
-        ``"track_album_less"`` rather than sharing ``"track"`` with genuine
-        album-constrained wins. That serves this test's original intent more
-        precisely — the point was always that a never-constrained request must
-        not be filed under a constrained surface, and ``"track"`` was itself
-        doing exactly that until the third value existed."""
-        client = _client(es256_keypair)
-        mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_songs_response([_make_song_data_full()]))
-        client._http = mock_http
-
-        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
-            match = await client.find_track_metadata(
-                "Noura Mint Seymali", "Hebebeb (Zrag)", album="   "
-            )
-
-        assert match is not None
-        assert match.artwork_url is None
-        assert match.release_year is None
-        assert match.album_verified is False
-        rec.assert_called_once()
-        assert rec.call_args.kwargs["surface"] == "track_album_less"
-
-    @pytest.mark.asyncio
-    async def test_emits_scores_of_chosen_winner_not_top_fuzz(self, es256_keypair):
-        """``best = best_with_artwork or best_overall`` — the emitted scores
-        must describe the CHOSEN winner (artwork-preferred), not the
-        higher-fuzz artworkless record. Guards the lockstep-stash fix."""
-        client = _client(es256_keypair)
-        # A: exact artist, NO artwork -> higher combined -> best_overall.
-        a = _make_song_data(
-            name="la paradoja",
-            artist_name="Wand",
-            album_name="DOGA",
-            url="https://music.apple.com/us/song/a/1",
-        )
-        # B: marginal artist, WITH artwork -> best_with_artwork -> chosen as best.
-        # B's album_name "DOGAS" is a deliberate near-miss (album axis 88.89)
-        # while its track title matches exactly (track axis 100), so the title
-        # assertion below pins the *track* axis of the chosen winner.
-        b = _make_song_data_full(
-            name="la paradoja",
-            artist_name="Wanda",
-            album_name="DOGAS",
-            url="https://music.apple.com/us/song/b/2",
-        )
-        mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_songs_response([a, b]))
-        client._http = mock_http
-
-        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
-            match = await client.find_track_metadata("Wand", "la paradoja", album="DOGA")
-
-        assert match is not None
-        assert match.url.endswith("/b/2")  # artwork-preferred winner chosen
-        # Emitted artist score is B's marginal 88.89, NOT A's exact 100.0.
-        assert 80.0 <= rec.call_args.kwargs["artist_score"] < 90.0
-        # Emitted title score is B's track axis (la paradoja == 100), NOT B's
-        # album axis (DOGA vs DOGAS == 88.89) — pins (artist, track) lockstep.
-        assert rec.call_args.kwargs["title_score"] >= 95.0
-
-    @pytest.mark.asyncio
-    async def test_fallback_winner_emits_distinct_surface(self, es256_keypair):
-        """LML#782: a winner selected by the album-less fallback re-score
-        emits ``surface="track_album_fallback"`` — exactly one call,
-        because the album-constrained pass chose no winner and so emitted
-        nothing. The distinct surface lets LML#592 dashboards track the
-        fallback rate separately from ordinary track wins."""
-        client = _client(es256_keypair)
-        mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(
-            return_value=_songs_response([_make_song_data(album_name="Some Unrelated Compilation")])
-        )
-        client._http = mock_http
-
-        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
-            match = await client.find_track_metadata(
-                "Jessica Pratt", "Back, Baby", album="On Your Own Love Again"
-            )
-
-        assert match is not None
-        rec.assert_called_once()
-        assert rec.call_args.kwargs["surface"] == "track_album_fallback"
 
 
 class TestRetryBehavior:
@@ -1838,7 +1630,6 @@ class TestErrorHandling:
         client._http = mock_http
 
         with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
-            mock_sentry.start_span.return_value.__enter__.return_value = MagicMock()
             results = await client.search_song("Stereolab", "Aluminum Tunes")
 
         assert results == []
@@ -1846,9 +1637,7 @@ class TestErrorHandling:
 
 
 class TestObservability:
-    """O3: every call lives in a dedicated `apple_music.search` child span;
-    `.status` and `.result` are set on that span (LML#213 wrap-at-chokepoint).
-    capture_exception preserves the stack on the error path; capture_message
+    """capture_exception preserves the stack on the error path; capture_message
     fires on terminal non-200."""
 
     @pytest.mark.asyncio
@@ -1861,45 +1650,9 @@ class TestObservability:
         client._http = mock_http
 
         with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
-            mock_span = MagicMock()
-            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
             await client.search_song("Stereolab", "Aluminum Tunes")
 
         mock_sentry.capture_message.assert_called_once()
-        set_data_calls = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
-        assert set_data_calls.get("apple_music.search.status") == 403
-        assert set_data_calls.get("apple_music.search.result") == "403"
-
-    @pytest.mark.asyncio
-    async def test_hit_projects_result_onto_span(self, es256_keypair):
-        client = _client(es256_keypair)
-        mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_songs_response([_make_song_data()]))
-        client._http = mock_http
-
-        with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
-            mock_span = MagicMock()
-            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
-            await client.search_song("Jessica Pratt", "Back, Baby")
-
-        set_data_calls = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
-        assert set_data_calls.get("apple_music.search.status") == 200
-        assert set_data_calls.get("apple_music.search.result") == "hit"
-
-    @pytest.mark.asyncio
-    async def test_empty_results_projects_miss(self, es256_keypair):
-        client = _client(es256_keypair)
-        mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_songs_response([]))
-        client._http = mock_http
-
-        with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
-            mock_span = MagicMock()
-            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
-            await client.search_song("Jessica Pratt", "Back, Baby")
-
-        set_data_calls = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
-        assert set_data_calls.get("apple_music.search.result") == "miss"
 
     @pytest.mark.asyncio
     async def test_network_error_captures_exception_with_stack(self, es256_keypair):
@@ -1912,7 +1665,6 @@ class TestObservability:
         client._http = mock_http
 
         with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
-            mock_sentry.start_span.return_value.__enter__.return_value = MagicMock()
             await client.search_song("Stereolab", "Aluminum Tunes")
 
         mock_sentry.capture_exception.assert_called_once()
@@ -1929,10 +1681,9 @@ class TestObservability:
         client._http = mock_http
 
         with (
-            patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry,
+            patch("clients.streaming.apple_music.sentry_sdk"),
             patch("clients.streaming.apple_music.capture_posthog_exception") as mock_posthog,
         ):
-            mock_sentry.start_span.return_value.__enter__.return_value = MagicMock()
             await client.search_song("Stereolab", "Aluminum Tunes")
 
         mock_posthog.assert_called_once_with(error)
@@ -1956,8 +1707,7 @@ class TestObservability:
         root = logging.getLogger()
         root.addHandler(handler)
         try:
-            with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
-                mock_sentry.start_span.return_value.__enter__.return_value = MagicMock()
+            with patch("clients.streaming.apple_music.sentry_sdk"):
                 await client.search_song("Stereolab", "Aluminum Tunes")
         finally:
             root.removeHandler(handler)

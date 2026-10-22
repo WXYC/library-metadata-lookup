@@ -53,7 +53,6 @@ from clients.streaming.matching import (
     SCORE_MATCH_ACCEPTANCE_FLOOR,
     album_subset_is_degenerate,
     find_best_source_match,
-    record_match_telemetry,
     title_subset_is_degenerate,
     va_artist_axis_is_uninformative,
 )
@@ -249,43 +248,25 @@ class AppleMusicClient(BaseStreamingClient):
     async def _search(self, artist: str, term: str, *, types: str, result_key: str) -> list[dict]:
         """Issue a signed search request and return the typed `data` list.
 
-        Wraps the call in a dedicated `apple_music.search` child span so
-        concurrent searches don't overwrite each other's status/result
-        attributes on the root transaction (LML#213 wrap-at-chokepoint
-        pattern). Non-200s + exceptions log + `capture_exception`/`capture_message`
+        Non-200s + exceptions log + `capture_exception`/`capture_message`
         so the silent-failure mode the old iTunes path exhibited (LML#444)
         cannot recur.
 
         Retries 429 (honoring `Retry-After`) and transient 5xx with
         exponential backoff. All other non-200s return `[]` after one attempt.
         """
-        with sentry_sdk.start_span(op="apple_music.search", name=types) as span:
-            try:
-                async with self._semaphore:
-                    data, last_status = await self._search_with_retry(
-                        artist, term, types=types, result_key=result_key, span=span
-                    )
-            except Exception as exc:
-                logger.exception("Apple Music search raised for %s - %s", artist, term)
-                span.set_data("apple_music.search.result", "error")
-                sentry_sdk.capture_exception()
-                capture_posthog_exception(exc)
-                return []
-
-            # `result` is the chokepoint signal Sentry dashboards filter on.
-            # Hit/miss only make sense for the 200 path; non-200 statuses
-            # carry the failure mode directly so a `result:403` query
-            # surfaces auth outages distinctly from genuine catalog misses.
-            if last_status == 200:
-                span.set_data("apple_music.search.result", "hit" if data else "miss")
-            else:
-                span.set_data(
-                    "apple_music.search.result",
-                    f"retries_exhausted_{last_status}"
-                    if last_status in _RETRYABLE_STATUSES
-                    else str(last_status),
+        try:
+            async with self._semaphore:
+                data, _ = await self._search_with_retry(
+                    artist, term, types=types, result_key=result_key
                 )
-            return data
+        except Exception as exc:
+            logger.exception("Apple Music search raised for %s - %s", artist, term)
+            sentry_sdk.capture_exception()
+            capture_posthog_exception(exc)
+            return []
+
+        return data
 
     async def _search_with_retry(
         self,
@@ -294,7 +275,6 @@ class AppleMusicClient(BaseStreamingClient):
         *,
         types: str,
         result_key: str,
-        span: sentry_sdk.tracing.Span,
     ) -> tuple[list[dict], int | None]:
         """Single-attempt fetch with 429/5xx retry.
 
@@ -302,8 +282,7 @@ class AppleMusicClient(BaseStreamingClient):
         on 200, ``[]`` on any non-200 outcome. ``last_status`` is the last
         HTTP status code observed (None only if a transport exception was
         raised inside the outer try/except). The caller decides what
-        observability marker to project — this layer only sets ``status``
-        on the span.
+        observability marker to project.
         """
         http = await self._get_client()
         last_status: int | None = None
@@ -317,7 +296,6 @@ class AppleMusicClient(BaseStreamingClient):
                 headers={"Authorization": f"Bearer {token}"},
             )
             last_status = resp.status_code
-            span.set_data("apple_music.search.status", resp.status_code)
 
             if resp.status_code == 200:
                 # `resp.json()` can raise on a 200-with-non-JSON body (CDN
@@ -471,7 +449,7 @@ class AppleMusicClient(BaseStreamingClient):
         # be mislabeled ``track_album_fallback`` in LML#592 telemetry.
         norm_album = (normalize_for_comparison(album) or None) if album else None
 
-        best, (artist_axis, track_axis) = _select_best_track_candidate(
+        best, _ = _select_best_track_candidate(
             results,
             norm_artist=norm_artist,
             norm_song=norm_song,
@@ -504,7 +482,7 @@ class AppleMusicClient(BaseStreamingClient):
         # URL — the issue's "URL beats null" call, accepted knowingly.
         album_fallback = False
         if best is None and norm_album is not None:
-            best, (artist_axis, track_axis) = _select_best_track_candidate(
+            best, _ = _select_best_track_candidate(
                 results,
                 norm_artist=norm_artist,
                 norm_song=norm_song,
@@ -516,31 +494,6 @@ class AppleMusicClient(BaseStreamingClient):
 
         if best is None:
             return None
-
-        record_match_telemetry(
-            artist_score=artist_axis,
-            title_score=track_axis,
-            service="apple_music",
-            # The fallback winner gets its own surface so LML#592 dashboards
-            # can watch the fallback rate separately from ordinary track wins.
-            # LML#1139 splits a third value off "track": an album-less-FROM-
-            # THE-START request never ran a constrained pass, and previously
-            # emitted "track" exactly like a constrained win, which made the
-            # album-less population — the other surface this issue's guard
-            # strikes — impossible to size in the 30d sample. Now "track"
-            # means strictly "the album-constrained pass won".
-            surface=(
-                "track_album_fallback"
-                if album_fallback
-                else ("track" if norm_album is not None else "track_album_less")
-            ),
-            # LML#592 labeling: request values vs the CHOSEN winner's strings
-            # (same record the axes were stashed from), for the marginal sample.
-            query_artist=artist,
-            matched_artist=_extract_artist_name(best),
-            query_title=song,
-            matched_title=_extract_name(best),
-        )
 
         # When no album constrained the scoring (``norm_album is None``
         # covers both ``album=None`` and a falsy/empty album string) the

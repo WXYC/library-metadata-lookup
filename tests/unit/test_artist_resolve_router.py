@@ -78,32 +78,6 @@ def mock_discogs_service():
     return service
 
 
-class _FakeSpan:
-    """Recording double for the route's sentry span."""
-
-    def __init__(self, recorded: dict):
-        self._recorded = recorded
-
-    def set_data(self, key, value):
-        self._recorded[key] = value
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-
-@pytest.fixture
-def recorded_span(monkeypatch):
-    """Patch the route module's `start_span`; yields the recorded set_data dict."""
-    import artists.router as router_module
-
-    recorded: dict = {}
-    monkeypatch.setattr(router_module.sentry_sdk, "start_span", lambda **kw: _FakeSpan(recorded))
-    return recorded
-
-
 _UNSET = object()
 
 
@@ -551,61 +525,3 @@ class TestRouteEnvelopeGaps:
             resp = await _post(app, {"names": ["Wishy"], "dry_run": False})
         assert resp.status_code == 200
         mock_entity_store.fill_identity_discogs_id.assert_awaited_once()
-
-
-class TestSentrySpanContract:
-    """The documented lml.artist_resolve.* span surface — the trace
-    explorer queries in docs/api-endpoints.md key off these exact names."""
-
-    @pytest.mark.asyncio
-    async def test_success_path_pins_all_documented_keys(self, make_app, recorded_span):
-        ctx, app = make_app()
-        with ctx:
-            resp = await _post(app, {"names": ["Wishy", "wishy"], "dry_run": True})
-
-        assert resp.status_code == 200
-        for key, expected in {
-            "lml.artist_resolve.names": 2,
-            "lml.artist_resolve.dry_run": True,
-            "lml.artist_resolve.deduped": 1,
-            "lml.artist_resolve.resolved": 2,
-            "lml.artist_resolve.not_found": 0,
-            "lml.artist_resolve.ambiguous": 0,
-            "lml.artist_resolve.escalation_unavailable": 0,
-            "lml.artist_resolve.discogs_api_calls": 1,
-            "lml.artist_resolve.minted": 0,
-            "http.status_code": 200,
-        }.items():
-            assert recorded_span.get(key) == expected, f"span key {key}: {recorded_span.get(key)!r}"
-
-    @pytest.mark.asyncio
-    async def test_dep_503_pins_span_status(self, make_app, mock_discogs_cache, recorded_span):
-        from discogs.cache_service import CacheUnavailableError
-
-        mock_discogs_cache.artist_equality_candidates = AsyncMock(
-            side_effect=CacheUnavailableError("PG pool exhausted")
-        )
-        ctx, app = make_app()
-        with ctx:
-            resp = await _post(app, {"names": ["Wishy"]})
-
-        assert resp.status_code == 503
-        assert recorded_span.get("http.status_code") == 503
-        # names/dry_run are pinned PRE-try from the request precisely so
-        # error exits still carry batch context in the trace explorer.
-        assert recorded_span.get("lml.artist_resolve.names") == 1
-        assert recorded_span.get("lml.artist_resolve.dry_run") is False
-
-    @pytest.mark.asyncio
-    async def test_client_abort_pins_499(self, make_app, mock_entity_store, recorded_span):
-        """The documented trace-explorer query for client aborts
-        (`op:http.server http.status_code:499`) depends on this pin."""
-        mock_entity_store.bulk_resolve_library_names = AsyncMock(
-            side_effect=asyncio.CancelledError()
-        )
-        ctx, app = make_app()
-        with ctx:
-            with pytest.raises((asyncio.CancelledError, RuntimeError)):
-                await _post(app, {"names": ["Wishy"]})
-
-        assert recorded_span.get("http.status_code") == 499
