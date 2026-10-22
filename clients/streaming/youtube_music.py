@@ -174,5 +174,4 @@ class YouTubeMusicClient:
             artist_fn=lambda x: x["artists"][0]["name"],
             title_fn=lambda x: x["title"],
             url_fn=lambda x: build_browse_url(x["browseId"]),
-            service="youtube_music",
         )

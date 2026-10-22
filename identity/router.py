@@ -638,6 +638,14 @@ async def bulk_resolve_libraries(
     # (`single_artist`, `compilation`, `unresolved`) come from
     # `BulkResolveResultKind` and are what the LML#355 audit needed when
     # it had to fall back to local-cache simulation.
+    #
+    # The track fields are LML#1138's coverage counter: asked = distinct
+    # non-V/A legacy ids eligible for derivation this batch; pinned = how
+    # many an override pin resolved (== how many emit
+    # tracks_attempted=true). The spread
+    # IS the v1 coverage gap (the un-pinned + MB tail the issue's
+    # decision record documents) -- observable per request here rather
+    # than inferred from consumer re-ask rates.
     kinds = Counter(r.kind.value for r in results)
     logger.info(
         "bulk resolve complete: inputs=%d single_artist=%d compilation=%d unresolved=%d"
@@ -650,12 +658,6 @@ async def bulk_resolve_libraries(
         single_artist_track_candidates,
         len(single_artist_pins),
     )
-    # LML#1138's coverage counter: asked = distinct non-V/A legacy ids
-    # eligible for derivation this batch; pinned = how many an override
-    # pin resolved (== how many emit tracks_attempted=true). The spread
-    # IS the v1 coverage gap (the un-pinned + MB tail the issue's
-    # decision record documents) -- observable per request here rather
-    # than inferred from consumer re-ask rates.
 
     return BulkResolveLibrariesResponse(
         results=results,

@@ -88,7 +88,6 @@ class SpotifyClient(BaseStreamingClient):
             artist_fn=lambda x: x["artists"][0]["name"],
             title_fn=lambda x: x["name"],
             url_fn=lambda x: x["external_urls"]["spotify"],
-            service="spotify",
         )
 
     async def search_album(self, artist: str, title: str, market: str = "US") -> list[dict]:

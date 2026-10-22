@@ -803,7 +803,6 @@ class BandcampClient(BaseStreamingClient):
                 artist_fn=lambda _: matched_artist_name,
                 title_fn=lambda x: x["title"],
                 url_fn=lambda x: x["url"],
-                service="bandcamp",
             )
         if match is not None:
             return match
@@ -1174,7 +1173,6 @@ class BandcampClient(BaseStreamingClient):
             artist_fn=lambda r: r["artist"],
             title_fn=lambda r: r["title"],
             url_fn=lambda r: r["url"],
-            service="bandcamp",
         )
         if match is not None:
             return match
@@ -1187,7 +1185,6 @@ class BandcampClient(BaseStreamingClient):
             artist_fn=lambda r: r["artist"],
             title_fn=lambda r: normalize_bc_title(r["title"]),
             url_fn=lambda r: r["url"],
-            service="bandcamp",
         )
 
     async def verify_album_page(self, url: str, artist: str, title: str) -> bool:
