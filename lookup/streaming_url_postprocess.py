@@ -59,7 +59,7 @@ whose client is present in ``clients``, this:
 * **Depth-bounded + deadline-aware** (LML#1108, see
   ``lookup.streaming_warm_admission``) — the semaphore bounds *concurrency*,
   not pending depth: an enqueue past a small multiple of it is SHED (still
-  ``unresolved``, but a distinct Sentry outcome + cache-stats counter). The
+  ``unresolved``, but a distinct cache-stats counter). The
   warm also arms ``clients.streaming.base.set_probe_deadline`` with the SAME
   deadline ``wait_for`` enforces, so a client's own retry loop
   (``SpotifyClient``'s 429 handler) can give up a doomed sleep instead of
@@ -69,25 +69,12 @@ whose client is present in ``clients``, this:
   reason ``lookup.enrichment.background._warm_bio_cache`` sets none). The warm logs its
   ``live_*`` outcome instead.
 
-Sentry on the hot path projects, per active service:
-
-* ``streaming_url.persistent_lookup.fired.<service>`` — "post-process ran".
-* ``streaming_url.persistent_lookup.<outcome>.<service>`` — one of
-  ``cache_hit`` / ``cache_miss_recent`` / ``cache_error_recent`` /
-  ``cache_miss_enqueued`` / ``cache_miss_unwarmed`` / ``cache_miss_shed``
-  (filled, genuine known-miss, fresh LML#1121 error-row miss, warm-scheduled,
-  warm-suppressed-on-bulk, or warm-shed-at-depth-bound). For a fresh error
-  row, ``cache_error_recent`` fires ALONGSIDE the specific
-  enqueued/unwarmed/shed sub-outcome (LML#1121 FIX 7) rather than masking it
-  — the earlier posture projected ONLY ``cache_error_recent`` for all three
-  sub-cases, which meant ``cache_miss_shed`` (docs/env-vars.md's designated
-  depth-shed signal) went silent for the dominant service during exactly the
-  outage when shedding peaks. Both tags are ``True`` when both apply; a
-  dashboard that only ever queried ``cache_error_recent`` keeps working
-  unchanged.
+The hot path no longer projects per-service ``streaming_url.persistent_lookup.*``
+outcomes onto a Sentry transaction (Sentry tracing was removed in LML#1472);
+the depth-shed signal survives as the cache-stats counter above.
 
 Side effects degrade gracefully: PG errors swallow inside the cache layer; mint
-failures log and continue; Sentry projection errors log and continue; the
+failures log and continue; the
 background task swallows every exception so a fire-and-forget warm never
 propagates to the event loop. The response shape is unaffected by any
 observability or persistence failure.

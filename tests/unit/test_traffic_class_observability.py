@@ -14,10 +14,6 @@ cannot ride the numeric-only ``cache_stats`` seam (``_LML_CACHE_STATS_EXTRA_KEYS
 ``dict[str, float]`` via ``CacheStatsRecorder.record()``); it uses the sibling
 per-request Sentry-tag / PostHog-freeform-dict channel instead.
 
-The companion ``lml.caller_budget_ms`` -> ``set_measurement`` promotion lives in
-``tests/unit/test_search.py::TestCallerBudget`` alongside the existing
-``set_data`` coverage it extends.
-
 Forward-compatible: LML#929 is expected to add ``"library_search"`` as a third
 ``endpoint_family`` value; no rework needed here.
 """

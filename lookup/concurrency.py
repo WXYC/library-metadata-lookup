@@ -113,11 +113,10 @@ def _record_search_api_call_cap_fired(
     """Record an LML#543 cap-fire on both observability surfaces.
 
     Telemetry — counter on the request-scoped cache-stats dict (each leg that
-    trips its own per-invocation cap adds 1). Projects onto the Sentry
-    transaction as ``lml.cache.search_api_call_cap_fired`` via the router's
-    :func:`_project_cache_stats_to_transaction`; filter on
-    ``lml.cache.search_api_call_cap_fired:>0`` for the cap-fire slice in
-    PostHog/Sentry.
+    trips its own per-invocation cap adds 1). PostHog receives it as
+    ``cache.search_api_call_cap_fired`` on ``lookup_completed``; filter on
+    ``> 0`` for the cap-fire slice. (The former Sentry-transaction projection
+    went away with Sentry tracing in LML#1472.)
 
     Control flow — bumps the per-pipeline-invocation counter the runner reads
     (:data:`core.search._cap_fire_count_var`). That channel is a per-task

@@ -19,8 +19,8 @@ song)``) by calling the client directly, returns a rich
 ``AppleMusicTrackMatch`` feeding three separate downstream consumers in
 ``enrich_one`` (artwork, release year, and the LML#505 sibling-invalidation
 that clears five URL slots), runs on the interactive AND bulk paths gated only
-by client injection, and classifies a timeout as clamped-vs-genuine with four
-Sentry transaction keys; Bandcamp probes the ALBUM cache through
+by client injection, and classifies a timeout as clamped-vs-genuine (logging
+only a genuine timeout at WARN); Bandcamp probes the ALBUM cache through
 ``resolve_streaming_url_with_cache(fail_fast=True)``, returns a bare URL, runs
 bulk-and-top-1-only, and classifies breaker/429/transport sheds onto a PostHog
 counter. Only ~20 lines are genuinely common (read a flag, clamp the timeout,
