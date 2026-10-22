@@ -12,7 +12,7 @@ All external dependencies (LibraryDB, DiscogsService) are mocked.
 """
 
 import asyncio
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -604,7 +604,7 @@ class TestAdmissionShedGate:
         assert response.degraded is False
         assert response.degraded_reason is None
         assert len(response.results) == 1
-        project.assert_called_once_with(enforced=False, lag_ms=900.0)
+        project.assert_called_once_with(enforced=False)
 
     @pytest.mark.asyncio
     async def test_interactive_high_lag_never_sheds(
@@ -2671,14 +2671,12 @@ class TestPerformLookupLocationUnion:
         assert response.results[0].library_item.id == queen_item.id
 
     @pytest.mark.asyncio
-    async def test_sentry_results_count_recomputed_post_fold(
+    async def test_search_type_and_results_reflect_the_post_fold_list(
         self, mock_library_db, mock_discogs_service, telemetry
     ):
-        """The Sentry `lookup.results_count`/`lookup.match_type` trace attrs
-        must be recomputed from the FINAL post-fold result list, agreeing
-        with the router's PostHog `results_count` (already `len(results)`).
-        `_step_project_trace_attrs` runs before the fold and would otherwise
-        leave a stale, smaller count -- this proves the later overwrite wins."""
+        """A location-only (Case-B) response reads as a compilation match with
+        its folded location as the one result, agreeing with the router's
+        PostHog `results_count` (already `len(results)`)."""
         mock_library_db.search.return_value = []
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
 
@@ -2691,17 +2689,10 @@ class TestPerformLookupLocationUnion:
             raw_message="Ikebana by Brian Reitzell",
         )
 
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
-        with (
-            patch(
-                "lookup.orchestrator.resolve_track_shelf_locations",
-                new_callable=AsyncMock,
-                return_value=[lit_location],
-            ),
-            patch("lookup.orchestrator.sentry_sdk.get_current_scope", return_value=mock_scope),
+        with patch(
+            "lookup.orchestrator.resolve_track_shelf_locations",
+            new_callable=AsyncMock,
+            return_value=[lit_location],
         ):
             response = await perform_lookup(
                 request,
@@ -2711,10 +2702,8 @@ class TestPerformLookupLocationUnion:
                 discogs_cache_pg=AsyncMock(),
             )
 
-        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
         assert len(response.results) == 1
-        assert calls["lookup.results_count"] == len(response.results) == 1
-        assert calls["lookup.match_type"] == response.search_type == "compilation"
+        assert response.search_type == "compilation"
 
 
 # ---------------------------------------------------------------------------

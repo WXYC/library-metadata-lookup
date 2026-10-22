@@ -9,7 +9,7 @@ request path.
 """
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from generated.api_models import DegradedReason
 from lookup.spine_deadline import LIMIT_CALLER_BUDGET, SpineDeadline
@@ -44,22 +44,12 @@ class TestShouldShedTail:
             == DegradedReason.deadline_exceeded
         )
 
-    def test_exhausted_emits_step_limit_tags_and_measurements(self):
-        txn = MagicMock()
-        with (
-            patch("lookup.tail_deadline.sentry_sdk.set_tag") as set_tag,
-            patch(
-                "lookup.tail_deadline.sentry_sdk.get_current_scope",
-                return_value=MagicMock(transaction=txn),
-            ),
-        ):
+    def test_exhausted_emits_step_and_limit_tags(self):
+        with patch("lookup.tail_deadline.sentry_sdk.set_tag") as set_tag:
             should_shed_tail(_exhausted_deadline(), "enrich_metadata", "raw msg")
         tag_names = {c.args[0] for c in set_tag.call_args_list}
         assert "lml.deadline.tail_shed_step" in tag_names
         assert "lml.deadline.tail_shed_limit" in tag_names
-        measurement_names = {c.args[0] for c in txn.set_measurement.call_args_list}
-        assert "lml.deadline.tail_remaining_ms" in measurement_names
-        assert "lml.deadline.tail_shed_ms" in measurement_names
 
     def test_not_exhausted_emits_no_telemetry(self):
         with patch("lookup.tail_deadline.project_tail_shed_telemetry") as project:
@@ -68,22 +58,7 @@ class TestShouldShedTail:
 
 
 class TestProjectTailShedTelemetry:
-    def test_no_active_transaction_is_noop(self):
-        """No transaction → measurements skipped (tags still attempted), no raise."""
-        with (
-            patch("lookup.tail_deadline.sentry_sdk.set_tag"),
-            patch(
-                "lookup.tail_deadline.sentry_sdk.get_current_scope",
-                return_value=MagicMock(transaction=None),
-            ),
-        ):
-            project_tail_shed_telemetry(
-                "fetch_artwork", -5.0, LIMIT_CALLER_BUDGET, _exhausted_deadline()
-            )
-
     def test_swallows_sentry_errors(self):
         """Observability must never break /lookup — an SDK error is logged, not raised."""
         with patch("lookup.tail_deadline.sentry_sdk.set_tag", side_effect=RuntimeError("boom")):
-            project_tail_shed_telemetry(
-                "fetch_artwork", -5.0, LIMIT_CALLER_BUDGET, _exhausted_deadline()
-            )
+            project_tail_shed_telemetry("fetch_artwork", LIMIT_CALLER_BUDGET)

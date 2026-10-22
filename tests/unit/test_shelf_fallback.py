@@ -15,7 +15,7 @@ and ``test_library_miss_discogs.py`` already use.
 
 import asyncio
 import logging
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -343,30 +343,6 @@ class TestApplyShelfFallback:
 
         with pytest.raises(asyncio.CancelledError):
             await apply_shelf_fallback(_parsed(), db, False, [], "direct", None, None)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("shelf_size", "expected_calls"),
-        [
-            pytest.param(2, [("lookup.shelf_fallback_rows", 2)], id="fires"),
-            pytest.param(0, [], id="does-not-fire"),
-        ],
-    )
-    async def test_sentry_attr_is_set_only_when_the_lane_fires(self, shelf_size, expected_calls):
-        db = AsyncMock()
-        shelve(
-            db,
-            [
-                make_library_item(id=i, artist="Jessica Pratt", title=f"Album {i}")
-                for i in range(1, shelf_size + 1)
-            ],
-        )
-        scope = Mock()
-
-        with patch("lookup.shelf_fallback.sentry_sdk.get_current_scope", return_value=scope):
-            await apply_shelf_fallback(_parsed(), db, False, [], "none", None, None)
-
-        assert [call.args for call in scope.transaction.set_data.call_args_list] == expected_calls
 
 
 class TestShelfFallbackPunctuationVariants:
@@ -941,14 +917,11 @@ class TestPerformLookupShelfFallbackInvariance:
             return await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
 
     @pytest.mark.asyncio
-    async def test_existing_trace_attrs_report_the_pre_fallback_response(
+    async def test_shelf_only_response_reads_as_fallback(
         self, mock_library_db, mock_discogs_service, telemetry
     ):
-        """Telemetry invisibility, Sentry half: ``lookup.results_count`` and
-        ``lookup.match_type`` are projected BEFORE step 8, so a shelf-only
-        response still reads as the empty ``direct`` response main reports.
-        The last write to each key wins, so a re-projection after step 8
-        fails here. ``lookup.shelf_fallback_rows`` is the lane's one new key."""
+        """A shelf-only response serves the artist's rows with the
+        ``fallback`` search type."""
         mock_library_db.find_similar_artist.return_value = None
         moon_pix = make_library_item(id=301, artist="Cat Power", title="Moon Pix")
 
@@ -961,22 +934,11 @@ class TestPerformLookupShelfFallbackInvariance:
         request = LookupRequest(
             artist="Cat Power", album="Zzyzx Road", raw_message="Play Zzyzx Road by Cat Power"
         )
-        scope = Mock()
 
-        with (
-            patch("lookup.orchestrator.sentry_sdk.get_current_scope", return_value=scope),
-            patch("lookup.shelf_fallback.sentry_sdk.get_current_scope", return_value=scope),
-        ):
-            response = await perform_lookup(
-                request, mock_library_db, mock_discogs_service, telemetry
-            )
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
 
         assert [item.library_item.id for item in response.results] == [301]
         assert response.search_type == SEARCH_TYPE_FALLBACK
-        attrs = {call.args[0]: call.args[1] for call in scope.transaction.set_data.call_args_list}
-        assert attrs["lookup.results_count"] == 0
-        assert attrs["lookup.match_type"] == "direct"
-        assert attrs["lookup.shelf_fallback_rows"] == 1
 
     @pytest.mark.asyncio
     async def test_admission_shed_degraded_path_never_calls_shelf_fallback(

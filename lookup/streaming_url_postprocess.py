@@ -98,9 +98,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Literal
-
-import sentry_sdk
+from typing import TYPE_CHECKING, Any
 
 from clients.streaming.base import AlbumMatchClient
 from entity.sources import PgSource
@@ -369,7 +367,6 @@ async def apply_streaming_url_postprocess(
             # Synchronous hit: fill the URL now. No mint — the URL was minted on
             # the resolution that first wrote this cache row.
             update[cfg.url_field] = cached_url
-            _project_sentry(storage_key, "cache_hit")
             statuses[service.catalog_key] = StreamingResolutionStatus.verified
         elif has_fresh_decision and not is_error:
             # Known recent GENUINE miss: the cache already records "checked,
@@ -377,7 +374,6 @@ async def apply_streaming_url_postprocess(
             # schedule a no-op warm (it would just re-derive the same
             # recent-miss verdict). A real, sourced negative — not a
             # couldn't-check, unlike the fresh-error-row case below.
-            _project_sentry(storage_key, "cache_miss_recent")
             statuses[service.catalog_key] = StreamingResolutionStatus.absent
         elif suppress_warm and not _bulk_rowless_warm_exempt(
             service, settings, is_rowless=is_rowless
@@ -394,15 +390,6 @@ async def apply_streaming_url_postprocess(
             # already warm them. A fresh LML#1121 error row (below) is gated by
             # this SAME bulk check — an outage during a bulk drain must not
             # spawn request-time warms either.
-            # LML#1121 FIX 7: project cache_error_recent AND the specific
-            # sub-outcome (cache_miss_unwarmed) rather than letting the former
-            # mask the latter — docs/env-vars.md designates cache_miss_unwarmed/
-            # cache_miss_shed as their own signals, which must not go silent
-            # for the dominant service during exactly the outage when they
-            # matter most.
-            if is_error:
-                _project_sentry(storage_key, "cache_error_recent")
-            _project_sentry(storage_key, "cache_miss_unwarmed")
             statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
         else:
             # Genuine miss (absent/stale), a rowless miss on the bulk path
@@ -428,7 +415,7 @@ async def apply_streaming_url_postprocess(
             # separate follow-up. ``bypass_error_row=is_error`` below only
             # keeps this warm's own read from short-circuiting on the row
             # that triggered it (FIX 2) — not a throttle.
-            enqueued = _enqueue_streaming_warm(
+            _enqueue_streaming_warm(
                 storage_key,
                 cfg,
                 client,
@@ -438,68 +425,9 @@ async def apply_streaming_url_postprocess(
                 request_album,
                 bypass_error_row=is_error,
             )
-            sub_outcome: _SentryOutcome = "cache_miss_enqueued" if enqueued else "cache_miss_shed"
-            # LML#1121 FIX 7: project both cache_error_recent AND the
-            # specific enqueued/shed sub-outcome, rather than letting the
-            # former mask the latter (see the suppress_warm branch above for
-            # the same rationale).
-            if is_error:
-                _project_sentry(storage_key, "cache_error_recent")
-            _project_sentry(storage_key, sub_outcome)
             # A shed (LML#1108) is transient, not terminal, so it gets the
             # same "couldn't confirm" verdict as a healthy enqueue — same for
             # a fresh error row, which never reached a verdict either.
             statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
 
     return statuses
-
-
-_SentryOutcome = Literal[
-    "cache_hit",
-    "cache_miss_recent",
-    "cache_error_recent",
-    "cache_miss_enqueued",
-    "cache_miss_unwarmed",
-    "cache_miss_shed",
-]
-
-
-def _project_sentry(service_key: str, outcome: _SentryOutcome) -> None:
-    """Project per-service Sentry data-attributes for the post-process hot path.
-
-    Two booleans land on the active transaction per service:
-
-    * ``streaming_url.persistent_lookup.fired.<service>`` — ran-for-service.
-    * ``streaming_url.persistent_lookup.<outcome>.<service>`` — the hot-path
-      disposition: filled (``cache_hit``), genuine known miss within
-      ``miss_ttl`` (``cache_miss_recent``), fresh LML#1121 error-row miss
-      within the shorter ``error_ttl`` (``cache_error_recent``, LML#1115),
-      warm scheduled (``cache_miss_enqueued``), warm suppressed on the bulk
-      path (``cache_miss_unwarmed``), or warm shed at the LML#1108
-      pending-depth bound (``cache_miss_shed``). For a fresh error row, the
-      caller calls this function TWICE (LML#1121 FIX 7) — once with
-      ``cache_error_recent``, once with the specific enqueued/unwarmed/shed
-      sub-outcome — so the sub-outcome stays queryable rather than being
-      masked by the uniform ``cache_error_recent`` tag every error sub-case
-      used to project alone.
-
-    Hot-path only (and therefore always in-request — correct attribution): the
-    background warm's ``live_*`` outcome is logged, never tagged here, because
-    by the time a warm finishes the request scope has closed and a tag would
-    mis-attribute to the next request.
-
-    Idempotent (same key set ``True`` repeatedly is a no-op). Observability must
-    not break the request — every failure mode is logged and swallowed.
-    """
-    try:
-        scope = sentry_sdk.get_current_scope()
-        if scope.transaction is not None:
-            scope.transaction.set_data(f"streaming_url.persistent_lookup.fired.{service_key}", True)
-            scope.transaction.set_data(
-                f"streaming_url.persistent_lookup.{outcome}.{service_key}", True
-            )
-    except Exception as e:
-        logger.warning(
-            "Failed to project streaming_url.persistent_lookup data onto Sentry transaction: %s",
-            e,
-        )

@@ -17,10 +17,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
-import sentry_sdk
-
 from core.exceptions import BreakerOpenError
-from core.observability import observability_guard, project_transaction
 from discogs.service import reset_retry_budget_deadline, set_retry_budget_deadline
 from generated.api_models import TrackMatchHint
 from library.models import LibraryItem
@@ -209,15 +206,10 @@ def resolve_effective_search_budget_ms(caller_budget_ms: int | None) -> int:
 def _log_search_budget_exceeded(
     *, elapsed_ms: float, skipped: list["SearchStrategyType"], budget_ms: int
 ) -> None:
-    """Project a budget breach onto the active Sentry transaction.
+    """Log a budget breach as a structured INFO line.
 
     Mirrors ``_log_album_title_fallback`` / ``_log_resolver_pre_pass`` in
-    ``lookup/orchestrator``: structured INFO log line plus two ``set_data``
-    keys on the active transaction so trace explorer can filter on
-    ``search_budget_exceeded:true`` without re-pulling Railway logs.
-
-    No-op when there is no active transaction. Any SDK error is swallowed so
-    observability cannot break /lookup.
+    ``lookup/orchestrator``.
     """
     payload = {
         "elapsed_ms": round(elapsed_ms, 2),
@@ -225,28 +217,16 @@ def _log_search_budget_exceeded(
         "skipped": [s.value for s in skipped],
     }
     logger.info("search_budget_exceeded %s", payload)
-    with observability_guard("project search_budget_exceeded onto Sentry transaction", logger):
-        project_transaction(
-            {
-                "search_budget_exceeded": True,
-                "search_strategies_skipped": payload["skipped"],
-            }
-        )
 
 
 def _log_hard_cap_fired(
     *, elapsed_ms: float, skipped: list["SearchStrategyType"], hard_cap_ms: int
 ) -> None:
-    """Project a hard-cap breach onto the active Sentry transaction (LML#370).
+    """Log a hard-cap breach as a structured INFO line (LML#370).
 
     Sibling of :func:`_log_search_budget_exceeded`. The hard cap fires when
     the cascade has spent more wall time than the safety floor allows,
-    regardless of ``state.results``. ``hard_cap_fired:true`` on the
-    trace lets Sentry trace explorer filter cap-firing requests without
-    re-pulling Railway logs.
-
-    No-op when there is no active transaction. Any SDK error is swallowed
-    so observability cannot break /lookup.
+    regardless of ``state.results``.
     """
     payload = {
         "elapsed_ms": round(elapsed_ms, 2),
@@ -254,14 +234,6 @@ def _log_hard_cap_fired(
         "skipped": [s.value for s in skipped],
     }
     logger.info("hard_cap_fired %s", payload)
-    with observability_guard("project hard_cap_fired onto Sentry transaction", logger):
-        project_transaction(
-            {
-                "hard_cap_fired": True,
-                "hard_cap_skipped_strategies": payload["skipped"],
-                "hard_cap_elapsed_ms": payload["elapsed_ms"],
-            }
-        )
 
 
 def detect_ambiguous_format(raw_message: str) -> tuple[str, str] | None:
@@ -867,25 +839,6 @@ async def _run_strategy_pipeline(
     set/reset in a try/finally without indenting the entire cascade. Callers
     use the outer function exclusively.
     """
-    # Project the caller-budget value when present so Sentry trace explorer can
-    # split header-driven vs env-driven cutoffs (A8 / LML#345). The
-    # effective-budget computation already clamps to env, so we record the raw
-    # header value the caller sent — that's the diagnostic that matters
-    # (mismatched expectations between caller and LML).
-    if caller_budget_ms is not None:
-        try:
-            transaction = sentry_sdk.get_current_scope().transaction
-            if transaction is not None:
-                transaction.set_data("lml.caller_budget_ms", caller_budget_ms)
-                # LML#944: promoted alongside the existing set_data. set_data alone
-                # is per-trace only (opaque to the spans/metrics datasets — reads
-                # back as "Unknown attribute"); set_measurement makes the series
-                # aggregatable (avg/percentile), mirroring the set_data +
-                # set_measurement pairing in `_project_cache_stats_to_transaction`
-                # (lookup/router.py).
-                transaction.set_measurement("lml.caller_budget_ms", caller_budget_ms)
-        except Exception as e:
-            logger.warning("Failed to project lml.caller_budget_ms onto Sentry transaction: %s", e)
     # Re-base the clock to the lookup-spine start when a prior-work offset is
     # supplied (LML#865): step 2's Discogs pass already spent
     # ``pipeline_start_offset_ms`` before step 3 began, so the hard cap and

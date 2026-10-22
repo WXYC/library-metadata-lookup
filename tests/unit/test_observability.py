@@ -1,15 +1,12 @@
 """Tests for ``core/observability.py`` -- the shared "observability must not
 break the request path" helpers.
 
-Pins the three primitives this module introduces:
+Pins the primitives this module provides:
 
 - ``observability_guard`` -- swallow-and-warn context manager (the try/except
   boilerplate duplicated at ~30 sites).
-- ``project_transaction`` -- attach a dict of fields onto the active Sentry
-  transaction, mirroring ``core.search._log_hard_cap_fired`` /
-  ``_log_search_budget_exceeded``'s bodies.
-- ``project_capped`` -- the "in-flight cap engaged" tag+measurement pair
-  duplicated across ``lookup/router.py``, ``streaming/router.py``, and
+- ``project_capped`` -- the "in-flight cap engaged" tag duplicated across
+  ``lookup/router.py``, ``streaming/router.py``, and
   ``core/bulk_concurrency.py``.
 """
 
@@ -17,7 +14,6 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -84,147 +80,17 @@ class TestObservabilityGuard:
         logger.warning.assert_called_once()
 
 
-class TestProjectTransaction:
-    """``set_data`` (+ optional ``set_measurement``) fan-out onto the active transaction."""
-
-    def test_noop_when_no_active_transaction(self):
-        from core.observability import project_transaction
-
-        mock_scope = Mock()
-        mock_scope.transaction = None
-        with patch("core.observability.sentry_sdk.get_current_scope", return_value=mock_scope):
-            # Must not raise.
-            project_transaction({"hard_cap_fired": True})
-
-    def test_sets_data_for_every_entry_by_default(self):
-        """Mirrors ``_log_hard_cap_fired`` / ``_log_search_budget_exceeded``'s
-        bodies: every entry gets ``set_data``, including non-numeric values
-        (bools, lists) -- there is no numeric filter unless ``measurements=True``.
-        """
-        from core.observability import project_transaction
-
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-        data = {"hard_cap_fired": True, "hard_cap_skipped_strategies": ["a", "b"]}
-
-        with patch("core.observability.sentry_sdk.get_current_scope", return_value=mock_scope):
-            project_transaction(data)
-
-        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert calls == data
-        mock_transaction.set_measurement.assert_not_called()
-
-    def test_prefix_is_prepended_to_every_key(self):
-        from core.observability import project_transaction
-
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
-        with patch("core.observability.sentry_sdk.get_current_scope", return_value=mock_scope):
-            project_transaction({"api_calls": 2}, prefix="lml.cache.")
-
-        mock_transaction.set_data.assert_called_once_with("lml.cache.api_calls", 2)
-
-    def test_measurements_true_also_sets_measurement_for_numeric_entries(self):
-        from core.observability import project_transaction
-
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-        data = {"api_calls": 2, "pg_time_ms": 12.5, "weird_string": "nope"}
-
-        with patch("core.observability.sentry_sdk.get_current_scope", return_value=mock_scope):
-            project_transaction(data, measurements=True)
-
-        measured = {c.args[0]: c.args[1] for c in mock_transaction.set_measurement.call_args_list}
-        assert measured == {"api_calls": 2, "pg_time_ms": 12.5}
-        # Non-numeric entries still get set_data even though they're not measured.
-        projected = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert projected == data
-
-    def test_measurements_true_excludes_bool_despite_being_an_int_subclass(self):
-        from core.observability import project_transaction
-
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
-        with patch("core.observability.sentry_sdk.get_current_scope", return_value=mock_scope):
-            project_transaction({"flag": True}, measurements=True)
-
-        mock_transaction.set_measurement.assert_not_called()
-        mock_transaction.set_data.assert_called_once_with("flag", True)
-
-
 class TestProjectCapped:
-    """The in-flight-cap tag+measurement pair, parameterized by key."""
+    """The in-flight-cap tag, parameterized by key."""
 
-    def test_noop_measurement_when_no_active_transaction(self):
+    def test_sets_only_the_tag(self):
         from core.observability import project_capped
 
-        mock_scope = Mock()
-        mock_scope.transaction = None
         set_tag = Mock()
-        with (
-            patch("core.observability.sentry_sdk.get_current_scope", return_value=mock_scope),
-            patch("core.observability.sentry_sdk.set_tag", set_tag),
-        ):
-            # Must not raise even with no active transaction.
-            project_capped("lml.lookup.inflight_capped", "lml.lookup.inflight_wait_ms", 42.0)
+        with patch("core.observability.sentry_sdk.set_tag", set_tag):
+            project_capped("lml.lookup.inflight_capped")
 
         set_tag.assert_called_once_with("lml.lookup.inflight_capped", "true")
-
-    def test_sets_tag_and_measurement_and_data_by_default(self):
-        """Default shape matches ``lookup.router``'s original
-        ``_project_inflight_capped`` -- tag + measurement + set_data.
-        """
-        from core.observability import project_capped
-
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-        set_tag = Mock()
-
-        with (
-            patch("core.observability.sentry_sdk.get_current_scope", return_value=mock_scope),
-            patch("core.observability.sentry_sdk.set_tag", set_tag),
-        ):
-            project_capped("lml.lookup.inflight_capped", "lml.lookup.inflight_wait_ms", 123.5)
-
-        set_tag.assert_called_once_with("lml.lookup.inflight_capped", "true")
-        mock_transaction.set_measurement.assert_called_once_with(
-            "lml.lookup.inflight_wait_ms", 123.5
-        )
-        mock_transaction.set_data.assert_called_once_with("lml.lookup.inflight_wait_ms", 123.5)
-
-    def test_also_set_data_false_skips_set_data(self):
-        """Matches ``streaming.router``'s original ``_project_inflight_capped``,
-        which only sets the measurement, not ``set_data``.
-        """
-        from core.observability import project_capped
-
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-        set_tag = Mock()
-
-        with (
-            patch("core.observability.sentry_sdk.get_current_scope", return_value=mock_scope),
-            patch("core.observability.sentry_sdk.set_tag", set_tag),
-        ):
-            project_capped(
-                "lml.streaming_check.inflight_capped",
-                "lml.streaming_check.inflight_wait_ms",
-                77.0,
-                also_set_data=False,
-            )
-
-        mock_transaction.set_measurement.assert_called_once_with(
-            "lml.streaming_check.inflight_wait_ms", 77.0
-        )
-        mock_transaction.set_data.assert_not_called()
 
     def test_does_not_swallow_exceptions(self):
         """``project_capped`` has no internal try/except -- callers compose it
@@ -236,7 +102,7 @@ class TestProjectCapped:
             "core.observability.sentry_sdk.set_tag", side_effect=RuntimeError("sdk exploded")
         ):
             with pytest.raises(RuntimeError):
-                project_capped("some.tag", "some.measurement", 1.0)
+                project_capped("some.tag")
 
 
 class TestObservabilityGuardComposesWithProjectCapped:
@@ -249,535 +115,39 @@ class TestObservabilityGuardComposesWithProjectCapped:
         with patch(
             "core.observability.sentry_sdk.set_tag", side_effect=RuntimeError("sdk exploded")
         ):
-            with observability_guard("project inflight_capped onto Sentry transaction", logger):
-                project_capped("some.tag", "some.measurement", 1.0)
+            with observability_guard("tag inflight_capped onto Sentry scope", logger):
+                project_capped("some.tag")
 
         logger.warning.assert_called_once()
         args = logger.warning.call_args.args
         assert args[0] == "Failed to %s: %s"
-        assert args[1] == "project inflight_capped onto Sentry transaction"
-
-
-class TestDropFastPoolResetSpans:
-    """The LML#1175 ``before_send_transaction`` filter.
-
-    asyncpg issues one fixed statement every time a pooled connection is
-    returned to the pool, and sentry-sdk's asyncpg instrumentation records
-    each one as a ``db`` span. At 113,906/day that was 19% of the entire
-    WXYC Sentry org's span consumption.
-
-    The filter keeps resets at or above a 50ms floor: measured over 24h,
-    only 35 of 113,906 (0.031%) cross it, and those are exactly the
-    pool-contention fingerprint LML#803 relies on. Dropping only the fast
-    ones sheds 99.97% of the volume while preserving the whole diagnostic
-    tail.
-    """
-
-    # The WIRE form -- newline-joined, as `asyncpg.Connection.get_reset_query`
-    # emits it. Writing the Sentry-UI rendering here (space-joined) is what
-    # made the filter a no-op for a month; `TestPoolResetStatementProvenance`
-    # pins this against asyncpg itself.
-    RESET = "SELECT pg_advisory_unlock_all();\nCLOSE ALL;\nUNLISTEN *;\nRESET ALL;"
-
-    @staticmethod
-    def _span(description: str, duration_ms: float | None = 2.0, op: str = "db") -> dict[str, Any]:
-        """Build a span dict shaped like ``sentry_sdk.tracing.Span.to_json()``.
-
-        Note there is NO ``duration`` key -- the SDK emits ``start_timestamp``
-        and ``timestamp`` as datetimes and leaves the subtraction to the
-        consumer. ``TestPoolResetSpanShapeGuard`` pins that against the real SDK.
-        """
-        from datetime import UTC, datetime, timedelta
-
-        span: dict = {"op": op, "description": description}
-        if duration_ms is not None:
-            start = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
-            span["start_timestamp"] = start
-            span["timestamp"] = start + timedelta(milliseconds=duration_ms)
-        return span
-
-    def test_drops_the_fast_reset_span_and_keeps_real_spans(self):
-        """The headline acceptance criterion: reset span out, real spans and
-        the transaction itself intact.
-        """
-        from core.observability import drop_fast_pool_reset_spans
-
-        real_one = self._span("SELECT id FROM release WHERE id = $1")
-        real_two = self._span("SELECT url FROM lml_cache.album_streaming_url_cache")
-        event = {
-            "type": "transaction",
-            "transaction": "/api/v1/lookup",
-            "spans": [real_one, self._span(self.RESET), real_two],
-        }
-
-        result = drop_fast_pool_reset_spans(event, None)
-
-        assert result is not None, "the parent transaction is a real request; never drop it"
-        assert result["spans"] == [real_one, real_two]
-        assert result["transaction"] == "/api/v1/lookup"
-
-    def test_returns_the_same_object_when_no_reset_spans_present(self):
-        """Identity, not a rebuilt copy -- this runs on every transaction."""
-        from core.observability import drop_fast_pool_reset_spans
-
-        spans = [self._span("SELECT id FROM release WHERE id = $1")]
-        event = {"type": "transaction", "spans": spans}
-
-        result = drop_fast_pool_reset_spans(event, None)
-
-        assert result is event
-        assert result["spans"] is spans
-
-    def test_keeps_a_slow_reset_span(self):
-        """The 50ms floor. A slow reset is pool contention -- the LML#803
-        fingerprint -- and is the entire reason this is a floor and not a
-        flat drop.
-        """
-        from core.observability import drop_fast_pool_reset_spans
-
-        slow = self._span(self.RESET, duration_ms=214.0)
-        event = {"type": "transaction", "spans": [slow]}
-
-        result = drop_fast_pool_reset_spans(event, None)
-
-        assert result["spans"] == [slow]
-
-    @pytest.mark.parametrize(
-        ("duration_ms", "kept"),
-        [
-            (49.999, False),
-            (50.0, True),
-            (50.001, True),
-        ],
-    )
-    def test_floor_boundary_is_inclusive(self, duration_ms: float, kept: bool):
-        """``>= 50ms`` is kept, ``< 50ms`` is dropped. Pinned so a later
-        refactor can't silently flip the comparison and take the tail with it.
-        """
-        from core.observability import drop_fast_pool_reset_spans
-
-        span = self._span(self.RESET, duration_ms=duration_ms)
-        event: Any = {"type": "transaction", "spans": [span]}
-
-        result = drop_fast_pool_reset_spans(event, None)
-
-        assert (result["spans"] == [span]) is kept
-
-    @pytest.mark.parametrize(
-        "description",
-        [
-            "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL",
-            "RESET ALL;",
-            "SELECT foo FROM bar; RESET ALL;",
-            "CLOSE ALL;",
-        ],
-    )
-    def test_matches_the_statement_exactly_never_a_substring(self, description: str):
-        """A genuine application statement that merely contains ``RESET ALL``
-        (or is a near-miss of the pool reset) must survive. Matching loosely
-        here would silently delete real query spans.
-        """
-        from core.observability import drop_fast_pool_reset_spans
-
-        span = self._span(description)
-        event: Any = {"type": "transaction", "spans": [span]}
-
-        assert drop_fast_pool_reset_spans(event, None)["spans"] == [span]
-
-    @pytest.mark.parametrize(
-        "description",
-        [
-            "SELECT pg_advisory_unlock_all();\nCLOSE ALL;\nUNLISTEN *;\nRESET ALL;",
-            "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;",
-            "  SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;  ",
-            "SELECT pg_advisory_unlock_all();\n\tCLOSE ALL;   UNLISTEN *;\nRESET ALL;",
-        ],
-        ids=["wire-newline-joined", "sentry-ui-rendering", "padded", "mixed-whitespace"],
-    )
-    def test_whitespace_variants_of_the_reset_statement_are_dropped(self, description: str):
-        """Whitespace is not identity, and treating it as identity WAS the bug.
-
-        The first case is what asyncpg puts on the wire; the second is how
-        Sentry renders that same statement, which is where the original
-        constant was (incorrectly) copied from. The filter has to recognise
-        both as the same statement, or the next person who reads a description
-        off a dashboard reintroduces LML#1175 verbatim.
-
-        The padded case is a deliberate behaviour change: it used to be pinned
-        as KEPT by ``test_matches_the_statement_exactly_never_a_substring``.
-        That assertion encoded "any whitespace difference means a different
-        statement", which is exactly the belief that made the filter blind.
-        Substring safety is unaffected and still pinned above -- normalization
-        collapses whitespace, it never relaxes whole-string equality.
-        """
-        from core.observability import drop_fast_pool_reset_spans
-
-        span = self._span(description)
-        event: Any = {"type": "transaction", "spans": [span]}
-
-        assert drop_fast_pool_reset_spans(event, None)["spans"] == []
-
-    def test_keeps_a_reset_span_whose_duration_cannot_be_computed(self):
-        """Fail open. An unclassifiable span costs one span of budget; dropping
-        it would risk deleting the contention signal we just chose to keep.
-        """
-        from core.observability import drop_fast_pool_reset_spans
-
-        span = self._span(self.RESET, duration_ms=None)
-        event: Any = {"type": "transaction", "spans": [span]}
-
-        assert drop_fast_pool_reset_spans(event, None)["spans"] == [span]
-
-    def test_handles_epoch_float_timestamps(self):
-        """Some SDK paths serialize timestamps as epoch floats rather than
-        datetimes; both shapes must be measurable.
-        """
-        from core.observability import drop_fast_pool_reset_spans
-
-        fast: dict[str, Any] = {
-            "op": "db",
-            "description": self.RESET,
-            "start_timestamp": 1_754_838_000.000,
-            "timestamp": 1_754_838_000.002,
-        }
-        slow: dict[str, Any] = {
-            "op": "db",
-            "description": self.RESET,
-            "start_timestamp": 1_754_838_000.000,
-            "timestamp": 1_754_838_000.200,
-        }
-        event: Any = {"type": "transaction", "spans": [fast, slow]}
-
-        assert drop_fast_pool_reset_spans(event, None)["spans"] == [slow]
-
-    @pytest.mark.parametrize("spans", [None, []], ids=["missing", "empty"])
-    def test_transaction_without_spans_passes_through(self, spans):
-        from core.observability import drop_fast_pool_reset_spans
-
-        event: dict = {"type": "transaction"}
-        if spans is not None:
-            event["spans"] = spans
-
-        assert drop_fast_pool_reset_spans(event, None) is event
-
-    def test_one_unmeasurable_span_does_not_disable_filtering_for_the_event(self):
-        """Blast-radius guard. Subtracting a naive datetime from an aware one
-        raises, and if that escaped to the event-level guard a single odd span
-        would forward the whole transaction unfiltered -- and log a warning on
-        every transaction that carried one. Per-span failures stay per-span.
-        """
-        from datetime import UTC, datetime
-
-        from core.observability import drop_fast_pool_reset_spans
-
-        mixed: dict[str, Any] = {
-            "op": "db",
-            "description": self.RESET,
-            "start_timestamp": datetime(2026, 8, 10, 12, 0, 0),
-            "timestamp": datetime(2026, 8, 10, 12, 0, 0, 2000, tzinfo=UTC),
-        }
-        droppable = self._span(self.RESET)
-        event: Any = {"type": "transaction", "spans": [mixed, droppable]}
-
-        with patch("core.observability.logger") as mock_logger:
-            result = drop_fast_pool_reset_spans(event, None)
-
-        assert result["spans"] == [mixed], "the measurable reset should still have been dropped"
-        mock_logger.warning.assert_not_called()
-
-    def test_trimmed_spans_sentinel_passes_through_without_warning(self):
-        """When the SDK trims an oversized event it swaps the span list for an
-        ``AnnotatedValue``, which is truthy but not iterable. That is a normal
-        SDK state, not an error -- forward it silently rather than logging a
-        warning on every trimmed transaction.
-        """
-        from sentry_sdk._types import AnnotatedValue
-
-        from core.observability import drop_fast_pool_reset_spans
-
-        event: Any = {"type": "transaction", "spans": AnnotatedValue(None, {"len": 1000})}
-
-        with patch("core.observability.logger") as mock_logger:
-            assert drop_fast_pool_reset_spans(event, None) is event
-
-        mock_logger.warning.assert_not_called()
-
-    def test_never_returns_none_even_on_a_malformed_event(self):
-        """Returning ``None`` from ``before_send_transaction`` drops the whole
-        transaction. A bug in this filter must cost spans, never requests.
-        """
-        from core.observability import drop_fast_pool_reset_spans
-
-        event: Any = {"type": "transaction", "spans": ["not-a-span-dict"]}
-
-        assert drop_fast_pool_reset_spans(event, None) is event
-
-    def test_swallows_and_warns_when_filtering_raises(self):
-        from core.observability import drop_fast_pool_reset_spans
-
-        class Exploding(list):
-            def __iter__(self):
-                raise RuntimeError("sdk exploded")
-
-        event = {"type": "transaction", "spans": Exploding([1])}
-
-        with patch("core.observability.logger") as mock_logger:
-            assert drop_fast_pool_reset_spans(event, None) is event
-
-        mock_logger.warning.assert_called_once()
-        assert mock_logger.warning.call_args.args[0] == "Failed to %s: %s"
-
-    def test_hint_argument_is_optional(self):
-        """sentry-sdk calls the hook as ``(event, hint)``; keeping ``hint``
-        defaulted lets tests and any direct caller omit it.
-        """
-        from core.observability import drop_fast_pool_reset_spans
-
-        event = {"type": "transaction", "spans": [self._span(self.RESET)]}
-
-        assert drop_fast_pool_reset_spans(event)["spans"] == []
-
-
-class TestPoolResetSpanShapeGuard:
-    """Guards the filter against sentry-sdk changing its span serialization.
-
-    Every assertion above builds span dicts by hand. If the SDK renamed
-    ``description`` or started emitting a pre-computed duration, those tests
-    would all still pass while the filter silently matched nothing in
-    production -- the same class of no-op that nearly shipped in
-    WXYC/Backend-Service#2089.
-    """
-
-    def test_real_sdk_span_json_is_recognized_and_dropped(self):
-        from datetime import UTC, datetime, timedelta
-
-        from sentry_sdk.tracing import Span
-
-        from core.observability import ASYNCPG_POOL_RESET_STATEMENT, drop_fast_pool_reset_spans
-
-        span = Span(op="db", description=ASYNCPG_POOL_RESET_STATEMENT)
-        span.start_timestamp = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
-        span.timestamp = span.start_timestamp + timedelta(milliseconds=2.3)
-        serialized = span.to_json()
-
-        assert serialized["description"] == ASYNCPG_POOL_RESET_STATEMENT
-        assert "duration" not in serialized, (
-            "the SDK now emits a duration -- simplify _span_duration_ms to read it"
-        )
-
-        event = {"type": "transaction", "spans": [serialized]}
-        assert drop_fast_pool_reset_spans(event, None)["spans"] == []
-
-
-class TestPoolResetStatementProvenance:
-    """Pins the match string against **asyncpg**, not against ourselves.
-
-    ``TestPoolResetSpanShapeGuard`` above builds its span from
-    ``ASYNCPG_POOL_RESET_STATEMENT`` -- it hands the constant back to the
-    constant, so it can prove the SDK still serializes ``description``, but it
-    can prove nothing about whether that string is what asyncpg actually puts
-    on the wire. It did not, for a month (LML#1175 regression, found
-    2026-09-09): the constant had been transcribed out of the Sentry UI, which
-    renders SQL with its whitespace collapsed, while
-    ``Connection.get_reset_query`` joins its statements with ``chr(10)``. The
-    equality test never once fired in production and ~114K spans/day shipped
-    at full rate.
-
-    So these tests derive the description from asyncpg's own code and drive it
-    through sentry-sdk's own instrumentation helper. If asyncpg changes how it
-    assembles the reset query, this fails here rather than silently in the
-    bill.
-    """
-
-    @staticmethod
-    def _asyncpg_reset_query() -> str:
-        """The reset query asyncpg emits, built by asyncpg's own method.
-
-        ``get_reset_query`` reads only ``_reset_query`` (its memo) and
-        ``_server_caps``, so an unbound call against a stub exercises the real
-        assembly without needing a live connection. All five caps are True on
-        any real PostgreSQL; they are False only on wire-compatible engines
-        (CockroachDB, Redshift) that this service does not talk to.
-        """
-        from asyncpg.connection import Connection, ServerCapabilities
-
-        caps = ServerCapabilities(
-            advisory_locks=True,
-            notifications=True,
-            plpgsql=True,
-            sql_reset=True,
-            sql_close_all=True,
-            sql_copy_from_where=True,
-            jit=True,
-        )
-        return Connection.get_reset_query(
-            SimpleNamespace(_reset_query=None, _server_caps=caps)  # type: ignore[arg-type]
-        )
-
-    def test_the_constant_is_what_asyncpg_actually_emits(self):
-        """The regression itself, stated directly."""
-        from core.observability import ASYNCPG_POOL_RESET_STATEMENT
-
-        assert ASYNCPG_POOL_RESET_STATEMENT == self._asyncpg_reset_query()
-
-    def test_asyncpg_reset_query_through_the_real_sdk_path_is_dropped(self):
-        """End to end over the seam that actually failed.
-
-        asyncpg's query string -> ``record_sql_queries`` (what sentry-sdk's
-        AsyncPGIntegration calls) -> ``Span.to_json()`` -> our filter. Every
-        hop here is library code except the assertion.
-        """
-        from datetime import UTC, datetime, timedelta
-
-        import sentry_sdk
-        from sentry_sdk.tracing_utils import record_sql_queries
-
-        from core.observability import drop_fast_pool_reset_spans
-
-        # `sentry_sdk.init` installs a client on the GLOBAL scope. Left in
-        # place it leaks into every later test in the session -- it made three
-        # unrelated suites fail on first run here. Restore the prior client.
-        global_scope = sentry_sdk.get_global_scope()
-        previous_client = global_scope.client
-        try:
-            sentry_sdk.init(dsn=None, traces_sample_rate=1.0)
-            with sentry_sdk.start_transaction(name="provenance"):
-                with record_sql_queries(
-                    cursor=None,
-                    query=self._asyncpg_reset_query(),
-                    params_list=None,
-                    paramstyle=None,
-                    executemany=False,
-                ) as span:
-                    pass
-        finally:
-            global_scope.set_client(previous_client)
-
-        span.start_timestamp = datetime(2026, 9, 9, 12, 0, 0, tzinfo=UTC)
-        span.timestamp = span.start_timestamp + timedelta(milliseconds=2.3)
-        serialized = span.to_json()
-
-        assert "\n" in serialized["description"], (
-            "asyncpg no longer newline-joins its reset statements -- re-derive "
-            "ASYNCPG_POOL_RESET_STATEMENT before relaxing this"
-        )
-
-        event: Any = {"type": "transaction", "spans": [serialized]}
-        assert drop_fast_pool_reset_spans(event, None)["spans"] == []
-
-
-class TestPoolResetSpanRoundTrip:
-    """The only test here that sees what production actually hands the hook.
-
-    Every other test in this file — including ``TestPoolResetSpanShapeGuard``,
-    which exists to catch exactly this — builds its span from
-    ``Span.to_json()`` or by hand, and then wraps it in an event dict itself.
-    That skips the SDK's ``prepare_event`` pipeline, and the pipeline is where
-    the span dict stops looking like the one those tests assert on:
-    ``Span.to_json()`` emits ``datetime`` timestamps, but by the time
-    ``before_send_transaction`` runs they have been serialized to **ISO-8601
-    strings**.
-
-    That difference silently defeated the filter a second time (LML#1303).
-    LML#1301 fixed the description mismatch and the reset span kept shipping,
-    because ``_span_duration_ms`` understood datetimes and floats but not
-    strings, returned ``None``, and the fail-open branch kept every span.
-    Two independent no-ops in one predicate, both invisible to a suite that
-    constructs its own fixtures.
-
-    So this drives a real transaction through a real ``sentry_sdk.init`` and
-    captures the span dict from inside an actual ``before_send_transaction``
-    call. Nothing here is hand-assembled.
-    """
-
-    @staticmethod
-    def _capture_reset_span() -> dict[str, Any]:
-        """Return the pool-reset span exactly as the hook receives it."""
-        import sentry_sdk
-        from sentry_sdk.tracing_utils import record_sql_queries
-
-        from tests.unit.test_observability import TestPoolResetStatementProvenance as P
-
-        captured: dict[str, Any] = {}
-
-        def hook(event: Any, hint: Any) -> None:
-            for span in event.get("spans", []):
-                if "pg_advisory_unlock_all" in str(span.get("description")):
-                    captured["span"] = span
-            return None  # never actually transmit
-
-        global_scope = sentry_sdk.get_global_scope()
-        previous_client = global_scope.client
-        try:
-            sentry_sdk.init(
-                dsn="https://public@o0.ingest.sentry.io/0",
-                traces_sample_rate=1.0,
-                before_send_transaction=hook,
-            )
-            with sentry_sdk.start_transaction(name="/api/v1/lookup", op="http.server"):
-                with record_sql_queries(
-                    cursor=None,
-                    query=P._asyncpg_reset_query(),
-                    params_list=None,
-                    paramstyle=None,
-                    executemany=False,
-                ):
-                    pass
-            sentry_sdk.flush(2000)
-        finally:
-            global_scope.set_client(previous_client)
-
-        assert "span" in captured, "before_send_transaction never saw the pool-reset span"
-        return captured["span"]
-
-    def test_the_hook_receives_iso_string_timestamps_not_datetimes(self):
-        """Pins the shape that broke it. If the SDK ever reverts to datetimes
-        this fails loudly rather than degrading to fail-open again.
-        """
-        span = self._capture_reset_span()
-
-        assert isinstance(span["start_timestamp"], str)
-        assert isinstance(span["timestamp"], str)
-
-    def test_the_real_hook_payload_is_dropped(self):
-        """The acceptance criterion, stated against production's own data."""
-        from core.observability import _span_duration_ms, drop_fast_pool_reset_spans
-
-        span = self._capture_reset_span()
-
-        assert _span_duration_ms(span) is not None, (
-            "duration unmeasurable on the real payload -- the filter will fail open"
-        )
-
-        event: Any = {"type": "transaction", "spans": [span]}
-        assert drop_fast_pool_reset_spans(event, None)["spans"] == []
+        assert args[1] == "tag inflight_capped onto Sentry scope"
 
 
 class TestSentryInitWiring:
-    """``main.py`` must actually hand the filter to ``init_sentry``.
+    """``main.py`` must pin tracing off.
 
-    A filter nobody passes is a no-op that every unit test above still
-    endorses, so the wiring gets its own assertion.
+    ``wxyc_fastapi.init_sentry`` defaults ``traces_sample_rate`` to 1.0, so
+    dropping the argument would silently turn tracing ON at 100% (BS#3393 D2).
     """
 
-    def test_main_passes_the_filter_as_before_send_transaction(self):
+    def test_main_pins_traces_sample_rate_to_zero(self):
+        import ast
         from pathlib import Path
 
-        source = (Path(__file__).resolve().parents[2] / "main.py").read_text()
-
-        assert "before_send_transaction=drop_fast_pool_reset_spans" in source
-
-    def test_wxyc_fastapi_accepts_the_keyword(self):
-        """Pins the LML#1175 dependency floor: the passthrough landed in
-        wxyc-fastapi 1.5.0 (WXYC/wxyc-fastapi#40). An accidental downgrade
-        below the pin fails here rather than at boot.
-        """
-        import inspect
-
-        from wxyc_fastapi.observability import init_sentry
-
-        parameter = inspect.signature(init_sentry).parameters["before_send_transaction"]
-        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        tree = ast.parse((Path(__file__).resolve().parents[2] / "main.py").read_text())
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "init_sentry"
+        ]
+        assert len(calls) == 1
+        rates = [kw.value for kw in calls[0].keywords if kw.arg == "traces_sample_rate"]
+        assert len(rates) == 1
+        assert isinstance(rates[0], ast.Constant)
+        assert rates[0].value == 0.0
 
 
 class TestCaptureUnsampledCounter:

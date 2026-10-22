@@ -9,16 +9,15 @@ non-library artist+song request could grind 60s+ for a caller that hung up at
 whole ``perform_lookup`` spine (step 2 + step 3).
 
 The pure-unit block exercises :class:`SpineDeadline`,
-:func:`run_within_spine_deadline`, and :func:`project_spine_deadline_telemetry`
-in isolation; the integration block drives ``perform_lookup`` with fake slow
-step-2 Discogs work to prove the deadline bounds it, frees the Discogs
-semaphore on cancellation (mirroring the #370 per-strategy ``wait_for``), and
-projects the step-distinguishing telemetry.
+:func:`run_within_spine_deadline` in isolation; the integration block drives
+``perform_lookup`` with fake slow step-2 Discogs work to prove the deadline
+bounds it and frees the Discogs semaphore on cancellation (mirroring the #370
+per-strategy ``wait_for``).
 """
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -35,7 +34,6 @@ from lookup.spine_deadline import (
     LIMIT_HARD_CAP,
     SpineDeadline,
     SpineDeadlineExceededError,
-    project_spine_deadline_telemetry,
     run_within_spine_deadline,
 )
 from lookup.strategies import build_strategies
@@ -341,49 +339,6 @@ class TestRunWithinSpineDeadline:
 
 
 # ---------------------------------------------------------------------------
-# project_spine_deadline_telemetry
-# ---------------------------------------------------------------------------
-
-
-class TestSpineDeadlineTelemetry:
-    def test_hard_cap_projection(self):
-        """A hard-cap-origin cap hit fires the existing hard_cap_fired key + a step marker."""
-        transaction = Mock()
-        scope = Mock()
-        scope.transaction = transaction
-        exc = SpineDeadlineExceededError(
-            limit=LIMIT_HARD_CAP, elapsed_ms=27_500.4, step="album_lookup"
-        )
-        with patch("lookup.spine_deadline.sentry_sdk.get_current_scope", return_value=scope):
-            project_spine_deadline_telemetry(exc)
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls["hard_cap_fired"] is True
-        assert calls["hard_cap_step"] == "album_lookup"
-
-    def test_caller_budget_projection(self):
-        """A budget-origin cap hit fires the existing search_budget_exceeded key + a step marker."""
-        transaction = Mock()
-        scope = Mock()
-        scope.transaction = transaction
-        exc = SpineDeadlineExceededError(
-            limit=LIMIT_CALLER_BUDGET, elapsed_ms=120.0, step="album_lookup"
-        )
-        with patch("lookup.spine_deadline.sentry_sdk.get_current_scope", return_value=scope):
-            project_spine_deadline_telemetry(exc)
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls["search_budget_exceeded"] is True
-        assert calls["search_budget_step"] == "album_lookup"
-
-    def test_no_transaction_is_noop(self):
-        scope = Mock()
-        scope.transaction = None
-        exc = SpineDeadlineExceededError(limit=LIMIT_HARD_CAP, elapsed_ms=1.0, step="album_lookup")
-        with patch("lookup.spine_deadline.sentry_sdk.get_current_scope", return_value=scope):
-            # Must not raise.
-            project_spine_deadline_telemetry(exc)
-
-
-# ---------------------------------------------------------------------------
 # execute_search_pipeline — pipeline_start_offset_ms
 # ---------------------------------------------------------------------------
 
@@ -517,40 +472,6 @@ class TestSpineDeadlineBoundsStepTwo:
         assert response.results == []
         assert elapsed < 1.0
         assert not sem.locked()  # the cancelled step-2 work freed its Discogs permit
-
-    @pytest.mark.asyncio
-    async def test_hard_cap_projects_step_marker(
-        self, mock_library_db, mock_discogs_service, monkeypatch
-    ):
-        """AC #4: a step-2-originated hard-cap hit is distinguishable in Sentry via hard_cap_step."""
-        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "100")
-
-        async def slow_step2(*args, **kwargs):
-            await asyncio.sleep(5)
-            return []
-
-        monkeypatch.setattr(
-            "lookup.orchestrator.lookup_releases_by_track", AsyncMock(side_effect=slow_step2)
-        )
-
-        transaction = Mock()
-        scope = Mock()
-        scope.transaction = transaction
-
-        request = LookupRequest(
-            artist="Jimmy Scott", song="Sycamore Trees", raw_message="Jimmy Scott - Sycamore Trees"
-        )
-        with patch("lookup.spine_deadline.sentry_sdk.get_current_scope", return_value=scope):
-            await perform_lookup(
-                request,
-                mock_library_db,
-                mock_discogs_service,
-                make_lml_telemetry(),
-            )
-
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get("hard_cap_fired") is True
-        assert calls.get("hard_cap_step") == "album_lookup"
 
     @pytest.mark.asyncio
     async def test_step3_offset_reflects_step2_elapsed(

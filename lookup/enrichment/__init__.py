@@ -58,20 +58,6 @@ logger = logging.getLogger(__name__)
 SKIPPED_PREFETCH_STAT_KEY = "skipped_prefetch"
 
 
-def _project_enrich_datum_to_transaction(key: str) -> None:
-    """Best-effort projection of a boolean ``True`` datum onto the active Sentry
-    transaction. Telemetry must never break a lookup, so a missing transaction
-    is a no-op and any Sentry-side failure is logged at WARNING and swallowed —
-    the same swallow-and-warn set_data contract used elsewhere in the enrichment
-    cluster (e.g. ``item.py``'s apple_music-timeout projection)."""
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data(key, True)
-    except Exception as e:
-        logger.warning("Failed to project %s onto Sentry transaction: %s", key, e)
-
-
 async def enrich_artwork_results(
     items_with_artwork: list[tuple[LibraryItem, DiscogsSearchResult | None]],
     discogs_service: DiscogsService | None,
@@ -267,15 +253,6 @@ async def enrich_artwork_results(
         top1_release = None
         top1_details = None
         get_cache_stats_recorder().record(SKIPPED_PREFETCH_STAT_KEY)
-        _project_enrich_datum_to_transaction("lml.enrich.synthesis_path_skipped_prefetch")
-
-    # LML#504-recovery cohort marker: fires whenever the top-1 item's artist
-    # verifies but its title doesn't (Yenbett-vs-Tzenni shape) — independent
-    # of the flag above, since it quantifies how often the prefetch pays off
-    # for bio-only recovery vs. how often it's pure waste (the skipped-
-    # prefetch counter above).
-    if top1_library_row_artist_verified and not top1_library_row_acceptable:
-        _project_enrich_datum_to_transaction("lml.enrich.synthesis_path_recovered_artist")
 
     # LML#504: release-side artist-identity hop. Computed once (shared across
     # all items in this batch) since ``top1_release`` is by definition top-1-only

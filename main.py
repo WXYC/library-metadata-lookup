@@ -40,7 +40,6 @@ from core.event_loop_lag import start_sampler, stop_sampler
 from core.logging import setup_logging
 from core.memory_profile import start_sampler as start_memory_profile_sampler
 from core.memory_profile import stop_sampler as stop_memory_profile_sampler
-from core.observability import drop_fast_pool_reset_spans
 from core.server_timing_middleware import LmlWallTimingMiddleware
 from discogs.router import router as discogs_router
 from entity.ddl import LmlCacheSchemaMismatchError, verifying_lml_cache_shape
@@ -74,14 +73,8 @@ init_sentry(
     service_name="library-metadata-lookup",
     environment=settings.environment,
     release=settings.app_version,
-    traces_sample_rate=settings.sentry_traces_sample_rate,
-    # Sheds asyncpg's sub-50ms pool-release bookkeeping span, which was 19% of
-    # the whole WXYC Sentry org's span budget on its own (LML#1175). Resets at
-    # or above the floor survive -- they are the pool-contention fingerprint,
-    # not bookkeeping. `traces_sample_rate` above cannot do this job: it is
-    # head-based and per-trace, so it drops whole requests rather than
-    # thinning one span family out of a kept trace.
-    before_send_transaction=drop_fast_pool_reset_spans,
+    # init_sentry defaults traces_sample_rate to 1.0; tracing is dropped (BS#3393 D2), so pin 0.0.
+    traces_sample_rate=0.0,
 )
 
 
@@ -114,17 +107,6 @@ if settings.log_level != "DEBUG":
 setup_logging(level=settings.log_level, log_file=log_file)
 
 logger = logging.getLogger(__name__)
-
-# State the tracing rate actually in force, every boot (LML#1306). Sentry's
-# sample rate is otherwise unobservable from outside the process -- /health does
-# not carry it, and a Railway variable change does not move `commit_sha` -- so
-# the only way to tell a working config from a rejected one was to measure span
-# volume against an unsampled denominator. That took an hour on 2026-09-09. One
-# line here answers it from the deploy log instead.
-logger.info(
-    "Sentry tracing: traces_sample_rate=%s (SENTRY_TRACES_SAMPLE_RATE)",
-    settings.sentry_traces_sample_rate,
-)
 
 # LML#706 multi-worker startup guard. One session-scoped advisory lock
 # serializes the lml_cache.* bootstraps across worker processes so N uvicorn

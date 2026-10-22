@@ -372,54 +372,6 @@ def _log_release_resolution_bind(
         logger.warning("Failed to add release_resolution_bind breadcrumb: %s", e)
 
 
-def _project_mb_rescue_attrs(
-    *,
-    attempted: bool,
-    tracklist_found: bool,
-    song_sanity_checked: bool = False,
-    song_sanity_rejected: bool = False,
-) -> None:
-    """Project MusicBrainz tracklist-rescue outcome onto the active Sentry trace.
-
-    Called from the synth path only when the rescue was eligible (top-1 +
-    extended + ``mb_pg`` set + non-empty artist + non-empty album), so the
-    trace gets an attr per eligible call — non-eligible lookups never emit
-    the boolean, keeping the trace explorer's filter on ``attempted=true``
-    informative.
-
-    The LML#506 song-sanity check has THREE outcomes, projected via two
-    booleans so they're independently filterable:
-
-    * ``song_sanity_checked=False, song_sanity_rejected=False`` — the
-      check was skipped. Three distinct scenarios collapse onto this
-      pair: (a) the request had no ``song`` (artist+album picker call),
-      (b) the rollback flag was off, OR (c) the resolver returned no
-      candidate at all (``tracklist_found=False``). To split (c) from
-      (a)+(b), join with ``tracklist_found`` and / or
-      ``lookup.mb_resolver.returned_album`` in the trace explorer.
-    * ``song_sanity_checked=True, song_sanity_rejected=False`` — the
-      check ran and the requested song appeared in the rescued
-      tracklist. Happy path.
-    * ``song_sanity_checked=True, song_sanity_rejected=True`` — the
-      check ran and dropped the tracklist (likely sibling-release leak,
-      bonus-only-track Deluxe cohort). Distinct from
-      ``tracklist_found=False`` (resolver returned nothing) so the trace
-      explorer can split the rejection cohort from the no-candidate
-      cohort.
-
-    Silent on Sentry SDK errors; observability never breaks /lookup.
-    """
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("lookup.mb_rescue.attempted", attempted)
-            transaction.set_data("lookup.mb_rescue.tracklist_found", tracklist_found)
-            transaction.set_data("lookup.mb_rescue.song_sanity_checked", song_sanity_checked)
-            transaction.set_data("lookup.mb_rescue.song_sanity_rejected", song_sanity_rejected)
-    except Exception as e:
-        logger.warning("Failed to project mb_rescue attrs onto Sentry transaction: %s", e)
-
-
 def _log_resolver_pre_pass(outcome: ResolverOutcome, *, actual_swap: bool) -> None:
     """Emit shadow-mode telemetry for the resolver pre-pass.
 
@@ -434,13 +386,7 @@ def _log_resolver_pre_pass(outcome: ResolverOutcome, *, actual_swap: bool) -> No
     ``data.resolver_pre_pass.would_swap=true`` while the flag is off is the
     shadow dataset; ``swapped`` is non-zero only after the flag flips.
 
-    Two surfaces:
-
-    1. Structured INFO log line for log-pipeline tools.
-    2. ``set_data("resolver_pre_pass", ...)`` on the active Sentry
-       transaction, mirroring ``lookup/router._project_cache_stats_to_transaction``.
-       No-op when there is no active transaction. Any Sentry SDK error is
-       swallowed so observability cannot break /lookup.
+    Emits a structured INFO log line for log-pipeline tools.
     """
     if not outcome.original.strip():
         return
@@ -452,12 +398,6 @@ def _log_resolver_pre_pass(outcome: ResolverOutcome, *, actual_swap: bool) -> No
         "would_swap": outcome.swapped,
     }
     logger.info("resolver_pre_pass %s", payload)
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("resolver_pre_pass", payload)
-    except Exception as e:
-        logger.warning("Failed to project resolver_pre_pass onto Sentry transaction: %s", e)
 
 
 def _log_artist_identity_split_gate(
@@ -481,13 +421,10 @@ def _log_artist_identity_split_gate(
     re-enablement; ``data.use_split_gate=false`` filters the rollback
     population.
 
-    Three surfaces (matching ``_log_resolver_pre_pass``):
+    Two surfaces:
 
-    1. ``set_data("artist_identity_split_gate", ...)`` on the active Sentry
-       transaction — queryable in the trace explorer at production rate.
-    2. ``add_breadcrumb`` for events that get captured (errors/sampled
-       transactions).
-    3. Structured INFO log on a 1% sample — cheap Railway-log grep target.
+    1. ``add_breadcrumb`` for events that get captured (errors).
+    2. Structured INFO log on a 1% sample — cheap Railway-log grep target.
 
     All SDK exceptions swallowed; same pattern as the other ``_log_*``
     helpers in this module.
@@ -507,14 +444,6 @@ def _log_artist_identity_split_gate(
         "release_anchor_present": release_anchor_present,
         "use_split_gate": use_split_gate,
     }
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("artist_identity_split_gate", payload)
-    except Exception as e:
-        logger.warning(
-            "Failed to project artist_identity_split_gate onto Sentry transaction: %s", e
-        )
     try:
         sentry_sdk.add_breadcrumb(
             category="artist_identity_split_gate",

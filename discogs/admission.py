@@ -13,17 +13,12 @@ pieces:
 
 The LML#927 bulk sub-semaphore + LML#358/#569 shared-semaphore acquisition
 (``acquire_discogs_permits``) stays defined in ``discogs/service.py`` rather
-than here, even though it is just as reusable in shape -- ``tests/unit/
-test_discogs_service.py::TestRequestWithRetrySpans`` patches the WHOLE
-``discogs.service.sentry_sdk`` name (``patch("discogs.service.sentry_sdk")``,
-no trailing attribute), which rebinds that one name in ``discogs.service``'s
-own namespace to a mock. That is different from an attribute-level patch
-like ``patch("discogs.service.sentry_sdk.start_span")`` (which mutates the
-shared ``sentry_sdk`` module object itself, so it is visible from any module
-that also did ``import sentry_sdk``): a whole-name patch only affects code
-whose ``sentry_sdk.*`` calls are textually resolved from ``discogs.service``'s
-globals. ``admit_or_shed`` and ``retry_429`` below never call ``sentry_sdk``,
-so they carry no such constraint and can live here.
+than here, even though it is just as reusable in shape -- it calls
+``discogs/service.py``'s queue-depth tag helpers and ``sentry_sdk.set_tag``,
+which ``tests/unit/test_discogs_service_bulk_priority.py`` patches by the
+``discogs.service.<name>`` dotted path. Moving the calls into another module
+would leave that patch intercepting nothing. ``admit_or_shed`` and ``retry_429``
+below never call ``sentry_sdk``, so they carry no such constraint and can live here.
 
 The per-attempt in-flight breaker re-check (``should_shed_inflight``) and the
 rate-gate acquire also stay inline in ``DiscogsService._request_with_retry``

@@ -12,9 +12,10 @@ strategies with mock Outcome-returning callables.
 """
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -754,25 +755,18 @@ class TestSearchBudget:
         mock_scope = Mock()
         mock_scope.transaction = mock_transaction
 
-        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
-            state = await execute_search_pipeline(
-                parsed,
-                "Stereolab - Miss Modular",
-                strategies,
-                song_not_found=True,
-            )
+        state = await execute_search_pipeline(
+            parsed,
+            "Stereolab - Miss Modular",
+            strategies,
+            song_not_found=True,
+        )
 
         # Compilation strategy never ran.
         search_comp.assert_not_awaited()
         assert SearchStrategyType.TRACK_ON_COMPILATION not in state.strategies_tried
         # State preserves the prior strategy's results.
         assert state.results == [first_hit]
-        # Telemetry projected onto the active Sentry transaction.
-        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert calls.get("search_budget_exceeded") is True
-        assert SearchStrategyType.TRACK_ON_COMPILATION.value in calls.get(
-            "search_strategies_skipped", []
-        )
 
     @pytest.mark.asyncio
     async def test_budget_exceeded_safety_branch_when_all_empty(self, monkeypatch):
@@ -844,100 +838,13 @@ class TestSearchBudget:
         mock_scope = Mock()
         mock_scope.transaction = mock_transaction
 
-        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
-            state = await execute_search_pipeline(
-                parsed,
-                "Juana Molina - DOGA",
-                strategies,
-            )
+        state = await execute_search_pipeline(
+            parsed,
+            "Juana Molina - DOGA",
+            strategies,
+        )
 
         assert state.results == [hit]
-        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert "search_budget_exceeded" not in calls
-
-    @pytest.mark.asyncio
-    async def test_budget_breach_no_active_transaction_is_noop(self, monkeypatch):
-        """Telemetry projection no-ops when there is no active Sentry transaction.
-
-        Mirrors `_log_album_title_fallback` — observability never breaks
-        /lookup. Confirms the breach path doesn't raise when Sentry has
-        nothing to attach to.
-        """
-        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "1")
-
-        first_hit = _item(id=1, artist="Stereolab", title="Dots and Loops")
-
-        async def slow_first(*args, **kwargs):
-            await asyncio.sleep(0.02)
-            return ([first_hit], False)
-
-        search_lib = AsyncMock(side_effect=slow_first)
-        search_alt = AsyncMock(return_value=([], None, {}))
-        search_comp = AsyncMock(return_value=([], {}))
-
-        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
-
-        parsed = ParsedRequest(
-            artist="Stereolab",
-            song="Miss Modular",
-            raw_message="Stereolab - Miss Modular",
-        )
-
-        mock_scope = Mock()
-        mock_scope.transaction = None  # no active transaction
-
-        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
-            state = await execute_search_pipeline(
-                parsed,
-                "Stereolab - Miss Modular",
-                strategies,
-                song_not_found=True,
-            )
-
-        # No crash; pipeline still surfaces the prior strategy's results.
-        assert state.results == [first_hit]
-
-    @pytest.mark.asyncio
-    async def test_budget_breach_swallows_sentry_sdk_errors(self, monkeypatch):
-        """Sentry SDK raising inside the projection path doesn't break /lookup.
-
-        The docstring on `_log_search_budget_exceeded` promises any SDK error
-        is swallowed. Pin that promise: if `get_current_scope` itself raises,
-        the pipeline still returns prior results normally.
-        """
-        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "1")
-
-        first_hit = _item(id=1, artist="Stereolab", title="Dots and Loops")
-
-        async def slow_first(*args, **kwargs):
-            await asyncio.sleep(0.02)
-            return ([first_hit], False)
-
-        search_lib = AsyncMock(side_effect=slow_first)
-        search_alt = AsyncMock(return_value=([], None, {}))
-        search_comp = AsyncMock(return_value=([], {}))
-
-        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
-
-        parsed = ParsedRequest(
-            artist="Stereolab",
-            song="Miss Modular",
-            raw_message="Stereolab - Miss Modular",
-        )
-
-        with patch(
-            "core.search.sentry_sdk.get_current_scope",
-            side_effect=RuntimeError("sentry exploded"),
-        ):
-            state = await execute_search_pipeline(
-                parsed,
-                "Stereolab - Miss Modular",
-                strategies,
-                song_not_found=True,
-            )
-
-        # No crash; pipeline still surfaces the prior strategy's results.
-        assert state.results == [first_hit]
 
 
 # ---------------------------------------------------------------------------
@@ -1056,90 +963,22 @@ class TestSearchHardTimeoutLoopGate:
         assert state.timed_out is True
         assert state.results == []
 
-    @pytest.mark.asyncio
-    async def test_hard_cap_telemetry_projected_onto_sentry(self, monkeypatch):
-        """When the cap fires, ``hard_cap_fired`` lands on the active transaction."""
-        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "50")
-        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
-
-        async def slow_empty(*args, **kwargs):
-            await asyncio.sleep(0.2)
-            return ([], False)
-
-        search_lib = AsyncMock(side_effect=slow_empty)
-        search_alt = AsyncMock(return_value=([], None, {}))
-        search_comp = AsyncMock(return_value=([], {}))
-
-        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
-
-        parsed = ParsedRequest(
-            artist="Untracked",
-            song="Song",
-            raw_message="Untracked - Song",
-        )
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
-        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
-            await execute_search_pipeline(
-                parsed,
-                "Untracked - Song",
-                strategies,
-                song_not_found=True,
-            )
-
-        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert calls.get("hard_cap_fired") is True
-        # Strategies past the cap recorded as skipped (telemetry diagnostic).
-        skipped = calls.get("hard_cap_skipped_strategies", [])
-        assert SearchStrategyType.SWAPPED_INTERPRETATION.value in skipped
-        assert SearchStrategyType.TRACK_ON_COMPILATION.value in skipped
-
 
 class TestLogHardCapFired:
-    """Sentry projection helper for the hard-cap-fired event."""
+    """Structured log for the hard-cap-fired event."""
 
-    def test_projects_keys_onto_active_transaction(self):
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
-        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
+    def test_logs_the_payload_at_info(self, caplog):
+        with caplog.at_level(logging.INFO, logger="core.search"):
             _log_hard_cap_fired(
                 elapsed_ms=27_500.5,
                 skipped=[SearchStrategyType.TRACK_ON_COMPILATION, SearchStrategyType.SONG_AS_TRACK],
                 hard_cap_ms=25_000,
             )
 
-        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert calls["hard_cap_fired"] is True
-        assert calls["hard_cap_skipped_strategies"] == [
-            SearchStrategyType.TRACK_ON_COMPILATION.value,
-            SearchStrategyType.SONG_AS_TRACK.value,
-        ]
-        # Pin the elapsed-ms projection — Sentry trace explorer filtering by
-        # "how much did we overshoot the cap" is the natural diagnostic for
-        # tuning the cap value over time. Rounded to 2 decimals on emit.
-        assert calls["hard_cap_elapsed_ms"] == 27_500.5
-
-    def test_noop_when_no_active_transaction(self):
-        """No transaction → silently no-op; do not raise."""
-        mock_scope = Mock()
-        mock_scope.transaction = None
-
-        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
-            # Must not raise; nothing to assert beyond that.
-            _log_hard_cap_fired(elapsed_ms=10.0, skipped=[], hard_cap_ms=25_000)
-
-    def test_swallows_sdk_errors(self):
-        """Any SDK-side exception is swallowed so observability cannot break /lookup."""
-        with patch(
-            "core.search.sentry_sdk.get_current_scope",
-            side_effect=RuntimeError("sentry exploded"),
-        ):
-            # Must not raise.
-            _log_hard_cap_fired(elapsed_ms=10.0, skipped=[], hard_cap_ms=25_000)
+        message = next(r.getMessage() for r in caplog.records if "hard_cap_fired" in r.getMessage())
+        assert "27500.5" in message
+        assert "25000" in message
+        assert SearchStrategyType.TRACK_ON_COMPILATION.value in message
 
 
 class TestPerStrategyWaitFor:
@@ -1448,24 +1287,16 @@ class TestHardCapSoftBudgetIndependence:
             song="Miss Modular",
             raw_message="Stereolab - Miss Modular",
         )
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
-        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
-            state = await execute_search_pipeline(
-                parsed,
-                "Stereolab - Miss Modular",
-                strategies,
-                song_not_found=True,
-            )
+        state = await execute_search_pipeline(
+            parsed,
+            "Stereolab - Miss Modular",
+            strategies,
+            song_not_found=True,
+        )
 
         # Soft budget wins; hard cap silent; results preserved; not timed out.
         assert state.results == [first_hit]
         assert state.timed_out is False
-        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert calls.get("search_budget_exceeded") is True
-        assert "hard_cap_fired" not in calls
 
 
 # ---------------------------------------------------------------------------
@@ -1563,80 +1394,18 @@ class TestCallerBudget:
             song="Miss Modular",
             raw_message="Stereolab - Miss Modular",
         )
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
         # caller_budget_ms = 201 → effective budget = 1 (201 - TRANSPORT_OVERHEAD_MS).
         # Tightest valid effective budget; any await trips the gate.
-        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
-            state = await execute_search_pipeline(
-                parsed,
-                "Stereolab - Miss Modular",
-                strategies,
-                song_not_found=True,
-                caller_budget_ms=TRANSPORT_OVERHEAD_MS + 1,
-            )
+        state = await execute_search_pipeline(
+            parsed,
+            "Stereolab - Miss Modular",
+            strategies,
+            song_not_found=True,
+            caller_budget_ms=TRANSPORT_OVERHEAD_MS + 1,
+        )
 
         search_comp.assert_not_awaited()
         assert state.results == [first_hit]
-        # Telemetry pins both the budget-exceeded flag AND the caller-budget value,
-        # so trace explorer queries can distinguish header-driven from env-driven cutoffs.
-        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert calls.get("search_budget_exceeded") is True
-        assert calls.get("lml.caller_budget_ms") == TRANSPORT_OVERHEAD_MS + 1
-        # LML#944: the same value is ALSO promoted to a measurement (aggregatable
-        # across traces via avg/percentile), alongside the set_data above — set_data
-        # alone is opaque to the spans/metrics datasets ("Unknown attribute").
-        measurement_calls = {
-            c.args[0]: c.args[1] for c in mock_transaction.set_measurement.call_args_list
-        }
-        assert measurement_calls.get("lml.caller_budget_ms") == TRANSPORT_OVERHEAD_MS + 1
-
-    @pytest.mark.asyncio
-    async def test_pipeline_no_caller_budget_does_not_set_caller_attr(self, monkeypatch):
-        """When the caller doesn't send the header, the lml.caller_budget_ms attr is not set.
-
-        Sentry attribute hygiene: only set the attribute on traces where the
-        caller actually opted into the contract. Saves trace-explorer noise.
-        """
-        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "10000")
-
-        first_hit = _item(id=1, artist="Stereolab", title="Dots and Loops")
-
-        async def fast_first(*args, **kwargs):
-            return ([first_hit], False)
-
-        search_lib = AsyncMock(side_effect=fast_first)
-        search_alt = AsyncMock(return_value=([], None, {}))
-        search_comp = AsyncMock(return_value=([], {}))
-
-        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
-
-        parsed = ParsedRequest(
-            artist="Stereolab",
-            song="Miss Modular",
-            raw_message="Stereolab - Miss Modular",
-        )
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
-        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
-            await execute_search_pipeline(
-                parsed,
-                "Stereolab - Miss Modular",
-                strategies,
-                song_not_found=True,
-                # caller_budget_ms not passed.
-            )
-
-        keys = {c.args[0] for c in mock_transaction.set_data.call_args_list}
-        assert "lml.caller_budget_ms" not in keys
-        # LML#944: the set_measurement promotion sits behind the same
-        # `if caller_budget_ms is not None` guard, so it must be equally absent.
-        measurement_keys = {c.args[0] for c in mock_transaction.set_measurement.call_args_list}
-        assert "lml.caller_budget_ms" not in measurement_keys
 
     @pytest.mark.asyncio
     async def test_pipeline_caller_budget_cuts_off_empty_results(self, monkeypatch):

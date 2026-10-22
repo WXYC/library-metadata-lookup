@@ -63,7 +63,6 @@ from contextvars import ContextVar
 from typing import Any
 
 import asyncpg.exceptions
-import sentry_sdk
 from wxyc_fastapi.observability import (
     add_breadcrumb,
     get_cache_stats_recorder,
@@ -153,24 +152,6 @@ def get_request_context() -> dict[str, str] | None:
     return _request_context_var.get()
 
 
-def apply_request_ctx_tags(span: Any) -> None:
-    """Tag a wait span with the LML#537 ``lml.discogs.method`` /
-    ``lml.discogs.cache_state`` labels read from the current context.
-
-    Called from ``DiscogsService._request_with_retry`` for both the
-    semaphore-acquire and per-retry rate-limiter spans. Encapsulated in
-    this module so the dict-key contract (``"method"`` / ``"cache_state"``)
-    AND the Sentry attribute names live next to the contextvar producer —
-    a future rename only has to touch ``fallthrough.py``. No-op when no
-    context is active (direct ``_request_with_retry`` callers from tests).
-    """
-    ctx = _request_context_var.get()
-    if ctx is None:
-        return
-    span.set_data("lml.discogs.method", ctx["method"])
-    span.set_data("lml.discogs.cache_state", ctx["cache_state"])
-
-
 # Default predicate for ``fallthrough(is_pg_hit=...)``. Hoisted to module scope
 # (rather than inlined as a default lambda) so ``repr(fallthrough)`` and the
 # signature read "default sentinel" instead of "anonymous lambda".
@@ -179,7 +160,7 @@ def _default_is_pg_hit(v: object | None) -> bool:
 
 
 def _arm_cool_down(reason: str, error: BaseException) -> None:
-    """Suppress PG reads for ``_COOL_DOWN_SECONDS`` and project onto Sentry."""
+    """Suppress PG reads for ``_COOL_DOWN_SECONDS``."""
     global _cool_down_until
     _cool_down_until = time.monotonic() + _COOL_DOWN_SECONDS
     payload = {
@@ -188,12 +169,6 @@ def _arm_cool_down(reason: str, error: BaseException) -> None:
         "cool_down_seconds": _COOL_DOWN_SECONDS,
     }
     logger.warning("cache_fallback_fired %s", payload)
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("cache_fallback_fired", payload)
-    except Exception as e:
-        logger.warning("Failed to project cache_fallback_fired onto Sentry transaction: %s", e)
 
 
 def _cool_down_active() -> bool:
@@ -303,10 +278,8 @@ async def fallthrough[T](
     if pg_read is not None and not skip and not in_cool_down:
         try:
             _add_discogs_breadcrumb(f"cache_lookup_{label}", bc_data)
-            with sentry_sdk.start_span(op="cache.get", name=f"l2:{label}") as span:
-                async with timed_pg():
-                    cached = await pg_read()
-                span.set_data("cache.hit", is_pg_hit(cached))
+            async with timed_pg():
+                cached = await pg_read()
             if is_pg_hit(cached):
                 _add_discogs_breadcrumb("cache_hit", bc_data)
                 get_cache_stats_recorder().record_pg_cache_hit()
@@ -366,9 +339,7 @@ async def fallthrough[T](
     # ----- Negative-cache pre-check (skipped under skip-cache flag).
     if pg_negative_check is not None and on_negative_hit is not None and not skip:
         try:
-            with sentry_sdk.start_span(op="cache.get", name=f"l2_negative:{label}") as span:
-                negative_hit = await pg_negative_check()
-                span.set_data("cache.hit", bool(negative_hit))
+            negative_hit = await pg_negative_check()
             if negative_hit:
                 _add_discogs_breadcrumb("negative_cache_hit", bc_data)
                 get_cache_stats_recorder().record("pg_negative_hits")
@@ -403,8 +374,7 @@ async def fallthrough[T](
         if pg_write is not None:
             try:
                 _add_discogs_breadcrumb(f"cache_write_{label}", bc_data)
-                with sentry_sdk.start_span(op="cache.put", name=f"l2:{label}"):
-                    await pg_write(api_result)
+                await pg_write(api_result)
                 logger.debug("Cached %s", label)
             except Exception as e:
                 logger.warning("Failed to cache %s: %s", label, e)
@@ -422,8 +392,7 @@ async def fallthrough[T](
     ):
         try:
             _add_discogs_breadcrumb("negative_cache_write", bc_data)
-            with sentry_sdk.start_span(op="cache.put", name=f"l2_negative:{label}"):
-                await pg_negative_record()
+            await pg_negative_record()
         except Exception as e:
             logger.warning("Negative-cache write failed for %s: %s", label, e)
 

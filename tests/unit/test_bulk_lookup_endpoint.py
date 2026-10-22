@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import sentry_sdk
@@ -1109,8 +1109,8 @@ class TestBulkLookupObservability:
     """Entry/exit instrumentation pins (LML#371).
 
     The bulk endpoint was silent in production — successful requests emitted no
-    uvicorn access lines AND no Sentry ``http.server`` spans (issue #371). The
-    underlying cause was that both signals fire on response completion, so a
+    uvicorn access lines (issue #371). The
+    underlying cause was that the signal fires on response completion, so a
     handler that hung past the client's AbortController timeout left zero trace
     on the server side even though Discogs work was visibly running downstream.
 
@@ -1120,10 +1120,6 @@ class TestBulkLookupObservability:
     2. An ``INFO`` log at handler exit carrying status counts — confirms
        response completion and gives operators a count breakdown without
        digging into Sentry.
-    3. A Sentry ``http.server`` span tied to the bulk route — emitted via an
-       explicit ``start_span(op="http.server", ...)`` wrap so the signal does
-       not depend on the FastApiIntegration patch landing for this specific
-       endpoint.
 
     The matching production change is in ``lookup/router.py:handle_bulk_lookup``.
     """
@@ -1229,72 +1225,6 @@ class TestBulkLookupObservability:
         assert "match=2" in exit_msg, f"Exit log missing match count: {exit_msg!r}"
         assert "no_match=1" in exit_msg, f"Exit log missing no_match count: {exit_msg!r}"
         assert "error=1" in exit_msg, f"Exit log missing error count: {exit_msg!r}"
-
-    @pytest.mark.asyncio
-    async def test_http_server_span_emitted_for_bulk(self, app_client):
-        """An ``http.server`` Sentry span is started with the bulk route name.
-
-        Pins the explicit ``sentry_sdk.start_span(op="http.server", ...)`` in
-        the handler. Without this, observability of the bulk endpoint depended
-        entirely on the FastApiIntegration's automatic instrumentation — which
-        the production logs at 22:21-22:34 on 2026-05-24 showed was not firing
-        for hung handlers (the album-level-backfill case in #371).
-        """
-        # Replace `start_span` with a factory that hands back a fresh MagicMock
-        # per call — including the inner `lml.bulk.batch` / `lml.bulk.item`
-        # spans the handler also opens. Each mock self-enters as its own
-        # context manager and records every `set_data(...)` call so the
-        # assertions below can pin both the span name and the `http.target`
-        # data field. (The previous version returned the real span, which made
-        # the data calls untestable.)
-        captured_spans: list[dict] = []
-
-        def capture_start_span(*args, **kwargs):
-            span_mock = MagicMock()
-            span_mock.__enter__ = MagicMock(return_value=span_mock)
-            span_mock.__exit__ = MagicMock(return_value=False)
-            captured_spans.append({"args": args, "kwargs": kwargs, "span": span_mock})
-            return span_mock
-
-        with (
-            patch(
-                "lookup.router.perform_lookup",
-                new_callable=AsyncMock,
-                return_value=_no_match_response(),
-            ),
-            patch("lookup.router.sentry_sdk.start_span", side_effect=capture_start_span),
-        ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app_client), base_url="http://test"
-            ) as ac:
-                resp = await ac.post(
-                    "/api/v1/lookup/bulk",
-                    json={"items": [{"artist": "Juana Molina", "album": "DOGA"}]},
-                )
-
-        assert resp.status_code == 200
-        http_server_spans = [s for s in captured_spans if s["kwargs"].get("op") == "http.server"]
-        assert http_server_spans, (
-            "Expected at least one Sentry span with op='http.server'; got: "
-            f"{[s['kwargs'].get('op') for s in captured_spans]}"
-        )
-        # The span name must be exactly the canonical route string so operators
-        # can filter for `span.description:"POST /api/v1/lookup/bulk"` in the
-        # trace explorer. A substring match would not catch a drift to e.g.
-        # `/api/v2/lookup/bulk` if the constant ever gets out of sync with the
-        # route registration.
-        span_name = http_server_spans[0]["kwargs"].get("name", "")
-        assert span_name == "POST /api/v1/lookup/bulk", (
-            f"Expected http.server span name 'POST /api/v1/lookup/bulk'; got {span_name!r}"
-        )
-        # Pin the `http.target` data field — the second canonical-route usage
-        # in the handler. Together with the span-name pin above, this proves
-        # both call sites stay in sync (e.g. after the constant is hoisted).
-        set_data_calls = http_server_spans[0]["span"].set_data.call_args_list
-        http_target_args = [c.args for c in set_data_calls if c.args and c.args[0] == "http.target"]
-        assert http_target_args == [("http.target", "/api/v1/lookup/bulk")], (
-            f"Expected http.target set to '/api/v1/lookup/bulk' exactly once; got {http_target_args!r}"
-        )
 
 
 class TestBulkLookupClientAbort:

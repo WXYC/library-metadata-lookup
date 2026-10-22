@@ -189,14 +189,11 @@ class TestInFlightCapConfiguration:
 
 class TestInFlightCapObservability:
     @pytest.mark.asyncio
-    async def test_capped_wait_sets_filterable_tag_and_wait_measurement(
-        self, app_client, monkeypatch
-    ):
-        """A queued request tags + measures; the tag is the post-deploy signal.
+    async def test_capped_wait_sets_filterable_tag(self, app_client, monkeypatch):
+        """A queued request tags; the tag is the post-deploy signal.
 
         ``sentry_sdk.set_tag`` (not ``set_data``) is load-bearing — the LML#683
-        lesson: ``set_data`` span attributes read back as "Unknown attribute" in
-        the spans dataset, so it can't back a query or an alert.
+        lesson: a filterable tag is the queryable signal.
         """
         monkeypatch.setenv("LML_STREAMING_CHECK_MAX_CONCURRENT", "1")
 
@@ -210,9 +207,6 @@ class TestInFlightCapObservability:
                 await gate.wait()
             return _empty_response()
 
-        transaction = Mock()
-        scope = Mock()
-        scope.transaction = transaction
         set_tag = Mock()
 
         with (
@@ -221,7 +215,6 @@ class TestInFlightCapObservability:
                 new_callable=AsyncMock,
                 side_effect=gated_check,
             ),
-            patch.object(observability.sentry_sdk, "get_current_scope", return_value=scope),
             patch.object(observability.sentry_sdk, "set_tag", set_tag),
         ):
             async with AsyncClient(
@@ -253,21 +246,11 @@ class TestInFlightCapObservability:
             if c.args == ("lml.streaming_check.inflight_capped", "true")
         ]
         assert len(capped_tags) == 1
-        wait_measurements = [
-            c
-            for c in transaction.set_measurement.call_args_list
-            if c.args[0] == "lml.streaming_check.inflight_wait_ms"
-        ]
-        assert len(wait_measurements) == 1
-        assert wait_measurements[0].args[1] > 0
 
     @pytest.mark.asyncio
-    async def test_uncontended_request_sets_no_tag_or_measurement(self, app_client, monkeypatch):
+    async def test_uncontended_request_sets_no_tag(self, app_client, monkeypatch):
         monkeypatch.setenv("LML_STREAMING_CHECK_MAX_CONCURRENT", "8")
 
-        transaction = Mock()
-        scope = Mock()
-        scope.transaction = transaction
         set_tag = Mock()
 
         with (
@@ -276,7 +259,6 @@ class TestInFlightCapObservability:
                 new_callable=AsyncMock,
                 return_value=_empty_response(),
             ),
-            patch.object(observability.sentry_sdk, "get_current_scope", return_value=scope),
             patch.object(observability.sentry_sdk, "set_tag", set_tag),
         ):
             async with AsyncClient(
@@ -287,8 +269,4 @@ class TestInFlightCapObservability:
         assert resp.status_code == 200
         assert not any(
             c.args[0] == "lml.streaming_check.inflight_capped" for c in set_tag.call_args_list
-        )
-        assert not any(
-            c.args[0] == "lml.streaming_check.inflight_wait_ms"
-            for c in transaction.set_measurement.call_args_list
         )

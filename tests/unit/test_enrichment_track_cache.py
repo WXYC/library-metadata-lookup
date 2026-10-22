@@ -341,8 +341,7 @@ class TestL1TrackCache:
 class TestClampedTimeoutLogDiscrimination:
     """LML#930 PR2 folded-in nit: a `wait_for` timeout self-inflicted by the
     deadline clamp (`item.py`'s `apple_probe_timeout_s < base_apple_timeout_s`)
-    is not an Apple outage. It must log at DEBUG (not the legacy WARNING) and
-    carry `apple_music.timeout.deadline_clamped=True` on the transaction; a
+    is not an Apple outage. It must log at DEBUG (not the legacy WARNING); a
     genuine, unclamped (full-ceiling) timeout must still WARN as today.
 
     Both tests force a REAL `asyncio.wait_for` timeout (no mocked exception)
@@ -351,7 +350,7 @@ class TestClampedTimeoutLogDiscrimination:
     deadline-pressured probe would hit.
     """
 
-    async def test_clamped_timeout_logs_debug_and_sets_deadline_clamped_true(self):
+    async def test_clamped_timeout_logs_debug(self):
         item, artwork, apple_music = _happy_inputs()
         apple_music.find_track_url = AsyncMock(side_effect=_slow_find_track_url)
         pg = AsyncMock(spec=PgSource)
@@ -360,17 +359,12 @@ class TestClampedTimeoutLogDiscrimination:
         deadline = SpineDeadline(
             start=time.monotonic(), hard_cap_ms=25000, caller_budget_ms=700, effective_budget_ms=500
         )
-        txn = MagicMock()
         mock_logger = MagicMock()
 
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
             patch("lookup.enrichment.apple_probe.logger", mock_logger),
             patch.object(SpineDeadline, "clamp_probe_timeout_s", return_value=0.02),
-            patch(
-                "lookup.enrichment.apple_probe.sentry_sdk.get_current_scope",
-                return_value=MagicMock(transaction=txn),
-            ),
         ):
             results = await enrich_artwork_results(
                 [(item, artwork)],
@@ -393,13 +387,6 @@ class TestClampedTimeoutLogDiscrimination:
         debug_messages = [call.args[0] for call in mock_logger.debug.call_args_list]
         assert any("timed out" in msg and "deadline-clamped" in msg for msg in debug_messages)
 
-        data = {c.args[0]: c.args[1] for c in txn.set_data.call_args_list}
-        assert data["apple_music.find_track_url.timeout"] is True
-        assert data["apple_music.timeout.deadline_clamped"] is True
-        # The clamp magnitude is recorded so a DEBUG-demoted clamped timeout
-        # stays diagnosable (near-zero here == self-inflicted deadline pressure).
-        assert data["apple_music.timeout.probe_timeout_s"] == 0.02
-
     async def test_unclamped_timeout_still_warns(self):
         """Control: with no spine deadline, the probe's timeout equals the
         (tiny, patched) base ceiling exactly — not clamped BELOW it — so a
@@ -409,17 +396,12 @@ class TestClampedTimeoutLogDiscrimination:
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)  # miss -> live probe
 
-        txn = MagicMock()
         mock_logger = MagicMock()
 
         with (
             patch("lookup.enrichment.item.get_settings", return_value=_flags()),
             patch("lookup.enrichment.apple_probe.logger", mock_logger),
             patch("lookup.enrichment.apple_probe.apple_music_lookup_timeout_s", return_value=0.02),
-            patch(
-                "lookup.enrichment.apple_probe.sentry_sdk.get_current_scope",
-                return_value=MagicMock(transaction=txn),
-            ),
         ):
             results = await enrich_artwork_results(
                 [(item, artwork)],
@@ -438,8 +420,3 @@ class TestClampedTimeoutLogDiscrimination:
         warning_messages = [call.args[0] for call in mock_logger.warning.call_args_list]
         assert any("timed out" in msg for msg in warning_messages)
         mock_logger.debug.assert_not_called()
-
-        data = {c.args[0]: c.args[1] for c in txn.set_data.call_args_list}
-        assert data["apple_music.timeout.deadline_clamped"] is False
-        # Unclamped: the recorded magnitude equals the (patched) base ceiling.
-        assert data["apple_music.timeout.probe_timeout_s"] == 0.02

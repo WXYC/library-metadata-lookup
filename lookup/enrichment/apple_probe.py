@@ -46,8 +46,6 @@ import asyncio
 import logging
 from typing import NamedTuple
 
-import sentry_sdk
-
 from clients.streaming.apple_music import AppleMusicTrackMatch
 from config.settings import Settings
 from entity.track_streaming_url_cache import (
@@ -267,34 +265,6 @@ async def run_apple_music_probe(
                     probe_method,
                     row_artist,
                     search_term,
-                )
-            # LML#462: project onto the active Sentry transaction so the
-            # trace explorer can distinguish "Apple Music timed out" from
-            # "Apple Music never ran" — the cancelled inner
-            # `apple_music.search` span never sets its `result` data, so
-            # without this marker the timeout shape is queryably
-            # indistinguishable from a no-op. The legacy key stays for
-            # dashboard continuity; the ``.method`` key disambiguates
-            # synthesis-path timeouts from happy-path timeouts; the LML#930
-            # ``.deadline_clamped`` key disambiguates a self-inflicted
-            # deadline-clamped timeout from a genuine Apple-side one; the
-            # ``.probe_timeout_s`` key records the effective clamp magnitude so
-            # a DEBUG-demoted clamped timeout stays diagnosable — a value near
-            # the base ceiling is a likely genuine Apple slowness, a near-zero
-            # value is self-inflicted deadline pressure.
-            try:
-                transaction = sentry_sdk.get_current_scope().transaction
-                if transaction is not None:
-                    transaction.set_data("apple_music.find_track_url.timeout", True)
-                    transaction.set_data("apple_music.timeout.method", probe_method)
-                    transaction.set_data("apple_music.timeout.deadline_clamped", deadline_clamped)
-                    transaction.set_data(
-                        "apple_music.timeout.probe_timeout_s", round(apple_probe_timeout_s, 3)
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Failed to project apple_music timeout onto Sentry transaction: %s",
-                    e,
                 )
         except Exception:
             # LML#1053: the LML#444 swallow-and-degrade path — attempted but

@@ -33,7 +33,6 @@ from lookup.artist_resolution import (
     _artist_pair_verified,
     _log_artist_identity_split_gate,
     _mb_rescue_song_match_required,
-    _project_mb_rescue_attrs,
 )
 from lookup.enrichment.apple_probe import run_apple_music_probe
 from lookup.enrichment.bandcamp_probe import probe_owns_bandcamp_leg, run_bandcamp_live_probe
@@ -681,10 +680,7 @@ async def enrich_one(
             # the same as ``song=None`` / whitespace-only: skip the
             # check rather than emit a misleading rejection.
             song_match_target = strip_track_suffix(song_stripped)
-            song_sanity_checked = False
-            song_sanity_rejected = False
             if mb_tracklist and song_match_target and _mb_rescue_song_match_required():
-                song_sanity_checked = True
                 # Require a non-empty stripped track title for the
                 # iteration to count as a hit. ``score_match_track("", "")``
                 # returns 100 by rapidfuzz convention, so without this
@@ -705,15 +701,8 @@ async def enrich_one(
                         song_stripped,
                     )
                     mb_tracklist = None
-                    song_sanity_rejected = True
             if mb_tracklist:
                 update["tracklist"] = mb_tracklist
-            _project_mb_rescue_attrs(
-                attempted=True,
-                tracklist_found=bool(mb_tracklist),
-                song_sanity_checked=song_sanity_checked,
-                song_sanity_rejected=song_sanity_rejected,
-            )
 
         # LML#487: surface the Apple Music probe's artwork URL on the
         # synthesized result. ``probe_artwork_url`` is non-None when

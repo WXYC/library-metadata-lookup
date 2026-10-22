@@ -33,38 +33,25 @@ from lookup.spine_deadline import SpineDeadline
 logger = logging.getLogger(__name__)
 
 
-def project_tail_shed_telemetry(
-    step: str, remaining_ms: float, limit: str, deadline: SpineDeadline
-) -> None:
-    """Project a caller-deadline enrichment-tail shed onto the active transaction (LML#930).
+def project_tail_shed_telemetry(step: str, limit: str) -> None:
+    """Tag a caller-deadline enrichment-tail shed onto the Sentry scope (LML#930).
 
-    Two-channel shape (the LML#683 lesson — ``set_data`` alone is unqueryable):
-    filterable TAGS to slice degraded traffic, aggregatable MEASUREMENTS to tune
-    the budget. (The ``lml.degraded_reason`` tag itself is set once, for *every*
-    degraded reason, by the orchestrator's ``_build_degraded_response``.)
+    Filterable TAGS to slice degraded traffic. (The ``lml.degraded_reason`` tag
+    itself is set once, for *every* degraded reason, by the orchestrator's
+    ``_build_degraded_response``.)
 
     - tag ``lml.deadline.tail_shed_step`` — the tail step we shed before
       (``library_miss_probe`` / ``validate_tracks`` / … / ``resolve_identities``).
     - tag ``lml.deadline.tail_shed_limit`` — ``hard_cap`` | ``caller_budget``
       (which limit bound), mirroring the step-2 spine-trip attribution.
-    - measurement ``lml.deadline.tail_remaining_ms`` — signed budget left at the
-      shed (≤ floor; negative shows overrun magnitude).
-    - measurement ``lml.deadline.tail_shed_ms`` — spine wall-clock already spent
-      at the shed point.
 
     Never breaks the request path; failures log and continue.
     """
     try:
         sentry_sdk.set_tag("lml.deadline.tail_shed_step", step)
         sentry_sdk.set_tag("lml.deadline.tail_shed_limit", limit)
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_measurement("lml.deadline.tail_remaining_ms", round(remaining_ms, 2))
-            transaction.set_measurement(
-                "lml.deadline.tail_shed_ms", round(deadline.elapsed_ms(), 2)
-            )
     except Exception as e:  # pragma: no cover - defensive
-        logger.warning("Failed to project tail-shed telemetry onto Sentry transaction: %s", e)
+        logger.warning("Failed to project tail-shed telemetry onto Sentry scope: %s", e)
 
 
 def should_shed_tail(
@@ -82,7 +69,7 @@ def should_shed_tail(
     exhausted, remaining_ms, limit = deadline.tail_exhausted()
     if not exhausted:
         return None
-    project_tail_shed_telemetry(step, remaining_ms, limit, deadline)
+    project_tail_shed_telemetry(step, limit)
     logger.info(
         "Caller deadline (%s) exhausted before tail step %s "
         "(%.1fms remaining, %.1fms elapsed); shedding enrichment tail and "

@@ -71,7 +71,6 @@ import asyncio
 import contextlib
 import logging
 import time
-import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from typing import Any
 
@@ -165,49 +164,19 @@ def _get_bulk_global_semaphore() -> asyncio.Semaphore:
     return _bulk_global_semaphore
 
 
-_global_wait_max_by_transaction: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-"""Per-transaction running max of capped-acquire waits.
+def _project_global_capped() -> None:
+    """Tag a capped global-permit acquire onto Sentry (LML#716).
 
-Keyed weakly by the Sentry transaction object so entries vanish with the
-transaction — a bulk request's items each acquire the permit independently,
-and the measurement should carry the WORST wait the request saw, not
-whichever item happened to write last.
-"""
-
-
-def _project_global_capped(wait_ms: float) -> None:
-    """Project a capped global-permit acquire onto Sentry (LML#716).
-
-    Same two-channel shape as ``lookup.router._project_inflight_capped``
-    (the LML#683 lesson — ``set_data`` alone is unqueryable):
-
-    * ``lml.bulk.global_capped: true`` tag — the filterable engagement flag,
-      set only when the acquire found the budget saturated.
-    * ``lml.bulk.global_wait_ms`` measurement — the quantitative series for
-      tuning ``LML_BULK_GLOBAL_MAX_CONCURRENT``; running max across the
-      transaction's items.
-
-    The running-max de-dup is this function's own bookkeeping (a bulk
-    request's items each acquire the permit independently, and only the
-    WORST wait should land as the measurement), so it stays local rather
-    than folding into :func:`core.observability.project_capped` — that
-    helper only knows how to set a tag + measurement for one call, not
-    de-dup across a transaction's many calls. The tag is idempotent
-    ("true" never changes), so gating the ``project_capped`` call on the
-    running-max check (rather than calling it unconditionally, as the
-    original unconditional ``set_tag`` did) has no observable difference:
-    the first capped call for a transaction always clears the check (a
-    genuine wait is never exactly 0.0), so the tag lands on that call same
-    as before.
+    Same one-channel shape as ``lookup.router._project_inflight_capped``: the
+    ``lml.bulk.global_capped: true`` tag is the filterable engagement flag,
+    set only when the acquire found the budget saturated. The tag is
+    idempotent ("true" never changes), so every capped acquire of a bulk
+    request's items may call it.
 
     Observability must not break the request path; failures log and continue.
     """
-    with observability_guard("project global_capped onto Sentry transaction", logger):
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is None or wait_ms > _global_wait_max_by_transaction.get(transaction, 0.0):
-            if transaction is not None:
-                _global_wait_max_by_transaction[transaction] = wait_ms
-            project_capped("lml.bulk.global_capped", "lml.bulk.global_wait_ms", wait_ms)
+    with observability_guard("tag global_capped onto Sentry scope", logger):
+        project_capped("lml.bulk.global_capped")
 
 
 @contextlib.asynccontextmanager
@@ -221,10 +190,9 @@ async def acquire_bulk_global_permit():
     """
     semaphore = _get_bulk_global_semaphore()
     capped_on_arrival = semaphore.locked()
-    wait_start = time.perf_counter()
     async with semaphore:
         if capped_on_arrival:
-            _project_global_capped((time.perf_counter() - wait_start) * 1000.0)
+            _project_global_capped()
         yield
 
 
@@ -355,7 +323,7 @@ async def acquire_bulk_global_permit_or_reap(request: Request):
         wait_ms = 0.0
         if capped_on_arrival:
             wait_ms = (time.perf_counter() - wait_start) * 1000.0
-            _project_global_capped(wait_ms)
+            _project_global_capped()
         yield wait_ms
     finally:
         if permit_held:
@@ -448,18 +416,15 @@ async def run_bulk_gather[R](
             observe that patch.
         on_abort: Invoked once, after the ``lml.client_aborted`` tag is set
             and the gather is cancelled + drained, but before the 499 is
-            raised. Each route uses it for its own abort log line and
-            ``http_span.set_data("http.status_code", 499)`` — wording/fields
+            raised. Each route uses it for its own abort log line — wording/fields
             differ per route, so they stay call-site data (the "parameterize
-            or accept a callback" LML#1033 calls for on per-route span data).
+            or accept a callback" LML#1033 calls for).
         sentinel_task_name: Forwarded to ``asyncio.create_task`` so each
             route keeps its own distinguishable task name (mirrors the
             pre-extraction per-route names).
         on_race_settled: Optional; called with the computed ``client_aborted``
-            boolean right after the race settles, for both outcomes.
-            ``handle_bulk_lookup`` / ``handle_refresh_for_identities`` use
-            this for an inner span's ``client_aborted`` data;
-            ``bulk_resolve_libraries`` never did, so it stays opt-in.
+            boolean right after the race settles, for both outcomes. No
+            production route passes it today, so it stays opt-in.
 
     Returns:
         ``gather_future.result()`` — per-item results in input order
@@ -498,7 +463,7 @@ async def run_bulk_gather[R](
 
     if client_aborted:
         # Tag is global-scope (filterable across all routes as
-        # `lml.client_aborted:true`); any span data is the caller's to set
+        # `lml.client_aborted:true`); anything else is the caller's to do
         # via `on_abort`.
         sentry_sdk.set_tag("lml.client_aborted", "true")
         await cancel_and_drain(gather_future)
