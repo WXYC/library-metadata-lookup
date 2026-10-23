@@ -26,6 +26,7 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
 from lookup.artist_rows import artist_rows
+from lookup.bilingual_titles import album_title_candidates
 from lookup.matching import _FETCH_LIMIT, filter_results_by_artist, is_self_titled
 from lookup.name_folding import fold_punctuation_for_comparison
 
@@ -82,8 +83,21 @@ async def album_rows(
     """The rows the lane keeps for ``album``; see the module docstring.
 
     ``spellings`` is :func:`~lookup.artist_shelf.artist_spellings` for
-    ``lib_artist``, read once per request by the caller.
+    ``lib_artist``, read once per request by the caller. Each of
+    :func:`album_title_candidates` is searched and filtered in turn, and their
+    rows follow one another without repeats.
     """
+    rows: dict[int, LibraryItem] = {}
+    for candidate in album_title_candidates(album):
+        for row in await _candidate_rows(db, lib_artist, candidate, spellings):
+            rows.setdefault(row.id, row)
+    return list(rows.values())
+
+
+async def _candidate_rows(
+    db: LibraryDB, lib_artist: str, album: str, spellings: list[str]
+) -> list[LibraryItem]:
+    """The rows the lane keeps for one title candidate."""
     window = filter_by_album_title(await album_search(db, lib_artist, album), album, lib_artist)
     return await artist_rows(
         db,

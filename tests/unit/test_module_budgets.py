@@ -49,8 +49,12 @@ MODULE_BUDGETS: dict[str, int] = {
     # `lookup/strategies/artist_plus_album.py` (295 -> 259) to make room under
     # that file's ceiling, on the `fallback_title_floors.py` precedent. Step 2's
     # guard in that module reads the same rows. 62 lines measured; 1.3x = 80.6
-    # -> 100.
-    "lookup/album_rows.py": 100,
+    # -> 100. LML#1485: `album_rows` searches and filters each of
+    # `album_title_candidates` (110 lines measured); 1.3x = 143 -> 150.
+    "lookup/album_rows.py": 150,
+    # LML#1485: the Latin-script title candidates of a bilingual Discogs title.
+    # 38 lines measured; 1.3x = 49.4 -> 50.
+    "lookup/bilingual_titles.py": 50,
     # LML#1452: the own-first row ordering, moved verbatim out of
     # `album_rows` and parameterized so LML#1445's fallbacks reuse it.
     # Smallest multiple of 50 at or above 1.3x the 52-line measured size (67.6).
