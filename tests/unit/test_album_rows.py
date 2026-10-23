@@ -7,6 +7,9 @@ the rows the lane keeps, which a mocked ``LibraryDB`` cannot show.
 
 import pytest
 
+from library.models import LibraryItem
+from lookup.album_rows import filter_by_album_title
+from lookup.bilingual_titles import album_title_candidates
 from lookup.strategies.artist_plus_album import search_library_with_fallback
 from services.parser import MessageType, ParsedRequest
 from tests.factories import crowd_rows, make_library_catalog
@@ -197,5 +200,95 @@ class TestPunctuationVariantSpellings:
 
         assert await _lane(tmp_path, rows, typed, "Emotions") == (
             [(stored, "Emotions"), (variant, "Emotions")],
+            False,
+        )
+
+
+class TestBilingualDiscogsTitles:
+    """LML#1485: step 2 hands the lane a Discogs title with a non-Latin-script
+    part, and a library row filed under the Latin title alone must still answer."""
+
+    @pytest.mark.parametrize(
+        ("discogs_title", "expected"),
+        [
+            pytest.param(
+                '深層 "The Message At The Depth"',
+                ['深層 "The Message At The Depth"', "The Message At The Depth"],
+                id="quoted-latin-after-kanji",
+            ),
+            pytest.param(
+                "愛的對白 = Love Dialogue",
+                ["愛的對白 = Love Dialogue", "Love Dialogue"],
+                id="translation",
+            ),
+            pytest.param("未来 -Mi Light-", ["未来 -Mi Light-", "Mi Light"], id="dashed-latin"),
+            pytest.param(
+                "ألف ليلة = Alf Leila Wa Leila",
+                ["ألف ليلة = Alf Leila Wa Leila", "Alf Leila Wa Leila"],
+                id="arabic-translation",
+            ),
+            pytest.param("Aluminum Tunes", ["Aluminum Tunes"], id="latin-only"),
+            pytest.param("E = MC²", ["E = MC²"], id="latin-only-with-equals"),
+            pytest.param("Pequena Vertigem de Amor", ["Pequena Vertigem de Amor"], id="diacritics"),
+            pytest.param("覚醒", ["覚醒"], id="one-non-latin-script"),
+            pytest.param("ライディーン", ["ライディーン"], id="katakana-only"),
+        ],
+    )
+    def test_title_candidates(self, discogs_title, expected):
+        assert album_title_candidates(discogs_title) == expected
+
+    @pytest.mark.parametrize(
+        ("discogs_title", "library_title", "kept"),
+        [
+            pytest.param(
+                '深層 "The Message At The Depth"',
+                "The Message at the Depth",
+                True,
+                id="quoted-latin-after-kanji",
+            ),
+            pytest.param("愛的對白 = Love Dialogue", "Love Dialogue", True, id="translation"),
+            pytest.param("Aluminum Tunes", "Aluminum Tunes", True, id="latin-only"),
+            pytest.param("覚醒", "覚醒", True, id="one-non-latin-script-verbatim"),
+            pytest.param("覚醒", "Kakusei", False, id="one-non-latin-script-no-variant"),
+        ],
+    )
+    def test_some_candidate_keeps_the_library_row(self, discogs_title, library_title, kept):
+        row = LibraryItem(id=1, artist="DJ Krush", title=library_title)
+
+        assert (
+            any(
+                filter_by_album_title([row], candidate, "DJ Krush")
+                for candidate in album_title_candidates(discogs_title)
+            )
+            is kept
+        )
+
+    @pytest.mark.asyncio
+    async def test_track_resolved_to_a_bilingual_title_finds_the_album(self, tmp_path):
+        """Production, 2026-10-22: "trihedron by dj krush" resolved to
+        '深層 "The Message At The Depth"' and answered with other DJ Krush albums."""
+        rows = [
+            ("DJ Krush", "Krush"),
+            ("DJ Krush", "Meiso"),
+            ("DJ Krush", "The Message at the Depth"),
+            ("DJ Krush", "Milight"),
+        ]
+        db = await make_library_catalog(tmp_path, rows)
+        parsed = ParsedRequest(
+            artist="DJ Krush",
+            song="Trihedron",
+            raw_message="trihedron by dj krush",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        try:
+            results, fallback = await search_library_with_fallback(
+                db, parsed, ['深層 "The Message At The Depth"']
+            )
+        finally:
+            await db.close()
+
+        assert ([(r.artist, r.title) for r in results], fallback) == (
+            [("DJ Krush", "The Message at the Depth")],
             False,
         )
