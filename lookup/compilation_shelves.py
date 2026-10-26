@@ -34,16 +34,18 @@ def is_various_artists(spellings: list[str]) -> bool:
     return any(normalize_for_comparison(s).strip() == _VARIOUS_ARTISTS for s in spellings)
 
 
-async def shelf_rows(db: LibraryDB, album: str, spellings: list[str]) -> list[LibraryItem]:
+async def shelf_rows(
+    db: LibraryDB, album: str, spellings: list[str], limit: int | None = None
+) -> list[LibraryItem]:
     """The compilation-shelf rows the full-text ``album`` matches, in id order.
 
     ``[]``, with no query, unless ``spellings`` (``artist_spellings``) are
     Various Artists. The match is the album's alone: "Soundtracks - S" does
     not contain the words "various artists", and a genre shelf's name always
     does, so for those rows the album alone matches what the lane's
-    artist+album query would.
+    artist+album query would. ``limit``, when given, keeps the first ``limit``.
     """
     if not is_various_artists(spellings):
         return []
     names = await db.artist_names_matching([_VARIOUS_ARTISTS, "soundtracks"])
-    return await db.search_among(album, [n for n in names if is_compilation_shelf(n)])
+    return await db.search_among(album, [n for n in names if is_compilation_shelf(n)], limit)
