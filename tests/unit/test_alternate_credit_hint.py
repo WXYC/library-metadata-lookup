@@ -10,7 +10,7 @@ from lookup.alternate_credit_hint import alternate_credit_hint
 from lookup.models import LookupRequest
 from lookup.orchestrator import perform_lookup
 from tests.conftest import make_lml_telemetry
-from tests.factories import make_library_catalog, make_library_item
+from tests.factories import library_catalog, make_library_item
 
 CREDIT = "Afel Bocoum, Damon Albarn, Toumani Diabate and friends"
 HINT = [ArtistMatchHint(matched_variant=CREDIT, source=ArtistSearchAliasSource.wxyc_library_alt)]
@@ -84,18 +84,15 @@ class TestPerformLookupLabelsTheCreditedRow:
     async def test_only_the_credited_row_is_labelled(
         self, tmp_path, mock_discogs_service, typed, shed
     ):
-        db = await make_library_catalog(
-            tmp_path, [("Afel Bocoum", "Mali Music"), ("Damon Albarn", "Mali Music", CREDIT)]
-        )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
         request = LookupRequest(artist=typed, album="Mali Music", raw_message=f"{typed} - Mali")
-        try:
+        async with library_catalog(
+            tmp_path, [("Afel Bocoum", "Mali Music"), ("Damon Albarn", "Mali Music", CREDIT)]
+        ) as db:
             with patch("lookup.orchestrator.should_shed_tail", return_value=shed):
                 response = await perform_lookup(
                     request, db, mock_discogs_service, make_lml_telemetry()
                 )
-        finally:
-            await db.close()
 
         assert response.degraded is (shed is not None)
         assert [(i.library_item.artist, i.matched_via_alias) for i in response.results] == [
