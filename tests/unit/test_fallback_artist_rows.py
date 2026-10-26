@@ -6,9 +6,12 @@ through ``lookup/artist_rows.py``. Real ``library_fts`` index
 between the rows the window returns and the artist's own.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from lookup.alternate_credit_hint import alternate_credit_hint
+from lookup.fallback_rows import SONG_READ_LIMIT, artist_only_rows
 from lookup.matching import _FETCH_LIMIT
 from lookup.strategies.artist_plus_album import runs_album_resolution, search_library_with_fallback
 from services.parser import MessageType, ParsedRequest
@@ -283,6 +286,124 @@ class TestArtistSongFallback:
         got = await _fallback(tmp_path, rows, "Various Artists", song="Sister Ray")
 
         assert got == ([("Various Artists - Rock - S", "Sister Ray")], True)
+
+
+HAROLD_BUDD_CREDIT = "Harold Budd, Elizabeth Fraser, Robin Guthrie, Simon Raymonde"
+
+
+class TestTruncatedSongTiers:
+    """A song cut short reaches the window through the LIKE fallback, which returns
+    rows in id order: only ``window_members``' tier sort and ``song_first`` order them."""
+
+    @pytest.mark.asyncio
+    async def test_an_own_row_leads_a_credited_row_at_a_lower_id(self, tmp_path):
+        rows = [
+            ("Cocteau Twins", "The Moon and the Melodies", HAROLD_BUDD_CREDIT),
+            ("Harold Budd", "The Moon and the Melodies Live"),
+        ]
+
+        got, _ = await _fallback(tmp_path, rows, "Harold Budd", song="The Moon and the Melodie")
+
+        assert got == [
+            ("Harold Budd", "The Moon and the Melodies Live"),
+            ("Cocteau Twins", "The Moon and the Melodies"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_credited_row_titled_with_the_song_leads_an_own_row_that_is_not(self, tmp_path):
+        """The LIKE fallback needs every word in some column, not the song as written."""
+        rows = [
+            ("Harold Budd", "Moon Rocks Melodies"),
+            ("Cocteau Twins", "Moon Melodies", HAROLD_BUDD_CREDIT),
+        ]
+
+        got, _ = await _fallback(tmp_path, rows, "Harold Budd", song="Moon Melodie")
+
+        assert got == [("Cocteau Twins", "Moon Melodies"), ("Harold Budd", "Moon Rocks Melodies")]
+
+    @pytest.mark.asyncio
+    async def test_only_various_artists_counts_a_compilation_shelf_as_its_own(self, tmp_path):
+        """An act named "Soundtracks" has a shelf, and the window admits a row on
+        "Soundtracks - P" by its name's prefix and the song's words: it is another
+        act's, not the act's own."""
+        rows = [("Soundtracks - P", "Pequena Vertigem de Amor"), ("Soundtracks", "Grandeza")]
+
+        got, _ = await _fallback(tmp_path, rows, "Soundtracks", song="Pequena Vertigem de Amo")
+
+        assert got == [("Soundtracks", "Grandeza")]
+
+
+class TestCreditedTail:
+    @pytest.mark.asyncio
+    async def test_no_tail_when_a_lead_row_is_titled_with_the_song(self, tmp_path):
+        """ "America Graffiti" reaches the "American Graffiti" shelf row. The credited
+        row after it would cost an artwork lookup and answer nothing."""
+        rows = [
+            ("Various Artists", "Sugar Hill - The Great Rap Hits"),
+            ("Various Artists - Rock - A", "American Graffiti"),
+            ("Pebbles", "Nuggets", "Various Artists"),
+        ]
+
+        got, _ = await _fallback(tmp_path, rows, "Various Artists", song="America Graffiti")
+
+        assert got == [("Various Artists - Rock - A", "American Graffiti")]
+
+    @pytest.mark.asyncio
+    async def test_the_tail_stays_when_the_lead_misses_the_song(self, tmp_path):
+        rows = [("Damon Albarn", "Mali Music", MALI_MUSIC_CREDIT), ("Afel Bocoum", "Alkibar")]
+
+        got, _ = await _fallback(tmp_path, rows, "Afel Bocoum", song=UNRESOLVABLE)
+
+        assert got == [("Afel Bocoum", "Alkibar"), ("Damon Albarn", "Mali Music")]
+
+
+class TestSongReadBound:
+    @pytest.mark.asyncio
+    async def test_a_song_made_of_the_artists_name_reads_a_bounded_number_of_own_rows(
+        self, tmp_path
+    ):
+        rows = [("Heart", f"Heart Record {i}") for i in range(SONG_READ_LIMIT + 20)]
+
+        got, _ = await _fallback(tmp_path, rows, "Heart", song="Heart")
+
+        assert got == rows[:SONG_READ_LIMIT]
+
+    @pytest.mark.asyncio
+    async def test_a_song_made_of_shelf_name_words_reads_a_bounded_number_of_shelf_rows(
+        self, tmp_path
+    ):
+        """The index covers the artist column, so "Rock" matches every row filed on
+        "Various Artists - Rock - N"."""
+        rows = [
+            ("Various Artists - Rock - N", f"Compilation {i}") for i in range(SONG_READ_LIMIT + 20)
+        ]
+        rows.append(("Various Artists", "Plain Shelf"))
+
+        got, _ = await _fallback(tmp_path, rows, "Various Artists", song="Rock")
+
+        assert got == rows[:SONG_READ_LIMIT]
+
+
+class TestSecondArtistOnlyRead:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("song, calls", [("Dots", 0), (None, 1)])
+    async def test_a_shelved_artist_with_a_song_is_not_read_a_second_time(
+        self, tmp_path, song, calls
+    ):
+        """The artist+song fallback already read the artist-only rows; an empty
+        answer (no Stereolab title clears the album floor) must not repeat it."""
+        db = await make_library_catalog(tmp_path, [("Stereolab", "Peng!")])
+        try:
+            with patch(
+                "lookup.strategies.artist_plus_album.artist_only_rows", wraps=artist_only_rows
+            ) as spy:
+                await search_library_with_fallback(
+                    db, _parsed("Stereolab", album="Zz Nonexistent", song=song), []
+                )
+        finally:
+            await db.close()
+
+        assert spy.call_count == calls
 
 
 class TestPlaceholderGuardAgreement:

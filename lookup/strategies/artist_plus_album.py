@@ -175,7 +175,10 @@ async def search_library_with_fallback(
     else the 50-row search window (LML#1421). The artist+song and artist-only
     fallbacks (``lookup/fallback_rows.py``) order their rows the same way
     (LML#1445); for a shelved artist whose own rows miss the song's words, the
-    artist+song fallback answers only with own rows and credited rows.
+    artist+song fallback answers only with the window's rows by the artist (own
+    rows, Various Artists' compilation-shelf rows, credited rows), plus the
+    artist-only credited rows unless a row's title holds the song's words; when the
+    window holds none, the artist-only rows answer.
 
     Returns:
         Tuple of (library_results, song_not_found_flag)

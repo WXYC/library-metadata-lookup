@@ -44,12 +44,13 @@ async def artist_rows(
     ``window_when_shelved=False`` returns ``[]`` instead of ``window`` when the
     artist has a shelf and ``keep`` leaves no own row, so the caller can answer
     another way (LML#1445's fallbacks, through :func:`window_members`). ``limit`` bounds the own
-    read (``LibraryDB.search_among``) to its lowest ids; pass it only with a ``keep``
-    that drops nothing, or rows past the bound that it would keep are lost.
+    read and the compilation-shelf read (``LibraryDB.search_among``) to their lowest ids;
+    pass it only with a ``keep`` that drops little, or rows past the bound that it would
+    keep are lost.
     """
     if spellings:
         own = own_rows_first(await db.search_among(query, spellings, limit), spellings)
-        own += await shelf_rows(db, shelf_query, spellings)
+        own += await shelf_rows(db, shelf_query, spellings, limit)
         if kept := keep(own):
             ids = {row.id for row in kept}
             return kept + [

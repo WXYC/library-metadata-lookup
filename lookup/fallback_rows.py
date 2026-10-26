@@ -3,8 +3,9 @@
 ``search_library_with_fallback`` (``lookup/strategies/artist_plus_album.py``)
 falls back to these when the artist+album lane keeps no row. Both order their
 rows like the lane, through :func:`~lookup.artist_rows.artist_rows`: the
-artist's own rows lead, then the window's rows credited to the artist, and
-prefix-only rows drop while own rows match. An artist with no shelf reads the
+artist's own rows lead, then the window's rows credited to the artist. For a
+shelved artist, prefix-only rows drop whether or not own rows match
+(:func:`~lookup.artist_rows.window_members`). An artist with no shelf reads the
 50-row ``db.search`` window narrowed by ``filter_results_by_artist``, as before.
 """
 
@@ -13,6 +14,10 @@ from library.models import LibraryItem
 from lookup.artist_rows import artist_rows, window_members
 from lookup.fallback_title_floors import _filter_results_by_album_match
 from lookup.matching import _FETCH_LIMIT, filter_results_by_artist
+
+SONG_READ_LIMIT = 250
+"""Rows the artist+song fallback reads from the artist's own shelf, and from the
+compilation shelves, before narrowing."""
 
 
 async def artist_song_rows(
@@ -27,11 +32,14 @@ async def artist_song_rows(
     """
     song_lower = song.lower()
 
+    def titled(row: LibraryItem) -> bool:
+        return song_lower in (row.title or "").lower()
+
     def song_first(rows: list[LibraryItem]) -> list[LibraryItem]:
-        return sorted(rows, key=lambda r: song_lower in (r.title or "").lower(), reverse=True)
+        return sorted(rows, key=titled, reverse=True)
 
     def narrow(rows: list[LibraryItem]) -> list[LibraryItem]:
-        return song_first(_filter_results_by_album_match(rows, album))
+        return _filter_results_by_album_match(rows, album)
 
     query = f"{lib_artist} {song}"
     window = narrow(
@@ -46,10 +54,15 @@ async def artist_song_rows(
         lib_artist=lib_artist,
         spellings=spellings,
         window_when_shelved=False,
+        limit=SONG_READ_LIMIT,
     )
     if rows or not spellings:
         return song_first(rows)
     lead = window_members(window, lib_artist, spellings)
+    if any(all(word in (row.title or "").lower() for word in song_lower.split()) for row in lead):
+        # A row's title holds every word of the song (a title cut short reaches it
+        # through the window's LIKE match): the credited tail adds only artwork lookups.
+        return song_first(lead)
     rest = await artist_only_rows(db, lib_artist, album, spellings)
     ids = {row.id for row in lead}
     return song_first(
@@ -67,7 +80,10 @@ async def artist_only_rows(
     shelf holds 3,113 rows); with one, every own row meets the floor first (about
     25 ms for Various Artists). When none clears it, only the window's rows by
     the artist that do answer (:func:`window_members`), often none: never another
-    act's record (LML#1425 decision 1). Step 8 lists the shelf for an empty answer.
+    act's record (LML#1425 decision 1). What follows an empty answer is
+    ``perform_lookup``'s: step 3a answers a confident Discogs match with a
+    not-in-library release, step 7 may fill from the external cache, and step 8
+    lists the shelf as display-only rows, except for X-Caller-Class 5 callers.
     """
 
     def narrow(rows: list[LibraryItem]) -> list[LibraryItem]:
