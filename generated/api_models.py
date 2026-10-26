@@ -551,54 +551,6 @@ class Show(BaseModel):
     end_time: AwareDatetime | None = None
 
 
-class OpenShow(BaseModel):
-    """
-    One open show as reported by `GET /flowsheet/open-shows`. Distinct from `Show`: it carries the derived `entry_count`, `is_current` and `likely_abandoned` fields, and omits `end_time`, which is NULL for every member of this collection by construction.
-
-    """
-
-    id: int
-    primary_dj_id: str | None = Field(
-        ...,
-        description="NULL for legacy/tubafrenzy-originated shows and for any show whose DJ account was deleted (`ON DELETE SET NULL`). Such a show can still be closed via `force-end`.\n",
-    )
-    dj_name: str | None = Field(
-        ...,
-        description="The DJ's public on-air handle, never the DJ's legal name. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371): per-show override -> the DJ's chosen handle -> the legacy tubafrenzy handle -> `null` when unresolvable.\n",
-    )
-    show_name: str | None = Field(...)
-    start_time: AwareDatetime
-    legacy_show_id: int | None = Field(
-        ..., description="The tubafrenzy surrogate key, when this show was mirrored."
-    )
-    entry_count: int = Field(
-        ...,
-        description="Flowsheet rows belonging to this show, all entry types included.",
-    )
-    is_current: bool = Field(
-        ...,
-        description="True for the single show every on-air read resolves to. Present so a client can never offer to close the live broadcast.\n",
-    )
-    likely_abandoned: bool = Field(
-        ...,
-        description="Advisory only — an operator hint, not a verdict. True when the show is not current and has fewer than four entries. A show with many entries can still be abandoned; check `start_time`.\n",
-    )
-
-
-class OpenShowsResponse(BaseModel):
-    shows: list[OpenShow] = Field(
-        ..., description="Ordered oldest-first by `start_time`, tie-broken on `id`."
-    )
-    total_in_window: int = Field(
-        ...,
-        description="How many open shows the window holds in total, before `limit` truncates. `shows.length < total_in_window` is the only way a caller can tell it is looking at a partial answer.\n",
-    )
-    older_open_show_count: int = Field(
-        ...,
-        description="Open shows that started BEFORE the window, reported as a count and never listed. Almost all of these are legacy imports whose `show_end` never arrived; see the endpoint description. Widen `window_hours` to reach them.\n\n**Expected to go to zero and stay there.** This field and the 30-year `window_hours` ceiling both exist for one finite cohort — the ~2,813 shows WXYC/Backend-Service#1543 repairs from the final tubafrenzy dump. Once that lands, both are vestigial and a later contract version should drop them rather than preserve them out of habit.\n",
-    )
-
-
 class RecentShow(BaseModel):
     """
     One show as reported by `GET /flowsheet/shows/recent`. Distinct from `OpenShow`: it carries `end_time` and the DJ list, and omits the `entry_count`, `is_current` and `likely_abandoned` fields that exist to help an operator decide what to force-end.
@@ -990,13 +942,109 @@ class CreateLabelRequest(BaseModel):
     parent_label_id: int | None = None
 
 
+class LabelReferenceCounts(BaseModel):
+    """
+    Per-table counts of rows whose `label_id` points at a label.
+
+    """
+
+    library: int
+    rotation: int
+    flowsheet: int
+    intake_items: int
+
+
+class LabelWithReferences(Label):
+    """
+    A `Label` plus what still points at it: `references` counts the rows whose `label_id` is this label, `child_labels` the labels whose `parent_label_id` is this id.
+
+    """
+
+    references: LabelReferenceCounts
+    child_labels: int
+
+
+class UpdateLabelRequest(BaseModel):
+    """
+    Partial update: only fields present are written. `parent_label_id: null` detaches the label from its parent.
+
+    """
+
+    label_name: constr(max_length=128) | None = None
+    parent_label_id: int | None = None
+
+
+class UpdateLabelResponse(BaseModel):
+    label: Label
+    rewritten: LabelReferenceCounts = Field(
+        ...,
+        description="Per-table counts of text copies of the label name rewritten on a rename; all zero when the name did not change.\n",
+    )
+
+
+class Details(BaseModel):
+    references: LabelReferenceCounts
+    child_labels: int
+
+
+class LabelInUseResponse(BaseModel):
+    """
+    The 409 `label_in_use` body of `DELETE /labels/{id}`: an `ApiErrorResponse` whose `details` carry the same counts `GET /labels/{id}` reports.
+
+    """
+
+    message: str
+    code: str | None = None
+    details: Details
+
+
 class AddArtistRequest(BaseModel):
     artist_name: str
+    alphabetical_name: str | None = Field(
+        None, description="Sort name; defaults to `artist_name` when omitted."
+    )
     code_letters: str
     genre_id: int
     code_number: conint(ge=1, le=2147483647) | None = Field(
         None,
-        description="Operator-chosen artist call number within the `(genre_id, code_letters)` bucket. The backing column (`genre_artist_crossreference.artist_genre_code`) is a Postgres integer, hence the 2147483647 ceiling — bounded here, at publish time, because oasdiff treats adding request-side bounds later as a breaking change (see `RotationCreateFields.urls`). Declared optional ahead of the Backend-Service relaxation that honors omission (WXYC/Backend-Service#2475): the deployed `POST /library/artists` still 400s on a body without it, so a client must keep sending it until #2475 ships. Once omission is honored, the server assigns the next number in the bucket — the same generator behind Backend's artist-code peek route (`GET /library/artists/peek-code`, a Backend route this contract does not declare) — and this field makes that assignment overridable, it does not replace it.\n",
+        description="Operator-chosen artist call number within the `(genre_id, code_letters)` bucket. The backing column (`genre_artist_crossreference.artist_genre_code`) is a Postgres integer, hence the 2147483647 ceiling — bounded here, at publish time, because oasdiff treats adding request-side bounds later as a breaking change (see `RotationCreateFields.urls`). Optional: when omitted, the server assigns the next number in the bucket (WXYC/Backend-Service#2475) — the same generator behind Backend's artist-code peek route (`GET /library/artists/peek-code`, a Backend route this contract does not declare) — and this field makes that assignment overridable, it does not replace it.\n",
+    )
+
+
+class Reason(StrEnum):
+    """
+    `artist_code_conflict`: the `(genre_id, code_letters, code_number)` slot is taken; checked first, so it wins when both apply. `artist_name_conflict`: an artist whose name fold-matches this one (case, diacritics and Unicode form folded) is already filed in this genre.
+
+    """
+
+    artist_code_conflict = "artist_code_conflict"
+    artist_name_conflict = "artist_name_conflict"
+
+
+class Artist1(BaseModel):
+    """
+    The artist that holds the slot or the name, so a client can offer it instead of reporting a bare failure. The same shape as `ArtistNameConflictError.artist`, not an `Artist`.
+
+    """
+
+    artist_id: int
+    artist_name: str
+    code_letters: str
+    code_comp_letter: str | None = Field(
+        None,
+        description="The compilation section letter of the taken slot (null when the slot has none). Present on `artist_code_conflict` only.\n",
+    )
+
+
+class AddArtistConflictResponse(BaseModel):
+    message: str
+    reason: Reason = Field(
+        ...,
+        description="`artist_code_conflict`: the `(genre_id, code_letters, code_number)` slot is taken; checked first, so it wins when both apply. `artist_name_conflict`: an artist whose name fold-matches this one (case, diacritics and Unicode form folded) is already filed in this genre.\n",
+    )
+    artist: Artist1 = Field(
+        ...,
+        description="The artist that holds the slot or the name, so a client can offer it instead of reporting a bare failure. The same shape as `ArtistNameConflictError.artist`, not an `Artist`.\n",
     )
 
 
@@ -2045,11 +2093,11 @@ class UpdateArtistRequest(BaseModel):
     )
 
 
-class Reason(StrEnum):
+class Reason1(StrEnum):
     artist_name_conflict = "artist_name_conflict"
 
 
-class Artist1(BaseModel):
+class Artist2(BaseModel):
     """
     The conflicting artist, so a client can offer merging into it rather than reporting a bare failure.
 
@@ -2067,8 +2115,8 @@ class ArtistNameConflictError(BaseModel):
     """
 
     message: str
-    reason: Reason
-    artist: Artist1 = Field(
+    reason: Reason1
+    artist: Artist2 = Field(
         ...,
         description="The conflicting artist, so a client can offer merging into it rather than reporting a bare failure.\n",
     )
@@ -2174,7 +2222,7 @@ class ArtistGenreMembership(BaseModel):
     code_artist_number: int
 
 
-class Reason1(StrEnum):
+class Reason2(StrEnum):
     """
     Which of the four `/wxycdb` refusals fired, checked in that order. `compilation_credit_count` never appears here — that dependent is informational only and never refuses a delete (see its own description on `ArtistCardWithDependentCounts`).
 
@@ -2197,7 +2245,7 @@ class ArtistDeleteRefusal(BaseModel):
     """
 
     message: str
-    reason: Reason1 = Field(
+    reason: Reason2 = Field(
         ...,
         description="Which of the four `/wxycdb` refusals fired, checked in that order. `compilation_credit_count` never appears here — that dependent is informational only and never refuses a delete (see its own description on `ArtistCardWithDependentCounts`).\n",
     )
@@ -2233,7 +2281,7 @@ class ArtistByCodeResponse(BaseModel):
     artists: list[ArtistByCodeMatch]
 
 
-class Reason2(StrEnum):
+class Reason3(StrEnum):
     genre_not_found = "genre_not_found"
     code_not_assigned = "code_not_assigned"
 
@@ -2245,7 +2293,7 @@ class ArtistByCodeError(BaseModel):
     """
 
     message: str
-    reason: Reason2
+    reason: Reason3
 
 
 class ArtistRelease(BaseModel):
@@ -2289,7 +2337,7 @@ class NextCodeNumberResponse(BaseModel):
     )
 
 
-class Reason3(StrEnum):
+class Reason4(StrEnum):
     lock_unavailable = "lock_unavailable"
 
 
@@ -2307,7 +2355,7 @@ class LockUnavailableRefusal(BaseModel):
             "Could not delete: the release is being written to right now. Try again in a moment."
         ],
     )
-    reason: Reason3
+    reason: Reason4
 
 
 class DigitalAssetReference(BaseModel):
@@ -2330,7 +2378,7 @@ class DigitalAssetReference(BaseModel):
     )
 
 
-class Reason4(StrEnum):
+class Reason5(StrEnum):
     digital_asset_references = "digital_asset_references"
 
 
@@ -2344,7 +2392,7 @@ class ReleaseDeleteRefusal(BaseModel):
         ...,
         examples=["Cannot delete: release has 2 digital assets on record (ids: 41, 42)"],
     )
-    reason: Reason4
+    reason: Reason5
     asset_count: int = Field(
         ...,
         description="Number of LIVE `digital_asset` rows blocking this delete (`assets.length`).",
@@ -2491,7 +2539,7 @@ class RestoreSlotConflict(BaseModel):
     )
 
 
-class Reason5(StrEnum):
+class Reason6(StrEnum):
     resolution_required = "resolution_required"
 
 
@@ -2504,11 +2552,11 @@ class RestoreResolutionRequiredRefusal(BaseModel):
     """
 
     message: str
-    reason: Reason5
+    reason: Reason6
     conflicts: list[RestoreSlotConflict]
 
 
-class Reason6(StrEnum):
+class Reason7(StrEnum):
     restore_declined = "restore_declined"
 
 
@@ -2521,11 +2569,11 @@ class RestoreDeclinedRefusal(BaseModel):
     """
 
     message: str
-    reason: Reason6
+    reason: Reason7
     conflicts: list[RestoreSlotConflict]
 
 
-class Reason7(StrEnum):
+class Reason8(StrEnum):
     already_restored = "already_restored"
 
 
@@ -2540,13 +2588,13 @@ class RestoreAlreadyRestoredRefusal(BaseModel):
     """
 
     message: str
-    reason: Reason7
+    reason: Reason8
     entity_ids: list[int] = Field(
         ..., description="The captured `entity_id`s already present in the catalog.\n"
     )
 
 
-class Reason8(StrEnum):
+class Reason9(StrEnum):
     unrestorable_kind = "unrestorable_kind"
 
 
@@ -2557,11 +2605,11 @@ class RestoreUnrestorableKindRefusal(BaseModel):
     """
 
     message: str
-    reason: Reason8
+    reason: Reason9
     entity_kind: str
 
 
-class Reason9(StrEnum):
+class Reason10(StrEnum):
     missing_reference = "missing_reference"
 
 
@@ -2572,7 +2620,7 @@ class RestoreMissingReferenceRefusal(BaseModel):
     """
 
     message: str
-    reason: Reason9
+    reason: Reason10
     table: str = Field(..., description="The table of the captured row that holds the reference.")
     row_id: int | None = Field(
         ...,
@@ -5393,7 +5441,7 @@ class AutoDJDeactivateResponse(BaseModel):
 
 class ShowAlreadyOpenShow(BaseModel):
     """
-    Identity of the open show the caller collided with. Carries `OpenShow`'s identity fields, with the same nullability and the same BS#1371 resolution chain for `dj_name`, plus the embedded `specialty`, which `OpenShow` (the rows `GET /flowsheet/open-shows` returns) does not have.
+    Identity of the open show the caller collided with. Carries `OpenShow`'s identity fields, with the same nullability and the same BS#1371 resolution chain for `dj_name`, plus the embedded `specialty`. It stays a separate schema because it omits `OpenShow`'s derived counters and `specialty_id`, and because `specialty` is optional here so a server that predates it stays valid.
 
     """
 
@@ -5731,6 +5779,62 @@ class OnAirInfo(BaseModel):
     )
 
 
+class OpenShow(BaseModel):
+    """
+    One open show as reported by `GET /flowsheet/open-shows`. Distinct from `Show`: it carries the derived `entry_count`, `is_current` and `likely_abandoned` fields, and omits `end_time`, which is NULL for every member of this collection by construction.
+
+    """
+
+    id: int
+    primary_dj_id: str | None = Field(
+        ...,
+        description="NULL for legacy/tubafrenzy-originated shows and for any show whose DJ account was deleted (`ON DELETE SET NULL`). Such a show can still be closed via `force-end`.\n",
+    )
+    dj_name: str | None = Field(
+        ...,
+        description="The DJ's public on-air handle, never the DJ's legal name. Same PII-safe resolution chain as `FlowsheetEntryFields.dj_name` (BS#1371): per-show override -> the DJ's chosen handle -> the legacy tubafrenzy handle -> `null` when unresolvable.\n",
+    )
+    show_name: str | None = Field(...)
+    start_time: AwareDatetime
+    legacy_show_id: int | None = Field(
+        ..., description="The tubafrenzy surrogate key, when this show was mirrored."
+    )
+    entry_count: int = Field(
+        ...,
+        description="Flowsheet rows belonging to this show, all entry types included.",
+    )
+    is_current: bool = Field(
+        ...,
+        description="True for the single show every on-air read resolves to. Present so a client can never offer to close the live broadcast.\n",
+    )
+    likely_abandoned: bool = Field(
+        ...,
+        description="Advisory only — an operator hint, not a verdict. True when the show is not current and has fewer than four entries. A show with many entries can still be abandoned; check `start_time`.\n",
+    )
+    specialty_id: int | None = Field(
+        ...,
+        description="The show's own `shows.specialty_id`; `null` for a freeform show.",
+    )
+    specialty: SpecialtyShowRef | None = Field(
+        ...,
+        description="The specialty program behind `specialty_id`, `null` for a freeform show. A retired program is still returned so a manager can clear it. Read from the show's own `specialty_id`, never from the catalog's slots.\n",
+    )
+
+
+class OpenShowsResponse(BaseModel):
+    shows: list[OpenShow] = Field(
+        ..., description="Ordered oldest-first by `start_time`, tie-broken on `id`."
+    )
+    total_in_window: int = Field(
+        ...,
+        description="How many open shows the window holds in total, before `limit` truncates. `shows.length < total_in_window` is the only way a caller can tell it is looking at a partial answer.\n",
+    )
+    older_open_show_count: int = Field(
+        ...,
+        description="Open shows that started BEFORE the window, reported as a count and never listed. Almost all of these are legacy imports whose `show_end` never arrived; see the endpoint description. Widen `window_hours` to reach them.\n\n**Expected to go to zero and stay there.** This field and the 30-year `window_hours` ceiling both exist for one finite cohort — the ~2,813 shows WXYC/Backend-Service#1543 repairs from the final tubafrenzy dump. Once that lands, both are vestigial and a later contract version should drop them rather than preserve them out of habit.\n",
+    )
+
+
 class ShowPlaylist(BaseModel):
     """
     The response of `GET /flowsheet/playlist?show_id=` — one archived show, its entries, and the ids of the shows either side of it.
@@ -5903,6 +6007,25 @@ class DigitalArchivePlaybackManifest(BaseModel):
         description="Every URL under `tracks` is dead after this instant — refetch this manifest rather than caching URLs past it.\n",
     )
     tracks: list[DigitalArchivePlaybackTrack]
+
+
+class AddArtistResponse(BaseModel):
+    """
+    The created `artists` row (serialized, so the six external-ID columns arrive nested as `reconciled_identity`), plus the `code_number` and `genre_id` it was filed under. Not an `Artist`: the row has no `code_artist_number`, which the handler sends as `code_number`.
+
+    """
+
+    id: int
+    artist_name: str
+    alphabetical_name: str
+    code_letters: str
+    code_number: int
+    genre_id: int
+    add_date: date_aliased | None = None
+    last_modified: AwareDatetime | None = None
+    reconciled_identity: ReconciledIdentity | None = Field(
+        None, description="Null when the artist has resolved none of the six IDs yet."
+    )
 
 
 class AlbumDetail(BaseModel):
