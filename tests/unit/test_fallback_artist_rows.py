@@ -333,6 +333,27 @@ class TestTruncatedSongTiers:
         assert got == [("Soundtracks", "Grandeza")]
 
 
+class TestTailOrder:
+    @pytest.mark.asyncio
+    async def test_a_credited_tail_row_titled_with_the_song_leads_the_tail(self, tmp_path):
+        """A crowded LIKE window (fifty rows whose artists only contain the words
+        "Harold" and "Budd") holds no row by the artist, so the whole artist-only
+        read is the tail, and its credited row titled with the song leads it."""
+        crowd = [(f"Harolds Buddy {i}", f"Moon Melodies {i}") for i in range(_FETCH_LIMIT + 5)]
+        rows = [
+            *crowd,
+            ("Harold Budd", "The Pavilion of Dreams"),
+            ("Cocteau Twins", "Moon Melodies", HAROLD_BUDD_CREDIT),
+        ]
+
+        got, _ = await _fallback(tmp_path, rows, "Harold Budd", song="Moon Melodie")
+
+        assert got == [
+            ("Cocteau Twins", "Moon Melodies"),
+            ("Harold Budd", "The Pavilion of Dreams"),
+        ]
+
+
 class TestCreditedTail:
     @pytest.mark.asyncio
     async def test_no_tail_when_a_lead_row_is_titled_with_the_song(self, tmp_path):
@@ -382,6 +403,34 @@ class TestSongReadBound:
         got, _ = await _fallback(tmp_path, rows, "Various Artists", song="Rock")
 
         assert got == rows[:SONG_READ_LIMIT]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "artist, song, album, crowd, target",
+        [
+            ("Stereolab", "Common Song", "Dots and Loops", ("Stereolab", "Common Song {}"), None),
+            (
+                "Various Artists",
+                "Rock",
+                "Anthology of Noise",
+                ("Various Artists - Rock - N", "Compilation {}"),
+                ("Various Artists - Rock - N", "Anthology of Noise"),
+            ),
+        ],
+    )
+    async def test_a_typed_album_reads_past_the_bound_before_its_floor(
+        self, tmp_path, artist, song, album, crowd, target
+    ):
+        """The album floor drops the read's rows, so a row it keeps past the bound
+        would be lost: with an album typed, the read has no bound."""
+        target = target or (artist, f"Common Song {album}")
+        rows = [(artist, "Plain Shelf")]
+        rows += [(crowd[0], crowd[1].format(i)) for i in range(SONG_READ_LIMIT + 20)]
+        rows.append(target)
+
+        got, _ = await _fallback(tmp_path, rows, artist, album=album, song=song)
+
+        assert got == [target]
 
 
 class TestSecondArtistOnlyRead:
