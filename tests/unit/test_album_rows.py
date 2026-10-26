@@ -1,6 +1,6 @@
 """The artist+album lane's rows against a real SQLite catalog (LML#1421).
 
-A real ``library_fts`` index (``tests/factories.py::make_library_catalog``): the
+A real ``library_fts`` index (``tests/factories.py::library_catalog``): the
 defect lived in the gap between the 50 rows the full-text search returns and
 the rows the lane keeps, which a mocked ``LibraryDB`` cannot show.
 """
@@ -12,12 +12,11 @@ from lookup.album_rows import filter_by_album_title
 from lookup.bilingual_titles import album_title_candidates
 from lookup.strategies.artist_plus_album import search_library_with_fallback
 from services.parser import MessageType, ParsedRequest
-from tests.factories import crowd_rows, make_library_catalog
+from tests.factories import crowd_rows, library_catalog
 
 
 async def _lane(tmp_path, rows, artist, album):
     """``((artist, title) of the lane's rows, fallback flag)`` for one typed album, no song."""
-    db = await make_library_catalog(tmp_path, rows)
     parsed = ParsedRequest(
         artist=artist,
         album=album,
@@ -25,10 +24,8 @@ async def _lane(tmp_path, rows, artist, album):
         is_request=True,
         message_type=MessageType.REQUEST,
     )
-    try:
+    async with library_catalog(tmp_path, rows) as db:
         results, fallback = await search_library_with_fallback(db, parsed, [album])
-    finally:
-        await db.close()
     return [(r.artist, r.title) for r in results], fallback
 
 
@@ -273,7 +270,6 @@ class TestBilingualDiscogsTitles:
             ("DJ Krush", "The Message at the Depth"),
             ("DJ Krush", "Milight"),
         ]
-        db = await make_library_catalog(tmp_path, rows)
         parsed = ParsedRequest(
             artist="DJ Krush",
             song="Trihedron",
@@ -281,12 +277,10 @@ class TestBilingualDiscogsTitles:
             is_request=True,
             message_type=MessageType.REQUEST,
         )
-        try:
+        async with library_catalog(tmp_path, rows) as db:
             results, fallback = await search_library_with_fallback(
                 db, parsed, ['深層 "The Message At The Depth"']
             )
-        finally:
-            await db.close()
 
         assert ([(r.artist, r.title) for r in results], fallback) == (
             [("DJ Krush", "The Message at the Depth")],

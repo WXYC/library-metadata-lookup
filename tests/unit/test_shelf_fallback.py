@@ -28,7 +28,7 @@ from lookup.orchestrator import perform_lookup
 from lookup.shelf_fallback import _order_shelf_rows, apply_shelf_fallback
 from services.parser import MessageType, ParsedRequest
 from tests.conftest import make_lml_telemetry
-from tests.factories import make_library_catalog, make_library_item, shelve
+from tests.factories import library_catalog, make_library_item, shelve
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -376,8 +376,7 @@ class TestShelfFallbackPunctuationVariants:
         ],
     )
     async def test_rows_and_sentence(self, tmp_path, typed, song, expected):
-        db = await make_library_catalog(tmp_path, self._ALASKA)
-        try:
+        async with library_catalog(tmp_path, self._ALASKA) as db:
             result_items, _type, context, _external, _rows = await apply_shelf_fallback(
                 _parsed(artist=typed, album="Nonexistent Album", song=song),
                 db,
@@ -387,8 +386,6 @@ class TestShelfFallbackPunctuationVariants:
                 None,
                 None,
             )
-        finally:
-            await db.close()
 
         assert [(i.library_item.artist, i.library_item.title) for i in result_items] == expected
         assert context == (
@@ -409,8 +406,7 @@ class TestShelfFallbackPunctuationVariants:
     ):
         """Two casings of one artist are not punctuation variants: the sentence
         names the first listed row's spelling, as before LML#1449."""
-        db = await make_library_catalog(tmp_path, [("BLO", "Step One"), ("Blo", "Step Three")])
-        try:
+        async with library_catalog(tmp_path, [("BLO", "Step One"), ("Blo", "Step Three")]) as db:
             _items, _type, context, _external, _rows = await apply_shelf_fallback(
                 _parsed(artist=typed, album="Nonexistent Album", song=song),
                 db,
@@ -420,8 +416,6 @@ class TestShelfFallbackPunctuationVariants:
                 None,
                 None,
             )
-        finally:
-            await db.close()
 
         assert context is not None and context.endswith(f"other albums by {named}:")
 
@@ -436,7 +430,7 @@ class TestShelfFallbackPunctuationVariants:
     async def test_another_act_on_other_call_letters_is_not_listed(self, tmp_path, typed, expected):
         """ "Mark Almond" (Marc Almond's solo records, AL) and "Mark-Almond" (the
         1970s band, MA) are two acts: neither shelf lists the other's rows."""
-        db = await make_library_catalog(
+        async with library_catalog(
             tmp_path,
             [
                 ("Mark-Almond", "Rising"),
@@ -445,13 +439,10 @@ class TestShelfFallbackPunctuationVariants:
                 ("Mark Almond", "Jacques"),
             ],
             call_letters={"Mark Almond": "AL", "Mark-Almond": "MA"},
-        )
-        try:
+        ) as db:
             result_items, _type, context, _external, _rows = await apply_shelf_fallback(
                 _parsed(artist=typed, album="Nonexistent Album"), db, False, [], "none", None, None
             )
-        finally:
-            await db.close()
 
         assert [i.library_item.title for i in result_items] == expected
         assert context is not None and context.endswith(f"other albums by {typed}:")

@@ -2,7 +2,7 @@
 
 Both fallbacks read the artist's own rows ahead of the 50-row search window,
 through ``lookup/artist_rows.py``. Real ``library_fts`` index
-(``tests/factories.py::make_library_catalog``): the defect lived in the gap
+(``tests/factories.py::library_catalog``): the defect lived in the gap
 between the rows the window returns and the artist's own.
 """
 
@@ -15,7 +15,7 @@ from lookup.fallback_rows import SONG_READ_LIMIT, artist_only_rows
 from lookup.matching import _FETCH_LIMIT
 from lookup.strategies.artist_plus_album import runs_album_resolution, search_library_with_fallback
 from services.parser import MessageType, ParsedRequest
-from tests.factories import crowd_rows, make_library_catalog
+from tests.factories import crowd_rows, library_catalog
 
 
 def _parsed(artist, album=None, song=None):
@@ -30,13 +30,10 @@ def _parsed(artist, album=None, song=None):
 
 
 async def _fallback(tmp_path, rows, artist, album=None, song=None, albums=()):
-    db = await make_library_catalog(tmp_path, rows)
-    try:
+    async with library_catalog(tmp_path, rows) as db:
         results, fallback = await search_library_with_fallback(
             db, _parsed(artist, album, song), list(albums)
         )
-    finally:
-        await db.close()
     return [(r.artist, r.title) for r in results], fallback
 
 
@@ -59,13 +56,10 @@ class TestUnresolvableSongReadsTheShelf:
             ("Afel Bocoum", "Alkibar"),
             ("Afel Bocoum", "Niger"),
         ]
-        db = await make_library_catalog(tmp_path, rows)
-        try:
+        async with library_catalog(tmp_path, rows) as db:
             results, fallback = await search_library_with_fallback(
                 db, _parsed("Afel Bocoum", song=UNRESOLVABLE), []
             )
-        finally:
-            await db.close()
 
         got = [(r.artist, r.title) for r in results]
         assert fallback is True
@@ -441,16 +435,13 @@ class TestSecondArtistOnlyRead:
     ):
         """The artist+song fallback already read the artist-only rows; an empty
         answer (no Stereolab title clears the album floor) must not repeat it."""
-        db = await make_library_catalog(tmp_path, [("Stereolab", "Peng!")])
-        try:
+        async with library_catalog(tmp_path, [("Stereolab", "Peng!")]) as db:
             with patch(
                 "lookup.strategies.artist_plus_album.artist_only_rows", wraps=artist_only_rows
             ) as spy:
                 await search_library_with_fallback(
                     db, _parsed("Stereolab", album="Zz Nonexistent", song=song), []
                 )
-        finally:
-            await db.close()
 
         assert spy.call_count == calls
 
@@ -466,12 +457,9 @@ class TestPlaceholderGuardAgreement:
         lists that same row for the same request."""
         rows = [*crowd_rows(artist), (artist, "S/T"), (artist, "Second Album")]
         parsed = _parsed(artist, album="S/T", song="Some Song")
-        db = await make_library_catalog(tmp_path, rows)
-        try:
+        async with library_catalog(tmp_path, rows) as db:
             guard_runs = await runs_album_resolution(parsed, db)
             got, _ = await search_library_with_fallback(db, parsed, [])
-        finally:
-            await db.close()
 
         assert guard_runs is False
         assert (artist, "S/T") in [(r.artist, r.title) for r in got]

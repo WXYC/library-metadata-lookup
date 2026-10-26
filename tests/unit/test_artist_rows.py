@@ -10,7 +10,7 @@ import pytest
 from library.models import LibraryItem
 from lookup.artist_rows import artist_rows
 from lookup.artist_shelf import artist_spellings
-from tests.factories import make_library_catalog
+from tests.factories import library_catalog
 
 
 async def _rows(tmp_path, rows, artist, title):
@@ -23,8 +23,7 @@ async def _rows(tmp_path, rows, artist, title):
     def keep(found: list[LibraryItem]) -> list[LibraryItem]:
         return [row for row in found if row.title == title]
 
-    db = await make_library_catalog(tmp_path, rows)
-    try:
+    async with library_catalog(tmp_path, rows) as db:
         got = await artist_rows(
             db,
             query=f"{artist} {title}",
@@ -34,8 +33,6 @@ async def _rows(tmp_path, rows, artist, title):
             lib_artist=artist,
             spellings=await artist_spellings(db, artist),
         )
-    finally:
-        await db.close()
     return [(r.artist, r.title) for r in got]
 
 

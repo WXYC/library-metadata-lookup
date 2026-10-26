@@ -1,6 +1,8 @@
 """Shared test factories for model construction."""
 
 import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 from discogs.models import DiscogsSearchResult
@@ -125,6 +127,20 @@ async def make_library_catalog(
     db = LibraryDB(db_path=db_file)
     await db.connect()
     return db
+
+
+@asynccontextmanager
+async def library_catalog(
+    tmp_path,
+    rows: list[tuple[str, ...]],
+    call_letters: dict[str | tuple[str, str], str] | None = None,
+) -> AsyncIterator[LibraryDB]:
+    """``make_library_catalog`` for a ``with`` block: yields the catalog, always closes it."""
+    db = await make_library_catalog(tmp_path, rows, call_letters)
+    try:
+        yield db
+    finally:
+        await db.close()
 
 
 def crowd_rows(word: str) -> list[tuple[str, str]]:

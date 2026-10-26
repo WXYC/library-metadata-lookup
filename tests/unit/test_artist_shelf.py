@@ -12,7 +12,7 @@ import pytest
 
 from lookup.artist_shelf import artist_spellings, rows_for_artist
 from lookup.matching import _FETCH_LIMIT
-from tests.factories import crowd_rows, make_library_catalog, make_library_item, shelve
+from tests.factories import crowd_rows, library_catalog, make_library_item, shelve
 
 
 class TestCrowdedOutArtists:
@@ -22,17 +22,14 @@ class TestCrowdedOutArtists:
         """The artist's rows sit after 60 rows that share its name's words.
         The 50-row window holds none of them; the artist-keyed read holds all,
         and nothing else."""
-        db = await make_library_catalog(
+        async with library_catalog(
             tmp_path,
             [*crowd_rows(artist), (artist, "First Album"), (artist, "Second Album")],
-        )
-        try:
+        ) as db:
             window = await db.search(query=artist, limit=_FETCH_LIMIT)
             assert [row for row in window if row.artist == artist] == []
 
             rows = await rows_for_artist(db, artist)
-        finally:
-            await db.close()
 
         assert [(row.artist, row.title) for row in rows] == [
             (artist, "First Album"),
@@ -80,11 +77,8 @@ class TestThisArtistOnly:
         ],
     )
     async def test_exact_rung(self, tmp_path, typed, catalog, expected):
-        db = await make_library_catalog(tmp_path, catalog)
-        try:
+        async with library_catalog(tmp_path, catalog) as db:
             rows = await rows_for_artist(db, typed)
-        finally:
-            await db.close()
 
         assert [(row.artist, row.title) for row in rows] == expected
 
@@ -164,11 +158,8 @@ class TestTolerantRungs:
         ],
     )
     async def test_variant_spellings(self, tmp_path, typed, catalog, expected):
-        db = await make_library_catalog(tmp_path, catalog)
-        try:
+        async with library_catalog(tmp_path, catalog) as db:
             rows = await rows_for_artist(db, typed)
-        finally:
-            await db.close()
 
         assert [row.artist for row in rows] == expected
 
@@ -176,13 +167,10 @@ class TestTolerantRungs:
     async def test_tolerant_rung_keeps_case_variants_of_one_artist(self, tmp_path):
         """Two stored casings are one artist under the exact rung, so a
         tolerant rung matching both is not ambiguous."""
-        db = await make_library_catalog(
+        async with library_catalog(
             tmp_path, [("The Clientele", "Suburban Light"), ("THE CLIENTELE", "Strange Geometry")]
-        )
-        try:
+        ) as db:
             rows = await rows_for_artist(db, "Clientele")
-        finally:
-            await db.close()
 
         assert [row.title for row in rows] == ["Suburban Light", "Strange Geometry"]
 
@@ -191,11 +179,8 @@ class TestTolerantRungs:
         """No window on the rows either, and two stored casings interleave by
         id rather than grouping by spelling."""
         catalog = [("Stereolab" if i % 2 else "STEREOLAB", f"Album {i}") for i in range(1, 61)]
-        db = await make_library_catalog(tmp_path, catalog)
-        try:
+        async with library_catalog(tmp_path, catalog) as db:
             rows = await rows_for_artist(db, "Stereolab")
-        finally:
-            await db.close()
 
         assert [row.id for row in rows] == list(range(1, 61))
 
@@ -256,34 +241,27 @@ class TestArtistSpellings:
         ],
     )
     async def test_artist_spellings(self, tmp_path, typed, catalog, expected):
-        db = await make_library_catalog(tmp_path, catalog)
-        try:
+        async with library_catalog(tmp_path, catalog) as db:
             spellings = await artist_spellings(db, typed)
-        finally:
-            await db.close()
 
         assert sorted(spellings) == sorted(expected)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("typed", ["Alaska", "Alaska!"])
     async def test_typed_spelling_leads_its_variants(self, tmp_path, typed):
-        db = await make_library_catalog(tmp_path, [("Alaska!", "Emotions"), ("Alaska", "Emotions")])
-        try:
+        async with library_catalog(
+            tmp_path, [("Alaska!", "Emotions"), ("Alaska", "Emotions")]
+        ) as db:
             spellings = await artist_spellings(db, typed)
-        finally:
-            await db.close()
 
         assert spellings[0].lower() == typed.lower() and len(spellings) == 2
 
     @pytest.mark.asyncio
     async def test_the_typed_spelling_comes_first_whatever_the_catalog_order(self, tmp_path):
-        db = await make_library_catalog(
+        async with library_catalog(
             tmp_path, [("STEREOLAB", "Emperor Tomato Ketchup"), ("Stereolab", "Dots and Loops")]
-        )
-        try:
+        ) as db:
             spellings = await artist_spellings(db, "Stereolab")
-        finally:
-            await db.close()
 
         assert spellings == ["Stereolab", "STEREOLAB"]
 
@@ -304,15 +282,12 @@ class TestPunctuationVariants:
     async def test_a_variant_on_other_call_letters_is_another_act(self, tmp_path, typed, expected):
         """Marc Almond's solo records are filed as "Mark Almond" under AL; the
         1970s band Mark-Almond is filed under MA."""
-        db = await make_library_catalog(
+        async with library_catalog(
             tmp_path,
             [("Mark-Almond", "Rising"), ("Mark Almond", "The Stars We Are")],
             call_letters={"Mark Almond": "AL", "Mark-Almond": "MA"},
-        )
-        try:
+        ) as db:
             rows = await rows_for_artist(db, typed)
-        finally:
-            await db.close()
 
         assert [row.artist for row in rows] == expected
 
@@ -327,7 +302,7 @@ class TestPunctuationVariants:
     async def test_sharing_one_call_letter_is_not_the_same_letters(self, tmp_path, typed, expected):
         """The band has one row misfiled under AL beside its MA rows: {AL, MA}
         is not {AL}, so the two spellings stay two acts."""
-        db = await make_library_catalog(
+        async with library_catalog(
             tmp_path,
             [
                 ("Mark-Almond", "Rising"),
@@ -339,11 +314,8 @@ class TestPunctuationVariants:
                 "Mark-Almond": "MA",
                 ("Mark-Almond", "Rising"): "AL",
             },
-        )
-        try:
+        ) as db:
             rows = await rows_for_artist(db, typed)
-        finally:
-            await db.close()
 
         assert [row.title for row in rows] == expected
 
@@ -351,11 +323,10 @@ class TestPunctuationVariants:
     async def test_an_unstored_spelling_reads_both_spellings_of_one_act(self, tmp_path):
         """ "Alaska?" matches "Alaska" and "Alaska!" on the punctuation rung: two
         rung-1 keys, one act on one call letters, so not ambiguous."""
-        db = await make_library_catalog(tmp_path, [("Alaska!", "Wide Awake"), ("Alaska", "Rescue")])
-        try:
+        async with library_catalog(
+            tmp_path, [("Alaska!", "Wide Awake"), ("Alaska", "Rescue")]
+        ) as db:
             rows = await rows_for_artist(db, "Alaska?")
-        finally:
-            await db.close()
 
         assert [(row.artist, row.title) for row in rows] == [
             ("Alaska", "Rescue"),
@@ -428,16 +399,13 @@ class TestPunctuationVariants:
         ],
     )
     async def test_variant_rows_follow_the_picked_spellings_rows(self, tmp_path, typed, expected):
-        db = await make_library_catalog(
+        async with library_catalog(
             tmp_path,
             [
                 ("The Cherry Point,", "Black Witchery"),
                 ("The Cherry Point", "Night of the Bloody Tapes"),
             ],
-        )
-        try:
+        ) as db:
             rows = await rows_for_artist(db, typed)
-        finally:
-            await db.close()
 
         assert [(row.artist, row.title) for row in rows] == expected
