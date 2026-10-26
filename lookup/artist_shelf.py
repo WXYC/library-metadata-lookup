@@ -43,7 +43,7 @@ the 2026-10-02 catalog). Those stay as they were before this module.
 """
 
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from library.db import LibraryDB
 from library.models import LibraryItem
@@ -126,6 +126,21 @@ async def _variants(db: LibraryDB, stored: dict[str, str], hits: list[str]) -> l
         return []
     shelf = await _shelves(db, stored, [*hits, *candidates])
     return [spelling for spelling in candidates if shelf[spelling] in {shelf[h] for h in hits}]
+
+
+def filed_under(row_artist: str | None, artist: str, spellings: Sequence[str]) -> bool:
+    """Whether a row filed under ``row_artist`` is filed under the typed ``artist`` (LML#1490).
+
+    For a shelved artist that is membership in ``spellings``
+    (:func:`artist_spellings`), the test the row readers apply. An artist with
+    no shelf (empty ``spellings``) falls back to equality on any rung; a rung
+    key that comes out empty matches nothing.
+    """
+    if spellings:
+        return row_artist in spellings
+    filed = normalize_for_comparison(row_artist or "").strip()
+    want = normalize_for_comparison(artist).strip()
+    return any(rung(want) and rung(filed) == rung(want) for rung in _RUNGS)
 
 
 def own_rows_first(rows: list[LibraryItem], spellings: list[str]) -> list[LibraryItem]:

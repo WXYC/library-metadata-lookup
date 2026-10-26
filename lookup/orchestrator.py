@@ -365,6 +365,13 @@ class LookupState:
     Written by the search pipeline (step 3); read by the response build to set
     each ``LookupResultItem.matched_via``."""
 
+    artist_spellings: list[str] | None = None
+    """The library artist's ``artist_spellings`` (LML#1490), as the artist+album
+    lane read them. Written by the search pipeline (step 3); read by the response
+    build, whose ``matched_via_alias`` label asks whether a row is filed under
+    the artist. ``None`` when that lane never ran: the label then falls back to
+    the rung test and the build reads nothing."""
+
     timed_out: bool = False
     """True when the LML#370 hard cap fired and the search pipeline was
     abandoned. Written by the search pipeline (step 3); read by the response
@@ -625,7 +632,10 @@ async def _step_search_pipeline(
         # write, on the backfill path.
         strategies = build_strategies(
             services.db,
-            search_library_func=search_library_with_fallback,
+            search_library_func=partial(
+                search_library_with_fallback,
+                on_spellings=partial(setattr, state, "artist_spellings"),
+            ),
             search_alternative_func=partial(
                 search_with_alternative_interpretation,
                 discogs_service=services.discogs_service,

@@ -30,7 +30,8 @@ def build_result_items(
     canonical rule statement is ``LookupState.result_count``),
     ``library_results``, ``matched_via_by_id``. ``artist`` is the requested
     library-channel artist; a library row it is credited on, not filed under,
-    carries ``matched_via_alias`` (LML#1444).
+    carries ``matched_via_alias`` (LML#1444), decided against
+    ``state.artist_spellings`` (LML#1490).
     WRITES: nothing.
     """
 
@@ -39,6 +40,7 @@ def build_result_items(
             return None
         return identities_by_artist.get(item.artist)
 
+    spellings = state.artist_spellings or ()
     result_items = []
     if state.items_with_artwork:
         for item, artwork in state.items_with_artwork:
@@ -61,7 +63,9 @@ def build_result_items(
                     # do not look up key 0 in matched_via_by_id to prevent accidental
                     # collision with any future strategy that might write to that key.
                     matched_via=None if item.id == 0 else state.matched_via_by_id.get(item.id),
-                    matched_via_alias=None if item.id == 0 else alternate_credit_hint(item, artist),
+                    matched_via_alias=None
+                    if item.id == 0
+                    else alternate_credit_hint(item, artist, spellings),
                 )
             )
     elif state.library_results:
@@ -71,7 +75,7 @@ def build_result_items(
                     library_item=item.to_catalog_item(),
                     reconciled_identity=_identity_for(item),
                     matched_via=state.matched_via_by_id.get(item.id),
-                    matched_via_alias=alternate_credit_hint(item, artist),
+                    matched_via_alias=alternate_credit_hint(item, artist, spellings),
                 )
             )
     return result_items
