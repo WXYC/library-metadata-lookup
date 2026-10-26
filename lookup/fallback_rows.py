@@ -17,7 +17,8 @@ from lookup.matching import _FETCH_LIMIT, filter_results_by_artist
 
 SONG_READ_LIMIT = 250
 """Rows the artist+song fallback reads from the artist's own shelf, and from the
-compilation shelves, before narrowing."""
+compilation shelves, when no album is typed. With one, the album floor drops rows
+from the read, so a bound would cut it before the floor ran."""
 
 
 async def artist_song_rows(
@@ -54,7 +55,7 @@ async def artist_song_rows(
         lib_artist=lib_artist,
         spellings=spellings,
         window_when_shelved=False,
-        limit=SONG_READ_LIMIT,
+        limit=None if album and album.strip() else SONG_READ_LIMIT,
     )
     if rows or not spellings:
         return song_first(rows)
@@ -81,8 +82,8 @@ async def artist_only_rows(
     25 ms for Various Artists). When none clears it, only the window's rows by
     the artist that do answer (:func:`window_members`), often none: never another
     act's record (LML#1425 decision 1). What follows an empty answer is
-    ``perform_lookup``'s: step 3a answers a confident Discogs match with a
-    not-in-library release, step 7 may fill from the external cache, and step 8
+    ``perform_lookup``'s: for a typed album, step 3a answers a confident Discogs
+    match with a not-in-library release, step 7 may fill from the external cache, and step 8
     lists the shelf as display-only rows, except for X-Caller-Class 5 callers.
     """
 

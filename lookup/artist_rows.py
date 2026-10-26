@@ -45,7 +45,7 @@ async def artist_rows(
     artist has a shelf and ``keep`` leaves no own row, so the caller can answer
     another way (LML#1445's fallbacks, through :func:`window_members`). ``limit`` bounds the own
     read and the compilation-shelf read (``LibraryDB.search_among``) to their lowest ids;
-    pass it only with a ``keep`` that drops little, or rows past the bound that it would
+    pass it only with a ``keep`` that drops nothing, or rows past the bound that it would
     keep are lost.
     """
     if spellings:
