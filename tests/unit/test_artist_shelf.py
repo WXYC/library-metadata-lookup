@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from lookup.artist_shelf import artist_spellings, rows_for_artist
+from lookup.artist_shelf import artist_spellings, filed_under, rows_for_artist
 from lookup.matching import _FETCH_LIMIT
 from tests.factories import crowd_rows, library_catalog, make_library_item, shelve
 
@@ -409,3 +409,28 @@ class TestPunctuationVariants:
             rows = await rows_for_artist(db, typed)
 
         assert [(row.artist, row.title) for row in rows] == expected
+
+
+@pytest.mark.parametrize(
+    ("row_artist", "artist", "spellings", "expected"),
+    [
+        # A shelved artist: membership in the spellings, exactly.
+        ("Alaska!", "Alaska", ["Alaska", "Alaska!"], True),
+        ("Alaska", "Alaska", ["Alaska", "Alaska!"], True),
+        ("The Girls", "Girls", ["Girls"], False),
+        ("Mark-Almond", "Mark Almond", ["Mark Almond"], False),
+        ("girls", "Girls", ["Girls"], False),
+        (None, "Girls", ["Girls"], False),
+        # No shelf (empty spellings): equality on any rung, as before LML#1490.
+        ("The Girls", "Girls", [], True),
+        ("Mark-Almond", "Mark Almond", [], True),
+        ("Girls", "girls", [], True),
+        ("Damon Albarn", "Afel Bocoum", [], False),
+        (None, "Girls", [], False),
+        # An empty rung key matches nothing.
+        ("...", "!!!", [], False),
+        ("The", "A", [], False),
+    ],
+)
+def test_filed_under(row_artist, artist, spellings, expected):
+    assert filed_under(row_artist, artist, spellings) is expected

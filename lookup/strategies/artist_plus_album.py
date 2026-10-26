@@ -161,6 +161,7 @@ async def search_library_with_fallback(
     db: LibraryDB,
     parsed: ParsedRequest,
     albums: list[str],
+    on_spellings: Callable[[list[str]], None] | None = None,
 ) -> tuple[list[LibraryItem], bool]:
     """Search library with artist+album(s), falling back to artist+song or artist-only.
 
@@ -180,6 +181,9 @@ async def search_library_with_fallback(
     artist-only credited rows unless a row's title holds the song's words; when the
     window holds none, the artist-only rows answer.
 
+    ``on_spellings`` receives the artist's :func:`~lookup.artist_shelf.artist_spellings`
+    once they are read, so the response build reuses them (LML#1490).
+
     Returns:
         Tuple of (library_results, song_not_found_flag)
     """
@@ -196,6 +200,8 @@ async def search_library_with_fallback(
         return [], bool(parsed.song)
 
     spellings = await artist_spellings(db, lib_artist) if lib_artist else []
+    if on_spellings:
+        on_spellings(spellings)
 
     if lib_artist and albums:
         album_results = await asyncio.gather(

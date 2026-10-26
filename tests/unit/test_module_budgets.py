@@ -465,8 +465,11 @@ MODULE_BUDGETS: dict[str, int] = {
     # matching rungs. Its own module because shelf_fallback.py sat at 222/250
     # and this is a separate concern (which rows are one artist's) from that
     # file's (when a lane fires and what it returns). Smallest multiple of 50
-    # at or above 1.3x the 87-line measured size (113.1).
-    "lookup/artist_shelf.py": 150,
+    # at or above 1.3x the 87-line measured size (113.1). Recalibrated
+    # (LML#1490): the public ``filed_under`` predicate and the earlier
+    # rung-pick work carried it to 160 lines; smallest multiple of 50 at or
+    # above 1.3x that (208).
+    "lookup/artist_shelf.py": 250,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line
     # ceiling (zero headroom) before this ticket's two mandated Sentry-tag call
