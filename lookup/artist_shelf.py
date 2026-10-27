@@ -47,7 +47,7 @@ from collections.abc import Callable, Sequence
 
 from library.db import LibraryDB
 from library.models import LibraryItem
-from lookup.matching import normalize_for_comparison, strip_leading_article
+from lookup.matching import artist_key, strip_leading_article
 from lookup.name_folding import fold_punctuation_for_comparison
 
 
@@ -82,7 +82,7 @@ async def artist_spellings(db: LibraryDB, artist: str) -> list[str]:
     ``LibraryItem``: a caller restricting its own query to these spellings
     (``LibraryDB.search_among``) reads only the rows its query matches. See the module docstring.
     """
-    name = normalize_for_comparison(artist).strip()
+    name = artist_key(artist)
     if not name or len(name) > _MAX_NAME_LENGTH:
         return []
     names = await db.artist_names_matching(
@@ -90,7 +90,7 @@ async def artist_spellings(db: LibraryDB, artist: str) -> list[str]:
     )
     # The typed spelling first, then a stable order: the DISTINCT scan has none.
     stored = {
-        spelling: normalize_for_comparison(spelling).strip()
+        spelling: artist_key(spelling)
         for spelling in sorted(names, key=lambda spelling: (spelling != artist, spelling))
     }
     for tolerant, rung in enumerate(_RUNGS):
@@ -138,15 +138,15 @@ def filed_under(row_artist: str | None, artist: str, spellings: Sequence[str]) -
     """
     if spellings:
         return row_artist in spellings
-    filed = normalize_for_comparison(row_artist or "").strip()
-    want = normalize_for_comparison(artist).strip()
+    filed = artist_key(row_artist)
+    want = artist_key(artist)
     return any(rung(want) and rung(filed) == rung(want) for rung in _RUNGS)
 
 
 def own_rows_first(rows: list[LibraryItem], spellings: list[str]) -> list[LibraryItem]:
     """``rows`` (id order), the picked artist's ahead of its punctuation variants' (LML#1449)."""
-    own = normalize_for_comparison(spellings[0]).strip() if spellings else ""
-    return sorted(rows, key=lambda row: normalize_for_comparison(row.artist or "").strip() != own)
+    own = artist_key(spellings[0]) if spellings else ""
+    return sorted(rows, key=lambda row: artist_key(row.artist) != own)
 
 
 async def rows_for_artist(db: LibraryDB, artist: str) -> list[LibraryItem]:

@@ -55,6 +55,7 @@ from lookup.artist_shelf import rows_for_artist
 from lookup.matching import (
     MAX_SEARCH_RESULTS,
     album_not_found_message,
+    artist_key,
     is_self_titled,
     is_self_titled_request_placeholder,
     library_artist_for,
@@ -194,8 +195,8 @@ async def apply_shelf_fallback(
         return unchanged
 
     # The first listed row filed as the picked artist, not a song-led variant's (LML#1449).
-    own = normalize_for_comparison(shelf[0].artist or "").strip()
-    named = next(r.artist for r in rows if normalize_for_comparison(r.artist or "").strip() == own)
+    own = artist_key(shelf[0].artist)
+    named = next(r.artist for r in rows if artist_key(r.artist) == own)
     return (
         shelf_items,
         SEARCH_TYPE_FALLBACK,

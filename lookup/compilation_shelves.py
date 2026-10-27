@@ -18,7 +18,7 @@ import re
 
 from library.db import LibraryDB
 from library.models import LibraryItem
-from lookup.matching import normalize_for_comparison
+from lookup.matching import artist_key
 
 _VARIOUS_ARTISTS = "various artists"
 _SHELF_NAME = re.compile(r"various artists - .+|soundtracks - [a-z]")
@@ -26,12 +26,12 @@ _SHELF_NAME = re.compile(r"various artists - .+|soundtracks - [a-z]")
 
 def is_compilation_shelf(name: str) -> bool:
     """Whether ``name`` is a compilation shelf ("Various Artists - Rock - H", "Soundtracks - S")."""
-    return bool(_SHELF_NAME.fullmatch(normalize_for_comparison(name).strip()))
+    return bool(_SHELF_NAME.fullmatch(artist_key(name)))
 
 
 def is_various_artists(spellings: list[str]) -> bool:
     """Whether ``spellings`` (``artist_spellings``) are Various Artists."""
-    return any(normalize_for_comparison(s).strip() == _VARIOUS_ARTISTS for s in spellings)
+    return any(artist_key(s) == _VARIOUS_ARTISTS for s in spellings)
 
 
 async def shelf_rows(
