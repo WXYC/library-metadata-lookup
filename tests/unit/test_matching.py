@@ -15,6 +15,7 @@ from discogs.matching import (
 from discogs.service import calculate_confidence
 from lookup.matching import (
     SELF_TITLED_PATTERNS,
+    artist_key,
     artist_variant_tie_break_key,
     artist_variants_with_stripped_suffix,
     is_self_titled,
@@ -827,3 +828,25 @@ class TestArtistVariantTieBreakKey:
         assert artist_variant_tie_break_key("Mavi", earlier) < artist_variant_tie_break_key(
             "Mavi", later
         )
+
+
+# ---------------------------------------------------------------------------
+# artist_key
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        (None, ""),
+        ("", ""),
+        ("  Stereolab  ", "stereolab"),
+        ("Nilüfer Yanya", normalize_for_comparison("Nilüfer Yanya").strip()),
+    ],
+)
+def test_artist_key(name, expected):
+    assert artist_key(name) == expected
+
+
+def test_artist_key_folds_diacritics_and_case():
+    assert artist_key("NILÜFER YANYA") == artist_key("nilufer yanya") != ""

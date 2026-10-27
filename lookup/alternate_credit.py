@@ -11,7 +11,7 @@ LML#1444 tags them with the credit line.
 ``cross_reference_names`` is a different column and is not consulted here.
 """
 
-from lookup.matching import normalize_for_comparison
+from lookup.matching import artist_key
 
 CREDIT_SEPARATORS = (", ", " & ", " and ", " / ")
 """What may follow the typed artist in a credit line. Names later in the line
@@ -28,8 +28,8 @@ def credits_artist(credit: str | None, artist: str) -> bool:
     "Agnes Obel & Friends" does not credit "Agnes": unlike the artist filter's
     prefix match, a name is never a prefix of a longer name here.
     """
-    name = normalize_for_comparison(artist).strip()
-    line = normalize_for_comparison(credit or "").strip()
+    name = artist_key(artist)
+    line = artist_key(credit)
     if not name or not line.startswith(name):
         return False
     rest = line[len(name) :]

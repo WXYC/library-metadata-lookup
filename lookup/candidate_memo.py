@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING
 
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
+from lookup.matching import artist_key
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -45,7 +47,7 @@ def _memo_key(track: str, artist: str) -> tuple[str, str]:
     """
     return (
         normalize_for_comparison(track or "").strip(),
-        normalize_for_comparison(artist or "").strip(),
+        artist_key(artist),
     )
 
 

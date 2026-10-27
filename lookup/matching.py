@@ -29,6 +29,13 @@ from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
 
+
+def artist_key(name: str | None) -> str:
+    """The comparison key of an artist name: ``normalize_for_comparison``, stripped,
+    with ``None`` treated as empty. Every "same artist" test goes through this."""
+    return normalize_for_comparison(name or "").strip()
+
+
 MAX_SEARCH_RESULTS = 5
 """Maximum number of results to return from search operations."""
 
@@ -110,8 +117,7 @@ def typed_album_is_artist(parsed: ParsedRequest) -> bool:
     """Whether the typed album normalizes equal to the typed artist's name, as a
     self-titled record's catalog title does (LML#1412)."""
     return bool(parsed.album and parsed.artist) and (
-        normalize_for_comparison(parsed.album or "").strip()
-        == normalize_for_comparison(parsed.artist or "").strip()
+        artist_key(parsed.album) == artist_key(parsed.artist)
     )
 
 
@@ -119,8 +125,8 @@ def order_self_titled_albums(placeholder: str, discogs_albums: list[str], artist
     """Step 2's albums for a placeholder naming no shelved record (LML#1392): the
     typed album, then Discogs albums titled with the artist's name, then the rest
     in Discogs order; deduped case-blind. ``albums[0]`` only breaks song-in-title ties."""
-    artist_key = normalize_for_comparison(artist).strip()
-    named = [a for a in discogs_albums if normalize_for_comparison(a).strip() == artist_key]
+    want = artist_key(artist)
+    named = [a for a in discogs_albums if artist_key(a) == want]
     ordered: dict[str, str] = {}
     for album in [placeholder, *named, *discogs_albums]:
         ordered.setdefault(album.strip().lower(), album)
