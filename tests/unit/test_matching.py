@@ -841,7 +841,8 @@ class TestArtistVariantTieBreakKey:
         (None, ""),
         ("", ""),
         ("  Stereolab  ", "stereolab"),
-        ("Nilüfer Yanya", normalize_for_comparison("Nilüfer Yanya").strip()),
+        ("\tStereolab\n", "stereolab"),
+        ("Nilüfer Yanya", "nilufer yanya"),
     ],
 )
 def test_artist_key(name, expected):

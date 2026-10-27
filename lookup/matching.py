@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 def artist_key(name: str | None) -> str:
     """The comparison key of an artist name: ``normalize_for_comparison``, stripped,
-    with ``None`` treated as empty. Every "same artist" test goes through this."""
+    with ``None`` treated as empty. Use it where artist names are compared as keys."""
     return normalize_for_comparison(name or "").strip()
 
 
