@@ -134,7 +134,7 @@ The drift the deepening (#393) removes — every `pg_write=None` call site docum
 
 | Method | `pg_write` | Why |
 |---|---|---|
-| `get_release` | `cache_service.write_release` | Full read-through. `ReleaseMetadataResponse` maps cleanly to the cache's normalized schema. |
+| `get_release` | `cache_service.write_release` | Full read-through. `ReleaseMetadataResponse` maps cleanly to the cache's normalized schema. `write_release` caps each track title at `MAX_TRACK_TITLE_CHARS` (1,000) on write (truncating, never dropping the track), so a cache hit can return a shorter title than the API did ([#1497](https://github.com/WXYC/library-metadata-lookup/issues/1497)). |
 | `get_artist_details` | `cache_service.write_artist_details` | Full read-through. Same shape. |
 | `search_releases_by_track` | `None` | Read-only by design — the PG side queries the normalized `release_track` index populated by the ETL pipeline. Writing arbitrary Discogs `/database/search` hits back wouldn't fit that schema. Negative-cache write still fires via `pg_negative_record`. |
 | `search` | `None` | Read-only by design — same shape. |
