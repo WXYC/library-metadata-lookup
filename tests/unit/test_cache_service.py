@@ -1,6 +1,7 @@
 """Unit tests for discogs/cache_service.py."""
 
 import asyncio
+import string
 from dataclasses import fields
 from datetime import UTC
 from unittest.mock import AsyncMock
@@ -969,12 +970,18 @@ class TestWriteRelease:
         """An oversized track title is truncated (never dropped) before the
         ``release_track`` insert so it cannot poison the trigram index.
         WXYC/library-metadata-lookup#1497."""
+        # Characters vary by position so a slice that keeps the wrong span (e.g. the tail)
+        # yields a different string, not just a different length.
+        # The 62-character alphabet keeps head and tail distinct at every case length,
+        # including 300,000, where a 52-character alphabet would make them coincide.
+        alphabet = string.ascii_letters + string.digits
+        title = (alphabet * (title_length // len(alphabet) + 1))[:title_length]
         release = ReleaseMetadataResponse(
             release_id=23116274,
             title="Album",
             artist="Artist",
             tracklist=[
-                TrackItem(position="1", title="x" * title_length, artists=[]),
+                TrackItem(position="1", title=title, artists=[]),
                 TrackItem(position="2", title="Short", artists=[]),
             ],
             release_url="https://discogs.com/release/23116274",
@@ -988,7 +995,9 @@ class TestWriteRelease:
         )
         assert len(track_rows) == 2
         assert len(track_rows[0][3]) == expected_length
+        assert track_rows[0][3] == title[:MAX_TRACK_TITLE_CHARS]
         assert track_rows[1][3] == "Short"
+        assert [row[1] for row in track_rows] == [1, 2]
 
     @pytest.mark.asyncio
     async def test_release_upsert_stamps_artwork_checked_at_now(
