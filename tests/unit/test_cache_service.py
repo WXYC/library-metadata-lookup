@@ -11,6 +11,7 @@ import pytest
 from discogs.cache_service import (
     _SEARCH_BY_TRACK_ARTIST_SQL,
     _SEARCH_BY_TRACK_SQL,
+    MAX_TRACK_TITLE_CHARS,
     ArtistEqualityCandidates,
     CacheSchemaSkewError,
     CacheUnavailableError,
@@ -951,6 +952,43 @@ class TestWriteRelease:
         conn = mock_asyncpg_pool._mock_conn
         assert conn.execute.call_count >= 3  # insert release, artist, delete tracks, cache_metadata
         assert conn.executemany.call_count >= 1  # insert tracks
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("title_length", "expected_length"),
+        [
+            (300_000, MAX_TRACK_TITLE_CHARS),
+            (MAX_TRACK_TITLE_CHARS + 1, MAX_TRACK_TITLE_CHARS),
+            (MAX_TRACK_TITLE_CHARS, MAX_TRACK_TITLE_CHARS),
+            (10, 10),
+        ],
+    )
+    async def test_track_title_capped_at_write(
+        self, cache_service, mock_asyncpg_pool, title_length, expected_length
+    ):
+        """An oversized track title is truncated (never dropped) before the
+        ``release_track`` insert so it cannot poison the trigram index.
+        WXYC/library-metadata-lookup#1497."""
+        release = ReleaseMetadataResponse(
+            release_id=23116274,
+            title="Album",
+            artist="Artist",
+            tracklist=[
+                TrackItem(position="1", title="x" * title_length, artists=[]),
+                TrackItem(position="2", title="Short", artists=[]),
+            ],
+            release_url="https://discogs.com/release/23116274",
+        )
+
+        await cache_service.write_release(release)
+
+        conn = mock_asyncpg_pool._mock_conn
+        track_rows = next(
+            c[0][1] for c in conn.executemany.call_args_list if "INTO release_track " in c[0][0]
+        )
+        assert len(track_rows) == 2
+        assert len(track_rows[0][3]) == expected_length
+        assert track_rows[1][3] == "Short"
 
     @pytest.mark.asyncio
     async def test_release_upsert_stamps_artwork_checked_at_now(

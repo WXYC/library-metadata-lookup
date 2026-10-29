@@ -138,6 +138,14 @@ class ArtistEqualityCandidates:
 # metadata-lookup#341.
 _NEGATIVE_CACHE_DEFAULT_TTL_SECONDS = 604_800
 
+# Longest track title ``write_release`` stores. A Discogs API response once
+# carried ~274,000-character titles (a dump of the whole character table);
+# such a title contains nearly every trigram, so ``idx_release_track_title_trgm``
+# returned it for almost every search and each recheck cost seconds. The
+# longest title in the monthly bulk import is 713 characters.
+# WXYC/library-metadata-lookup#1497.
+MAX_TRACK_TITLE_CHARS = 1_000
+
 # In-process TTL cache for ``search_artists_by_name``. The trigram scan over
 # UNION(artist, artist_name_variation) was the dominant DB chokepoint in prod
 # (p50 = 303 ms × ~1k calls/day, ~317 s aggregate DB time per 24 h). The
@@ -1737,6 +1745,10 @@ class DiscogsCacheService:
     async def write_release(self, release: ReleaseMetadataResponse) -> None:
         """Write or update a release in the cache.
 
+        Track titles are truncated to ``MAX_TRACK_TITLE_CHARS`` on write, so a
+        cache hit returns the capped title while a fresh Discogs API response
+        returns the full one.
+
         Args:
             release: Release metadata to cache
 
@@ -1937,7 +1949,13 @@ class DiscogsCacheService:
 
                 if release.tracklist:
                     track_data = [
-                        (release.release_id, i + 1, t.position, t.title, t.duration)
+                        (
+                            release.release_id,
+                            i + 1,
+                            t.position,
+                            t.title[:MAX_TRACK_TITLE_CHARS],
+                            t.duration,
+                        )
                         for i, t in enumerate(release.tracklist)
                     ]
                     await conn.executemany(
