@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from wxyc_etl.text import is_compilation_artist
+from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from config.settings import get_settings
 from core.search import (
@@ -29,6 +30,7 @@ from core.search import (
     no_results_and_song_but_no_artist,
 )
 from discogs.lookup import lookup_releases_by_artist
+from discogs.models import DiscogsSearchResult
 from discogs.service import DiscogsService
 from library.db import LibraryDB
 from library.models import LibraryItem
@@ -39,8 +41,13 @@ from lookup.matching import (
     filter_results_by_artist,
     limit_results,
 )
+from lookup.name_folding import fold_punctuation_for_comparison
 from lookup.release_resolution import ResolvedRelease
-from lookup.rowless import ROWLESS_LIBRARY_ID, _select_rowless_artist_release
+from lookup.rowless import (
+    ROWLESS_LIBRARY_ID,
+    _own_release_credit,
+    _select_rowless_artist_release,
+)
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -117,19 +124,27 @@ async def search_song_as_artist(
 
     logger.info(f"Found {len(discogs_releases)} Discogs releases for '{song_as_artist}'")
 
-    async def search_album(album_title: str) -> list[LibraryItem]:
-        if not album_title:
+    # LML#1501: a V/A library row only counts when the Discogs release that produced
+    # the title credits the typed token or is itself V/A -- a look-alike artist's
+    # compilation must not stand in for the song and block SONG_AS_TRACK.
+    token_form = normalize_for_comparison(song_as_artist)
+    token_folded = fold_punctuation_for_comparison(token_form)
+
+    async def search_album(r: DiscogsSearchResult) -> list[LibraryItem]:
+        if not r.album:
             return []
-        album_results = await db.search(query=album_title, limit=_FETCH_LIMIT)
+        va_ok = _own_release_credit(
+            r, token_form, token_folded
+        ) is not None or is_compilation_artist(r.artist or "")
+        album_results = await db.search(query=r.album, limit=_FETCH_LIMIT)
         return [
             item
             for item in album_results
-            if artist_matches_item(item, song_as_artist) or is_compilation_artist(item.artist or "")
+            if artist_matches_item(item, song_as_artist)
+            or (va_ok and is_compilation_artist(item.artist or ""))
         ]
 
-    all_matches = await asyncio.gather(
-        *[search_album(release.album or "") for release in discogs_releases]
-    )
+    all_matches = await asyncio.gather(*[search_album(release) for release in discogs_releases])
 
     seen_ids: set[int] = set()
     for matches in all_matches:

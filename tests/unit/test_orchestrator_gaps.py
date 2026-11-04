@@ -4,12 +4,19 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from core.search import SearchState, SearchStrategyType, _apply, get_search_type_from_state
+from core.search import (
+    SearchState,
+    SearchStrategyType,
+    _apply,
+    execute_search_pipeline,
+    get_search_type_from_state,
+)
 from generated.api_models import TrackMatchHint, TrackMatchSource
 from lookup.artwork import fetch_artwork_for_items
 from lookup.matching import album_title_acceptable
 from lookup.orchestrator import resolve_albums_for_track
 from lookup.release_resolution import ResolvedRelease
+from lookup.strategies import build_strategies
 from lookup.strategies.artist_plus_album import search_library_with_fallback
 from lookup.strategies.song_as_artist import search_song_as_artist
 from lookup.strategies.song_as_track import SongAsTrack
@@ -160,6 +167,70 @@ class TestSearchSongAsArtist:
 
         assert len(results) == 1
         assert results[0].artist == "Various Artists"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("discogs_artist", "expected_rows"),
+        [
+            pytest.param("Towers Of Dubb", 0, id="look-alike-artist-compilation-rejected"),
+            pytest.param("Towers of Dub", 1, id="release-credits-typed-artist-accepted"),
+            pytest.param("Various", 1, id="various-artists-discogs-release-accepted"),
+        ],
+    )
+    async def test_va_library_row_requires_release_to_credit_token_or_be_va(
+        self, discogs_artist, expected_rows
+    ):
+        """LML#1501: a V/A library row passes only if the producing Discogs release is
+        V/A itself; a look-alike artist's release must not drag in unrelated V/A rows."""
+        db = AsyncMock()
+        comp_item = _item(id=3, artist="Various Artists", title="Dub Comp")
+        db.search = AsyncMock(side_effect=[[], [comp_item]])
+
+        with patch(
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[
+                make_discogs_result(release_id=3, artist=discogs_artist, album="Dub Comp")
+            ],
+        ):
+            results, _ = await search_song_as_artist(db, "Towers of Dub")
+
+        assert len(results) == expected_rows
+
+    @pytest.mark.asyncio
+    async def test_song_only_query_reaches_song_as_track_past_lookalike_compilation(self):
+        """LML#1501: the false-positive V/A row no longer short-circuits SONG_AS_TRACK."""
+        comp_item = _item(id=3, artist="Various Artists", title="Dub Comp")
+        db = AsyncMock()
+        db.search = AsyncMock(side_effect=[[], [comp_item]])
+        search_track = AsyncMock(return_value=([], {}, {}))
+
+        async def song_as_artist(db_, song):
+            return await search_song_as_artist(db_, song)
+
+        strategies = build_strategies(
+            db,
+            search_library_func=AsyncMock(return_value=([], False)),
+            search_alternative_func=AsyncMock(return_value=([], None, {})),
+            search_compilations_func=AsyncMock(return_value=([], {})),
+            search_song_as_artist_func=song_as_artist,
+            search_song_as_track_func=search_track,
+        )
+        with patch(
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[
+                make_discogs_result(release_id=3, artist="Towers Of Dubb", album="Dub Comp")
+            ],
+        ):
+            state = await execute_search_pipeline(
+                ParsedRequest(song="Towers of Dub", raw_message="Towers of Dub"),
+                "Towers of Dub",
+                strategies,
+            )
+
+        assert SearchStrategyType.SONG_AS_TRACK in state.strategies_tried
+        search_track.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_skips_empty_album_title(self):
