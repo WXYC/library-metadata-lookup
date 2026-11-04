@@ -3,8 +3,9 @@
 The route answers one entry per requested `legacy_release_id`, in request
 order, with the row's Discogs pin and grouped tracklist. PG access goes
 through a fake `PgSource` override; the pins reader and the tracklist loader
-are monkeypatched at the router, the real SQL being covered by the
-`pg`-marked integration suite.
+are monkeypatched at the router, so these tests cover the route, the id
+validation and the grouping only. The pins reader's real SQL is covered by
+`tests/integration/test_library_release_override.py` (`pg` marker).
 """
 
 from __future__ import annotations
@@ -178,11 +179,27 @@ class TestPinnedTracklists:
             ({"legacy_release_ids": list(range(1001))}, 422),
             ({"legacy_release_ids": ["x"]}, 422),
             ({}, 422),
+            # Out of the int4 range of library.legacy_release_id: rejected at
+            # validation, not left to fail inside asyncpg as a permanent 503.
+            ({"legacy_release_ids": [2**31]}, 422),
+            ({"legacy_release_ids": [-(2**31) - 1]}, 422),
+            ({"legacy_release_ids": [5, 3_000_000_000]}, 422),
+            # Non-integers must not be coerced by Pydantic's lax mode.
+            ({"legacy_release_ids": ["5"]}, 422),
+            ({"legacy_release_ids": [5.0]}, 422),
+            ({"legacy_release_ids": [True]}, 422),
         ],
     )
     async def test_invalid_bodies_are_422(self, client_app, body, status):
         app, _ = client_app
         assert (await _post(app, body)).status_code == status
+
+    @pytest.mark.parametrize("legacy_id", [2**31 - 1, -(2**31), 0, 1])
+    async def test_int4_range_edges_are_accepted(self, client_app, legacy_id):
+        app, state = client_app
+        resp = await _post(app, {"legacy_release_ids": [legacy_id]})
+        assert resp.status_code == 200
+        assert state["pin_ids"] == [legacy_id]
 
     async def test_malformed_json_is_400(self, client_app):
         app, _ = client_app

@@ -43,7 +43,6 @@ from generated.api_models import (
     BulkResolveLibrariesRequest,
     BulkResolveLibrariesResponse,
     BulkResolveResult,
-    PinnedTracklistsRequest,
     PinnedTracklistsResponse,
     ReleaseIdentityResolveRequest,
     ReleaseIdentityResolveResponse,
@@ -63,7 +62,10 @@ from identity.models import (
     BulkIdentityResponse,
     IdentityResponse,
 )
-from identity.pinned_tracklists import build_pinned_tracklists_results
+from identity.pinned_tracklists import (
+    StrictPinnedTracklistsRequest,
+    build_pinned_tracklists_results,
+)
 from identity.release_validation import (
     InvalidReleaseExternalIdError,
     validate_and_canonicalize_external_id,
@@ -745,7 +747,7 @@ async def resolve_release_identity(
     )
 
 
-_PINNED_TRACKLISTS_CAP = resolve_input_cap(PinnedTracklistsRequest, "legacy_release_ids")
+_PINNED_TRACKLISTS_CAP = resolve_input_cap(StrictPinnedTracklistsRequest, "legacy_release_ids")
 
 
 @api_v1_router.post(
@@ -755,7 +757,9 @@ _PINNED_TRACKLISTS_CAP = resolve_input_cap(PinnedTracklistsRequest, "legacy_rele
     responses={
         200: {"description": "One entry per requested id, in request order."},
         401: {"description": "Missing or invalid `LML_API_KEY` bearer token."},
-        422: {"description": "Empty or oversize (over 1,000) id list, or a non-integer id."},
+        422: {
+            "description": "Empty or oversize (over 1,000) id list, a non-integer id, or an id outside the int4 range."
+        },
         503: {"description": "The discogs-cache is unavailable; retry."},
     },
 )
@@ -772,7 +776,7 @@ async def pinned_tracklists(
     """
     request = await parse_bulk_body(
         http_request,
-        PinnedTracklistsRequest,
+        StrictPinnedTracklistsRequest,
         _PINNED_TRACKLISTS_CAP,
         field="legacy_release_ids",
         cap_status=422,
