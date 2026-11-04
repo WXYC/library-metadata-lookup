@@ -12,6 +12,9 @@ Concrete production risks the unit tests cannot catch:
 * The ``library_id`` primary key enforces one pin per library row.
 * ``get_library_release_overrides`` returns exactly the subset of queried ids
   that carry a pin, keyed correctly.
+* ``get_library_release_pins_strict`` (LML#1503) keys on ``library_id`` (the
+  legacy release id space), returns ``(discogs_release_id, source)`` and omits
+  ids with no pin.
 
 Run with: pytest -m pg -v tests/integration/test_library_release_override.py
 """
@@ -24,6 +27,7 @@ import pytest_asyncio
 
 from entity.library_release_override import (
     get_library_release_overrides,
+    get_library_release_pins_strict,
     set_up_library_release_override_schema,
 )
 from tests.integration.conftest import skip_if_named_tables_populated
@@ -31,6 +35,10 @@ from tests.integration.conftest import skip_if_named_tables_populated
 _INSERT_SQL = (
     "INSERT INTO lml_cache.library_release_override "
     "(library_id, discogs_release_id) VALUES ($1, $2)"
+)
+_INSERT_WITH_SOURCE_SQL = (
+    "INSERT INTO lml_cache.library_release_override "
+    "(library_id, discogs_release_id, source) VALUES ($1, $2, $3)"
 )
 
 
@@ -97,3 +105,45 @@ class TestPrefetchReadHelper:
     async def test_prefetch_empty_when_no_pins(self, pg_source):
         result = await get_library_release_overrides(pg_source, [17, 28])
         assert result == {}
+
+
+@pytest.mark.pg
+class TestPinsReader:
+    """The pinned-tracklists route's reader (LML#1503), against the real table."""
+
+    @pytest.mark.asyncio
+    async def test_returns_release_and_source_keyed_on_library_id(self, pg_source, pg_pool):
+        async with pg_pool.acquire() as conn:
+            await conn.execute(_INSERT_WITH_SOURCE_SQL, 17, 437503, "alex-l-2026")
+            await conn.execute(_INSERT_WITH_SOURCE_SQL, 28, 9590, "other-batch")
+            # Not requested: must not leak into the answer.
+            await conn.execute(_INSERT_WITH_SOURCE_SQL, 99, 1, "alex-l-2026")
+
+        result = await get_library_release_pins_strict(pg_source, [17, 28])
+        assert result == {17: (437503, "alex-l-2026"), 28: (9590, "other-batch")}
+
+    @pytest.mark.asyncio
+    async def test_missing_ids_are_absent(self, pg_source, pg_pool):
+        async with pg_pool.acquire() as conn:
+            await conn.execute(_INSERT_WITH_SOURCE_SQL, 17, 437503, "alex-l-2026")
+
+        result = await get_library_release_pins_strict(pg_source, [17, 999, 1000])
+        assert result == {17: (437503, "alex-l-2026")}
+
+    @pytest.mark.asyncio
+    async def test_source_defaults_to_the_table_default(self, pg_source, pg_pool):
+        async with pg_pool.acquire() as conn:
+            await conn.execute(_INSERT_SQL, 17, 437503)
+
+        assert await get_library_release_pins_strict(pg_source, [17]) == {
+            17: (437503, "alex-l-2026")
+        }
+
+    @pytest.mark.asyncio
+    async def test_int4_range_edges_round_trip(self, pg_source, pg_pool):
+        async with pg_pool.acquire() as conn:
+            await conn.execute(_INSERT_WITH_SOURCE_SQL, 2**31 - 1, 5, "edge")
+            await conn.execute(_INSERT_WITH_SOURCE_SQL, -(2**31), 6, "edge")
+
+        result = await get_library_release_pins_strict(pg_source, [2**31 - 1, -(2**31)])
+        assert result == {2**31 - 1: (5, "edge"), -(2**31): (6, "edge")}

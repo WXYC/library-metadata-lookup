@@ -9,8 +9,44 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
+from pydantic import ConfigDict, field_validator
+
 from entity.release_tracklist import ReleaseTracklistRow
-from generated.api_models import PinnedTrack, PinnedTracklist, PinnedTracklistsResult
+from generated.api_models import (
+    PinnedTrack,
+    PinnedTracklist,
+    PinnedTracklistsRequest,
+    PinnedTracklistsResult,
+)
+
+# ``library.legacy_release_id`` (and the override table's ``library_id``) is a
+# Postgres INTEGER. An id outside this range cannot be bound as ``int4[]``:
+# asyncpg raises a client-side ``DataError`` (an ``InterfaceError``), which the
+# route's transient-503 handler would report as a retryable outage forever.
+INT4_MIN = -(2**31)
+INT4_MAX = 2**31 - 1
+
+
+class StrictPinnedTracklistsRequest(PinnedTracklistsRequest):
+    """The generated request model, tightened to what api.yaml documents.
+
+    The generated ``list[int]`` validates in Pydantic's lax mode, which coerces
+    ``"5"``, ``5.0`` and ``true`` into ints, while the contract says a
+    non-integer id is a 422. Strict mode rejects all three; the validator
+    bounds each id to the INTEGER column's range so an out-of-range id is a
+    422 here rather than a permanent 503 at query time. A subclass, so
+    ``generated/api_models.py`` stays untouched.
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    @field_validator("legacy_release_ids")
+    @classmethod
+    def _ids_fit_int4(cls, ids: list[int]) -> list[int]:
+        for legacy_id in ids:
+            if not INT4_MIN <= legacy_id <= INT4_MAX:
+                raise ValueError(f"legacy_release_id {legacy_id} is outside the int4 range")
+        return ids
 
 
 def group_tracks(rows: Sequence[ReleaseTracklistRow]) -> list[PinnedTrack]:
