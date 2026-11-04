@@ -67,6 +67,13 @@ FROM lml_cache.library_release_override
 WHERE library_id = ANY($1)\
 """
 
+# The same prefetch plus the pin's ``source`` batch marker (LML#1503).
+_SELECT_PINS_SQL = """\
+SELECT library_id, discogs_release_id, source
+FROM lml_cache.library_release_override
+WHERE library_id = ANY($1)\
+"""
+
 
 async def set_up_library_release_override_schema(pg: PgSource) -> None:
     """Apply the idempotent override-schema DDL.
@@ -128,3 +135,19 @@ async def get_library_release_overrides_strict(
         return {}
     rows = await pg.fetchall(_SELECT_SQL, library_ids)
     return {row["library_id"]: row["discogs_release_id"] for row in rows}
+
+
+async def get_library_release_pins_strict(
+    pg: PgSource, library_ids: list[int]
+) -> dict[int, tuple[int, str]]:
+    """``library_id -> (discogs_release_id, source)`` in one query (LML#1503).
+
+    The pinned-tracklists route must report which override batch a pin came
+    from, which ``get_library_release_overrides_strict`` deliberately does
+    not select. Same strict posture: PG failures propagate so the route can
+    answer 503 instead of passing an outage off as "no pin".
+    """
+    if not library_ids:
+        return {}
+    rows = await pg.fetchall(_SELECT_PINS_SQL, library_ids)
+    return {row["library_id"]: (row["discogs_release_id"], row["source"]) for row in rows}
