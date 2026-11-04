@@ -4274,6 +4274,36 @@ class BulkResolveLibrariesResponse(BaseModel):
     cache_stats: CacheStats | None = None
 
 
+class PinnedTracklistsRequest(BaseModel):
+    """
+    Request to `POST /api/v1/identity/pinned-tracklists`.
+    """
+
+    legacy_release_ids: list[int] = Field(
+        ...,
+        description="`library.legacy_release_id` values (not `library.id`). Up to 1,000 per call. Order is preserved in the response.\n",
+        max_length=1000,
+        min_length=1,
+    )
+
+
+class PinnedTrack(BaseModel):
+    """
+    One track of a pinned release, as the Discogs cache has it.
+    """
+
+    sequence: int = Field(..., description="The track's order within the release.")
+    position: str | None = Field(
+        ...,
+        description='Track position as Discogs has it ("A1", "3", …). An empty Discogs position is sent as null.\n',
+    )
+    title: str = Field(..., description="The track title.")
+    artist_credits: list[str] = Field(
+        ...,
+        description="One list per track, primary credits only (`extra = 0`); empty when the track carries none.\n",
+    )
+
+
 class IdentityKind(StrEnum):
     """
     Discriminator for the identity being resolved. v1 of the `/api/v1/identity/resolve` endpoint accepts only `release`; the `artist` value is reserved for the planned symmetric extension.
@@ -6524,6 +6554,23 @@ class BulkResolveLibrariesRequest(BaseModel):
     )
 
 
+class PinnedTracklist(BaseModel):
+    """
+    A library row's Discogs pin and the tracklist LML holds for it.
+    """
+
+    discogs_release_id: int = Field(..., description="The pinned Discogs release.")
+    source: str = Field(..., description="The override batch the pin came from.")
+    in_cache: bool = Field(
+        ...,
+        description="`false` means the pinned release is outside the Discogs cache; `tracks` is then empty and means nothing. `true` means the release is in the cache and `tracks` is its tracklist.\n",
+    )
+    tracks: list[PinnedTrack] = Field(
+        ...,
+        description="The release's tracks. Read it only when `in_cache` is `true`: `in_cache: true` with `[]` means the release has no tracks, while `in_cache: false` with `[]` says nothing about them.\n",
+    )
+
+
 class LiveFsUpdateEvent(BaseModel):
     """
     SSE event emitted on the `live-fs-topic` when an enrichment-worker (BS#892) finalizes the metadata for a flowsheet row. Payload carries the client-facing flowsheet row (the `FlowsheetEntryResponse` fields) so a newly-mounted client (e.g. a /live viewer that just opened the page) can surface the post-enrichment fields (`artwork_url`, `release_year`, ...) without a follow-up GET. The `live-fs-topic` is anonymous, so Backend projects the raw CDC row through its client-facing allow-list (BS#1534) — internal columns (`search_doc`, `composer`, `legacy_*`, ...) do not ride this stream. Provider: Backend-Service/apps/backend/services/metadata-broadcast/metadata-broadcast.ts (`filterMetadataUpdate`). Consumer: dj-site `live-updates-listener.ts`. Contract: `CONTRACTS.LIVE_FS_UPDATE_INCLUDES_FULL_ROW`.
@@ -6605,6 +6652,20 @@ class FlowsheetV2PaginatedResponse(BaseModel):
     )
 
 
+class PinnedTracklistsResult(BaseModel):
+    """
+    The pin, if any, for one requested library row.
+    """
+
+    legacy_release_id: int = Field(
+        ..., description="Echo of the requested `library.legacy_release_id`."
+    )
+    pin: PinnedTracklist | None = Field(
+        ...,
+        description='The row\'s Discogs pin, or null when the row has none. Null only ever means "no pin": a lookup that failed answers 503 instead.\n',
+    )
+
+
 class ShowAlreadyOpenError(BaseModel):
     """
     The `POST /flowsheet/join` 409 body. Purpose-built rather than a `$ref` to the shared `ApiErrorResponse`, following `AuthErrorResponse` and the `DeviceAuth*Error` family: `ApiErrorResponse.details` is `additionalProperties: true`, which reaches consumers as an untyped bag (`JSONValue` in Swift, `Record<string, unknown>` in TS), and `details.show.id` is not an incidental diagnostic here — a client is REQUIRED to read it and echo it back as `expected_show_id` to complete the takeover handshake. Typing it is what makes that a compare-and-set rather than four hand-written key-path digs.
@@ -6614,3 +6675,12 @@ class ShowAlreadyOpenError(BaseModel):
     message: str
     code: ShowAlreadyOpenErrorCode | None = None
     details: ShowAlreadyOpenErrorDetails | None = None
+
+
+class PinnedTracklistsResponse(BaseModel):
+    """
+    Response to `POST /api/v1/identity/pinned-tracklists`. One entry per requested id, in the order of the request.
+
+    """
+
+    results: list[PinnedTracklistsResult]

@@ -34,6 +34,7 @@ from core.dependencies import discogs_pool_max_size, get_discogs_cache_pg
 from core.observability import capture_unsampled_counter
 from discogs.ratelimit import set_discogs_low_priority
 from entity.compilation_track_identity import CompilationTrackIdentityRow
+from entity.library_release_override import get_library_release_pins_strict
 from entity.release_tracklist import ReleaseTracklistRow
 from entity.sources import PgSource
 from entity.store import EntityStore, Identity
@@ -42,6 +43,8 @@ from generated.api_models import (
     BulkResolveLibrariesRequest,
     BulkResolveLibrariesResponse,
     BulkResolveResult,
+    PinnedTracklistsRequest,
+    PinnedTracklistsResponse,
     ReleaseIdentityResolveRequest,
     ReleaseIdentityResolveResponse,
     TracksContractVersion,
@@ -60,6 +63,7 @@ from identity.models import (
     BulkIdentityResponse,
     IdentityResponse,
 )
+from identity.pinned_tracklists import build_pinned_tracklists_results
 from identity.release_validation import (
     InvalidReleaseExternalIdError,
     validate_and_canonicalize_external_id,
@@ -738,4 +742,52 @@ async def resolve_release_identity(
         identity_id=identity_id,
         kind=request.kind,
         minted=minted,
+    )
+
+
+_PINNED_TRACKLISTS_CAP = resolve_input_cap(PinnedTracklistsRequest, "legacy_release_ids")
+
+
+@api_v1_router.post(
+    "/identity/pinned-tracklists",
+    response_model=PinnedTracklistsResponse,
+    summary="Each library row's Discogs pin and its grouped tracklist",
+    responses={
+        200: {"description": "One entry per requested id, in request order."},
+        401: {"description": "Missing or invalid `LML_API_KEY` bearer token."},
+        422: {"description": "Empty or oversize (over 1,000) id list, or a non-integer id."},
+        503: {"description": "The discogs-cache is unavailable; retry."},
+    },
+)
+async def pinned_tracklists(
+    http_request: Request,
+    discogs_cache_pg: PgSource | None = Depends(get_discogs_cache_pg),
+) -> PinnedTracklistsResponse:
+    """Answer the pin and tracklist for each requested ``legacy_release_id``.
+
+    At most three batched queries per request (pins, then the pinned
+    releases' presence probe and tracklists), over the de-duplicated ids;
+    repeats fan back out by position. Unlike bulk-resolve's optional tracks
+    enrichment, a transient PG failure is a 503, never a null pin.
+    """
+    request = await parse_bulk_body(
+        http_request,
+        PinnedTracklistsRequest,
+        _PINNED_TRACKLISTS_CAP,
+        field="legacy_release_ids",
+        cap_status=422,
+    )
+    if discogs_cache_pg is None:
+        raise HTTPException(status_code=503, detail="Discogs cache is not available.")
+    unique_ids = list(dict.fromkeys(request.legacy_release_ids))
+    try:
+        pins = await get_library_release_pins_strict(discogs_cache_pg, unique_ids)
+        tracklists = await load_release_tracklists_by_release_id(
+            discogs_cache_pg, sorted({release_id for release_id, _ in pins.values()})
+        )
+    except TRANSIENT_PG_ERRORS:
+        logger.exception("pinned-tracklists read failed for %d ids", len(unique_ids))
+        raise HTTPException(status_code=503, detail="Discogs cache query failed.") from None
+    return PinnedTracklistsResponse(
+        results=build_pinned_tracklists_results(request.legacy_release_ids, pins, tracklists)
     )
