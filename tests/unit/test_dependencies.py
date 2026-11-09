@@ -30,12 +30,14 @@ def reset_globals():
     """
     deps_module._library_db = None
     deps_module._library_db_signature = None
+    deps_module._library_db_open_task = None
     deps_module._object_store = None
     asyncio.run(close_discogs_service())
     asyncio.run(close_musicbrainz_pg())
     yield
     deps_module._library_db = None
     deps_module._library_db_signature = None
+    deps_module._library_db_open_task = None
     deps_module._object_store = None
     asyncio.run(close_discogs_service())
     asyncio.run(close_musicbrainz_pg())
@@ -237,6 +239,128 @@ class TestGetLibraryDB:
             assert deps_module._library_db_signature == deps_module._library_db_file_signature(
                 db_file
             )
+
+
+def _slow_connect_db(gate: asyncio.Event) -> AsyncMock:
+    """A LibraryDB double whose ``connect()`` parks until ``gate`` is set.
+
+    The park is the window the 2026-10-23 race lived in: a request awaiting
+    ``connect()`` while siblings arrive and inspect the module state. Tests
+    await ``db.entered`` to know that window is open, rather than guessing how
+    many event-loop turns the shared open task needs to reach it.
+    """
+    db = AsyncMock()
+    db.entered = asyncio.Event()
+
+    async def connect() -> None:
+        db.entered.set()
+        await gate.wait()
+
+    db.connect = AsyncMock(side_effect=connect)
+    return db
+
+
+class TestGetLibraryDBConcurrentOpen:
+    """Concurrent first callers after a close must share one open.
+
+    Production 2026-10-23 16:54:11 UTC: an admin upload closed the connection,
+    then three requests arrived in the same millisecond. The first stored its
+    not-yet-connected instance; the other two mistook it for the
+    FileNotFoundError stub, closed it mid-connect, and each opened their own.
+    Two canary searches returned 500 ``no active connection``.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("callers", [2, 3, 8])
+    async def test_burst_after_close_shares_one_connection(self, tmp_path, mock_settings, callers):
+        db_file = tmp_path / "library.db"
+        db_file.write_text("catalog")
+        mock_settings.library_db_path = str(db_file)
+        gate = asyncio.Event()
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            dbs = [_slow_connect_db(gate) for _ in range(callers)]
+            mock_db_cls.side_effect = dbs
+
+            tasks = [asyncio.create_task(get_library_db(mock_settings)) for _ in range(callers)]
+            await dbs[0].entered.wait()  # every caller is inside the connect window
+            gate.set()
+            results = await asyncio.gather(*tasks)
+
+        mock_db_cls.assert_called_once_with(db_path=db_file)
+        dbs[0].connect.assert_awaited_once()
+        dbs[0].close.assert_not_awaited()
+        assert all(result is dbs[0] for result in results)
+        assert deps_module._library_db is dbs[0]
+        assert deps_module._library_db_signature == deps_module._library_db_file_signature(db_file)
+
+    @pytest.mark.asyncio
+    async def test_unconnected_instance_is_never_visible(self, tmp_path, mock_settings):
+        """The module reference only ever holds a finished instance."""
+        db_file = tmp_path / "library.db"
+        db_file.write_text("catalog")
+        mock_settings.library_db_path = str(db_file)
+        gate = asyncio.Event()
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            db = _slow_connect_db(gate)
+            mock_db_cls.return_value = db
+            task = asyncio.create_task(get_library_db(mock_settings))
+            await db.entered.wait()
+            assert deps_module._library_db is None
+            gate.set()
+            await task
+
+    @pytest.mark.asyncio
+    async def test_cancelled_caller_does_not_cancel_shared_open(self, tmp_path, mock_settings):
+        """A client disconnect on the first caller must not strand the others."""
+        db_file = tmp_path / "library.db"
+        db_file.write_text("catalog")
+        mock_settings.library_db_path = str(db_file)
+        gate = asyncio.Event()
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            db = _slow_connect_db(gate)
+            mock_db_cls.return_value = db
+            first = asyncio.create_task(get_library_db(mock_settings))
+            second = asyncio.create_task(get_library_db(mock_settings))
+            await db.entered.wait()
+            first.cancel()
+            gate.set()
+            assert await second is db
+
+        mock_db_cls.assert_called_once()
+        db.close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_file_swapped_during_connect_reopens_on_next_call(self, tmp_path, mock_settings):
+        """The signature describes the file connect() opened, not a later one.
+
+        Taking the signature after connect() would record the replacement's
+        identity against a connection to the old inode, and the worker would
+        never notice it is serving a stale catalog.
+        """
+        db_file = tmp_path / "library.db"
+        db_file.write_text("old")
+        mock_settings.library_db_path = str(db_file)
+        gate = asyncio.Event()
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            old_db = _slow_connect_db(gate)
+            new_db = AsyncMock()
+            mock_db_cls.side_effect = [old_db, new_db]
+
+            task = asyncio.create_task(get_library_db(mock_settings))
+            await old_db.entered.wait()
+            replacement = tmp_path / "library-new.db"
+            replacement.write_text("new-content")
+            replacement.replace(db_file)
+            gate.set()
+            assert await task is old_db
+
+            assert await get_library_db(mock_settings) is new_db
+
+        old_db.close.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
