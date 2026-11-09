@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -52,16 +53,28 @@ def discogs_pool_max_size() -> int:
 
 logger = logging.getLogger(__name__)
 
-# `_library_db` keeps its bespoke lazy lifecycle (sync construct + async
-# `connect()`). The only `await` happens after the module-level reference is
-# already assigned, so there is no concurrent-first-caller TOCTOU window —
-# `async_singleton` would change failure semantics around `FileNotFoundError`
-# (the missing-file path needs to leave the LibraryDB instance cached so the
-# health endpoint reports `unhealthy` instead of repeatedly retrying connect).
-# See WXYC/library-metadata-lookup#283.
+# `_library_db` keeps its bespoke lazy lifecycle rather than `async_singleton`,
+# because the missing-file path must leave an unconnected LibraryDB cached so
+# the health endpoint reports `unhealthy` instead of retrying connect on every
+# call (WXYC/library-metadata-lookup#283). It also has to reopen when the file
+# is replaced on disk, which `async_singleton` has no notion of.
+#
+# Two rules keep concurrent callers safe without a lock:
+#
+# 1. `_library_db` is assigned only after `connect()` returns or raises
+#    FileNotFoundError. A published instance with a `None` signature is
+#    therefore always the missing-file stub, never an open still in progress.
+# 2. Every caller that needs a fresh instance awaits the one shared
+#    `_library_db_open_task`, so a burst opens one connection, not N.
+#
+# On 2026-10-23 neither rule held. An admin upload closed the connection, three
+# requests arrived in the same millisecond, the first published its unconnected
+# instance, and the other two treated it as the stub and closed it mid-connect.
+# Two searches returned 500 "no active connection".
 _library_db: LibraryDB | None = None
 _LibraryDbSignature = tuple[int, int, int]
 _library_db_signature: _LibraryDbSignature | None = None
+_library_db_open_task: asyncio.Task[LibraryDB] | None = None
 
 
 def _library_db_file_signature(db_path: Path) -> _LibraryDbSignature | None:
@@ -80,58 +93,96 @@ def _library_db_file_signature(db_path: Path) -> _LibraryDbSignature | None:
     return (stat_result.st_ino, stat_result.st_mtime_ns, stat_result.st_size)
 
 
+def _library_db_is_current(db_path: Path) -> bool:
+    """Whether the published instance still matches the file at ``db_path``."""
+    if _library_db is None:
+        return False
+    current_signature = _library_db_file_signature(db_path)
+    if current_signature is None:
+        # File absent: keep serving what we have (connected or stub).
+        return True
+    if _library_db_signature is None:
+        # Missing-file stub, and the file exists now (e.g. a sibling worker's
+        # admin upload landed). Rule 1 above guarantees this is a real stub,
+        # not an open still in progress. See #706.
+        logger.info("Library database file now present; connecting: %s", db_path)
+        return False
+    if current_signature != _library_db_signature:
+        # The path was atomically swapped (an admin upload's os.replace() gives
+        # it a new inode). A sibling worker that missed the in-process close
+        # otherwise keeps serving the old, unlinked inode. See #706.
+        logger.info("Library database file changed; reopening: %s", db_path)
+        return False
+    return True
+
+
+async def _open_library_db(db_path: Path) -> LibraryDB:
+    """Connect a new LibraryDB, publish it, then close the one it replaces."""
+    global _library_db, _library_db_signature
+
+    # Stat BEFORE connect: if the file is swapped mid-connect, the recorded
+    # signature belongs to the file this connection opened, so the next call
+    # sees the mismatch and reopens instead of serving the old inode forever.
+    signature = _library_db_file_signature(db_path)
+    new_db = LibraryDB(db_path=db_path)
+    try:
+        await new_db.connect()
+        logger.info(f"Library database connected: {db_path}")
+    except FileNotFoundError:
+        signature = None
+        logger.warning(
+            f"Library database not found at {db_path}. "
+            "Service will start without database (health check will report unhealthy). "
+            "Upload library.db via POST /admin/upload-library-db to enable."
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize library database: {e}")
+        raise ServiceInitializationError(f"Database initialization failed: {e}") from e
+
+    old_db = _library_db
+    _library_db, _library_db_signature = new_db, signature
+    if old_db is not None:
+        await old_db.close()
+    return new_db
+
+
+def _clear_library_db_open_task(task: asyncio.Task[LibraryDB]) -> None:
+    global _library_db_open_task
+    if _library_db_open_task is task:
+        _library_db_open_task = None
+
+
 async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryDB:
-    """Get library database instance.
+    """Get the process-wide library database instance.
+
+    Opens it on first use and reopens it when ``library.db`` is replaced on
+    disk. Concurrent callers share one open; see the module notes above
+    ``_library_db``.
 
     Args:
         settings: Application settings
 
     Returns:
-        LibraryDB: Connected library database instance
+        LibraryDB: A connected instance, or an unconnected stub whose
+        ``is_available()`` is False when ``library.db`` does not exist.
 
     Raises:
         ServiceInitializationError: If database initialization fails
     """
-    global _library_db, _library_db_signature
+    global _library_db_open_task
 
     db_path = Path(settings.resolved_library_db_path)
-    if _library_db is not None:
-        current_signature = _library_db_file_signature(db_path)
-        if _library_db_signature is not None:
-            # Connected instance: reopen only when the backing file was
-            # atomically swapped (an admin upload's os.replace() gives the path
-            # a new inode). A sibling worker that missed the in-process close
-            # otherwise keeps serving the old, unlinked inode. See #706.
-            if current_signature is not None and current_signature != _library_db_signature:
-                logger.info("Library database file changed; reopening: %s", db_path)
-                await close_library_db()
-        elif current_signature is not None:
-            # A prior connect() hit FileNotFoundError and cached an unconnected
-            # instance (health reports unhealthy) with a None signature. The
-            # file exists now — e.g. a sibling worker's admin upload landed — so
-            # drop the stub and connect on the fall-through below. See #706.
-            logger.info("Library database file now present; connecting: %s", db_path)
-            await close_library_db()
+    if _library_db is not None and _library_db_is_current(db_path):
+        return _library_db
 
-    if _library_db is None:
-        try:
-            _library_db = LibraryDB(db_path=db_path)
-            await _library_db.connect()
-            _library_db_signature = _library_db_file_signature(db_path)
-            logger.info(f"Library database connected: {db_path}")
-        except FileNotFoundError:
-            _library_db_signature = None
-            logger.warning(
-                f"Library database not found at {settings.resolved_library_db_path}. "
-                "Service will start without database (health check will report unhealthy). "
-                "Upload library.db via POST /admin/upload-library-db to enable."
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize library database: {e}")
-            raise ServiceInitializationError(f"Database initialization failed: {e}") from e
-
-    assert _library_db is not None  # Set above; narrows type for mypy
-    return _library_db
+    task = _library_db_open_task
+    if task is None:
+        task = asyncio.create_task(_open_library_db(db_path))
+        task.add_done_callback(_clear_library_db_open_task)
+        _library_db_open_task = task
+    # shield: one caller's cancellation (a client disconnect) must not cancel
+    # the open that the other callers are waiting on.
+    return await asyncio.shield(task)
 
 
 async def close_library_db() -> None:
