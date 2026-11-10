@@ -1710,6 +1710,10 @@ class Reviewer(BaseModel):
         None,
         description="When the account last submitted a review; `null` if never. Optional: a server that predates it omits it. Station-only: not for any public surface, because this is an activity fact about a person; never for client telemetry (analytics properties, error breadcrumbs, logs).\n",
     )
+    reviews_beta: bool | None = Field(
+        None,
+        description="Whether the account holds the `reviews_beta` capability. Optional: a server that predates it omits it, and a client reads a missing value as false. Change it with `PUT` or `DELETE /reviews/reviewers/{id}/reviews-beta`.\n",
+    )
 
 
 class Review(BaseModel):
