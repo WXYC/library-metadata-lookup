@@ -14,11 +14,11 @@ from wxyc_fastapi.observability import get_posthog_client as _shared_posthog_cli
 
 from config.settings import Settings, get_settings
 from core.exceptions import ServiceInitializationError
-from core.search import resolve_positive_int_env
+from core.search import resolve_positive_int_env, resolve_search_hard_timeout_ms
 from discogs.cache_service import DiscogsCacheService
 from discogs.service import DiscogsService
 from entity.sources import PgSource
-from library.db import LibraryDB
+from library.db import LibraryDB, clear_library_caches
 from storage.object_store import LocalDirStore, ObjectStore, S3ObjectStore
 
 if TYPE_CHECKING:
@@ -59,13 +59,16 @@ logger = logging.getLogger(__name__)
 # call (WXYC/library-metadata-lookup#283). It also has to reopen when the file
 # is replaced on disk, which `async_singleton` has no notion of.
 #
-# Two rules keep concurrent callers safe without a lock:
+# Three rules keep concurrent callers safe without a lock:
 #
 # 1. `_library_db` is assigned only after `connect()` returns or raises
 #    FileNotFoundError. A published instance with a `None` signature is
 #    therefore always the missing-file stub, never an open still in progress.
 # 2. Every caller that needs a fresh instance awaits the one shared
 #    `_library_db_open_task`, so a burst opens one connection, not N.
+# 3. A swap retires the old instance instead of closing it: requests that
+#    already hold it keep querying until they finish, and it is closed only
+#    after `_library_db_retire_grace_s()`. See `retire_library_db` (#1508).
 #
 # On 2026-10-23 neither rule held. An admin upload closed the connection, three
 # requests arrived in the same millisecond, the first published its unconnected
@@ -75,6 +78,41 @@ _library_db: LibraryDB | None = None
 _LibraryDbSignature = tuple[int, int, int]
 _library_db_signature: _LibraryDbSignature | None = None
 _library_db_open_task: asyncio.Task[LibraryDB] | None = None
+# Deferred closes of retired instances, keyed to the instance each will close.
+# Held here so the tasks are not garbage collected mid-sleep, and so shutdown
+# can close the instances without waiting out the grace period.
+_retiring_library_db_tasks: dict[asyncio.Task[None], LibraryDB] = {}
+
+# Added to the search hard timeout so a request that took the old instance just
+# before the swap has finished its non-search work too when the close lands.
+_LIBRARY_DB_RETIRE_MARGIN_S = 5.0
+
+
+def _library_db_retire_grace_s() -> float:
+    """Seconds a retired instance stays open after a swap.
+
+    The search hard timeout bounds how long a request keeps querying the
+    instance it was handed, so outliving it by a margin covers in-flight work.
+    """
+    return resolve_search_hard_timeout_ms() / 1000 + _LIBRARY_DB_RETIRE_MARGIN_S
+
+
+async def _close_after_grace(db: LibraryDB) -> None:
+    await asyncio.sleep(_library_db_retire_grace_s())
+    await db.close()
+
+
+def _discard_retirement(task: asyncio.Task[None]) -> None:
+    _retiring_library_db_tasks.pop(task, None)
+
+
+def _schedule_retirement(db: LibraryDB) -> None:
+    # Clear now so no request reads the old catalog from cache; close() clears
+    # again later, dropping anything in-flight requests wrote in the meantime.
+    clear_library_caches()
+    task = asyncio.create_task(_close_after_grace(db))
+    _retiring_library_db_tasks[task] = db
+    task.add_done_callback(_discard_retirement)
 
 
 def _library_db_file_signature(db_path: Path) -> _LibraryDbSignature | None:
@@ -142,7 +180,7 @@ async def _open_library_db(db_path: Path) -> LibraryDB:
     old_db = _library_db
     _library_db, _library_db_signature = new_db, signature
     if old_db is not None:
-        await old_db.close()
+        _schedule_retirement(old_db)
     return new_db
 
 
@@ -185,13 +223,39 @@ async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryD
     return await asyncio.shield(task)
 
 
+def retire_library_db() -> None:
+    """Take the current instance out of service without closing it under in-flight work.
+
+    For a hot-swap (``POST /admin/upload-library-db``): call it, then
+    ``os.replace`` the file, with no ``await`` in between. The next request opens
+    the new file; requests that already hold the old instance keep using it, and
+    it is closed after :func:`_library_db_retire_grace_s`. Synchronous so no
+    request can run between the detach and the replace.
+    """
+    global _library_db, _library_db_signature
+    old_db = _library_db
+    _library_db = None
+    _library_db_signature = None
+    if old_db is not None:
+        _schedule_retirement(old_db)
+
+
 async def close_library_db() -> None:
-    """Close library database connection."""
+    """Close the library database now, including retired instances (shutdown)."""
     global _library_db, _library_db_signature
     if _library_db:
         await _library_db.close()
         _library_db = None
         _library_db_signature = None
+    # Cancel rather than await the grace sleeps, then close here: a task
+    # cancelled before it first runs never executes its body at all.
+    retiring = list(_retiring_library_db_tasks.items())
+    _retiring_library_db_tasks.clear()
+    for task, _ in retiring:
+        task.cancel()
+    await asyncio.gather(*(task for task, _ in retiring), return_exceptions=True)
+    for _, db in retiring:
+        await db.close()
 
 
 # Object store selection (WXYC/library-metadata-lookup#835). Built once and

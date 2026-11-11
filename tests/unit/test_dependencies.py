@@ -1,6 +1,8 @@
 """Unit tests for core/dependencies.py."""
 
 import asyncio
+import os
+import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -15,6 +17,7 @@ from core.dependencies import (
     get_library_db,
     get_posthog_client,
     get_streaming_posthog_client,
+    retire_library_db,
 )
 
 
@@ -31,6 +34,7 @@ def reset_globals():
     deps_module._library_db = None
     deps_module._library_db_signature = None
     deps_module._library_db_open_task = None
+    deps_module._retiring_library_db_tasks = {}
     deps_module._object_store = None
     asyncio.run(close_discogs_service())
     asyncio.run(close_musicbrainz_pg())
@@ -38,9 +42,25 @@ def reset_globals():
     deps_module._library_db = None
     deps_module._library_db_signature = None
     deps_module._library_db_open_task = None
+    deps_module._retiring_library_db_tasks = {}
     deps_module._object_store = None
     asyncio.run(close_discogs_service())
     asyncio.run(close_musicbrainz_pg())
+
+
+@pytest.fixture(autouse=True)
+def short_retire_grace(monkeypatch):
+    """Shrink the post-swap close delay (search hard timeout + margin) to 50ms.
+
+    Long enough that a test can observe the retired instance still open after
+    the swap; short enough that ``_finish_retirements()`` returns quickly.
+    """
+    monkeypatch.setattr(deps_module, "_library_db_retire_grace_s", lambda: 0.05)
+
+
+async def _finish_retirements() -> None:
+    """Run every pending deferred close to completion."""
+    await asyncio.gather(*deps_module._retiring_library_db_tasks)
 
 
 def test_no_module_level_asyncio_lock_in_dependencies():
@@ -173,7 +193,7 @@ class TestGetLibraryDB:
     ):
         """A sibling uvicorn worker notices the admin upload's atomic file swap.
 
-        The upload handler closes the DB only in the worker that handles the
+        The upload handler retires the DB only in the worker that handles the
         request. Other workers must reopen on their next ``get_library_db`` call
         or they keep serving the old unlinked SQLite inode indefinitely.
         """
@@ -195,6 +215,7 @@ class TestGetLibraryDB:
 
             result = await get_library_db(mock_settings)
 
+            await _finish_retirements()
             old_db.close.assert_awaited_once()
             mock_db_cls.assert_called_once_with(db_path=db_file)
             new_db.connect.assert_awaited_once()
@@ -232,6 +253,7 @@ class TestGetLibraryDB:
 
             result = await get_library_db(mock_settings)
 
+            await _finish_retirements()
             stub_db.close.assert_awaited_once()
             mock_db_cls.assert_called_once_with(db_path=db_file)
             new_db.connect.assert_awaited_once()
@@ -360,6 +382,7 @@ class TestGetLibraryDBConcurrentOpen:
 
             assert await get_library_db(mock_settings) is new_db
 
+        await _finish_retirements()
         old_db.close.assert_awaited_once()
 
 
@@ -383,6 +406,129 @@ class TestCloseLibraryDB:
     async def test_noop_when_none(self):
         deps_module._library_db = None
         await close_library_db()  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_closes_retired_instances_without_waiting_for_grace(self, monkeypatch):
+        """Shutdown must not leave a retired connection parked until its grace ends."""
+        monkeypatch.setattr(deps_module, "_library_db_retire_grace_s", lambda: 3600.0)
+        retired = AsyncMock()
+        deps_module._library_db = retired
+        retire_library_db()
+        current = AsyncMock()
+        deps_module._library_db = current
+
+        await close_library_db()
+
+        retired.close.assert_awaited_once()
+        current.close.assert_awaited_once()
+        assert not deps_module._retiring_library_db_tasks
+
+
+# ---------------------------------------------------------------------------
+# retire_library_db / deferred close on swap (LML#1508)
+# ---------------------------------------------------------------------------
+
+
+class TestRetireLibraryDB:
+    """A swap retires the old instance instead of closing it under in-flight work.
+
+    A request that already holds the old ``LibraryDB`` keeps querying it until it
+    finishes; closing it at swap time is what returned 500 "no active connection".
+    """
+
+    @pytest.mark.asyncio
+    async def test_detaches_without_closing_until_grace_elapses(self):
+        old_db = AsyncMock()
+        deps_module._library_db = old_db
+        deps_module._library_db_signature = (1, 2, 3)
+
+        with patch("core.dependencies.clear_library_caches") as mock_clear:
+            retire_library_db()
+
+            assert deps_module._library_db is None
+            assert deps_module._library_db_signature is None
+            mock_clear.assert_called_once()
+            old_db.close.assert_not_awaited()
+
+            await _finish_retirements()
+
+        old_db.close.assert_awaited_once()
+        assert not deps_module._retiring_library_db_tasks
+
+    @pytest.mark.asyncio
+    async def test_noop_when_none(self):
+        retire_library_db()
+        assert not deps_module._retiring_library_db_tasks
+
+    @pytest.mark.asyncio
+    async def test_signature_reopen_defers_closing_the_held_instance(self, tmp_path, mock_settings):
+        db_file = tmp_path / "library.db"
+        db_file.write_text("old")
+        mock_settings.library_db_path = str(db_file)
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            old_db, new_db = AsyncMock(), AsyncMock()
+            mock_db_cls.side_effect = [old_db, new_db]
+            held = await get_library_db(mock_settings)
+
+            replacement = tmp_path / "library-new.db"
+            replacement.write_text("new-content")
+            replacement.replace(db_file)
+
+            assert await get_library_db(mock_settings) is new_db
+            held.close.assert_not_awaited()
+
+            await _finish_retirements()
+
+        old_db.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_held_connection_keeps_answering_across_upload_swap(
+        self, tmp_path, mock_settings, monkeypatch
+    ):
+        """End to end on real SQLite: the admin-upload sequence (retire, then
+        ``os.replace``) leaves a request's held connection usable, and the next
+        request opens the new file."""
+        # Real SQLite runs queries on a thread; leave ample room before the close.
+        monkeypatch.setattr(deps_module, "_library_db_retire_grace_s", lambda: 1.0)
+        db_file = tmp_path / "library.db"
+        _make_library_db(db_file, artist="Stereolab", title="Aluminum Tunes")
+        mock_settings.library_db_path = str(db_file)
+
+        held = await get_library_db(mock_settings)
+        try:
+            replacement = tmp_path / "upload.db"
+            _make_library_db(replacement, artist="Juana Molina", title="DOGA")
+            retire_library_db()
+            os.replace(replacement, db_file)
+
+            rows = await held.get_items_by_ids([1])
+            assert rows[1].artist == "Stereolab"
+
+            fresh = await get_library_db(mock_settings)
+            assert fresh is not held
+            assert (await fresh.get_items_by_ids([1]))[1].artist == "Juana Molina"
+
+            await _finish_retirements()
+            assert await held.is_available() is False
+        finally:
+            await close_library_db()
+
+
+def _make_library_db(path: Path, *, artist: str, title: str) -> None:
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE library ("
+        "id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+        "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+        "genre TEXT, format TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO library (id, title, artist, call_letters) VALUES (1, ?, ?, 'S')",
+        (title, artist),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ---------------------------------------------------------------------------

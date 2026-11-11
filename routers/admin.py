@@ -19,9 +19,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from config.settings import Settings, get_settings
 from core.auth import require_admin_token
 from core.dependencies import (
-    close_library_db,
     get_discogs_cache_service_from_pool,
     get_object_store,
+    retire_library_db,
 )
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.memory_cache import evict_cached
@@ -505,8 +505,11 @@ async def upload_library_db(
         logger.error(f"Failed to store library.db in the object store: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to store library.db: {e}") from e
 
-    # Close current database connection (clears the TTL caches via LibraryDB.close)
-    await close_library_db()
+    # Retire, not close: searches still holding the old instance would fail with
+    # "no active connection" (#1508). Retiring clears the TTL caches now and
+    # closes the old connection after a grace period. No await between this and
+    # the replace, so no request can open the old file in between.
+    retire_library_db()
 
     # Atomic local hot-swap so this replica serves the new file immediately.
     os.replace(str(tmp_path), str(db_path))

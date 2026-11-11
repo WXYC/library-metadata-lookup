@@ -362,7 +362,12 @@ class TestUploadLibraryDB:
 
     @pytest.mark.asyncio
     async def test_upload_triggers_db_reconnection(self, tmp_path, admin_settings):
-        """After upload, close_library_db is called so next request gets new data."""
+        """After upload the old instance is retired, not closed (LML#1508).
+
+        Closing it here failed every in-flight search still holding it with
+        "no active connection"; retiring detaches it so the next request opens
+        the new file, and closes it only after the grace period.
+        """
         from main import app
 
         db_file = tmp_path / "upload.db"
@@ -381,7 +386,8 @@ class TestUploadLibraryDB:
                     get_settings: admin_settings,
                 },
             ),
-            patch("routers.admin.close_library_db", new_callable=AsyncMock) as mock_close,
+            patch("routers.admin.retire_library_db") as mock_retire,
+            patch("core.dependencies.close_library_db", new_callable=AsyncMock) as mock_close,
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
@@ -394,7 +400,8 @@ class TestUploadLibraryDB:
                     )
 
         assert resp.status_code == 200
-        mock_close.assert_called_once()
+        mock_retire.assert_called_once_with()
+        mock_close.assert_not_called()
 
 
 class TestGetStreamingIds:
