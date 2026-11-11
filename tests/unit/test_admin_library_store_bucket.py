@@ -2,7 +2,7 @@
 
 The upload endpoint is mode-agnostic: it writes the validated file to the active
 :class:`~storage.object_store.ObjectStore` (the durable canonical copy) and then
-performs today's local hot-swap (``close_library_db()`` then ``os.replace``) so
+performs the local hot-swap (``retire_library_db()`` then ``os.replace``) so
 the replica that served the request also picks up the new file. These tests pin
 the bucket-mode leg against a moto-backed :class:`S3ObjectStore`; the existing
 ``test_admin_router.py`` suite proves the identical contract against the default
