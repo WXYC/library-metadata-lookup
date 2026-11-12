@@ -7,8 +7,9 @@ absolute row floor. The floor's own behavior is pinned in
 """
 
 import asyncio
+import os
 import sqlite3
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -366,7 +367,8 @@ class TestUploadLibraryDB:
 
         Closing it here failed every in-flight search still holding it with
         "no active connection"; retiring detaches it so the next request opens
-        the new file, and closes it only after the grace period.
+        the new file, and closes it once no request holds it. Retire must run
+        before ``os.replace``, so no request opens the old file after the swap.
         """
         from main import app
 
@@ -387,8 +389,11 @@ class TestUploadLibraryDB:
                 },
             ),
             patch("routers.admin.retire_library_db") as mock_retire,
-            patch("core.dependencies.close_library_db", new_callable=AsyncMock) as mock_close,
+            patch("routers.admin.os.replace", wraps=os.replace) as mock_replace,
         ):
+            calls = Mock()
+            calls.attach_mock(mock_retire, "retire")
+            calls.attach_mock(mock_replace, "replace")
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as client:
@@ -401,7 +406,16 @@ class TestUploadLibraryDB:
 
         assert resp.status_code == 200
         mock_retire.assert_called_once_with()
-        mock_close.assert_not_called()
+        served = str(admin_settings.resolved_library_db_path)
+        order = [
+            name
+            for name, args, _ in calls.mock_calls
+            if name == "retire" or (name == "replace" and str(args[1]) == served)
+        ]
+        # In local mode the object store's put already replaced the served file
+        # (and a request seeing that takes the lease-safe signature reopen); the
+        # handler's own hot-swap is the last replace, and retire must precede it.
+        assert order[-2:] == ["retire", "replace"]
 
 
 class TestGetStreamingIds:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,15 +15,15 @@ from wxyc_fastapi.observability import get_posthog_client as _shared_posthog_cli
 
 from config.settings import Settings, get_settings
 from core.exceptions import ServiceInitializationError
-from core.search import resolve_positive_int_env, resolve_search_hard_timeout_ms
+from core.search import resolve_positive_int_env
 from discogs.cache_service import DiscogsCacheService
 from discogs.service import DiscogsService
 from entity.sources import PgSource
-from library.db import LibraryDB, clear_library_caches
+from library.db import LibraryDB
 from storage.object_store import LocalDirStore, ObjectStore, S3ObjectStore
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
     from posthog import Posthog
 
@@ -66,53 +67,47 @@ logger = logging.getLogger(__name__)
 #    therefore always the missing-file stub, never an open still in progress.
 # 2. Every caller that needs a fresh instance awaits the one shared
 #    `_library_db_open_task`, so a burst opens one connection, not N.
-# 3. A swap retires the old instance instead of closing it: requests that
-#    already hold it keep querying until they finish, and it is closed only
-#    after `_library_db_retire_grace_s()`. See `retire_library_db` (#1508).
+# 3. A swap retires the old instance instead of closing it. Requests hold a
+#    lease on the instance they were handed (`lease_library_db`), and a retired
+#    instance is closed when its last lease is released, however long that
+#    request waits or runs. See `retire_library_db` (#1508).
 #
-# On 2026-10-23 neither rule held. An admin upload closed the connection, three
-# requests arrived in the same millisecond, the first published its unconnected
-# instance, and the other two treated it as the stub and closed it mid-connect.
-# Two searches returned 500 "no active connection".
+# On 2026-10-23 rules 1 and 2 did not hold. An admin upload closed the
+# connection, three requests arrived in the same millisecond, the first
+# published its unconnected instance, and the other two treated it as the stub
+# and closed it mid-connect. Two searches returned 500 "no active connection".
 _library_db: LibraryDB | None = None
 _LibraryDbSignature = tuple[int, int, int]
 _library_db_signature: _LibraryDbSignature | None = None
 _library_db_open_task: asyncio.Task[LibraryDB] | None = None
-# Deferred closes of retired instances, keyed to the instance each will close.
-# Held here so the tasks are not garbage collected mid-sleep, and so shutdown
-# can close the instances without waiting out the grace period.
-_retiring_library_db_tasks: dict[asyncio.Task[None], LibraryDB] = {}
-
-# Added to the search hard timeout so a request that took the old instance just
-# before the swap has finished its non-search work too when the close lands.
-_LIBRARY_DB_RETIRE_MARGIN_S = 5.0
-
-
-def _library_db_retire_grace_s() -> float:
-    """Seconds a retired instance stays open after a swap.
-
-    The search hard timeout bounds how long a request keeps querying the
-    instance it was handed, so outliving it by a margin covers in-flight work.
-    """
-    return resolve_search_hard_timeout_ms() / 1000 + _LIBRARY_DB_RETIRE_MARGIN_S
+# Open leases per instance. An entry exists only while its count is positive.
+_library_db_leases: dict[LibraryDB, int] = {}
+# Every instance ever retired. Weak, so a closed instance is not kept alive; the
+# lease dict above holds the strong reference while a retired one is in use.
+_retired_library_dbs: weakref.WeakSet[LibraryDB] = weakref.WeakSet()
+# Closes of retired instances, held so the tasks are not garbage collected.
+_closing_library_db_tasks: set[asyncio.Task[None]] = set()
 
 
-async def _close_after_grace(db: LibraryDB) -> None:
-    await asyncio.sleep(_library_db_retire_grace_s())
-    await db.close()
+async def _close_retired_library_db(db: LibraryDB) -> None:
+    try:
+        await db.close()
+    except Exception:
+        logger.exception("Failed to close retired library database %s", db)
 
 
-def _discard_retirement(task: asyncio.Task[None]) -> None:
-    _retiring_library_db_tasks.pop(task, None)
+def _close_retired_when_unleased(db: LibraryDB) -> None:
+    """Close a retired instance in the background once no request holds it."""
+    if _library_db_leases.get(db):
+        return
+    task = asyncio.create_task(_close_retired_library_db(db))
+    _closing_library_db_tasks.add(task)
+    task.add_done_callback(_closing_library_db_tasks.discard)
 
 
-def _schedule_retirement(db: LibraryDB) -> None:
-    # Clear now so no request reads the old catalog from cache; close() clears
-    # again later, dropping anything in-flight requests wrote in the meantime.
-    clear_library_caches()
-    task = asyncio.create_task(_close_after_grace(db))
-    _retiring_library_db_tasks[task] = db
-    task.add_done_callback(_discard_retirement)
+def _retire(db: LibraryDB) -> None:
+    _retired_library_dbs.add(db)
+    _close_retired_when_unleased(db)
 
 
 def _library_db_file_signature(db_path: Path) -> _LibraryDbSignature | None:
@@ -180,7 +175,7 @@ async def _open_library_db(db_path: Path) -> LibraryDB:
     old_db = _library_db
     _library_db, _library_db_signature = new_db, signature
     if old_db is not None:
-        _schedule_retirement(old_db)
+        _retire(old_db)
     return new_db
 
 
@@ -223,13 +218,43 @@ async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryD
     return await asyncio.shield(task)
 
 
+async def lease_library_db(
+    db: LibraryDB = Depends(get_library_db),
+    settings: Settings = Depends(get_settings),
+) -> AsyncIterator[LibraryDB]:
+    """Request-scoped access to the library database. Use this in routes.
+
+    Holds a lease on the instance for the whole request, so a hot-swap that
+    retires it mid-request does not close it until the request is done. This
+    covers time spent queued for admission and every item of a ``/lookup/bulk``
+    batch, which no fixed grace period bounds (#1508).
+
+    Depends on :func:`get_library_db` so ``dependency_overrides`` on it still
+    apply. If the instance it resolved was retired before the lease was taken,
+    the current one is fetched instead.
+    """
+    while db in _retired_library_dbs:
+        db = await get_library_db(settings)
+    _library_db_leases[db] = _library_db_leases.get(db, 0) + 1
+    try:
+        yield db
+    finally:
+        remaining = _library_db_leases[db] - 1
+        if remaining:
+            _library_db_leases[db] = remaining
+        else:
+            del _library_db_leases[db]
+            if db in _retired_library_dbs:
+                _close_retired_when_unleased(db)
+
+
 def retire_library_db() -> None:
     """Take the current instance out of service without closing it under in-flight work.
 
     For a hot-swap (``POST /admin/upload-library-db``): call it, then
     ``os.replace`` the file, with no ``await`` in between. The next request opens
     the new file; requests that already hold the old instance keep using it, and
-    it is closed after :func:`_library_db_retire_grace_s`. Synchronous so no
+    it is closed when the last of them releases its lease. Synchronous so no
     request can run between the detach and the replace.
     """
     global _library_db, _library_db_signature
@@ -237,25 +262,23 @@ def retire_library_db() -> None:
     _library_db = None
     _library_db_signature = None
     if old_db is not None:
-        _schedule_retirement(old_db)
+        _retire(old_db)
 
 
 async def close_library_db() -> None:
-    """Close the library database now, including retired instances (shutdown)."""
+    """Close the library database now, including retired instances still leased (shutdown)."""
     global _library_db, _library_db_signature
-    if _library_db:
-        await _library_db.close()
-        _library_db = None
-        _library_db_signature = None
-    # Cancel rather than await the grace sleeps, then close here: a task
-    # cancelled before it first runs never executes its body at all.
-    retiring = list(_retiring_library_db_tasks.items())
-    _retiring_library_db_tasks.clear()
-    for task, _ in retiring:
-        task.cancel()
-    await asyncio.gather(*(task for task, _ in retiring), return_exceptions=True)
-    for _, db in retiring:
-        await db.close()
+    current, _library_db, _library_db_signature = _library_db, None, None
+    to_close = [db for db in _library_db_leases if db in _retired_library_dbs]
+    if current is not None:
+        to_close.append(current)
+    # Each close is attempted even if an earlier one fails.
+    for db in to_close:
+        try:
+            await db.close()
+        except Exception:
+            logger.exception("Failed to close library database %s", db)
+    await asyncio.gather(*_closing_library_db_tasks, return_exceptions=True)
 
 
 # Object store selection (WXYC/library-metadata-lookup#835). Built once and

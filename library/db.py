@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import logging
 import math
 import re
@@ -342,8 +343,12 @@ def _fts_normalize(query: str) -> str:
 
 # Module-level caches for library search results.
 # Lazy-initialized from settings. Cleared when the database is closed/replaced.
+# Keys lead with the computing instance's `_cache_scope`: after a hot-swap a
+# retired instance keeps answering leased requests (#1508), and its old-catalog
+# results must not be served to requests on the new instance.
 _artist_cache: TTLCache | None = None
 _search_cache: TTLCache | None = None
+_cache_scopes = itertools.count()
 
 
 def _get_library_caches() -> tuple[TTLCache, TTLCache]:
@@ -376,6 +381,7 @@ class LibraryDB:
 
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or DEFAULT_DB_PATH
+        self._cache_scope = next(_cache_scopes)
         self._conn: aiosqlite.Connection | None = None
         self._has_alternate_artist: bool = False
         self._has_album_artist: bool = False
@@ -766,7 +772,15 @@ class LibraryDB:
             raise RuntimeError("Database not connected")
 
         _, search_cache = _get_library_caches()
-        cache_key = (query, artist, title, limit, fallback_to_like, fallback_to_fuzzy)
+        cache_key = (
+            self._cache_scope,
+            query,
+            artist,
+            title,
+            limit,
+            fallback_to_like,
+            fallback_to_fuzzy,
+        )
         if cache_key in search_cache:
             return search_cache[cache_key]
 
@@ -1180,7 +1194,7 @@ class LibraryDB:
             raise RuntimeError("Database not connected")
 
         artist_cache, _ = _get_library_caches()
-        cache_key = artist.lower()
+        cache_key = (self._cache_scope, artist.lower())
         if cache_key in artist_cache:
             return artist_cache[cache_key]
 

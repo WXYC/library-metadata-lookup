@@ -40,9 +40,9 @@ from core.dependencies import (
     get_discogs_cache_pg,
     get_discogs_cache_service,
     get_discogs_service,
-    get_library_db,
     get_musicbrainz_pg,
     get_posthog_client,
+    lease_library_db,
 )
 from core.event_loop_lag import get_event_loop_lag_ms
 from core.observability import (
@@ -488,7 +488,7 @@ async def handle_lookup(
     request: LookupRequest,
     http_request: Request,
     http_response: Response,
-    db: LibraryDB = Depends(get_library_db),
+    db: LibraryDB = Depends(lease_library_db),
     discogs_service: DiscogsService | None = Depends(get_discogs_service),
     discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service),
     mb_pg: PgSource | None = Depends(get_musicbrainz_pg),
@@ -834,7 +834,7 @@ async def handle_lookup(
 async def handle_bulk_lookup(
     http_request: Request,
     http_response: Response,
-    db: LibraryDB = Depends(get_library_db),
+    db: LibraryDB = Depends(lease_library_db),
     discogs_service: DiscogsService | None = Depends(get_discogs_service),
     discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service),
     mb_pg: PgSource | None = Depends(get_musicbrainz_pg),

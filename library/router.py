@@ -4,7 +4,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from core.dependencies import get_library_db
+from core.dependencies import lease_library_db
 from library.db import LibraryDB
 from library.models import LibrarySearchResponse
 from lookup.endpoint_family import (
@@ -46,7 +46,7 @@ async def search_library(
     artist: str | None = Query(None, description="Filter by artist name"),
     title: str | None = Query(None, description="Filter by album title"),
     limit: int = Query(10, ge=1, le=100, description="Max results"),
-    db: LibraryDB = Depends(get_library_db),
+    db: LibraryDB = Depends(lease_library_db),
 ):
     """Search the library catalog."""
     # LML#929: label this request's Sentry transaction with the local-catalog
