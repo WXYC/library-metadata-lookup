@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import weakref
 from pathlib import Path
@@ -64,8 +63,12 @@ logger = logging.getLogger(__name__)
 # Three rules keep concurrent callers safe without a lock:
 #
 # 1. `_library_db` is assigned only after `connect()` returns or raises
-#    FileNotFoundError. A published instance with a `None` signature is
-#    therefore always the missing-file stub, never an open still in progress.
+#    FileNotFoundError, so a published instance is never an open still in
+#    progress. A `None` signature means the file was absent at the pre-connect
+#    stat: usually the missing-file stub, or a connection whose file landed
+#    mid-connect. Either way the next call reopens once the file exists, which
+#    rule 3 makes safe. (Re-statting after connect could record a later file's
+#    signature against this connection, so it is deliberately not done.)
 # 2. Every caller that needs a fresh instance awaits the one shared
 #    `_library_db_open_task`, so a burst opens one connection, not N.
 # 3. A swap retires the old instance instead of closing it. Requests hold a
@@ -88,20 +91,23 @@ _library_db_leases: dict[LibraryDB, int] = {}
 _retired_library_dbs: weakref.WeakSet[LibraryDB] = weakref.WeakSet()
 # Closes of retired instances, held so the tasks are not garbage collected.
 _closing_library_db_tasks: set[asyncio.Task[None]] = set()
+# How long shutdown waits for an open in flight to publish before closing.
+_SHUTDOWN_OPEN_WAIT_S = 10.0
 
 
-async def _close_retired_library_db(db: LibraryDB) -> None:
+async def _close_logging_failure(db: LibraryDB, what: str, *, clear_caches: bool = True) -> None:
+    """Close ``db``; a failure is logged, never raised, so other closes still run."""
     try:
-        await db.close()
+        await db.close(clear_caches=clear_caches)
     except Exception:
-        logger.exception("Failed to close retired library database %s", db)
+        logger.exception("Failed to close %s %s", what, db)
 
 
 def _close_retired_when_unleased(db: LibraryDB) -> None:
     """Close a retired instance in the background once no request holds it."""
     if _library_db_leases.get(db):
         return
-    task = asyncio.create_task(_close_retired_library_db(db))
+    task = asyncio.create_task(_close_logging_failure(db, "retired library database"))
     _closing_library_db_tasks.add(task)
     task.add_done_callback(_closing_library_db_tasks.discard)
 
@@ -162,10 +168,6 @@ async def _open_library_db(db_path: Path) -> LibraryDB:
     try:
         await new_db.connect()
         logger.info(f"Library database connected: {db_path}")
-        if signature is None:
-            # The file landed between the stat and connect(). A connected
-            # instance must not carry the stub's None signature (rule 1).
-            signature = _library_db_file_signature(db_path)
     except FileNotFoundError:
         signature = None
         logger.warning(
@@ -173,16 +175,22 @@ async def _open_library_db(db_path: Path) -> LibraryDB:
             "Service will start without database (health check will report unhealthy). "
             "Upload library.db via POST /admin/upload-library-db to enable."
         )
-    except Exception as e:
+    except BaseException as e:
+        # connect() may have opened the file before the schema probe raised (or
+        # before a cancellation). The failure is not cached and the next request
+        # retries, so an unclosed connection here would leak one per request
+        # (#1512). Nothing was served from it, so the shared caches stay.
+        await _close_logging_failure(
+            new_db, "library database after a failed connect", clear_caches=False
+        )
+        if not isinstance(e, Exception):
+            raise
         logger.error(f"Failed to initialize library database: {e}")
-        # connect() may have opened the file before the schema probe raised. The
-        # failure is not cached and the next request retries, so an unclosed
-        # connection here would leak one per request (#1512).
-        try:
-            await new_db.close()
-        except Exception:
-            logger.exception("Failed to close library database after a failed connect")
         raise ServiceInitializationError(f"Database initialization failed: {e}") from e
+    finally:
+        # Clear the slot in the same turn the result is set, so no caller can
+        # find this task finished but still registered as in flight.
+        _release_library_db_open_task()
 
     old_db = _library_db
     _library_db, _library_db_signature = new_db, signature
@@ -191,9 +199,9 @@ async def _open_library_db(db_path: Path) -> LibraryDB:
     return new_db
 
 
-def _clear_library_db_open_task(task: asyncio.Task[LibraryDB]) -> None:
+def _release_library_db_open_task() -> None:
     global _library_db_open_task
-    if _library_db_open_task is task:
+    if _library_db_open_task is asyncio.current_task():
         _library_db_open_task = None
 
 
@@ -218,8 +226,8 @@ async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryD
 
     db_path = Path(settings.resolved_library_db_path)
     task = _library_db_open_task
-    # A finished task may not have been cleared yet (its done-callback runs on a
-    # later loop turn); its result is stale, so it does not count as in flight.
+    # The open clears its own slot when it finishes. A task cancelled before it
+    # ever ran never gets to, and must not wedge every later caller.
     if task is not None and task.done():
         task = None
     # Join an open in flight before checking the file: every caller in a burst
@@ -228,7 +236,6 @@ async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryD
         if _library_db is not None and _library_db_is_current(db_path):
             return _library_db
         task = asyncio.create_task(_open_library_db(db_path))
-        task.add_done_callback(_clear_library_db_open_task)
         _library_db_open_task = task
     # shield: one caller's cancellation (a client disconnect) must not cancel
     # the open that the other callers are waiting on.
@@ -285,21 +292,21 @@ def retire_library_db() -> None:
 async def close_library_db() -> None:
     """Close the library database now, including retired instances still leased (shutdown)."""
     global _library_db, _library_db_signature
-    # Let an open in flight publish first; otherwise it publishes after shutdown
-    # and nothing closes it. Its failure is already logged by the open.
-    if _library_db_open_task is not None:
-        with contextlib.suppress(Exception):
-            await asyncio.shield(_library_db_open_task)
+    # Let opens in flight publish first; otherwise one publishes after shutdown
+    # and nothing closes it. asyncio.wait neither raises the open's failure
+    # (already logged) nor its cancellation, and the bound keeps a stuck open
+    # from stalling the closers that run after this one.
+    while (task := _library_db_open_task) is not None and not task.done():
+        _, pending = await asyncio.wait({task}, timeout=_SHUTDOWN_OPEN_WAIT_S)
+        if pending:
+            logger.error("Library database open still running at shutdown; not waiting")
+            break
     current, _library_db, _library_db_signature = _library_db, None, None
     to_close = [db for db in _library_db_leases if db in _retired_library_dbs]
     if current is not None:
         to_close.append(current)
-    # Each close is attempted even if an earlier one fails.
     for db in to_close:
-        try:
-            await db.close()
-        except Exception:
-            logger.exception("Failed to close library database %s", db)
+        await _close_logging_failure(db, "library database")
     await asyncio.gather(*_closing_library_db_tasks, return_exceptions=True)
 
 

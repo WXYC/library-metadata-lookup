@@ -709,8 +709,14 @@ class LibraryDB:
         except Exception:
             return False
 
-    async def close(self):
-        """Close database connection and clear caches."""
+    async def close(self, *, clear_caches: bool = True):
+        """Close database connection and clear caches.
+
+        ``clear_caches=False`` is for an instance that never served a request
+        (its connect failed), so it cannot have cached anything; clearing the
+        process-wide caches would only cost the published instance its warm
+        entries (LML#1512).
+        """
         if self._conn:
             await self._conn.close()
             self._conn = None
@@ -723,7 +729,8 @@ class LibraryDB:
             self._artist_name_pool_lower_list = []
             self._artist_name_pool_compare = []
             self._artist_name_pool_usable = False
-            clear_library_caches()
+            if clear_caches:
+                clear_library_caches()
             logger.info("Closed SQLite connection")
 
     def _select_columns(self, prefix: str = "") -> str:
