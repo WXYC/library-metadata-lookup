@@ -388,6 +388,138 @@ class TestGetLibraryDBConcurrentOpen:
         old_db.close.assert_awaited_once()
 
 
+class TestGetLibraryDBOpenHardening:
+    """Edge cases of the shared open found in review of #1507 (LML#1512)."""
+
+    @pytest.mark.asyncio
+    async def test_failed_connect_closes_the_instance_and_the_next_call_retries(
+        self, tmp_path, mock_settings
+    ):
+        """A corrupt library.db must not leak a connection per request: connect()
+        opens one before the schema probe raises, and the failure is not cached."""
+        from core.exceptions import ServiceInitializationError
+
+        db_file = tmp_path / "library.db"
+        db_file.write_text("not sqlite")
+        mock_settings.library_db_path = str(db_file)
+        gate = asyncio.Event()
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            broken = _slow_connect_db(gate)
+
+            async def connect() -> None:
+                broken.entered.set()
+                await gate.wait()
+                raise sqlite3.DatabaseError("file is not a database")
+
+            broken.connect = AsyncMock(side_effect=connect)
+            retry = AsyncMock()
+            mock_db_cls.side_effect = [broken, retry]
+
+            callers = [asyncio.create_task(get_library_db(mock_settings)) for _ in range(3)]
+            await broken.entered.wait()
+            gate.set()
+            results = await asyncio.gather(*callers, return_exceptions=True)
+
+            assert all(isinstance(r, ServiceInitializationError) for r in results)
+            broken.close.assert_awaited_once()
+            assert deps_module._library_db is None
+            assert deps_module._library_db_open_task is None
+
+            assert await get_library_db(mock_settings) is retry
+
+    @pytest.mark.asyncio
+    async def test_file_appearing_during_connect_is_published_with_its_signature(
+        self, tmp_path, mock_settings
+    ):
+        """A None signature means 'missing-file stub'; a connected instance must
+        never carry one, or the next call reopens it for nothing."""
+        db_file = tmp_path / "library.db"
+        mock_settings.library_db_path = str(db_file)
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            db = AsyncMock()
+            db.connect = AsyncMock(side_effect=lambda: db_file.write_text("landed"))
+            mock_db_cls.return_value = db
+
+            assert await get_library_db(mock_settings) is db
+
+            assert deps_module._library_db_signature == deps_module._library_db_file_signature(
+                db_file
+            )
+            assert await get_library_db(mock_settings) is db
+            mock_db_cls.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_finished_open_task_is_not_reused(self, tmp_path, mock_settings):
+        """Between an open task finishing and its done-callback clearing it, a
+        caller must start a fresh open rather than take the stale result."""
+        db_file = tmp_path / "library.db"
+        db_file.write_text("current")
+        mock_settings.library_db_path = str(db_file)
+        stale = AsyncMock()
+
+        async def finished() -> AsyncMock:
+            return stale
+
+        done_task = asyncio.create_task(finished())
+        await done_task
+        deps_module._library_db_open_task = done_task  # callback not yet run
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            fresh = AsyncMock()
+            mock_db_cls.return_value = fresh
+
+            assert await get_library_db(mock_settings) is fresh
+
+    @pytest.mark.asyncio
+    async def test_shutdown_during_an_open_closes_what_it_publishes(self, tmp_path, mock_settings):
+        db_file = tmp_path / "library.db"
+        db_file.write_text("current")
+        mock_settings.library_db_path = str(db_file)
+        gate = asyncio.Event()
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            db = _slow_connect_db(gate)
+            mock_db_cls.return_value = db
+
+            caller = asyncio.create_task(get_library_db(mock_settings))
+            await db.entered.wait()
+            shutdown = asyncio.create_task(close_library_db())
+            await asyncio.sleep(0)
+            gate.set()
+            await shutdown
+            await caller
+
+        db.close.assert_awaited_once()
+        assert deps_module._library_db is None
+
+    @pytest.mark.asyncio
+    async def test_one_reopen_logs_once(self, tmp_path, mock_settings, caplog):
+        db_file = tmp_path / "library.db"
+        db_file.write_text("old")
+        mock_settings.library_db_path = str(db_file)
+        deps_module._library_db = AsyncMock()
+        deps_module._library_db_signature = deps_module._library_db_file_signature(db_file)
+        replacement = tmp_path / "library-new.db"
+        replacement.write_text("new-content")
+        replacement.replace(db_file)
+        gate = asyncio.Event()
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            db = _slow_connect_db(gate)
+            mock_db_cls.return_value = db
+            with caplog.at_level("INFO", logger="core.dependencies"):
+                first = asyncio.create_task(get_library_db(mock_settings))
+                await db.entered.wait()
+                rest = [asyncio.create_task(get_library_db(mock_settings)) for _ in range(4)]
+                await asyncio.sleep(0)
+                gate.set()
+                await asyncio.gather(first, *rest)
+
+        assert caplog.text.count("Library database file changed; reopening") == 1
+
+
 # ---------------------------------------------------------------------------
 # close_library_db
 # ---------------------------------------------------------------------------
