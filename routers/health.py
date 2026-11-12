@@ -40,7 +40,7 @@ from wxyc_fastapi.healthcheck import DEFAULT_TIMEOUT_SECONDS, Check
 from config.settings import Settings, get_settings
 from core import build_info
 from core.build_info import resolve_commit_sha
-from core.dependencies import get_discogs_service, get_library_db
+from core.dependencies import get_discogs_service, lease_library_db
 from discogs.breaker import BreakerState
 from discogs.live_request_counter import get_discogs_live_requests_total
 from discogs.ratelimit import get_discogs_breaker
@@ -197,7 +197,7 @@ async def _run_check_preserving_value(check: Check, timeout: float) -> str:
 )
 async def health_check(
     settings: Settings = Depends(get_settings),
-    db: LibraryDB = Depends(get_library_db),
+    db: LibraryDB = Depends(lease_library_db),
     discogs_service: DiscogsService | None = Depends(get_discogs_service),
 ):
     """Health check with real connectivity probes for every dependency."""

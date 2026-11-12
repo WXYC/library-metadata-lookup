@@ -506,9 +506,9 @@ async def upload_library_db(
         raise HTTPException(status_code=500, detail=f"Failed to store library.db: {e}") from e
 
     # Retire, not close: searches still holding the old instance would fail with
-    # "no active connection" (#1508). Retiring clears the TTL caches now and
-    # closes the old connection after a grace period. No await between this and
-    # the replace, so no request can open the old file in between.
+    # "no active connection" (#1508). The old connection closes when the last
+    # request holding it finishes. No await between this and the replace, so no
+    # request can open the old file in between.
     retire_library_db()
 
     # Atomic local hot-swap so this replica serves the new file immediately.

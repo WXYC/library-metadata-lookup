@@ -18,6 +18,7 @@ from library.db import (
     _to_fts_match_query,
     clear_library_caches,
 )
+from library.models import LibraryItem
 from tests.factories import make_library_catalog
 
 # ---------------------------------------------------------------------------
@@ -2059,6 +2060,30 @@ class TestLibraryDBCacheInvalidation:
         assert len(artist_cache) == 0
         assert len(search_cache) == 0
 
+    @pytest.mark.asyncio
+    async def test_cache_entries_are_scoped_to_the_computing_instance(self):
+        """A retired instance still answering leased requests after a hot-swap
+        (LML#1508) must not feed its old-catalog results to the new instance."""
+        from library.db import clear_library_caches
+
+        clear_library_caches()
+        old_db, new_db = LibraryDB(), LibraryDB()
+        old_db._conn, new_db._conn = AsyncMock(), AsyncMock()
+        old_rows = [LibraryItem(id=1, artist="Stereolab", title="Aluminum Tunes")]
+        new_rows = [LibraryItem(id=2, artist="Juana Molina", title="DOGA")]
+
+        with (
+            patch.object(old_db, "_search_uncached", AsyncMock(return_value=old_rows)),
+            patch.object(new_db, "_search_uncached", AsyncMock(return_value=new_rows)),
+            patch.object(old_db, "_find_similar_artist_uncached", AsyncMock(return_value="Old")),
+            patch.object(new_db, "_find_similar_artist_uncached", AsyncMock(return_value="New")),
+        ):
+            assert await old_db.search(query="doga") == old_rows
+            assert await new_db.search(query="doga") == new_rows
+            assert await old_db.find_similar_artist("juana") == "Old"
+            assert await new_db.find_similar_artist("juana") == "New"
+        clear_library_caches()
+
 
 class TestStreamingLinks:
     """Tests for streaming_links table access."""
@@ -2981,8 +3006,10 @@ class TestArtistCorrectionPoolDegradation:
     async def test_a_hot_swap_landing_mid_scan_does_not_crash_the_lookup(self, tmp_path):
         """``close()`` during an in-flight scan must not turn the lookup into a 500.
 
-        The LML#706/#834 hot-swap path calls ``close_library_db()`` while a
-        ``/lookup`` can be parked inside the off-loop scan. The scan thread
+        The LML#706/#834 hot-swap path used to call ``close_library_db()`` while a
+        ``/lookup`` could be parked inside the off-loop scan; since LML#1508 a
+        swap closes the old instance only once no request holds it, and shutdown
+        can still close one mid-scan. The scan thread
         holds the old lists safely; what broke was the resume, which indexed
         the instance attributes ``close()`` had just emptied. The correction
         path must read the same snapshot it scanned.
