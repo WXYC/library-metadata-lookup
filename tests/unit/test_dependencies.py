@@ -422,33 +422,53 @@ class TestGetLibraryDBOpenHardening:
             results = await asyncio.gather(*callers, return_exceptions=True)
 
             assert all(isinstance(r, ServiceInitializationError) for r in results)
-            broken.close.assert_awaited_once()
+            # Never served a request, so the shared caches are left alone.
+            broken.close.assert_awaited_once_with(clear_caches=False)
             assert deps_module._library_db is None
             assert deps_module._library_db_open_task is None
 
             assert await get_library_db(mock_settings) is retry
 
     @pytest.mark.asyncio
-    async def test_file_appearing_during_connect_is_published_with_its_signature(
+    async def test_file_appearing_during_connect_keeps_the_pre_connect_signature(
         self, tmp_path, mock_settings
     ):
-        """A None signature means 'missing-file stub'; a connected instance must
-        never carry one, or the next call reopens it for nothing."""
+        """The signature is only ever taken before connect(): a re-stat afterwards
+        could record a later file's identity against this connection and serve
+        the old inode forever. A file that landed mid-connect costs one reopen,
+        which leases make safe (#1508)."""
         db_file = tmp_path / "library.db"
         mock_settings.library_db_path = str(db_file)
 
         with patch("core.dependencies.LibraryDB") as mock_db_cls:
-            db = AsyncMock()
-            db.connect = AsyncMock(side_effect=lambda: db_file.write_text("landed"))
-            mock_db_cls.return_value = db
+            first, second = AsyncMock(), AsyncMock()
+            first.connect = AsyncMock(side_effect=lambda: db_file.write_text("landed"))
+            mock_db_cls.side_effect = [first, second]
 
-            assert await get_library_db(mock_settings) is db
+            assert await get_library_db(mock_settings) is first
+            assert deps_module._library_db_signature is None
 
+            assert await get_library_db(mock_settings) is second
             assert deps_module._library_db_signature == deps_module._library_db_file_signature(
                 db_file
             )
-            assert await get_library_db(mock_settings) is db
-            mock_db_cls.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_open_task_slot_clears_in_the_turn_it_finishes(self, tmp_path, mock_settings):
+        db_file = tmp_path / "library.db"
+        db_file.write_text("current")
+        mock_settings.library_db_path = str(db_file)
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            mock_db_cls.return_value = AsyncMock()
+            caller = asyncio.create_task(get_library_db(mock_settings))
+            await asyncio.sleep(0)
+            open_task = deps_module._library_db_open_task
+            assert open_task is not None
+            await asyncio.wait({open_task})
+
+            assert deps_module._library_db_open_task is None
+            await caller
 
     @pytest.mark.asyncio
     async def test_finished_open_task_is_not_reused(self, tmp_path, mock_settings):
@@ -493,6 +513,31 @@ class TestGetLibraryDBOpenHardening:
 
         db.close.assert_awaited_once()
         assert deps_module._library_db is None
+
+    @pytest.mark.asyncio
+    async def test_shutdown_survives_a_cancelled_open(self, tmp_path, mock_settings):
+        """A cancelled open must not abort shutdown and skip the closers after it."""
+        db_file = tmp_path / "library.db"
+        db_file.write_text("current")
+        mock_settings.library_db_path = str(db_file)
+        current = AsyncMock()
+        deps_module._library_db = current
+        deps_module._library_db_signature = (0, 0, 0)  # stale, forces an open
+        gate = asyncio.Event()
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            opening = _slow_connect_db(gate)
+            mock_db_cls.return_value = opening
+            caller = asyncio.create_task(get_library_db(mock_settings))
+            await opening.entered.wait()
+            deps_module._library_db_open_task.cancel()
+
+            await close_library_db()
+
+            with contextlib.suppress(asyncio.CancelledError):
+                await caller
+        current.close.assert_awaited_once()
+        opening.close.assert_awaited_once_with(clear_caches=False)
 
     @pytest.mark.asyncio
     async def test_one_reopen_logs_once(self, tmp_path, mock_settings, caplog):
