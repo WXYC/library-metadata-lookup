@@ -34,7 +34,7 @@ from core.dependencies import discogs_pool_max_size, get_discogs_cache_pg
 from core.observability import capture_unsampled_counter
 from discogs.ratelimit import set_discogs_low_priority
 from entity.compilation_track_identity import CompilationTrackIdentityRow
-from entity.library_release_override import get_library_release_pins_strict
+from entity.library_release_override import PinnedRelease, get_library_release_pins_strict
 from entity.release_tracklist import ReleaseTracklistRow
 from entity.sources import PgSource
 from entity.store import EntityStore, Identity
@@ -53,6 +53,7 @@ from identity.bulk_resolve import (
     compilation_result,
     compose_for_identity,
     load_compilation_track_rows_by_legacy_id,
+    load_release_master_ids,
     load_release_tracklists_by_release_id,
     load_single_artist_release_pins,
 )
@@ -446,10 +447,17 @@ async def bulk_resolve_libraries(
     # every affected single_artist row emits the honest unvisited
     # (false, []) state and BS#1991's sweep re-asks on its own schedule --
     # never a 503 that would also fail the batch's unrelated rows.
-    single_artist_pins: dict[int, int] = {}
+    #
+    # LML#1516: the pins are read whatever `include_tracks` says, because an
+    # `md-*` pin also decides the main row's release; the tracklists stay
+    # gated on the flag. The md-pinned releases' masters are one more read in
+    # the same degrade arm, so a failure sends null release fields ("keep
+    # what you stored"), never a release without its master.
+    single_artist_pins: dict[int, PinnedRelease] = {}
     tracklists_by_release: dict[int, list[ReleaseTracklistRow]] = {}
+    masters_by_release: dict[int, int] = {}
     single_artist_track_candidates = 0
-    if include_tracks and discogs_cache_pg is not None:
+    if discogs_cache_pg is not None:
         single_artist_legacy_ids = sorted(
             {
                 input_row.legacy_release_id
@@ -465,9 +473,17 @@ async def bulk_resolve_libraries(
                 single_artist_pins = await load_single_artist_release_pins(
                     discogs_cache_pg, single_artist_legacy_ids
                 )
-                if single_artist_pins:
+                if include_tracks and single_artist_pins:
                     tracklists_by_release = await load_release_tracklists_by_release_id(
-                        discogs_cache_pg, sorted(set(single_artist_pins.values()))
+                        discogs_cache_pg,
+                        sorted({p.release_id for p in single_artist_pins.values()}),
+                    )
+                md_release_ids = sorted(
+                    {p.release_id for p in single_artist_pins.values() if p.exempt_from_floor}
+                )
+                if md_release_ids:
+                    masters_by_release = await load_release_master_ids(
+                        discogs_cache_pg, md_release_ids
                     )
             except TRANSIENT_PG_ERRORS as exc:
                 logger.warning(
@@ -484,6 +500,7 @@ async def bulk_resolve_libraries(
                 )
                 single_artist_pins = {}
                 tracklists_by_release = {}
+                masters_by_release = {}
 
     # Per-input lookups dispatch concurrently under a semaphore (LML#278).
     # Worst case drops from ~3,000 sequential PG round-trips for a 1,000-row
@@ -561,16 +578,19 @@ async def bulk_resolve_libraries(
             # the filtered cache has no key and gets NO derivation, staying
             # at the not-yet-visited (false, []) so BS#1991 keeps re-asking
             # until a discogs-etl ingest supplies the release.
+            pin = (
+                single_artist_pins.get(input_row.legacy_release_id)
+                if input_row.legacy_release_id is not None
+                else None
+            )
             track_derivation: SingleArtistTrackDerivation | None = None
-            if include_tracks and input_row.legacy_release_id is not None:
-                pinned_release_id = single_artist_pins.get(input_row.legacy_release_id)
-                if pinned_release_id is not None:
-                    tracklist_rows = tracklists_by_release.get(pinned_release_id)
-                    if tracklist_rows is not None:
-                        track_derivation = SingleArtistTrackDerivation(
-                            discogs_release_id=pinned_release_id,
-                            rows=tracklist_rows,
-                        )
+            if include_tracks and pin is not None:
+                tracklist_rows = tracklists_by_release.get(pin.release_id)
+                if tracklist_rows is not None:
+                    track_derivation = SingleArtistTrackDerivation(
+                        discogs_release_id=pin.release_id,
+                        rows=tracklist_rows,
+                    )
 
             try:
                 # `compose_for_identity` issues its own
@@ -583,6 +603,10 @@ async def bulk_resolve_libraries(
                     store,
                     include_tracks=include_tracks,
                     track_derivation=track_derivation,
+                    release_pin=pin,
+                    release_master_id=(
+                        masters_by_release.get(pin.release_id) if pin is not None else None
+                    ),
                 )
             except TRANSIENT_PG_ERRORS:
                 logger.exception(
@@ -655,7 +679,8 @@ async def bulk_resolve_libraries(
     kinds = Counter(r.kind.value for r in results)
     logger.info(
         "bulk resolve complete: inputs=%d single_artist=%d compilation=%d unresolved=%d"
-        " include_tracks=%s single_artist_tracks_asked=%d single_artist_tracks_pinned=%d",
+        " include_tracks=%s single_artist_tracks_asked=%d single_artist_tracks_pinned=%d"
+        " single_artist_md_pins=%d",
         inputs_count,
         kinds.get("single_artist", 0),
         kinds.get("compilation", 0),
@@ -663,6 +688,7 @@ async def bulk_resolve_libraries(
         include_tracks,
         single_artist_track_candidates,
         len(single_artist_pins),
+        sum(1 for p in single_artist_pins.values() if p.exempt_from_floor),
     )
 
     return BulkResolveLibrariesResponse(

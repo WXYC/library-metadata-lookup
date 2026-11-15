@@ -17,6 +17,7 @@ from asyncpg.exceptions import PostgresError
 from entity.release_tracklist import (
     ReleaseTracklistRow,
     get_present_release_ids,
+    get_release_master_ids,
     get_release_tracklists_for_releases,
 )
 from entity.sources import PgSource
@@ -131,3 +132,42 @@ class TestGetPresentReleaseIds:
 
         with pytest.raises(PostgresError):
             await get_present_release_ids(pg, [555])
+
+
+@pytest.mark.asyncio
+class TestGetReleaseMasterIds:
+    """LML#1516: the master of each MD-pinned release, from the cache's
+    `release.master_id`. `0` is Discogs's "no master" sentinel the ETL stores
+    verbatim, so it maps to absent like NULL."""
+
+    async def test_maps_present_releases_with_a_real_master(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(
+            return_value=[
+                {"id": 555, "master_id": 4321},
+                {"id": 556, "master_id": 0},
+                {"id": 557, "master_id": None},
+            ]
+        )
+
+        masters = await get_release_master_ids(pg, [555, 556, 557, 558])
+
+        assert masters == {555: 4321}
+        assert pg.fetchall.await_count == 1
+        query = pg.fetchall.await_args.args[0]
+        assert "master_id" in query
+        assert "ANY(" in query
+
+    async def test_empty_release_ids_short_circuits_without_query(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(return_value=[])
+
+        assert await get_release_master_ids(pg, []) == {}
+        pg.fetchall.assert_not_awaited()
+
+    async def test_pg_error_propagates(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchall = AsyncMock(side_effect=PostgresError("connection reset"))
+
+        with pytest.raises(PostgresError):
+            await get_release_master_ids(pg, [555])
