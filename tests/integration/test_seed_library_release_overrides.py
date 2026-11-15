@@ -22,7 +22,8 @@ import pytest
 import pytest_asyncio
 
 from entity.library_release_override import (
-    get_library_release_overrides,
+    PinnedRelease,
+    get_library_release_pins,
     set_up_library_release_override_schema,
 )
 from scripts.seed_library_release_overrides import OverrideRow, seed_overrides
@@ -56,8 +57,8 @@ class TestSeedRoundTrip:
             written = await seed_overrides(conn, rows, execute=True, source=_SOURCE)
         assert written == 2
 
-        result = await get_library_release_overrides(pg_source, [17, 28, 999])
-        assert result == {17: 437503, 28: 9590}
+        result = await get_library_release_pins(pg_source, [17, 28, 999])
+        assert result == {17: PinnedRelease(437503, _SOURCE), 28: PinnedRelease(9590, _SOURCE)}
 
     @pytest.mark.asyncio
     async def test_reseed_updates_in_place_and_is_idempotent(self, pg_source, pg_pool):
@@ -80,8 +81,8 @@ class TestSeedRoundTrip:
                 "SELECT count(*)::int FROM lml_cache.library_release_override WHERE library_id = 17"
             )
         assert count == 1
-        result = await get_library_release_overrides(pg_source, [17])
-        assert result == {17: 111111}
+        result = await get_library_release_pins(pg_source, [17])
+        assert result == {17: PinnedRelease(111111, _SOURCE)}
 
     @pytest.mark.asyncio
     async def test_reseed_does_not_clobber_a_different_source_pin(self, pg_source, pg_pool):
@@ -118,7 +119,7 @@ class TestSeedRoundTrip:
                 source=_SOURCE,
             )
         assert written == 0
-        result = await get_library_release_overrides(pg_source, [17])
+        result = await get_library_release_pins(pg_source, [17])
         assert result == {}
 
     @pytest.mark.asyncio
@@ -135,5 +136,5 @@ class TestSeedRoundTrip:
             await conn.execute(
                 "DELETE FROM lml_cache.library_release_override WHERE source = $1", _SOURCE
             )
-        result = await get_library_release_overrides(pg_source, [17])
+        result = await get_library_release_pins(pg_source, [17])
         assert result == {}

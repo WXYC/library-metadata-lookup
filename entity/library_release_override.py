@@ -21,7 +21,7 @@ Models ``entity/streaming_url_cache.py`` (LML#573) and
 ``entity/release_resolution_cache.py`` (LML#632): the same LML-owned
 ``lml_cache`` schema (per WXYC/discogs-etl#288 Option 3, *not* the
 discogs-cache-owned ``entity.*``), the same lifespan bootstrap, and the same
-best-effort posture — a PG error degrades ``get_library_release_overrides`` to
+best-effort posture — a PG error degrades ``get_library_release_pins`` to
 an empty map so the lookup path falls through to the fuzzy pick as if no
 override table existed.
 
@@ -29,11 +29,20 @@ Reversibility is by design: every seeded row carries a ``source`` marker, so a
 seed run is undone by a single ``DELETE FROM lml_cache.library_release_override
 WHERE source = 'alex-l-2026'`` plus turning the ``lml_library_release_override``
 flag off.
+
+Two kinds of writer stamp ``source``. Seed scripts write their batch name
+(``alex-l-2026``, ``alex-l-2026-masters-api``). A music director setting a
+release from the DJ site writes ``md-<user id>`` (the Discogs release picker,
+WXYC/Backend-Service#3790). The readers return each pin tagged with its source
+(:class:`PinnedRelease`) because the two kinds bind differently: an MD pin is
+exempt from the ``lml_override_requires_floor`` 80/80 floor, a seed pin is not
+(LML#1514).
 """
 
 from __future__ import annotations
 
 import logging
+from typing import NamedTuple
 
 from entity.cache_toolkit import swallowing_fetch
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
@@ -75,6 +84,37 @@ WHERE library_id = ANY($1)\
 """
 
 
+# The ``source`` prefix a music director's pin carries (``md-<user id>``).
+MD_PIN_SOURCE_PREFIX = "md-"
+
+
+class PinnedRelease(NamedTuple):
+    """One pin: the Discogs release and the ``source`` that wrote it."""
+
+    release_id: int
+    source: str
+
+    @property
+    def exempt_from_floor(self) -> bool:
+        """True for a music director's pin, which binds without the 80/80 floor.
+
+        An MD chose this release by hand, on the record's own card, usually
+        because the card's title is defective -- the case the floor fails on
+        (LML#1290's notes: 85% of floor failures are correct pins on such
+        rows). A demoted MD pin would also let the enrichment worker and the
+        BS#3137 re-ask overwrite the MD's choice. The title gate in
+        ``lookup/enrichment/item.py`` still applies: it guards the request, not
+        the pin (LML#1514).
+        """
+        return self.source.startswith(MD_PIN_SOURCE_PREFIX)
+
+
+def _pins_from_rows(rows: list) -> dict[int, PinnedRelease]:
+    return {
+        row["library_id"]: PinnedRelease(row["discogs_release_id"], row["source"]) for row in rows
+    }
+
+
 async def set_up_library_release_override_schema(pg: PgSource) -> None:
     """Apply the idempotent override-schema DDL.
 
@@ -89,21 +129,23 @@ async def set_up_library_release_override_schema(pg: PgSource) -> None:
     await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE)
 
 
-async def get_library_release_overrides(pg: PgSource, library_ids: list[int]) -> dict[int, int]:
-    """Prefetch verified ``library_id -> discogs_release_id`` pins in one query.
+async def get_library_release_pins(
+    pg: PgSource, library_ids: list[int]
+) -> dict[int, PinnedRelease]:
+    """Prefetch the request's pins, tagged with their source, in one query.
 
     Returns a map for the subset of ``library_ids`` that carry an override; ids
     without a pin are simply absent. An empty ``library_ids`` short-circuits
     without touching PG. A PG failure degrades to an empty map (best-effort
     posture, same as the streaming / resolution caches) so a transient outage
     can never break the lookup path — the caller falls through to the fuzzy
-    pick.
+    pick. The best-effort sibling of :func:`get_library_release_pins_strict`.
     """
     if not library_ids:
         return {}
     rows = await swallowing_fetch(
         pg,
-        _SELECT_SQL,
+        _SELECT_PINS_SQL,
         library_ids,
         miss=[],
         logger=logger,
@@ -111,7 +153,7 @@ async def get_library_release_overrides(pg: PgSource, library_ids: list[int]) ->
         log_args=(len(library_ids),),
         many=True,
     )
-    return {row["library_id"]: row["discogs_release_id"] for row in rows}
+    return _pins_from_rows(rows)
 
 
 async def get_library_release_overrides_strict(
@@ -139,7 +181,7 @@ async def get_library_release_overrides_strict(
 
 async def get_library_release_pins_strict(
     pg: PgSource, library_ids: list[int]
-) -> dict[int, tuple[int, str]]:
+) -> dict[int, PinnedRelease]:
     """``library_id -> (discogs_release_id, source)`` in one query (LML#1503).
 
     The pinned-tracklists route must report which override batch a pin came
@@ -150,4 +192,4 @@ async def get_library_release_pins_strict(
     if not library_ids:
         return {}
     rows = await pg.fetchall(_SELECT_PINS_SQL, library_ids)
-    return {row["library_id"]: (row["discogs_release_id"], row["source"]) for row in rows}
+    return _pins_from_rows(rows)

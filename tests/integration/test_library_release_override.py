@@ -2,7 +2,7 @@
 
 All unit coverage mocks ``PgSource``; this file is the matching layer driving
 the real DDL, the real ``CHECK (discogs_release_id > 0)`` constraint, and the
-real ``get_library_release_overrides`` prefetch against an actual PostgreSQL
+real ``get_library_release_pins`` prefetch against an actual PostgreSQL
 connection. Rows are inserted with raw SQL here (the seeder — and its own
 round-trip integration coverage — lives in a separate change).
 
@@ -10,8 +10,8 @@ Concrete production risks the unit tests cannot catch:
 
 * The CHECK constraint rejects a non-positive ``discogs_release_id``.
 * The ``library_id`` primary key enforces one pin per library row.
-* ``get_library_release_overrides`` returns exactly the subset of queried ids
-  that carry a pin, keyed correctly.
+* ``get_library_release_pins`` returns exactly the subset of queried ids
+  that carry a pin, keyed correctly and tagged with each pin's ``source``.
 * ``get_library_release_pins_strict`` (LML#1503) keys on ``library_id`` (the
   legacy release id space), returns ``(discogs_release_id, source)`` and omits
   ids with no pin.
@@ -26,7 +26,8 @@ import pytest
 import pytest_asyncio
 
 from entity.library_release_override import (
-    get_library_release_overrides,
+    PinnedRelease,
+    get_library_release_pins,
     get_library_release_pins_strict,
     set_up_library_release_override_schema,
 )
@@ -95,15 +96,20 @@ class TestPrefetchReadHelper:
     async def test_prefetch_returns_only_pinned_subset(self, pg_source, pg_pool):
         async with pg_pool.acquire() as conn:
             await conn.execute(_INSERT_SQL, 17, 437503)
-            await conn.execute(_INSERT_SQL, 28, 9590)
+            await conn.execute(_INSERT_WITH_SOURCE_SQL, 28, 9590, "md-12")
 
-        # Query a superset of ids: only the pinned ones come back, keyed right.
-        result = await get_library_release_overrides(pg_source, [17, 28, 999])
-        assert result == {17: 437503, 28: 9590}
+        # Query a superset of ids: only the pinned ones come back, keyed right,
+        # with the column's default source on the row inserted without one.
+        result = await get_library_release_pins(pg_source, [17, 28, 999])
+        assert result == {
+            17: PinnedRelease(437503, "alex-l-2026"),
+            28: PinnedRelease(9590, "md-12"),
+        }
+        assert result[28].exempt_from_floor and not result[17].exempt_from_floor
 
     @pytest.mark.asyncio
     async def test_prefetch_empty_when_no_pins(self, pg_source):
-        result = await get_library_release_overrides(pg_source, [17, 28])
+        result = await get_library_release_pins(pg_source, [17, 28])
         assert result == {}
 
 

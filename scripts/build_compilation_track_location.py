@@ -152,7 +152,7 @@ async def match_comp_release(
     Seeds the result from ``lml_cache.library_release_override`` (LML#850 /
     LML#858) -- the same hand-verified ``library_id -> discogs_release_id``
     pin the runtime ``/lookup`` path consults via
-    ``lookup/artwork.py::get_library_release_overrides``. An override only
+    ``entity/library_release_override.py::get_library_release_pins``. An override only
     seeds a match when its target is itself indexable: present in
     ``va_release`` *and* carrying at least one ``release_track`` row (the
     ``_OVERRIDE_SQL`` guard) -- the same "no cached tracklist" skip class the

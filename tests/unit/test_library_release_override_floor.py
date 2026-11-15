@@ -38,6 +38,7 @@ import pytest
 
 from config.settings import get_settings
 from discogs.models import DiscogsSearchResponse, ReleaseMetadataResponse
+from entity.library_release_override import PinnedRelease
 from lookup.artwork import fetch_artwork_for_items
 from lookup.release_resolution import ResolvedRelease
 from tests.factories import make_discogs_result, make_library_item
@@ -46,6 +47,13 @@ _LIBRARY_ID = 42
 _PIN_RELEASE_ID = 5000
 _MATCHER_RELEASE_ID = 99999
 _CARRIED_RELEASE_ID = 77777
+_SEED_SOURCE = "alex-l-2026"
+_MD_SOURCE = "md-17"
+
+
+def _pin(source: str = _SEED_SOURCE) -> dict[int, PinnedRelease]:
+    return {_LIBRARY_ID: PinnedRelease(release_id=_PIN_RELEASE_ID, source=source)}
+
 
 # The card as the librarians filed it.
 _CARD_ARTIST = "Jessica Pratt"
@@ -126,10 +134,8 @@ def _item(**kwargs):
     return make_library_item(id=_LIBRARY_ID, artist=_CARD_ARTIST, title=_CARD_TITLE, **kwargs)
 
 
-async def _bind(svc, item, **kwargs):
-    results = await fetch_artwork_for_items(
-        [item], svc, release_overrides={_LIBRARY_ID: _PIN_RELEASE_ID}, **kwargs
-    )
+async def _bind(svc, item, *, source: str = _SEED_SOURCE, **kwargs):
+    results = await fetch_artwork_for_items([item], svc, release_overrides=_pin(source), **kwargs)
     return results[0][1]
 
 
@@ -302,6 +308,87 @@ class TestValidatedOverridesAreExempt:
         assert bound is not None
         assert bound.release_id == _PIN_RELEASE_ID
         svc.cache_service.get_release_lean.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestMusicDirectorPinsAreExempt:
+    """LML#1514: a pin an MD set from the DJ site (``source`` ``md-<user id>``)
+    binds without grading. 85% of floor failures are correct pins on card rows
+    with defective titles -- exactly what an MD is fixing -- and a demoted MD
+    pin would let the CDC worker and the BS#3137 re-ask overwrite the MD's
+    choice with the matcher's. Seed batches keep the floor."""
+
+    @pytest.mark.parametrize("matcher_clears", [True, False])
+    async def test_md_pin_failing_the_floor_binds_the_pin(self, floor_gate_on, matcher_clears):
+        svc = _service(
+            pin_artist="Someone Else",
+            pin_title="A Different Album",
+            matcher_clears=matcher_clears,
+        )
+
+        bound = await _bind(svc, _item(), source=_MD_SOURCE)
+
+        assert bound is not None
+        assert bound.release_id == _PIN_RELEASE_ID
+        svc.cache_service.get_release_lean.assert_not_awaited()
+        svc.search.assert_not_awaited()
+
+    async def test_md_pin_wins_over_a_track_validated_carried_release(
+        self, floor_gate_on, monkeypatch
+    ):
+        """Decision-table row 2 applies only to a pin that was graded and failed;
+        an MD pin is never graded, so it binds like any flag-off pin would."""
+        monkeypatch.setenv("LML_RESOLVE_COMPILATION_RELEASE", "true")
+        get_settings.cache_clear()
+        svc = _service(pin_artist="Someone Else", pin_title="A Different Album")
+        carried = ResolvedRelease(
+            release_id=_CARRIED_RELEASE_ID,
+            release_url=f"https://www.discogs.com/release/{_CARRIED_RELEASE_ID}",
+            is_compilation=False,
+            album_title=_CARD_TITLE,
+            track_confirmed=True,
+        )
+
+        bound = await _bind(
+            svc,
+            _item(),
+            source=_MD_SOURCE,
+            discogs_titles={_LIBRARY_ID: carried},
+            found_on_compilation=True,
+        )
+
+        assert bound is not None
+        assert bound.release_id == _PIN_RELEASE_ID
+
+    @pytest.mark.parametrize("source", ["alex-l-2026", "alex-l-2026-masters-api", "MD-17"])
+    async def test_seed_pin_failing_the_floor_is_still_demoted(self, floor_gate_on, source):
+        svc = _service(pin_artist="Someone Else", pin_title="A Different Album")
+
+        bound = await _bind(svc, _item(), source=source)
+
+        assert bound is not None
+        assert bound.release_id == _MATCHER_RELEASE_ID
+        svc.cache_service.get_release_lean.assert_awaited()
+
+    async def test_exemption_is_per_pin_not_per_map(self, floor_gate_on):
+        """One request can surface an MD-pinned row beside a seed-pinned one;
+        the MD tag must not exempt its neighbour."""
+        svc = _service(pin_artist="Someone Else", pin_title="A Different Album")
+        md_item = _item()
+        seed_item = make_library_item(id=_LIBRARY_ID + 1, artist=_CARD_ARTIST, title=_CARD_TITLE)
+
+        results = await fetch_artwork_for_items(
+            [md_item, seed_item],
+            svc,
+            release_overrides={
+                md_item.id: PinnedRelease(release_id=_PIN_RELEASE_ID, source=_MD_SOURCE),
+                seed_item.id: PinnedRelease(release_id=_PIN_RELEASE_ID, source=_SEED_SOURCE),
+            },
+        )
+
+        bound = {item.id: artwork for item, artwork in results}
+        assert bound[md_item.id].release_id == _PIN_RELEASE_ID
+        assert bound[seed_item.id].release_id == _MATCHER_RELEASE_ID
 
 
 @pytest.mark.asyncio
@@ -500,7 +587,7 @@ class TestDegenerateCardRow:
             [item],
             svc,
             {_LIBRARY_ID: carried},
-            release_overrides={_LIBRARY_ID: _PIN_RELEASE_ID},
+            release_overrides=_pin(),
             found_on_compilation=True,
         )
 
@@ -513,9 +600,7 @@ class TestDegenerateCardRow:
         svc = _service()
         item = make_library_item(id=_LIBRARY_ID, artist=_CARD_ARTIST, title="")
 
-        results = await fetch_artwork_for_items(
-            [item], svc, release_overrides={_LIBRARY_ID: _PIN_RELEASE_ID}
-        )
+        results = await fetch_artwork_for_items([item], svc, release_overrides=_pin())
 
         bound = results[0][1]
         assert bound is not None

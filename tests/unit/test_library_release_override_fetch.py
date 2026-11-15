@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from discogs.models import DiscogsSearchResponse, ReleaseMetadataResponse
+from entity.library_release_override import PinnedRelease
 from lookup.artwork import fetch_artwork_for_items
 from lookup.release_resolution import ResolvedRelease
 from tests.factories import make_discogs_result, make_library_item
@@ -27,6 +28,7 @@ from tests.factories import make_discogs_result, make_library_item
 # The verified pin: library row 42 -> Discogs release 5000.
 _OVERRIDE_LIBRARY_ID = 42
 _OVERRIDE_RELEASE_ID = 5000
+_PIN = PinnedRelease(release_id=_OVERRIDE_RELEASE_ID, source="alex-l-2026")
 
 
 def _svc_with_override_release() -> AsyncMock:
@@ -72,7 +74,7 @@ class TestOverrideBeatsFuzzy:
         results = await fetch_artwork_for_items(
             [item],
             svc,
-            release_overrides={_OVERRIDE_LIBRARY_ID: _OVERRIDE_RELEASE_ID},
+            release_overrides={_OVERRIDE_LIBRARY_ID: _PIN},
         )
 
         bound = results[0][1]
@@ -150,7 +152,7 @@ class TestOverrideBeatsCarriedRelease:
                 [item],
                 svc,
                 {_OVERRIDE_LIBRARY_ID: carried},  # discogs_titles seam
-                release_overrides={_OVERRIDE_LIBRARY_ID: _OVERRIDE_RELEASE_ID},
+                release_overrides={_OVERRIDE_LIBRARY_ID: _PIN},
             )
 
             bound = results[0][1]

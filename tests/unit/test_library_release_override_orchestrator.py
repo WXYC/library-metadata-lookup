@@ -14,8 +14,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from entity.library_release_override import PinnedRelease
 from lookup.orchestrator import LookupState, _prefetch_release_overrides, _step_fetch_artwork
 from tests.factories import make_library_item
+
+_SEED = "alex-l-2026"
+
+
+def _pin(release_id: int, source: str = _SEED) -> PinnedRelease:
+    return PinnedRelease(release_id=release_id, source=source)
 
 
 def _services_stub(**overrides):
@@ -73,12 +80,14 @@ class TestPrefetchReleaseOverrides:
 
     async def test_flag_on_prefetches_map(self, _flag_on):
         pg = AsyncMock()
-        pg.fetchall = AsyncMock(return_value=[{"library_id": 42, "discogs_release_id": 5000}])
+        pg.fetchall = AsyncMock(
+            return_value=[{"library_id": 42, "discogs_release_id": 5000, "source": _SEED}]
+        )
         items = [make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")]
 
         result = await _prefetch_release_overrides(items, pg)
 
-        assert result == {42: 5000}
+        assert result == {42: _pin(5000)}
         assert pg.fetchall.await_count == 1
 
     async def test_flag_on_no_pg_returns_empty(self, _flag_on):
@@ -101,7 +110,9 @@ class TestPrefetchReleaseOverrides:
         # A synthesized row-less item (id=0) is never a real card-catalog id and
         # can carry no verified pin — it must not enter the prefetched id list.
         pg = AsyncMock()
-        pg.fetchall = AsyncMock(return_value=[{"library_id": 42, "discogs_release_id": 5000}])
+        pg.fetchall = AsyncMock(
+            return_value=[{"library_id": 42, "discogs_release_id": 5000, "source": _SEED}]
+        )
         items = [
             make_library_item(id=0, artist="Jessica Pratt", title="On Your Own Love Again"),
             make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again"),
@@ -109,7 +120,7 @@ class TestPrefetchReleaseOverrides:
 
         result = await _prefetch_release_overrides(items, pg)
 
-        assert result == {42: 5000}
+        assert result == {42: _pin(5000)}
         queried_ids = pg.fetchall.await_args.args[1]
         assert 0 not in queried_ids
 
@@ -118,7 +129,9 @@ class TestPrefetchReleaseOverrides:
         # prefetch must be skipped entirely (no per-item PG fan-out across the
         # shared discogs-cache pool), parity with every sibling bulk exclusion.
         pg = AsyncMock()
-        pg.fetchall = AsyncMock(return_value=[{"library_id": 42, "discogs_release_id": 5000}])
+        pg.fetchall = AsyncMock(
+            return_value=[{"library_id": 42, "discogs_release_id": 5000, "source": _SEED}]
+        )
         items = [make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")]
 
         result = await _prefetch_release_overrides(
@@ -144,7 +157,7 @@ class TestStepWiring:
         with (
             patch(
                 "lookup.orchestrator._prefetch_release_overrides",
-                new=AsyncMock(return_value={42: 5000}),
+                new=AsyncMock(return_value={42: _pin(5000)}),
             ),
             patch(
                 "lookup.orchestrator.fetch_artwork_for_items",
@@ -153,7 +166,7 @@ class TestStepWiring:
         ):
             await _step_fetch_artwork(_parsed_stub(), state, services)
 
-        assert mock_fetch.await_args.kwargs["release_overrides"] == {42: 5000}
+        assert mock_fetch.await_args.kwargs["release_overrides"] == {42: _pin(5000)}
 
     async def test_step_fetch_artwork_passes_bulk_kill_switch(self):
         # The per-request bulk flag must reach _prefetch_release_overrides so the
@@ -193,9 +206,9 @@ class TestPrefetchReusesCascadePins:
         pg.fetchall = AsyncMock(return_value=[])
         items = [make_library_item(id=55651, artist="Broadcast", title="Investigate...")]
 
-        result = await _prefetch_release_overrides(items, pg, prefetched={55651: 1944554})
+        result = await _prefetch_release_overrides(items, pg, prefetched={55651: _pin(1944554)})
 
-        assert result == {55651: 1944554}
+        assert result == {55651: _pin(1944554)}
         pg.fetchall.assert_not_awaited()
 
     async def test_partially_covered_ids_still_query(self, _flag_on):
@@ -203,8 +216,8 @@ class TestPrefetchReusesCascadePins:
         pg = AsyncMock()
         pg.fetchall = AsyncMock(
             return_value=[
-                {"library_id": 55651, "discogs_release_id": 1944554},
-                {"library_id": 52201, "discogs_release_id": 5441389},
+                {"library_id": 55651, "discogs_release_id": 1944554, "source": _SEED},
+                {"library_id": 52201, "discogs_release_id": 5441389, "source": _SEED},
             ]
         )
         items = [
@@ -212,9 +225,9 @@ class TestPrefetchReusesCascadePins:
             make_library_item(id=52201, artist="Broadcast", title="Tender Buttons"),
         ]
 
-        result = await _prefetch_release_overrides(items, pg, prefetched={55651: 1944554})
+        result = await _prefetch_release_overrides(items, pg, prefetched={55651: _pin(1944554)})
 
-        assert result == {55651: 1944554, 52201: 5441389}
+        assert result == {55651: _pin(1944554), 52201: _pin(5441389)}
         pg.fetchall.assert_awaited_once()
 
     async def test_flag_off_ignores_prefetched_pins_entirely(self, _flag_off):
@@ -223,7 +236,45 @@ class TestPrefetchReusesCascadePins:
         pg.fetchall = AsyncMock(return_value=[])
         items = [make_library_item(id=55651, artist="Broadcast", title="Investigate...")]
 
-        result = await _prefetch_release_overrides(items, pg, prefetched={55651: 1944554})
+        result = await _prefetch_release_overrides(items, pg, prefetched={55651: _pin(1944554)})
 
         assert result == {}
         pg.fetchall.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestPrefetchKeepsTheSourceTag:
+    """LML#1514: the floor exemption reads each pin's ``source``, so the
+    prefetch must hand it through rather than flatten to a release id."""
+
+    @pytest.mark.parametrize(("source", "exempt"), [("md-17", True), (_SEED, False)])
+    async def test_source_reaches_fetch(self, _flag_on, source, exempt):
+        pg = AsyncMock()
+        pg.fetchall = AsyncMock(
+            return_value=[{"library_id": 42, "discogs_release_id": 5000, "source": source}]
+        )
+        items = [make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")]
+
+        result = await _prefetch_release_overrides(items, pg)
+
+        assert result == {42: _pin(5000, source)}
+        assert result[42].exempt_from_floor is exempt
+
+    async def test_probe_pins_are_validated_only_when_the_tags_match(self):
+        """``overrides_are_validated`` compares whole pins, source included."""
+        item = make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")
+        state = LookupState(library_results=[item], release_overrides={42: _pin(5000)})
+
+        with (
+            patch(
+                "lookup.orchestrator._prefetch_release_overrides",
+                new=AsyncMock(return_value={42: _pin(5000, "md-17")}),
+            ),
+            patch(
+                "lookup.orchestrator.fetch_artwork_for_items",
+                new=AsyncMock(return_value=[(item, None)]),
+            ) as mock_fetch,
+        ):
+            await _step_fetch_artwork(_parsed_stub(), state, _services_stub())
+
+        assert mock_fetch.await_args.kwargs["release_overrides_validated"] is False

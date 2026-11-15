@@ -21,7 +21,7 @@ from config.settings import get_settings
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import DiscogsSearchRequest
 from discogs.service import DiscogsService
-from entity.library_release_override import get_library_release_overrides
+from entity.library_release_override import PinnedRelease, get_library_release_pins
 from entity.sources import PgSource
 from library.db import LibraryDB
 from library.models import LibraryItem
@@ -325,7 +325,7 @@ async def _rebind_rowless_release_via_override(
     *,
     release_id: int,
     shelf_rows: list[LibraryItem],
-) -> LibraryItem | None:
+) -> tuple[LibraryItem, PinnedRelease] | None:
     """Reverse-probe: does one of the artist's OWN shelf rows already carry a
     hand-verified override (LML#850, ``lml_cache.library_release_override``)
     pinning it to ``release_id``?
@@ -364,9 +364,10 @@ async def _rebind_rowless_release_via_override(
     matters for the 1,444 behaviorally-contradicted pins LML#1316 reports.
 
     Bounded to the first :data:`_SHELF_REBIND_PROBE_LIMIT` rows and fetched in
-    ONE query (``get_library_release_overrides``, best-effort — a PG failure
+    ONE query (``get_library_release_pins``, best-effort — a PG failure
     or an empty/absent ``pg`` degrades to no match, never a crash). Returns the
-    first shelf row whose override matches, in ``shelf_rows`` order.
+    first shelf row whose override matches, in ``shelf_rows`` order, with its
+    pin, so step 4 keeps the pin's ``source`` tag.
     """
     if not get_settings().lml_library_release_override:
         return None
@@ -375,10 +376,11 @@ async def _rebind_rowless_release_via_override(
     candidate_rows = [row for row in shelf_rows[:_SHELF_REBIND_PROBE_LIMIT] if row.id > 0]
     if not candidate_rows:
         return None
-    overrides = await get_library_release_overrides(pg, [row.id for row in candidate_rows])
+    overrides = await get_library_release_pins(pg, [row.id for row in candidate_rows])
     for row in candidate_rows:
-        if overrides.get(row.id) == release_id:
-            return row
+        pin = overrides.get(row.id)
+        if pin is not None and pin.release_id == release_id:
+            return row, pin
     return None
 
 
@@ -390,7 +392,7 @@ class Step3bResult:
     song_not_found: bool
     discogs_titles: dict[int, ResolvedRelease]
 
-    release_overrides: dict[int, int] = field(default_factory=dict)
+    release_overrides: dict[int, PinnedRelease] = field(default_factory=dict)
     """LML#850 pins this cascade already fetched, for step 4 to reuse.
 
     Populated only by the row-less reverse probe, and only on a hit: the probe
@@ -547,12 +549,13 @@ async def apply_track_validation_cascade(
             # to the same release from DJ Alex L.'s card-catalog walk.
             resolved_release = promoted_titles.get(ROWLESS_LIBRARY_ID)
             if resolved_release is not None:
-                shelf_row = await _rebind_rowless_release_via_override(
+                rebound = await _rebind_rowless_release_via_override(
                     pg,
                     release_id=resolved_release.release_id,
                     shelf_rows=real_results,
                 )
-                if shelf_row is not None:
+                if rebound is not None:
+                    shelf_row, shelf_pin = rebound
                     logger.info(
                         "Row-less reverse probe rebound release %s to shelved row "
                         "%r via its LML#850 override instead of surfacing it row-less",
@@ -580,7 +583,7 @@ async def apply_track_validation_cascade(
                         [shelf_row],
                         False,
                         {**discogs_titles, shelf_row.id: carried},
-                        release_overrides={shelf_row.id: resolved_release.release_id},
+                        release_overrides={shelf_row.id: shelf_pin},
                     )
 
             # A row-less release yields to any shelved row that answers the
