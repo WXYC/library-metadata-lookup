@@ -4229,6 +4229,14 @@ class BulkResolveResult(BaseModel):
         None,
         description="Composed external IDs for `kind: single_artist`. NULL for every other `kind`. URL construction is the consumer's job (see existing ReconciledIdentity contract).\n",
     )
+    discogs_release_id: int | None = Field(
+        None,
+        description='The Discogs release a music director pinned for this row. Set only when a manual (`md-*`) pin decides the `kind: single_artist` main row, with `method: manual` and confidence 1.0; null otherwise, including every other `kind` and every row without an `md-*` pin. It sits on the result, not on `main`, because `ReconciledIdentity` carries artist ids and is shared by other responses. Null means no pin decided the release, not "clear it": a consumer that stores the release must keep its stored value when this is null (WXYC/Backend-Service#3790).\n',
+    )
+    discogs_master_id: int | None = Field(
+        None,
+        description='The Discogs master of the release in `discogs_release_id`. Set only when a manual (`md-*`) pin decides the `kind: single_artist` main row and the pinned release belongs to a master; null otherwise, including every other `kind` and every row without an `md-*` pin. Null means no pin decided it, not "clear it": a consumer that stores the master must keep its stored value when this is null (WXYC/Backend-Service#3790).\n',
+    )
     method: IdentityMethod | None = Field(
         None,
         description="The composed top-level method LML's bulk-resolve handler picked per §3.4.1.1 (typically the strongest leg's method, or `cross_source_agreement` when Rule 2 boosted). NULL for `kind: unresolved`.\n",
@@ -4305,6 +4313,130 @@ class PinnedTrack(BaseModel):
     artist_credits: list[str] = Field(
         ...,
         description="One list per track, primary credits only (`extra = 0`); empty when the track carries none.\n",
+    )
+
+
+class ReleasePin(BaseModel):
+    """
+    One LML release pin (`lml_cache.library_release_override`): the Discogs release a library record's lookups use instead of searching, and the batch or writer that set it.
+
+    """
+
+    discogs_release_id: int = Field(..., description="The pinned Discogs release.")
+    source: str = Field(
+        ...,
+        description="Who set the pin: `md-<user id>` for a music director, or a seed batch name such as `alex-l-2026` for a catalog import.\n",
+    )
+
+
+class ReleasePinWriteRequest(BaseModel):
+    """
+    Request to `PUT /api/v1/library-release-override/{legacy_release_id}`.
+    """
+
+    discogs_release_id: conint(ge=1) = Field(
+        ...,
+        description="The Discogs release to pin. Must be positive (the table's CHECK) and must resolve through LML's `get_release`, so a typo cannot pin a release that does not exist.\n",
+    )
+    source: constr(pattern=r"^md-") = Field(
+        ...,
+        description="`md-<user id>`. A seed batch name is reserved for the seed scripts, so this writer can never write or overwrite a pin under a seed batch's name.\n",
+    )
+    note: str | None = Field(None, description="Optional free-text note stored with the pin.")
+
+
+class ReleasePinWriteResponse(BaseModel):
+    """
+    Response to `PUT /api/v1/library-release-override/{legacy_release_id}`: the pin as written, whether it binds, and the pin it replaced.
+
+    """
+
+    legacy_release_id: int = Field(
+        ..., description="Echo of the path's `library.legacy_release_id`."
+    )
+    discogs_release_id: int = Field(..., description="The pinned Discogs release.")
+    source: str = Field(..., description="The `md-*` source as written.")
+    binds: bool = Field(
+        ...,
+        description="Whether the next `/lookup` for this record, built from its own artist and title, uses the pinned release. A caller reports success only when this is `true`.\n",
+    )
+    replaced: ReleasePin | None = Field(
+        ...,
+        description="The pin this write replaced, as it was before the upsert, or null when the record had no pin. Backend records it in `library_discogs_release_change`.\n",
+    )
+
+
+class ReleasePinDeleteResponse(BaseModel):
+    """
+    Response to `DELETE /api/v1/library-release-override/{legacy_release_id}`: the pin that was removed.
+
+    """
+
+    legacy_release_id: int = Field(
+        ..., description="Echo of the path's `library.legacy_release_id`."
+    )
+    removed: ReleasePin
+
+
+class DiscogsReleaseChangeRequest(BaseModel):
+    """
+    Request to `PUT /library/{id}/discogs-release`.
+    """
+
+    url: str = Field(
+        ...,
+        description="A pasted Discogs release URL or a bare release id, parsed as `GET /library/releases/discogs-prefill` parses its `url`.\n",
+    )
+
+
+class DiscogsLinkProvenance(StrEnum):
+    """
+    Where a record's Discogs link came from, derived from the LML pin source. `md`: a pin whose source starts with `md-`, set by a music director ("set by an MD"). `catalog_import`: a seed-batch pin such as `alex-l-2026` or `alex-l-2026-masters-api` ("from the catalog import"). `automatic`: no pin; LML's search chose the release ("found automatically").
+
+    """
+
+    md = "md"
+    catalog_import = "catalog_import"
+    automatic = "automatic"
+
+
+class DiscogsReleasePinProvenance(BaseModel):
+    """
+    The record's current Discogs link and where it came from.
+    """
+
+    discogs_release_id: int = Field(..., description="The linked Discogs release.")
+    source: str | None = Field(
+        ..., description="The raw LML pin source, or null when the record has no pin."
+    )
+    provenance: DiscogsLinkProvenance
+
+
+class DiscogsReleasePrefill(BaseModel):
+    """
+    Response to `GET /library/releases/discogs-prefill`: one Discogs release, as `DiscogsReleasePrefill` in Backend's `library.service.ts`.
+
+    """
+
+    discogs_release_id: int
+    discogs_master_id: int | None = Field(...)
+    artist_name: str
+    album_title: str
+    label: str | None = Field(...)
+    discogs_label_id: int | None = Field(...)
+    year: int | None = Field(
+        ..., description='Release year; Discogs\' "unknown" (0) is sent as null.'
+    )
+    discogs_artist_id: int | None = Field(...)
+    genres: list[str]
+    styles: list[str]
+    artwork_url: str | None = Field(
+        ...,
+        description="The release's cover, or null (Discogs' spacer image is sent as null).",
+    )
+    track_count: int = Field(
+        ...,
+        description="Tracks on the release's tracklist. Added by WXYC/Backend-Service#3793; the other fields are already emitted.\n",
     )
 
 
@@ -6573,6 +6705,17 @@ class PinnedTracklist(BaseModel):
         ...,
         description="The release's tracks. Read it only when `in_cache` is `true`: `in_cache: true` with `[]` means the release has no tracks, while `in_cache: false` with `[]` says nothing about them.\n",
     )
+
+
+class DiscogsReleaseChangeResponse(BaseModel):
+    """
+    Response to `PUT /library/{id}/discogs-release`: everything the DJ site needs to show the new release without refetching. `pin` is the pin this save wrote, so its `provenance` is always `md` and its `source` is never null; the schema's other values serve a read of the current link (WXYC/Backend-Service#3794).
+
+    """
+
+    album: AlbumDetail
+    metadata: AlbumMetadataResponse
+    pin: DiscogsReleasePinProvenance
 
 
 class LiveFsUpdateEvent(BaseModel):
