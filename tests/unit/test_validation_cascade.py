@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from config.settings import get_settings
+from entity.library_release_override import PinnedRelease
 from entity.sources import PgSource
 from lookup.matching import MAX_SEARCH_RESULTS
 from lookup.release_resolution import ResolvedRelease
@@ -24,6 +25,12 @@ from lookup.validation import (
     apply_track_validation_cascade,
 )
 from tests.factories import make_library_item
+
+_SEED = "alex-l-2026"
+
+
+def _pin(release_id: int) -> PinnedRelease:
+    return PinnedRelease(release_id=release_id, source=_SEED)
 
 
 @pytest.mark.asyncio
@@ -507,18 +514,26 @@ class TestRebindRowlessReleaseViaOverride:
         """The Broadcast shape: the row's own override matches the target release."""
         pg = AsyncMock(spec=PgSource)
         pg.fetchall = AsyncMock(
-            return_value=[{"library_id": 55651, "discogs_release_id": BROADCAST_RELEASE_ID}]
+            return_value=[
+                {"library_id": 55651, "discogs_release_id": BROADCAST_RELEASE_ID, "source": _SEED}
+            ]
         )
         result = await _rebind_rowless_release_via_override(
             pg, release_id=BROADCAST_RELEASE_ID, shelf_rows=[BROADCAST_ITEM]
         )
-        assert result == BROADCAST_ITEM
+        assert result == (BROADCAST_ITEM, _pin(BROADCAST_RELEASE_ID))
 
     async def test_override_pinned_to_a_different_release_is_rejected(self):
         """Hiding Places / High Places: the row's OWN override points elsewhere."""
         pg = AsyncMock(spec=PgSource)
         pg.fetchall = AsyncMock(
-            return_value=[{"library_id": 8001, "discogs_release_id": HIDING_PLACES_OWN_RELEASE_ID}]
+            return_value=[
+                {
+                    "library_id": 8001,
+                    "discogs_release_id": HIDING_PLACES_OWN_RELEASE_ID,
+                    "source": _SEED,
+                }
+            ]
         )
         result = await _rebind_rowless_release_via_override(
             pg, release_id=HIGH_PLACES_RELEASE_ID, shelf_rows=[HIDING_PLACES_ITEM]
@@ -594,7 +609,7 @@ class TestCascadeRowLessReverseProbe:
                 return_value=([rowless], {ROWLESS_LIBRARY_ID: resolved}),
             ),
             patch(
-                "lookup.validation.get_library_release_overrides",
+                "lookup.validation.get_library_release_pins",
                 new_callable=AsyncMock,
                 return_value=overrides,
             ) as mock_overrides,
@@ -622,7 +637,7 @@ class TestCascadeRowLessReverseProbe:
         result, _ = await self._run(
             real_results=[BROADCAST_ITEM],
             promoted_release_id=BROADCAST_RELEASE_ID,
-            overrides={55651: BROADCAST_RELEASE_ID},
+            overrides={55651: _pin(BROADCAST_RELEASE_ID)},
         )
         assert result.library_results == [BROADCAST_ITEM]
         assert result.song_not_found is False
@@ -646,7 +661,7 @@ class TestCascadeRowLessReverseProbe:
         result, _ = await self._run(
             real_results=[HIDING_PLACES_ITEM],
             promoted_release_id=HIGH_PLACES_RELEASE_ID,
-            overrides={8001: HIDING_PLACES_OWN_RELEASE_ID},
+            overrides={8001: _pin(HIDING_PLACES_OWN_RELEASE_ID)},
             song="High Places",
         )
         assert [r.id for r in result.library_results] == [
@@ -671,7 +686,7 @@ class TestCascadeRowLessReverseProbe:
                 new_callable=AsyncMock,
             ) as mock_cached_track,
             patch(
-                "lookup.validation.get_library_release_overrides", new_callable=AsyncMock
+                "lookup.validation.get_library_release_pins", new_callable=AsyncMock
             ) as mock_overrides,
         ):
             result = await apply_track_validation_cascade(
@@ -760,10 +775,10 @@ class TestShelfRebindProbeBound:
         target = rows[48]
         pg = AsyncMock(spec=PgSource)
         pg.fetchall = AsyncMock(
-            return_value=[{"library_id": target.id, "discogs_release_id": 8894021}]
+            return_value=[{"library_id": target.id, "discogs_release_id": 8894021, "source": _SEED}]
         )
         result = await _rebind_rowless_release_via_override(pg, release_id=8894021, shelf_rows=rows)
-        assert result == target
+        assert result == (target, _pin(8894021))
 
     async def test_still_one_query_and_still_bounded(self):
         """The bound is raised, not removed — one query, capped array."""
@@ -828,9 +843,9 @@ class TestProbeHonoursTheOverrideFlag:
                 return_value=([rowless], {ROWLESS_LIBRARY_ID: resolved}),
             ),
             patch(
-                "lookup.validation.get_library_release_overrides",
+                "lookup.validation.get_library_release_pins",
                 new_callable=AsyncMock,
-                return_value={BROADCAST_ITEM.id: BROADCAST_RELEASE_ID},
+                return_value={BROADCAST_ITEM.id: _pin(BROADCAST_RELEASE_ID)},
             ) as mock_overrides,
         ):
             result = await apply_track_validation_cascade(
@@ -892,9 +907,9 @@ class TestRebindCarriesTheResolvedRelease:
                 return_value=([rowless], {ROWLESS_LIBRARY_ID: resolved}),
             ),
             patch(
-                "lookup.validation.get_library_release_overrides",
+                "lookup.validation.get_library_release_pins",
                 new_callable=AsyncMock,
-                return_value={BROADCAST_ITEM.id: BROADCAST_RELEASE_ID},
+                return_value={BROADCAST_ITEM.id: _pin(BROADCAST_RELEASE_ID)},
             ),
         ):
             return await apply_track_validation_cascade(
@@ -940,4 +955,4 @@ class TestRebindCarriesTheResolvedRelease:
     async def test_hands_the_pin_forward_so_step_four_need_not_requery(self):
         """LML#1332 finding 3: the probe already fetched this pin."""
         result = await self._rebind()
-        assert result.release_overrides == {BROADCAST_ITEM.id: BROADCAST_RELEASE_ID}
+        assert result.release_overrides == {BROADCAST_ITEM.id: _pin(BROADCAST_RELEASE_ID)}

@@ -89,3 +89,50 @@ class TestPinnedReleaseEnrichment:
         assert enriched is not None
         assert enriched.release_id == 0
         assert enriched.tracklist is None
+
+
+class TestTitleGateAdmitsTheCatalogRowsOwnTitle:
+    """LML#1514: an MD pin is exempt from the 80/80 floor but not from this
+    gate, which is only safe if the gate never rejects a request built from
+    the catalog row's own title -- the shape the DJ site and Backend-Service
+    send. The cases are the defective titles an MD is most likely fixing:
+    punctuation only, abbreviations, and titles that normalize to nothing."""
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "On Your Own Love Again",
+            "Hermanos Gutiérrez",
+            "S/t",
+            "...",
+            "???",
+            "!!!",
+            "/",
+            "()",
+            "(Remastered)",
+            "(Deluxe Edition)",
+            "LP",
+            '12"',
+            "",
+            "   ",
+        ],
+    )
+    def test_request_with_the_row_title_passes(self, title):
+        from lookup.enrichment.item import compute_row_title_matches_requested_album
+
+        item = make_library_item(id=_LIBRARY_ID, artist=ARTIST, title=title)
+        artwork = make_discogs_result(release_id=RELEASE_ID, artist=ARTIST, album=RELEASE_TITLE)
+
+        assert compute_row_title_matches_requested_album(
+            title, item, artwork, found_on_compilation=False
+        )
+
+    def test_a_different_album_still_collapses(self):
+        from lookup.enrichment.item import compute_row_title_matches_requested_album
+
+        item = make_library_item(id=_LIBRARY_ID, artist=ARTIST, title=RELEASE_TITLE)
+        artwork = make_discogs_result(release_id=RELEASE_ID, artist=ARTIST, album=RELEASE_TITLE)
+
+        assert not compute_row_title_matches_requested_album(
+            MISMATCHED_ALBUM, item, artwork, found_on_compilation=False
+        )

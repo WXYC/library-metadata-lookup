@@ -45,7 +45,7 @@ from discogs.models import (
 )
 from discogs.ratelimit import is_discogs_low_priority
 from discogs.service import DiscogsService
-from entity.library_release_override import get_library_release_overrides
+from entity.library_release_override import PinnedRelease, get_library_release_pins
 from entity.sources import PgSource, PgSourceProtocol
 from entity.store import EntityStore, Identity
 from generated.api_models import (
@@ -343,7 +343,7 @@ class LookupState:
     read by track validation (3b) to validate the artist's own album against
     Discogs tracklists on the compilation branch."""
 
-    release_overrides: dict[int, int] = field(default_factory=dict)
+    release_overrides: dict[int, PinnedRelease] = field(default_factory=dict)
     """LML#1332: verified LML#850 pins an earlier step already fetched.
 
     Written by track validation (3b) — only the row-less reverse probe fills
@@ -925,8 +925,8 @@ async def _prefetch_release_overrides(
     discogs_cache_pg: PgSource | None,
     *,
     allow_release_resolution_fallback: bool = True,
-    prefetched: dict[int, int] | None = None,
-) -> dict[int, int]:
+    prefetched: dict[int, PinnedRelease] | None = None,
+) -> dict[int, PinnedRelease]:
     """Flag-gated prefetch of verified library-release overrides (LML#850).
 
     Reads the ``lml_library_release_override`` flag once. When off (the default),
@@ -934,8 +934,10 @@ async def _prefetch_release_overrides(
     pre-override fuzzy pick byte-for-byte. When on, issues a single query for the
     request's real (``id > 0``) library ids — a row-less synthesized id (0) is
     never a card-catalog id and can carry no pin, so it is excluded from the id
-    list. Best-effort: ``get_library_release_overrides`` swallows PG errors and
-    returns ``{}``, so a transient outage falls through to the fuzzy pick.
+    list. Best-effort: ``get_library_release_pins`` swallows PG errors and
+    returns ``{}``, so a transient outage falls through to the fuzzy pick. Each
+    pin comes back tagged with its ``source`` (LML#1514), which decides whether
+    the override floor grades it.
 
     ``allow_release_resolution_fallback`` is the bulk kill switch: ``/lookup/bulk``
     passes ``False`` (like the #604/#628/#632 fallbacks and the #573 streaming
@@ -965,7 +967,7 @@ async def _prefetch_release_overrides(
         return {library_id: known[library_id] for library_id in library_ids}
     if discogs_cache_pg is None:
         return {}
-    return await get_library_release_overrides(discogs_cache_pg, library_ids)
+    return await get_library_release_pins(discogs_cache_pg, library_ids)
 
 
 async def _step_fetch_artwork(
@@ -1022,8 +1024,8 @@ async def _step_fetch_artwork(
             # this gate exists to prevent. This form is false the moment the map
             # carries anything the probe did not put there.
             overrides_are_validated = bool(override_map) and all(
-                state.release_overrides.get(library_id) == release_id
-                for library_id, release_id in override_map.items()
+                state.release_overrides.get(library_id) == pin
+                for library_id, pin in override_map.items()
             )
             for _ in state.library_results:
                 services.telemetry.record_api_call("discogs")

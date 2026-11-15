@@ -20,6 +20,7 @@ from wxyc_fastapi.observability import get_cache_stats_recorder
 from config.settings import get_settings
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
 from discogs.service import DiscogsService
+from entity.library_release_override import PinnedRelease
 from library.models import LibraryItem
 from lookup.artist_resolution import (
     _log_release_resolution_bind,
@@ -121,7 +122,7 @@ async def fetch_artwork_for_items(
     album: str | None = None,
     allow_release_resolution_fallback: bool = True,
     found_on_compilation: bool = False,
-    release_overrides: dict[int, int] | None = None,
+    release_overrides: dict[int, PinnedRelease] | None = None,
     release_overrides_validated: bool = False,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Fetch artwork for multiple library items in parallel.
@@ -170,7 +171,7 @@ async def fetch_artwork_for_items(
     A test pins that narrowing; if it ever widens, the boolean stops being sound
     and this must become a tagged map.
 
-    ``release_overrides`` (LML#850): a ``library_id -> discogs_release_id`` map of
+    ``release_overrides`` (LML#850): a ``library_id -> PinnedRelease`` map of
     **hand-verified** pins the orchestrator prefetched for this request (empty /
     ``None`` when the ``lml_library_release_override`` flag is off, so this is a
     no-op by default). A pinned library row binds its release BEFORE the
@@ -180,7 +181,10 @@ async def fetch_artwork_for_items(
     ``lml_override_requires_floor`` is on** (LML#1290): a pin that fails the
     80/80 floor yields to a track-validated carried release, or to the floored
     search — which it then pays for. It is still never *dropped*; see that flag
-    and ``lookup/override_floor.py``.
+    and ``lookup/override_floor.py``. A music director's pin
+    (``PinnedRelease.exempt_from_floor``, source ``md-*``) is never graded, so
+    it binds as if the flag were off (LML#1514); the tag is per pin, so it
+    exempts only its own row.
     """
     if not discogs_service:
         return [(item, None) for item in items]
@@ -274,8 +278,9 @@ async def fetch_artwork_for_items(
             # release id (and thus the tracklist). ``> 0`` mirrors the DB CHECK;
             # a malformed 0/negative pin can never reach the ``release_id=0``
             # sentinel path.
-            override_release_id = release_overrides.get(item.id)
-            if override_release_id is not None and override_release_id > 0:
+            pin = release_overrides.get(item.id)
+            override_release_id = pin.release_id if pin is not None else 0
+            if pin is not None and override_release_id > 0:
                 override_release = ResolvedRelease(
                     release_id=override_release_id,
                     release_url=f"https://www.discogs.com/release/{override_release_id}",
@@ -290,7 +295,13 @@ async def fetch_artwork_for_items(
                 # for same-request-derived pins — the LML#1332 shelf-rebind probe
                 # exists precisely TO bypass this floor, and re-imposing it there
                 # lands on the release_id=0 sentinel with no artwork or tracklist.
-                if not require_override_floor or release_overrides_validated:
+                # Also skipped for a music director's pin (LML#1514): an MD chose
+                # it on this very card, usually one whose title the floor fails.
+                if (
+                    not require_override_floor
+                    or release_overrides_validated
+                    or pin.exempt_from_floor
+                ):
                     return await _bind_resolved_release(
                         discogs_service,
                         override_release,
