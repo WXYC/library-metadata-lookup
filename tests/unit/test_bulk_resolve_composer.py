@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from entity.compilation_track_identity import CompilationTrackIdentityRow
+from entity.library_release_override import PinnedRelease
 from entity.release_tracklist import ReleaseTracklistRow
 from entity.store import Identity, ProvenanceRow
 from generated.api_models import (
@@ -1438,6 +1439,82 @@ class TestSingleArtistDerivedTracks:
             assert not (result.tracks_attempted is False and result.tracks), (
                 "forbidden (False, populated) pairing emitted on the single_artist arm"
             )
+
+
+class TestMdPinDecidesMainRelease:
+    """LML#1516: an MD's (`md-*`) pin decides the `kind: single_artist` main
+    row's release, so Backend's `library_identity` follows the pick. Every
+    other pin, and no pin, leaves both release fields null ("keep what you
+    stored") and the composed method/confidence untouched."""
+
+    async def _compose(self, pin, master_id=None, *, identity=None):
+        return await compose_for_identity(
+            library_id=42,
+            identity=identity
+            if identity is not None
+            else _make_identity(library_name="Juana Molina", discogs_artist_id=2154),
+            entity_store=_store(
+                {
+                    "discogs": ProvenanceRow(
+                        source="discogs", external_id="2154", confidence=0.85, method="member_group"
+                    )
+                }
+            ),
+            release_pin=pin,
+            release_master_id=master_id,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("master_id", "expected_master"),
+        [(4321, 4321), (None, None)],
+        ids=["with-master", "no-master-known"],
+    )
+    async def test_md_pin_emits_release_with_manual_full_confidence(
+        self, master_id, expected_master
+    ):
+        result = await self._compose(PinnedRelease(555, "md-user-7"), master_id)
+        assert result.kind is BulkResolveResultKind.single_artist
+        assert result.discogs_release_id == 555
+        assert result.discogs_master_id == expected_master
+        assert result.method is IdentityMethod.manual
+        assert result.confidence == 1.0
+        # The artist ids still come from the composed identity.
+        assert result.main is not None
+        assert result.main.discogs_artist_id == 2154
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "pin",
+        [None, PinnedRelease(555, "alex-l-2026"), PinnedRelease(555, "play-corroborated-2026-08")],
+        ids=["no-pin", "alex-pin", "corroborated-pin"],
+    )
+    async def test_non_md_pin_or_no_pin_emits_null_and_keeps_composition(self, pin):
+        result = await self._compose(pin, 4321)
+        assert result.kind is BulkResolveResultKind.single_artist
+        assert result.discogs_release_id is None
+        assert result.discogs_master_id is None
+        assert result.method is IdentityMethod.member_group
+        assert result.confidence == 0.85
+
+    @pytest.mark.asyncio
+    async def test_unresolved_row_ignores_md_pin(self):
+        result = await compose_for_identity(
+            library_id=42,
+            identity=None,
+            entity_store=_store(),
+            release_pin=PinnedRelease(555, "md-user-7"),
+            release_master_id=4321,
+        )
+        assert result.kind is BulkResolveResultKind.unresolved
+        assert result.discogs_release_id is None
+        assert result.discogs_master_id is None
+        assert result.method is None
+
+    def test_compilation_result_never_carries_a_release(self):
+        result = compilation_result(42, include_tracks=False, store_rows=None)
+        assert result.discogs_release_id is None
+        assert result.discogs_master_id is None
 
 
 def test_floors_are_what_the_spec_says():

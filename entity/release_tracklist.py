@@ -128,3 +128,27 @@ async def get_present_release_ids(pg: PgSource, release_ids: Sequence[int]) -> s
         return set()
     rows = await pg.fetchall(_SELECT_PRESENT_RELEASES_SQL, list(release_ids))
     return {row["id"] for row in rows}
+
+
+# The master of each MD-pinned release (LML#1516), so bulk-resolve can send it
+# with the release. ``master_id = 0`` is Discogs's "no master" sentinel, which
+# the ETL stores verbatim (discogs-etl#427); it is dropped like NULL.
+_SELECT_RELEASE_MASTERS_SQL = """\
+SELECT id, master_id
+FROM release
+WHERE id = ANY($1::int[])\
+"""
+
+
+async def get_release_master_ids(pg: PgSource, release_ids: Sequence[int]) -> dict[int, int]:
+    """``release_id -> master_id`` for the releases the cache holds with a master.
+
+    ONE query for the batch. A release that is absent from the filtered cache,
+    or has no master (NULL or the ``0`` sentinel), has no key. An empty
+    ``release_ids`` skips the query. PG failures propagate, so the router can
+    degrade the batch rather than send a release with a wrong master.
+    """
+    if not release_ids:
+        return {}
+    rows = await pg.fetchall(_SELECT_RELEASE_MASTERS_SQL, list(release_ids))
+    return {row["id"]: row["master_id"] for row in rows if (row["master_id"] or 0) > 0}

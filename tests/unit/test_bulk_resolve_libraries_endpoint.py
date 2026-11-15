@@ -15,6 +15,7 @@ import sentry_sdk
 from asyncpg.exceptions import PostgresError
 from httpx import ASGITransport, AsyncClient
 
+from entity.library_release_override import PinnedRelease
 from entity.store import Identity
 from tests.unit.conftest import override_deps
 
@@ -1529,7 +1530,7 @@ class TestIncludeTracksSingleArtistDerivation:
         async def counting_pins(pg, legacy_release_ids):
             nonlocal pins_calls
             pins_calls += 1
-            return {lid: 5000 + lid for lid in legacy_release_ids}
+            return {lid: PinnedRelease(5000 + lid, "alex-l-2026") for lid in legacy_release_ids}
 
         async def counting_tracklists(pg, release_ids):
             nonlocal tracklist_calls
@@ -1610,7 +1611,7 @@ class TestIncludeTracksSingleArtistDerivation:
         from entity.sources import PgSource
 
         async def fake_pins(pg, legacy_release_ids):
-            return {101: 555} if 101 in legacy_release_ids else {}
+            return {101: PinnedRelease(555, "alex-l-2026")} if 101 in legacy_release_ids else {}
 
         async def fake_tracklists(pg, release_ids):
             assert list(release_ids) == [555]
@@ -1719,7 +1720,7 @@ class TestIncludeTracksSingleArtistDerivation:
         from entity.sources import PgSource
 
         async def fake_pins(pg, legacy_release_ids):
-            return {101: 555}
+            return {101: PinnedRelease(555, "alex-l-2026")}
 
         async def fake_tracklists(pg, release_ids):
             return {555: []}
@@ -1775,7 +1776,7 @@ class TestIncludeTracksSingleArtistDerivation:
         from entity.sources import PgSource
 
         async def fake_pins(pg, legacy_release_ids):
-            return {101: 555}
+            return {101: PinnedRelease(555, "alex-l-2026")}
 
         async def fake_tracklists(pg, release_ids):
             return {}
@@ -1934,3 +1935,127 @@ class TestIncludeTracksSingleArtistDerivation:
         assert event["properties"]["error_type"] == "PostgresError"
         assert event["properties"]["legacy_release_id_count"] == 2
         assert event["properties"]["environment"] == "unit-test-env"
+
+
+class TestMdPinMainRelease:
+    """LML#1516: the router hands each single-artist input its pin, and an
+    `md-*` pin's release (plus its master, read once per request) reaches
+    the wire as the main-row `discogs_release_id` / `discogs_master_id`.
+    The pin read is not gated by `include_tracks`: the release is a main-row
+    fact, not a track one."""
+
+    async def _post(self, app, body):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            return await ac.post("/api/v1/identity/bulk-resolve-libraries", json=body)
+
+    _INPUTS = [
+        {
+            "library_id": 1,
+            "legacy_release_id": 101,
+            "artist_name": "Juana Molina",
+            "album_title": "DOGA",
+        },
+        {
+            "library_id": 2,
+            "legacy_release_id": 102,
+            "artist_name": "Jessica Pratt",
+            "album_title": "On Your Own Love Again",
+        },
+        {
+            "library_id": 3,
+            "legacy_release_id": 103,
+            "artist_name": "Stereolab",
+            "album_title": "Dots and Loops",
+        },
+        {
+            "library_id": 4,
+            "legacy_release_id": 104,
+            "artist_name": "Various Artists",
+            "album_title": "VA One",
+        },
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("include_tracks", [True, False], ids=["tracks", "no-tracks"])
+    async def test_only_md_pins_reach_the_main_row(
+        self, app_client, mock_entity_store, monkeypatch, include_tracks
+    ):
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.sources import PgSource
+
+        master_calls: list[list[int]] = []
+
+        async def fake_pins(pg, legacy_release_ids):
+            pins = {
+                101: PinnedRelease(555, "md-user-7"),
+                102: PinnedRelease(666, "alex-l-2026"),
+                104: PinnedRelease(777, "md-user-7"),
+            }
+            return {lid: pin for lid, pin in pins.items() if lid in legacy_release_ids}
+
+        async def fake_tracklists(pg, release_ids):
+            return {}
+
+        async def fake_masters(pg, release_ids):
+            master_calls.append(list(release_ids))
+            return {555: 4321}
+
+        monkeypatch.setattr(router_module, "load_single_artist_release_pins", fake_pins)
+        monkeypatch.setattr(router_module, "load_release_tracklists_by_release_id", fake_tracklists)
+        monkeypatch.setattr(router_module, "load_release_master_ids", fake_masters)
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Juana Molina", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+
+        resp = await self._post(
+            app_client, {"include_tracks": include_tracks, "inputs": self._INPUTS}
+        )
+
+        assert resp.status_code == 200
+        by_id = {r["library_id"]: r for r in resp.json()["results"]}
+        md = by_id[1]
+        assert (md["discogs_release_id"], md["discogs_master_id"]) == (555, 4321)
+        assert (md["method"], md["confidence"]) == ("manual", 1.0)
+        for library_id in (2, 3, 4):  # non-md pin, no pin, compilation
+            assert by_id[library_id]["discogs_release_id"] is None
+            assert by_id[library_id]["discogs_master_id"] is None
+        assert by_id[2]["method"] == "exact_match"
+        assert by_id[4]["kind"] == "compilation"
+        # One master read per request, for the single-artist md pins only.
+        assert master_calls == [[555]]
+
+    @pytest.mark.asyncio
+    async def test_master_read_failure_degrades_to_null_not_503(
+        self, app_client, mock_entity_store, monkeypatch
+    ):
+        """Null means "keep what you stored", so a failed read must never
+        send a release without its master, nor fail the batch."""
+        import identity.router as router_module
+        from core.dependencies import get_discogs_cache_pg
+        from entity.sources import PgSource
+
+        async def fake_pins(pg, legacy_release_ids):
+            return {101: PinnedRelease(555, "md-user-7")}
+
+        async def failing_masters(pg, release_ids):
+            raise PostgresError("simulated release read failure")
+
+        monkeypatch.setattr(router_module, "load_single_artist_release_pins", fake_pins)
+        monkeypatch.setattr(router_module, "load_release_master_ids", failing_masters)
+        app_client.dependency_overrides[get_discogs_cache_pg] = lambda: AsyncMock(spec=PgSource)
+        mock_entity_store.resolve_library_name.return_value = _identity(
+            "Juana Molina", id=1, discogs_artist_id=2154
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+
+        resp = await self._post(app_client, {"inputs": self._INPUTS[:1]})
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["kind"] == "single_artist"
+        assert result["discogs_release_id"] is None
+        assert result["discogs_master_id"] is None
+        assert result["method"] == "exact_match"

@@ -35,6 +35,12 @@ per-track `confidence`/`method` inherit the pin's provenance (`manual`/1.0).
 `(True, tracks)` when it does — see `SingleArtistTrackDerivation` below and
 the 2026-08-08 decision record on LML#1138.
 
+A music director's (`md-*`) pin also decides the single-artist main row's
+release (LML#1516): the result carries `discogs_release_id` and, where the
+discogs-cache knows it, `discogs_master_id`, with `manual`/1.0 as the composed
+method and confidence. Any other pin, and no pin, leaves both null, which
+consumers read as "keep what you stored".
+
 LML#1021's per-track composition (`compilation_result`'s `store_rows`
 parameter) applies Rule 4 (MIN-of-confidences) only, deliberately NOT Rule 2
 (cross-source agreement boost) — see `_compose_confidence_and_method`'s
@@ -56,10 +62,11 @@ from entity.compilation_track_identity import (
     CompilationTrackIdentityRow,
     get_compilation_track_identity_for_libraries,
 )
-from entity.library_release_override import get_library_release_overrides_strict
+from entity.library_release_override import PinnedRelease, get_library_release_pins_strict
 from entity.release_tracklist import (
     ReleaseTracklistRow,
     get_present_release_ids,
+    get_release_master_ids,
     get_release_tracklists_for_releases,
 )
 from entity.sources import PgSource
@@ -439,6 +446,8 @@ async def compose_for_identity(
     *,
     include_tracks: bool = False,
     track_derivation: SingleArtistTrackDerivation | None = None,
+    release_pin: PinnedRelease | None = None,
+    release_master_id: int | None = None,
 ) -> BulkResolveResult:
     """Compose a single-artist verdict for one library row.
 
@@ -466,6 +475,14 @@ async def compose_for_identity(
       `(True, entries)` derived from its cached tracklist, or `(True, [])`
       when the present release genuinely has no track rows ("we looked,
       the answer is nothing").
+
+    `release_pin` is this row's override pin, if any, and `release_master_id`
+    its release's master from the discogs-cache (LML#1516). Only an `md-*`
+    pin (`PinnedRelease.exempt_from_floor`) on a `kind: single_artist` result
+    sets `discogs_release_id` / `discogs_master_id`, and it replaces the
+    composed method and confidence with the pin's `manual`/1.0: an MD chose
+    the release by hand. Every other case leaves both null and the
+    composition as it was.
 
     `track_derivation` is the composer-side seam of the derivation: the
     router builds it per input from the batched pre-fan-out reads
@@ -511,6 +528,13 @@ async def compose_for_identity(
     main, method, confidence = _compose_main(composed)
     provenance = [_row_to_provenance(r) for r in composed]
 
+    discogs_release_id: int | None = None
+    discogs_master_id: int | None = None
+    if release_pin is not None and release_pin.exempt_from_floor:
+        discogs_release_id = release_pin.release_id
+        discogs_master_id = release_master_id
+        method, confidence = _PIN_METHOD, _PIN_CONFIDENCE
+
     tracks: list[BulkResolveTrackIdentity] | None
     tracks_attempted: bool | None
     if not include_tracks:
@@ -525,6 +549,8 @@ async def compose_for_identity(
         kind=BulkResolveResultKind.single_artist,
         library_id=library_id,
         main=main,
+        discogs_release_id=discogs_release_id,
+        discogs_master_id=discogs_master_id,
         method=method,
         confidence=confidence,
         provenance=provenance,
@@ -935,8 +961,9 @@ class SingleArtistTrackDerivation:
 
 async def load_single_artist_release_pins(
     pg: PgSource, legacy_release_ids: Sequence[int]
-) -> dict[int, int]:
-    """Batched `legacy_release_id` → pinned `discogs_release_id` mapping.
+) -> dict[int, PinnedRelease]:
+    """Batched `legacy_release_id` → pinned release mapping, tagged with the
+    pin's `source` so an `md-*` pin can also decide the main row (LML#1516).
 
     THE mapping seam of the LML#1138 derivation (see the section comment
     above): v1 reads `lml_cache.library_release_override` — the only
@@ -954,7 +981,18 @@ async def load_single_artist_release_pins(
     """
     if not legacy_release_ids:
         return {}
-    return await get_library_release_overrides_strict(pg, list(legacy_release_ids))
+    return await get_library_release_pins_strict(pg, list(legacy_release_ids))
+
+
+async def load_release_master_ids(pg: PgSource, release_ids: Sequence[int]) -> dict[int, int]:
+    """Batched master read for the MD-pinned releases (LML#1516).
+
+    ONE query per request, and only when the batch carries an `md-*` pin. A
+    release absent from the filtered cache, or without a master, has no key,
+    so its row sends `discogs_master_id: null`. PG failures propagate to the
+    router's degrade arm with the pins read.
+    """
+    return await get_release_master_ids(pg, release_ids)
 
 
 async def load_release_tracklists_by_release_id(
