@@ -57,6 +57,7 @@ from library.db import LibraryDB
 from library.models import LibraryItem
 from lookup.admission import evaluate_admission_shed
 from lookup.artwork import fetch_artwork_for_items
+from lookup.artwork_shed import ArtworkFetchOutcome
 from lookup.candidate_memo import TrackCandidateMemo
 from lookup.enrichment import enrich_artwork_results
 from lookup.enrichment.shed import Top1FetchOutcome
@@ -393,6 +394,24 @@ class LookupState:
     ``upstream_shed``. Kept separate from ``upstream_shed`` because that flag
     also gates the step-8 shelf fallback and the miss-kind classifier, which
     are about the SEARCH leg; a shed after a match was found changes neither."""
+
+    artwork_shed: bool = False
+    """True when the artwork fetch (step 4) was shed rather than answered for
+    at least one row (LML#1398) — a ``BreakerOpenError`` inside ``fetch_one``,
+    or the ``None`` ``DiscogsService.search`` returns for a degraded call
+    (LML#918). Written by artwork fetch (4), read by the normal response build,
+    which ORs it into ``degraded`` alongside ``upstream_shed`` and
+    ``enrichment_shed``.
+
+    A shed is "couldn't ask, try later — never a confirmed miss"
+    (``core/exceptions.py``): without this flag a transient outage went out as
+    ``artwork: null, degraded: false``, byte-identical to a genuine "Discogs
+    has no cover", and callers negative-cached that shape for up to 7 days
+    (WXYC/Backend-Service#2522 / #2743). Kept separate from
+    ``enrichment_shed`` because that flag is written by step 4b from its own
+    ``Top1FetchOutcome``; the two legs must not clobber each other's marker.
+    The shed row still carries ``None`` artwork (there is nothing to show) and
+    its siblings in the same request keep theirs."""
 
     @property
     def result_count(self) -> int:
@@ -980,7 +999,9 @@ async def _step_fetch_artwork(
     READS: ``library_results``, ``discogs_titles``, ``found_on_compilation``,
     ``serve_blocked_probe_pair``.
     WRITES: ``items_with_artwork`` (builds the ``(item, artwork)`` pairs every
-    later step consumes). The flag-gated LML#850 prefetch feeds
+    later step consumes) and ``artwork_shed`` (LML#1398: a breaker shed or a
+    degraded ``search`` made the nulls inconclusive, so the response must be
+    marked degraded). The flag-gated LML#850 prefetch feeds
     ``release_overrides`` to ``fetch_artwork_for_items`` so a hand-verified pin
     binds instead of the fuzzy pick.
 
@@ -1029,6 +1050,7 @@ async def _step_fetch_artwork(
             )
             for _ in state.library_results:
                 services.telemetry.record_api_call("discogs")
+            artwork_outcome = ArtworkFetchOutcome()
             state.items_with_artwork = await fetch_artwork_for_items(
                 state.library_results,
                 services.discogs_service,
@@ -1039,7 +1061,9 @@ async def _step_fetch_artwork(
                 found_on_compilation=state.found_on_compilation,
                 release_overrides=override_map,
                 release_overrides_validated=overrides_are_validated,
+                outcome=artwork_outcome,
             )
+            state.artwork_shed = artwork_outcome.upstream_shed
 
     if state.serve_blocked_probe_pair is not None:
         state.items_with_artwork = [state.serve_blocked_probe_pair, *state.items_with_artwork]
@@ -1439,7 +1463,9 @@ async def perform_lookup(
     # LML#1126: a search-leg breaker shed must not read as a genuine no-match
     # -- see ``LookupState.upstream_shed``'s docstring. LML#1420: nor may a
     # top-1 enrichment shed read as "no Discogs profile" (``enrichment_shed``).
-    degraded = state.upstream_shed or state.enrichment_shed
+    # LML#1398: nor may an artwork shed read as "Discogs has no cover"
+    # (``artwork_shed``) -- callers negative-cache that shape.
+    degraded = state.upstream_shed or state.enrichment_shed or state.artwork_shed
     response = LookupResponse(
         results=result_items,
         search_type=search_type,
