@@ -89,6 +89,16 @@ MODULE_BUDGETS: dict[str, int] = {
     # bind Discogs results". Three call sites, no import cycle. Do that
     # instead of raising this again.
     "lookup/artwork.py": 550,
+    # LML#1398: the artwork fetch's breaker-shed marker, extracted out of
+    # `lookup/artwork.py` at the boundary the comment above prescribes rather
+    # than raising that budget again (the two hook sites fit in the 550 by
+    # pointing their rationale here). `ArtworkFetchOutcome` mirrors
+    # `lookup/enrichment/shed.py`'s `Top1FetchOutcome` (LML#1420): `fetch_one`
+    # keeps the per-item `None`, records the shed, and the orchestrator's
+    # `LookupState.artwork_shed` turns it into `degraded: true,
+    # degraded_reason: upstream_unavailable`. 63 lines measured;
+    # 1.3x = 81.9 -> 100.
+    "lookup/artwork_shed.py": 100,
     # The two `token_set_ratio` floors over artist-fallback row titles (the
     # LML#400 album floor with its drop helper, and the LML#717
     # song-as-album-title floor), moved verbatim out of `lookup/matching.py`

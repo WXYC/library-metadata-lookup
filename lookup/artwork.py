@@ -18,6 +18,7 @@ from wxyc_etl.text import is_compilation_artist
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from config.settings import get_settings
+from core.exceptions import BreakerOpenError
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
 from discogs.service import DiscogsService
 from entity.library_release_override import PinnedRelease
@@ -26,6 +27,7 @@ from lookup.artist_resolution import (
     _log_release_resolution_bind,
     resolve_canonical_artist,
 )
+from lookup.artwork_shed import ArtworkFetchOutcome, mark_if_search_degraded, record_shed
 from lookup.fallback_artwork import _resolve_fallback_artwork
 from lookup.matching import is_self_titled, map_library_format_to_discogs
 from lookup.override_floor import (
@@ -124,6 +126,7 @@ async def fetch_artwork_for_items(
     found_on_compilation: bool = False,
     release_overrides: dict[int, PinnedRelease] | None = None,
     release_overrides_validated: bool = False,
+    outcome: ArtworkFetchOutcome | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Fetch artwork for multiple library items in parallel.
 
@@ -185,6 +188,9 @@ async def fetch_artwork_for_items(
     (``PinnedRelease.exempt_from_floor``, source ``md-*``) is never graded, so
     it binds as if the flag were off (LML#1514); the tag is per pin, so it
     exempts only its own row.
+
+    ``outcome`` (LML#1398): caller-owned out-parameter recording whether any
+    item's fetch was *shed* rather than answered — see ``lookup/artwork_shed.py``.
     """
     if not discogs_service:
         return [(item, None) for item in items]
@@ -481,11 +487,11 @@ async def fetch_artwork_for_items(
                     if resolve_artist_canonical:
                         # Same handle the override floor uses, resolved once per
                         # request above (LML#1290) instead of re-derived per item.
-                        outcome = await resolve_canonical_artist(
+                        canonical_outcome = await resolve_canonical_artist(
                             track_artist, cache_service=cache_service
                         )
-                        if outcome.swapped:
-                            probe_artist = outcome.canonical
+                        if canonical_outcome.swapped:
+                            probe_artist = canonical_outcome.canonical
                             swapped = True
                     candidates = await resolve_release_for_track_cached(
                         discogs_service,
@@ -510,6 +516,9 @@ async def fetch_artwork_for_items(
                             album=request_album,
                             allow_release_resolution_fallback=allow_release_resolution_fallback,
                         )
+                # No candidate cleared the floor and no fallback recovered the
+                # row: record a degraded search as "couldn't ask" (LML#1398).
+                mark_if_search_degraded(response, outcome)
                 return None
             if demoted_pin is not None:
                 # Row 3: the matcher's answer replaces the pin. With row 2 this is
@@ -524,6 +533,15 @@ async def fetch_artwork_for_items(
                 if fallback:
                     result = result.model_copy(update={"artwork_url": fallback})
             return result
+        except BreakerOpenError:
+            # LML#1398: "couldn't ask, try later — never a confirmed miss"
+            # (``core/exceptions.py``). The catch-all below would return the
+            # same ``None`` a genuine "no artwork" answer does, which callers
+            # negative-cache for up to 7 days (BS#2522 / #2743). Keep the
+            # per-item ``None``; mark the request shed instead.
+            logger.warning(f"Artwork lookup shed for {item.title}")
+            record_shed(outcome)
+            return None
         except Exception as e:
             logger.warning(f"Artwork lookup failed for {item.title}: {e}")
             return None
